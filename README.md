@@ -280,4 +280,5 @@ Read `MEMORY/principles.md` first if you're contributing. The headline:
 
 ## License
 
-Apache-2.0. As the beautiful upstream `ironplc/` software developed by Mr.Garret Fick is also Apache-2.0.
+IA2 is licensed under [Apache-2.0](LICENSE). Vendored IronPLC carries its own
+[MIT license](vendor/ironplc/LICENSE); other dependencies retain their respective licenses.
