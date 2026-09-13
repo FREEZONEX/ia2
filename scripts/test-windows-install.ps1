@@ -121,6 +121,26 @@ try {
     $second = @(Tree-Hashes $roots)
     if (@(Compare-Object $first $second).Count -ne 0) { throw 'Identical release changed installed content during upgrade.' }
     $second | Set-Content -LiteralPath (Join-Path $ArtifactsDirectory 'installed-hashes.txt') -Encoding UTF8
+    $noticeHashes = @()
+    foreach ($notice in @('LICENSE', 'NOTICE', 'THIRD-PARTY-NOTICES')) {
+        $noticeSource = Join-Path $extracted $notice
+        if (-not (Test-Path -LiteralPath $noticeSource)) { continue }
+        $noticeFiles = if (Test-Path -LiteralPath $noticeSource -PathType Container) {
+            @(Get-ChildItem -LiteralPath $noticeSource -File -Recurse -Force)
+        } else { @(Get-Item -LiteralPath $noticeSource -Force) }
+        foreach ($file in $noticeFiles) {
+            $relative = $file.FullName.Substring($extracted.Length).TrimStart('\')
+            $installedNotice = Join-Path $install $relative
+            if (-not (Test-Path -LiteralPath $installedNotice -PathType Leaf)) { throw "Installer omitted license or notice: $relative" }
+            $sourceHash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
+            if ((Get-FileHash -LiteralPath $installedNotice -Algorithm SHA256).Hash -ne $sourceHash) {
+                throw "Installed license or notice differs from package: $relative"
+            }
+            $noticeHashes += "$relative $sourceHash"
+        }
+    }
+    $noticeHashes | Sort-Object | Set-Content -LiteralPath (Join-Path $ArtifactsDirectory 'installed-notice-hashes.txt') -Encoding UTF8
+    $result.installed_notice_files_verified = $noticeHashes.Count
     if ((Get-FileHash -LiteralPath $sentinel).Hash -ne $sentinelHash) { throw 'Installer changed user data.' }
     if ($env:PATH -ne $minimalPath -or [Environment]::GetEnvironmentVariable('PATH', 'User') -ne $userPath -or [Environment]::GetEnvironmentVariable('PATH', 'Machine') -ne $machinePath) {
         throw 'Installer changed process or persistent PATH.'

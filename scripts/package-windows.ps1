@@ -111,8 +111,9 @@ try {
     foreach ($document in @('windows-validation.md', 'windows-can-ethercat.md', 'edge-deploy.md')) {
         Copy-Item -LiteralPath (Join-Path $SourceRoot "docs\$document") -Destination (Join-Path $stage $document)
     }
-    foreach ($notice in @('LICENSE', 'NOTICE')) {
-        if (Test-Path -LiteralPath (Join-Path $SourceRoot $notice)) { Copy-Item -LiteralPath (Join-Path $SourceRoot $notice) -Destination $stage }
+    foreach ($notice in @('LICENSE', 'NOTICE', 'THIRD-PARTY-NOTICES')) {
+        $noticeSource = Join-Path $SourceRoot $notice
+        if (Test-Path -LiteralPath $noticeSource) { Copy-Item -LiteralPath $noticeSource -Destination (Join-Path $stage $notice) -Recurse -Force }
     }
     $commit = (& git rev-parse HEAD | Out-String).Trim()
     if ($LASTEXITCODE -ne 0) { throw 'Cannot determine source revision.' }
@@ -129,6 +130,7 @@ Open IA2 IDE from the desktop or Start menu. IA2 Terminal remains available for 
 The native app requires Microsoft Edge WebView2 Runtime. If the installer reports it missing,
 install Evergreen Runtime from https://developer.microsoft.com/microsoft-edge/webview2/ and retry.
 Read WINDOWS.md for scope and operation. The app, server and web assets must stay together.
+Bundled LICENSE, NOTICE and THIRD-PARTY-NOTICES are retained in the installed application folder.
 '@
     Set-Content -LiteralPath (Join-Path $stage 'INSTALL.txt') -Value $instructions -Encoding UTF8
     # Compress-Archive skips hidden directories, including the bundled .claude skill.

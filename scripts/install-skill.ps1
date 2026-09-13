@@ -150,6 +150,12 @@ try {
         }
         Copy-Item -LiteralPath $WebSource -Destination (Join-Path $appStage 'web') -Recurse -Force
         Copy-Item -LiteralPath (Join-Path $SourceRoot 'library') -Destination (Join-Path $appStage 'library') -Recurse -Force
+        foreach ($notice in @('LICENSE', 'NOTICE', 'THIRD-PARTY-NOTICES')) {
+            $noticeSource = Join-Path $SourceRoot $notice
+            if (Test-Path -LiteralPath $noticeSource) {
+                Copy-Item -LiteralPath $noticeSource -Destination (Join-Path $appStage $notice) -Recurse -Force
+            }
+        }
         Set-Content -LiteralPath (Join-Path $appStage $AppMarker) -Value 'IA2 Windows installer v1; projects and preferences are outside this directory.' -Encoding ASCII
         $launcher = @'
 #requires -Version 5.1
