@@ -26,10 +26,10 @@ export function WindowTitleBar({ onSearch, onToggleSidebar, sidebarCollapsed, on
   const { project } = useRuntime()
   const theme = useDarkMode()
   return (
-    <header data-testid="workspace-header" className="flex h-12 min-h-12 shrink-0 items-center gap-3 border-b border-border bg-background px-3 text-foreground">
+    <header data-testid="workspace-header" className="ia2-workspace-header flex shrink-0 items-center border-b border-border bg-background px-3 text-foreground">
       {project && <Button variant="ghost" size="icon-sm" onClick={onToggleSidebar} aria-label={sidebarCollapsed ? "Show project explorer" : "Hide project explorer"} aria-pressed={!sidebarCollapsed}><PanelLeftOpen className="size-4" /></Button>}
-      <div className="flex shrink-0 items-center gap-2"><Ia2Mark /><span className="text-[15px] font-medium">IA2</span></div>
-      <span aria-hidden className="h-4 w-px bg-border" />
+      <div data-app-brand className="shrink-0 items-center gap-2"><Ia2Mark /><span className="text-[15px] font-medium">IA2</span></div>
+      <span data-app-brand-separator aria-hidden className="h-4 w-px bg-border" />
       <ProjectPicker />
       <div className="flex-1" />
       {project && <button type="button" onClick={onSearch} title={`Search (${shortcut("P")})`} aria-label="Search project" className="flex h-8 w-8 min-[1000px]:w-64 max-w-[24vw] items-center gap-2 rounded border border-border bg-secondary px-2 min-[1000px]:px-2.5 text-xs text-muted-foreground hover:border-input hover:text-foreground"><Search className="size-4 shrink-0" /><span className="hidden min-w-0 flex-1 truncate text-left min-[1000px]:block">Find in project</span><kbd className="ml-auto hidden shrink-0 font-sans min-[1000px]:block">{shortcut("P")}</kbd></button>}
