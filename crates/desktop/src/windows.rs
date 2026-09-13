@@ -15,11 +15,15 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget};
+use tao::platform::windows::WindowExtWindows;
 use tao::window::{Icon, Theme, Window, WindowBuilder, WindowId};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{TrayIconBuilder, TrayIconEvent};
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, HANDLE, WAIT_OBJECT_0,
+};
+use windows_sys::Win32::Graphics::Dwm::{
+    DwmSetWindowAttribute, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR,
 };
 use windows_sys::Win32::Security::Cryptography::{
     BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
@@ -38,6 +42,29 @@ use wry::{
 };
 
 const RGBA: &[u8] = include_bytes!("../assets/ia2.rgba");
+
+fn style_caption(window: &Window, theme: DesktopTheme) {
+    let (red, green, blue, _) = theme.background();
+    // DWM uses COLORREF (0x00bbggrr), not CSS/RGBA ordering.
+    let caption = u32::from(red) | (u32::from(green) << 8) | (u32::from(blue) << 16);
+    let text: u32 = match theme {
+        DesktopTheme::Light => 0x0014_0b05,
+        DesktopTheme::Dark => 0x00f9_f9f9,
+    };
+    for (attribute, color) in [(DWMWA_CAPTION_COLOR, caption), (DWMWA_TEXT_COLOR, text)] {
+        // SAFETY: the HWND belongs to this live window; DWM copies a COLORREF
+        // from the stack synchronously. Windows 10 does not support these
+        // Windows 11 colors and keeps its standard caption on failure.
+        unsafe {
+            let _ = DwmSetWindowAttribute(
+                window.hwnd() as _,
+                attribute as _,
+                std::ptr::from_ref(&color).cast(),
+                std::mem::size_of::<u32>() as _,
+            );
+        }
+    }
+}
 
 fn wide(value: impl AsRef<OsStr>) -> Vec<u16> {
     value.as_ref().encode_wide().chain(Some(0)).collect()
@@ -382,6 +409,7 @@ impl View {
             DesktopTheme::Dark => (Theme::Dark, wry::Theme::Dark),
         };
         self.window.set_theme(Some(native));
+        style_caption(&self.window, theme);
         self.window.set_background_color(Some(theme.background()));
         self.webview.set_background_color(theme.background())?;
         self.webview.set_theme(browser)
@@ -413,6 +441,7 @@ fn make_view(
         .with_visible(false)
         .build(target)
         .map_err(|e| e.to_string())?;
+    style_caption(&window, DesktopTheme::Light);
     let navigation_origin = origin.clone();
     let navigation_proxy = proxy.clone();
     let popup_origin = origin.clone();

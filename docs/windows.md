@@ -124,7 +124,12 @@ shown rather than treated as a successful launch. The existing
 
 The standard Windows title bar, resize border, Snap and per-monitor DPI
 remain native. The title bar and WebView background follow the workbench's
-light/dark choice; the default is light regardless of the OS theme.
+light/dark choice; the default is light regardless of the OS theme. On
+Windows 11, the caption uses the same solid background as the workbench,
+without the system accent tint. Its native icon and IA2 title are the only
+app branding; the 40 px toolbar below shows project navigation and actions.
+The browser edition retains its own branding and 48 px header. Windows 10
+keeps the standard system caption colors where these DWM options are unavailable.
 Startup and connection-error pages render locally without network assets.
 
 **Closing the window hides IA2 to the notification-area tray; the server

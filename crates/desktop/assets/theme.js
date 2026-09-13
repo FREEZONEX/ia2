@@ -4,6 +4,9 @@
   if (window.top !== window) return;
   const observe = () => {
     const root = document.documentElement;
+    // Presentation hint only: the native caption already carries the app's
+    // identity, so the workbench must not render a second logo/title row.
+    root.setAttribute("data-ia2-desktop", "");
     let previous;
     const sync = () => {
       const theme = root.classList.contains("dark") ? "dark" : "light";
