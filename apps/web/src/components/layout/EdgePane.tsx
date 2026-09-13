@@ -20,7 +20,7 @@ import {
 } from "@/components/ui/icons"
 import { useEffect, useRef, useState } from "react"
 
-import { UppercaseBadge } from "@/components/ui/badge"
+import { StatusBadge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { ErrorBox } from "@/components/ui/error-box"
 import { Field } from "@/components/ui/field"
@@ -723,7 +723,7 @@ function DebugPanel({ name }: { name: string }) {
   return (
     <div className="flex-1 space-y-4 overflow-auto p-4">
       <div className="flex items-center gap-2">
-        <UppercaseBadge
+        <StatusBadge
           className={
             mode === "running"
               ? "bg-highlight/15 text-highlight"
@@ -732,7 +732,7 @@ function DebugPanel({ name }: { name: string }) {
         >
           {mode}
           {status?.mode.remaining != null ? ` ${status.mode.remaining}` : ""}
-        </UppercaseBadge>
+        </StatusBadge>
         <span className="text-xs text-muted-foreground">
           scan {status ? status.scan_count.toLocaleString() : "—"}
         </span>
@@ -860,17 +860,17 @@ function ReachBadge({
 }) {
   if (probing) {
     return (
-      <UppercaseBadge className="bg-muted/50 text-muted-foreground">
+      <StatusBadge className="bg-muted/50 text-muted-foreground">
         <Loader2 className="size-3 animate-spin" />
         probing
-      </UppercaseBadge>
+      </StatusBadge>
     )
   }
   if (!probe) {
     return (
-      <UppercaseBadge className="bg-muted/50 text-muted-foreground">
+      <StatusBadge className="bg-muted/50 text-muted-foreground">
         unknown
-      </UppercaseBadge>
+      </StatusBadge>
     )
   }
   if (probe.reachable) {
@@ -880,33 +880,33 @@ function ReachBadge({
     const down = probe.unhealthy_devices
     if (down.length > 0) {
       return (
-        <UppercaseBadge
+        <StatusBadge
           className="bg-warn/15 text-warn"
           title={`Runtime is up, but ${down.length === 1 ? "this device is" : "these devices are"} down (inputs frozen, outputs dropped): ${down.join(", ")}`}
         >
           <AlertCircle className="size-3" />
           degraded
-        </UppercaseBadge>
+        </StatusBadge>
       )
     }
     return (
-      <UppercaseBadge
+      <StatusBadge
         className="bg-highlight/15 text-highlight"
         title="Edge runtime is responding"
       >
         <CheckCircle2 className="size-3" />
         running
-      </UppercaseBadge>
+      </StatusBadge>
     )
   }
   return (
-    <UppercaseBadge
+    <StatusBadge
       className="bg-destructive/15 text-destructive"
       title={probe.error ?? ""}
     >
       <AlertCircle className="size-3" />
       unreachable
-    </UppercaseBadge>
+    </StatusBadge>
   )
 }
 

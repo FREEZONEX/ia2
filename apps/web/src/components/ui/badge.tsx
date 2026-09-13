@@ -2,14 +2,8 @@ import * as React from "react"
 
 import { cn } from "@/lib/utils"
 
-/**
- * Small monospace uppercase pill — the recurring status-badge markup
- * (`inline-flex … rounded-md px-1.5 py-0.5 font-mono text-[10px] uppercase
- * tracking-wider`). Colour is left to the caller via `className`
- * (`bg-highlight/15 text-highlight`, `bg-destructive/15 text-destructive`,
- * …) so one primitive covers every state.
- */
-export function UppercaseBadge({
+/** Status label using caption typography; callers supply state colours. */
+export function StatusBadge({
   className,
   children,
   ...props
@@ -17,7 +11,7 @@ export function UppercaseBadge({
   return (
     <span
       className={cn(
-        "inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider",
+        "inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 font-mono text-xs normal-case tracking-normal",
         className,
       )}
       {...props}
