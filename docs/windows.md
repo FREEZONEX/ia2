@@ -177,7 +177,7 @@ the existing macOS gate; newer Clippy releases can add warnings in the
 locked upstream compiler. Select the validated toolchain for this clone:
 
 ```powershell
-git clone --recursive https://github.com/supcon-international/ia2
+git clone --recursive --branch codex/windows https://github.com/supcon-international/ia2
 Set-Location ia2
 rustup toolchain install 1.95.0 --profile minimal --component clippy --component rustfmt
 rustup override set 1.95.0
