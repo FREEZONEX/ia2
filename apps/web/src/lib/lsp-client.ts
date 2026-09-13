@@ -26,6 +26,14 @@ export type LspClientOptions = {
   onDiagnostics: (diags: CheckDiagnostic[]) => void
 }
 
+/** The LSP receives source text in memory; this URI identifies a logical
+ * POU, not a file on the server's disk. Keep it independent of host drive
+ * letters, and encode each segment so spaces, Unicode, # and % stay in
+ * the document path instead of becoming an invalid URI or a fragment. */
+export function pouDocumentUri(path: string): string {
+  return `file:///${path.split("/").map(encodeURIComponent).join("/")}.st`
+}
+
 function lspToCheck(diag: LspDiagnostic): CheckDiagnostic {
   return {
     severity:

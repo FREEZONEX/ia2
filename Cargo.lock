@@ -4288,6 +4288,7 @@ dependencies = [
  "iomap-opcua",
  "ironplc-bridge",
  "parking_lot",
+ "percent-encoding",
  "project",
  "serde",
  "serde_json",

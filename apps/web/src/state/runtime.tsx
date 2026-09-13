@@ -65,9 +65,18 @@ import {
   updateIomap as apiUpdateIomap,
   updateTasks as apiUpdateTasks,
 } from "@/lib/api"
-import { LspClient } from "@/lib/lsp-client"
+import { LspClient, pouDocumentUri } from "@/lib/lsp-client"
 
 export type View = "app" | "device" | "iomap" | "edge" | "tasks" | "hmi"
+
+/** Select the project before the next API request reads its routing header.
+ * Creating and opening must both replace a previous window's selector. */
+function selectWindowProject(name: string): void {
+  if (typeof window === "undefined") return
+  const url = new URL(window.location.href)
+  url.searchParams.set("project", name)
+  window.history.replaceState(null, "", url.toString())
+}
 
 /**
  * Handle a single `Mutation` event from `/api/events`.
@@ -109,13 +118,15 @@ export function usePouSpawnTick(): number {
   return useSyncExternalStore(pouSpawnStore.subscribe, pouSpawnStore.getTick)
 }
 
-function handleMutationEvent(
+export function handleMutationEvent(
   event: MutationEvent,
   currentPouRef: React.MutableRefObject<Pou | null>,
   sourceRef: React.MutableRefObject<string>,
   selectPouRef: React.MutableRefObject<
     ((path: string) => Promise<void>) | null
   >,
+  displayedProject: string | null,
+  onProjectClosed: () => void,
 ): void {
   // Project-scoping: the SSE channel is single, but server tags every
   // mutation with its `project` so windows can filter. A window with
@@ -125,7 +136,14 @@ function handleMutationEvent(
   // `event.project === ""` means a server still tagged something
   // without a name (defensive) — treat as universal and let it
   // through so we don't lose events from edge cases.
-  const ours = currentProject()
+  const ours = currentProject() ?? displayedProject
+  // A closed project no longer has a tree to fetch. Consume its explicit
+  // lifecycle event before invalidation, and only clear the window that
+  // actually displays it (including a window without a URL selector).
+  if (event.detail.kind === "project_closed") {
+    if (event.project && event.project === ours) onProjectClosed()
+    return
+  }
   if (ours && event.project && event.project !== ours) {
     return
   }
@@ -309,12 +327,33 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
   const currentPouRef = useRef<Pou | null>(null)
   const sourceRef = useRef("")
   const selectPouRef = useRef<((path: string) => Promise<void>) | null>(null)
+  const displayedProjectRef = useRef<string | null>(null)
+  useEffect(() => {
+    displayedProjectRef.current = project?.name ?? null
+  }, [project?.name])
   useEffect(() => {
     currentPouRef.current = currentPou
   }, [currentPou])
   useEffect(() => {
     sourceRef.current = source
   }, [source])
+
+  const clearProjectState = useCallback(() => {
+    displayedProjectRef.current = null
+    currentPouRef.current = null
+    sourceRef.current = ""
+    setProject(null)
+    setCurrentPou(null)
+    setCurrentDevice(null)
+    setCurrentEdge(null)
+    setCurrentHmi(null)
+    setView(null)
+    setSource("")
+    setAttached(null)
+    setIsRunning(false)
+    setRunning(null)
+    liveFeedStore.setSnapshot(null)
+  }, [])
 
   // Register the project's own FUNCTION_BLOCKs (e.g. the imported
   // process-control library) so the graphical FBD / LD editors offer
@@ -529,6 +568,11 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
                 currentPouRef,
                 sourceRef,
                 selectPouRef,
+                displayedProjectRef.current,
+                () => {
+                  clearProjectState()
+                  void refreshProjects()
+                },
               )
               break
             // NOTE: `agent_activity` is intentionally NOT handled here.
@@ -546,7 +590,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       es.close()
       esRef.current = null
     }
-  }, [attached])
+  }, [attached, clearProjectState, refreshProjects])
 
   // Dedicated, always-on /api/events subscription for agent-takeover
   // activity. The main stream above gets repointed at an edge runtime
@@ -592,7 +636,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       return
     }
     const client = new LspClient({
-      uri: `file:///${currentPou.path}.st`,
+      uri: pouDocumentUri(currentPou.path),
       languageId: "iec61131",
       onDiagnostics: () => {},
     })
@@ -739,7 +783,8 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
   const createProject = useCallback(async (name: string): Promise<boolean> => {
     setError(null)
     try {
-      await apiCreateProject(name)
+      const info = await apiCreateProject(name)
+      selectWindowProject(info.name)
       const tree = await fetchProject()
       setProject(tree)
       setCurrentPou(null)
@@ -755,20 +800,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     setError(null)
     try {
       const info = await apiOpenProject(path)
-      // Point this window at the just-opened project BEFORE the
-      // follow-up fetch. Otherwise, if the window already carried a
-      // `?project=other` (e.g. the user switched via the picker
-      // earlier), `fetchProject()` would send `X-IA2-Project: other`
-      // and we'd open the new project on the server but keep showing
-      // the old one. replaceState updates the URL without a reload so
-      // `currentProject()` (read by apiFetch) returns the new name.
-      try {
-        const url = new URL(window.location.href)
-        url.searchParams.set("project", info.name)
-        window.history.replaceState(null, "", url.toString())
-      } catch {
-        /* non-browser env — ignore */
-      }
+      selectWindowProject(info.name)
       const tree = await fetchProject()
       setProject(tree)
       setCurrentPou(null)
@@ -782,17 +814,12 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     setError(null)
     try {
       await apiCloseProject()
-      setProject(null)
-      setCurrentPou(null)
-      setSource("")
-      setIsRunning(false)
-      setRunning(null)
-      liveFeedStore.setSnapshot(null)
+      clearProjectState()
       setAvailableProjects(await apiFetchProjects())
     } catch (e) {
       setError(String(e))
     }
-  }, [])
+  }, [clearProjectState])
 
   // ---------------- POU / Device actions ----------------
 

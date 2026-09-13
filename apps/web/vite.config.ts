@@ -1,4 +1,5 @@
 import { defineConfig } from 'vite'
+import { fileURLToPath } from 'node:url'
 import { TanStackRouterVite } from '@tanstack/router-plugin/vite'
 import viteReact from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
@@ -52,8 +53,8 @@ export default defineConfig({
     sourcemap: false,
     rollupOptions: {
       input: {
-        main: new URL('./index.html', import.meta.url).pathname,
-        hmi: new URL('./hmi.html', import.meta.url).pathname,
+        main: fileURLToPath(new URL('./index.html', import.meta.url)),
+        hmi: fileURLToPath(new URL('./hmi.html', import.meta.url)),
       },
     },
   },

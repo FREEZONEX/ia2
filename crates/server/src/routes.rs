@@ -50,8 +50,9 @@ pub const PROJECT_HEADER: &str = "x-ia2-project";
 
 /// Axum extractor that pulls the `X-IA2-Project` header off a
 /// request. `None` means "header absent / empty"; the route handler
-/// then falls back to the active project. Never errors — invalid /
-/// missing headers are interpreted as `None`.
+/// then falls back to the active project. Encoded headers carry an
+/// explicit marker so legacy literal percent sequences remain literal.
+/// Invalid selectors fail rather than silently targeting the active project.
 #[derive(Debug, Clone, Default)]
 pub struct ProjectName(pub Option<String>);
 
@@ -65,17 +66,43 @@ impl<S> FromRequestParts<S> for ProjectName
 where
     S: Send + Sync,
 {
-    type Rejection = Infallible;
+    type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        let value = parts
-            .headers
-            .get(PROJECT_HEADER)
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-        Ok(ProjectName(value))
+        parse_project_header(&parts.headers)
+    }
+}
+
+fn parse_project_header(headers: &axum::http::HeaderMap) -> Result<ProjectName, ApiError> {
+    let invalid = || ApiError::BadRequest("invalid X-IA2-Project selector or encoding".into());
+    let value = headers
+        .get(PROJECT_HEADER)
+        .map(|v| v.to_str().map(str::trim).map_err(|_| invalid()))
+        .transpose()?;
+    match headers.get("x-ia2-project-encoding") {
+        None => Ok(ProjectName(
+            value.filter(|v| !v.is_empty()).map(str::to_owned),
+        )),
+        Some(encoding) => {
+            if encoding.to_str().map_err(|_| invalid())? != "percent" {
+                return Err(invalid());
+            }
+            let value = value.filter(|v| !v.is_empty()).ok_or_else(invalid)?;
+            let bytes = value.as_bytes();
+            for (i, byte) in bytes.iter().enumerate() {
+                if *byte == b'%'
+                    && !bytes
+                        .get(i + 1..i + 3)
+                        .is_some_and(|pair| pair.iter().all(u8::is_ascii_hexdigit))
+                {
+                    return Err(invalid());
+                }
+            }
+            let decoded = percent_encoding::percent_decode_str(value)
+                .decode_utf8()
+                .map_err(|_| invalid())?;
+            Ok(ProjectName(Some(decoded.into_owned())))
+        }
     }
 }
 
@@ -3215,5 +3242,53 @@ mod governance_freshness_tests {
         // …and the run path must not use it.
         let fresh = fresh_governance(&cached).unwrap();
         assert_eq!(fresh.write_mode, project::WriteMode::Allowlist);
+    }
+}
+
+#[cfg(test)]
+mod project_header_tests {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    #[test]
+    fn encoded_unicode_and_literal_percent_are_distinct_from_legacy_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(PROJECT_HEADER, "a%20b".parse().unwrap());
+        assert_eq!(
+            parse_project_header(&headers).unwrap().as_deref(),
+            Some("a%20b")
+        );
+        headers.insert("x-ia2-project-encoding", "percent".parse().unwrap());
+        headers.insert(
+            PROJECT_HEADER,
+            "%E6%8E%A7%E5%88%B6%20%2520".parse().unwrap(),
+        );
+        assert_eq!(
+            parse_project_header(&headers).unwrap().as_deref(),
+            Some("控制 %20")
+        );
+    }
+
+    #[test]
+    fn malformed_explicit_selectors_do_not_fall_back_to_the_active_project() {
+        for (name, encoding) in [
+            ("%", "percent"),
+            ("%GG", "percent"),
+            ("%FF", "percent"),
+            ("", "percent"),
+            ("main", "other"),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(PROJECT_HEADER, name.parse().unwrap());
+            headers.insert("x-ia2-project-encoding", encoding.parse().unwrap());
+            assert!(matches!(
+                parse_project_header(&headers),
+                Err(ApiError::BadRequest(_))
+            ));
+        }
+        assert!(parse_project_header(&HeaderMap::new())
+            .unwrap()
+            .as_deref()
+            .is_none());
     }
 }

@@ -1,3 +1,4 @@
+import "./monaco-local"
 import Editor, { type Monaco, type OnMount } from "@monaco-editor/react"
 import type { editor } from "monaco-editor"
 import { useCallback, useEffect, useRef } from "react"

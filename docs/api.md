@@ -13,6 +13,13 @@ serves a smaller subset on its own port — see `docs/edge-deploy.md`.
   `%2F`-encoded form decodes back to `/` inside the path param. E.g.,
   `GET /api/pous/pid_loops%2Ftemperature`.
 - All bodies are JSON unless noted. POU sources are `text/plain`.
+- Select an open project with `X-IA2-Project`. To send Unicode names,
+  percent-encode the UTF-8 bytes and add `X-IA2-Project-Encoding: percent`
+  (for example, `demo%20line` selects `demo line`). The IDE applies this
+  encoding automatically. Without the encoding header, legacy values
+  remain literal: `a%20b` selects the name `a%20b`. Unsupported encodings
+  and malformed encoded values return HTTP 400 instead of falling back
+  to the active project.
 - Errors are HTTP status + a human-readable body. 4xx for client errors,
   5xx for server bugs.
 - Generated TypeScript types live under `apps/web/src/types/generated/` and

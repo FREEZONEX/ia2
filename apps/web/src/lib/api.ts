@@ -79,7 +79,8 @@ export async function apiFetch(input: string, init?: RequestInit): Promise<Respo
   }
   const project = currentProject()
   if (project && !headers.has("X-IA2-Project")) {
-    headers.set("X-IA2-Project", project)
+    headers.set("X-IA2-Project", encodeURIComponent(project))
+    headers.set("X-IA2-Project-Encoding", "percent")
   }
   return fetch(input, { ...init, headers })
 }
