@@ -1,5 +1,10 @@
-import { Lock, Pause, Pin, Play, StepForward, Unlock } from "lucide-react"
+import { ChevronDown, ChevronUp, Lock, Pause, Pin, Play, Search, StepForward, Unlock } from "@/components/ui/icons"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+
+import { Button } from "@/components/ui/button"
+import { EmptyState } from "@/components/ui/empty-state"
+import { PaneHeader } from "@/components/ui/pane-header"
+import { canWriteMonitorType, currentForceValue, monitorWriteValue } from "./monitor-values"
 
 import { Sparkline } from "@/components/charts/Sparkline"
 import { TrendChart, type TrendSeries } from "@/components/charts/TrendChart"
@@ -48,7 +53,7 @@ import type { VarValue } from "@/types/generated/VarValue"
  *  much on pin so a reload no longer starts the trace from empty. */
 const MONITOR_TREND_WINDOW_S = 300
 
-export function MonitorPane() {
+export function MonitorPane({ collapsed, onToggleCollapse }: { collapsed: boolean; onToggleCollapse: () => void }) {
   const { isRunning, currentPou, running, attached } = useRuntime()
   const lastSnapshot = useLastSnapshot()
   // Variable writes go through the local bridge. When attached to a
@@ -56,37 +61,75 @@ export function MonitorPane() {
   // controls in that case to avoid silently losing the user's input.
   const canWrite = isRunning && !attached
 
-  // Debug control state. We poll /api/runtime/status on a 1s timer
-  // when the program is running so the toolbar reflects external
-  // changes (e.g. `cs runtime pause` from a shell). Optimistic local
-  // updates keep clicks feeling instant.
-  const [mode, setMode] = useState<"running" | "paused" | "step">("running")
+  const [mode, setMode] = useState<"running" | "paused" | "step" | null>(null)
   const [forces, setForces] = useState<Set<string>>(new Set())
+  const [pendingCommand, setPendingCommand] = useState<string | null>(null)
+  const [commandError, setCommandError] = useState<string | null>(null)
+  const [statusError, setStatusError] = useState<string | null>(null)
+  const [runtimeFault, setRuntimeFault] = useState<string | null>(null)
+  const [alarmCount, setAlarmCount] = useState(0)
+  const [alarmStatusError, setAlarmStatusError] = useState<string | null>(null)
+  const [query, setQuery] = useState("")
+  const commandRef = useRef(false)
+  const revisionRef = useRef(0)
+
+  const refreshStatus = useCallback(async () => {
+    const revision = revisionRef.current
+    try {
+      const data = await fetchRuntimeStatus()
+      if (revision !== revisionRef.current) return
+      const nextMode = data.mode?.kind
+      setMode(nextMode === "running" || nextMode === "paused" || nextMode === "step" ? nextMode : null)
+      setForces(new Set(data.forces.map(force => force.name)))
+      const failedDevices = data.device_health.filter(device => !device.healthy).map(device => device.name)
+      setRuntimeFault(data.watchdog_tripped
+        ? "Watchdog tripped — outputs are locked"
+        : data.last_error || (failedDevices.length ? `Device connection lost: ${failedDevices.join(", ")}` : null))
+      setStatusError(null)
+    } catch (error) {
+      if (revision === revisionRef.current) setStatusError(`Runtime status unavailable: ${String(error)}`)
+      throw error
+    }
+  }, [])
+
   useEffect(() => {
-    if (!isRunning) return
-    let cancelled = false
-    const tick = async () => {
-      try {
-        // Typed helper, not raw fetch: apiFetch injects the X-IA2-Project
-        // header, so a multi-window session polls ITS project's runtime
-        // status rather than whichever project the server considers active.
-        const data = await fetchRuntimeStatus()
-        if (cancelled) return
-        const m = data?.mode?.kind as string | undefined
-        if (m === "running" || m === "paused" || m === "step") setMode(m)
-        const fs: Array<{ name: string }> = data?.forces ?? []
-        setForces(new Set(fs.map((f) => f.name)))
-      } catch {
-        /* ignore */
-      }
+    if (!isRunning || attached) {
+      setMode(null)
+      setForces(new Set())
+      return
     }
-    void tick()
-    const id = setInterval(tick, 1000)
-    return () => {
-      cancelled = true
-      clearInterval(id)
+    const tick = () => {
+      if (!commandRef.current) void refreshStatus().catch(() => {})
     }
-  }, [isRunning])
+    tick()
+    const timer = setInterval(tick, 1000)
+    return () => { clearInterval(timer); revisionRef.current++ }
+  }, [isRunning, attached, refreshStatus])
+
+  // A click is pending until the request succeeds and status is read back.
+  // A failed command never changes the displayed scan mode or force state.
+  const command = useCallback(async (label: string, action: () => Promise<void>) => {
+    if (commandRef.current) return false
+    commandRef.current = true
+    revisionRef.current++
+    setPendingCommand(label)
+    setCommandError(null)
+    let accepted = false
+    try {
+      await action()
+      accepted = true
+      await refreshStatus()
+      return true
+    } catch (error) {
+      setCommandError(accepted
+        ? `${label} accepted; status unconfirmed: ${String(error)}`
+        : `${label} failed: ${String(error)}`)
+      return false
+    } finally {
+      commandRef.current = false
+      setPendingCommand(null)
+    }
+  }, [refreshStatus])
 
   // History buffers (mutated in place; re-rendered via a tick counter).
   // `historyRef` is the untimed count-capped buffer the per-row
@@ -200,118 +243,59 @@ export function MonitorPane() {
   const vars = lastSnapshot?.vars ?? []
   const stale = !!lastSnapshot && !isRunning
 
-  // Optimistic-update wrappers: flip local state immediately for
-  // responsiveness, then issue the API call. The 1s status poll
-  // reconciles any drift from external changes.
-  const onPause = useCallback(async () => {
-    setMode("paused")
-    try { await pauseRuntime() } catch { /* status poll will re-sync */ }
-  }, [])
-  const onResume = useCallback(async () => {
-    setMode("running")
-    try { await resumeRuntime() } catch { /* */ }
-  }, [])
-  const onStep = useCallback(async () => {
-    setMode("step")
-    try { await stepRuntime(1) } catch { /* */ }
-  }, [])
-
-  const onToggleForce = useCallback(
-    async (v: VarValue) => {
-      if (forces.has(v.name)) {
-        setForces((p) => {
-          const n = new Set(p)
-          n.delete(v.name)
-          return n
-        })
-        try { await unforceVariable(v.name) } catch { /* */ }
-      } else {
-        // Pin to the *current* value — operator's intent is usually
-        // "lock this where it is now" rather than picking a fresh
-        // value. They can change it via the inline numeric editor /
-        // BOOL toggle once forced.
-        setForces((p) => new Set(p).add(v.name))
-        try {
-          const cat = classifyType(v.type_name)
-          let i32 = 0
-          if (cat === "bool") {
-            i32 = v.value === "TRUE" ? 1 : 0
-          } else if (cat === "numeric") {
-            i32 = parseInt(v.value, 10) || 0
-          }
-          await forceVariable(v.name, i32, v.type_name)
-        } catch { /* */ }
-      }
-    },
-    [forces],
+  const visibleVars = vars.filter(variable => `${variable.name} ${variable.type_name}`.toLowerCase().includes(query.toLowerCase()))
+  const onToggleForce = (variable: VarValue) => void command(
+    `${forces.has(variable.name) ? "Unforce" : "Force"} ${variable.name}`,
+    () => forces.has(variable.name)
+      ? unforceVariable(variable.name)
+      : forceVariable(variable.name, currentForceValue(variable), variable.type_name),
   )
+  const error = commandError || statusError || runtimeFault || (collapsed ? alarmStatusError : null)
 
   return (
-    <section className="flex h-full min-h-0 min-w-0 flex-col border-t border-border bg-muted/20">
-      <div className="flex h-7 items-center justify-between gap-3 border-b border-border px-3 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-        <span className="flex shrink-0 items-center gap-2">
-          <span>Monitor</span>
+    <section aria-label="Monitor" className="flex h-full min-h-0 min-w-0 flex-col bg-background">
+      <div className="shrink-0 [&_.ia2-pane-header]:h-10 [&_.ia2-pane-header]:min-h-10 [&_.ia2-pane-header]:flex-nowrap [&_.ia2-pane-header]:py-0 [&_.ia2-pane-header>div:first-child>div]:flex-nowrap [&_.ia2-pane-header>div:first-child>div>div]:flex-nowrap">
+        <PaneHeader title="Monitor" meta={<>
           <RunningPill running={running} isRunning={isRunning} />
-          {isRunning && !attached && (
-            <DebugToolbar
-              mode={mode}
-              onPause={onPause}
-              onResume={onResume}
-              onStep={onStep}
-            />
-          )}
-        </span>
-        {lastSnapshot && (
-          <span
-            className={cn(
-              "shrink-0 font-mono normal-case tracking-normal",
-              stale ? "text-muted-foreground" : "text-foreground",
-            )}
-          >
-            {stale && "(last) "}scan #{Number(lastSnapshot.scan_count)}
-          </span>
-        )}
+          {mode && <span className={cn("text-xs", mode !== "running" && "text-warn")}>{mode === "step" ? "Stepping" : mode === "paused" ? "Paused" : "Running"}</span>}
+          {alarmCount > 0 && <span className="text-destructive">{alarmCount} standing alarms</span>}
+          {collapsed && error && <span role="alert" title={error} className="max-w-72 truncate text-destructive">{error}</span>}
+        </>} actions={<>
+          {lastSnapshot && <span className="font-mono text-xs text-muted-foreground">{stale && "Last "}scan #{Number(lastSnapshot.scan_count)}</span>}
+          <Button variant="ghost" size="icon-sm" title={collapsed ? "Expand Monitor" : "Collapse Monitor"} aria-label={collapsed ? "Expand Monitor" : "Collapse Monitor"} aria-expanded={!collapsed} aria-controls="monitor-content" onClick={onToggleCollapse}>
+            {collapsed ? <ChevronUp /> : <ChevronDown />}
+          </Button>
+        </>} />
       </div>
-
-      {pinnedSeries.length > 0 && (
-        <div className="border-b border-border bg-background/40 px-3 py-2">
-          <TrendChart series={pinnedSeries} windowS={MONITOR_TREND_WINDOW_S} />
+      <div id="monitor-content" hidden={collapsed} className={cn("min-h-0 flex-1 flex-col", !collapsed && "flex")}>
+        {(vars.length > 0 || (isRunning && !attached)) && <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 px-4 py-2">
+          {vars.length > 0 && <label className="flex h-8 min-w-40 max-w-72 flex-1 items-center gap-2 rounded border border-input bg-background px-2">
+            <Search className="size-4 text-muted-foreground" />
+            <input aria-label="Search variables" placeholder="Search variables" value={query} onChange={event => setQuery(event.target.value)} className="min-w-0 flex-1 bg-transparent text-[13px] outline-none" />
+            <span className="text-xs text-muted-foreground">{visibleVars.length}</span>
+          </label>}
+          {isRunning && !attached && <DebugToolbar mode={mode} pending={pendingCommand} disabled={!!pendingCommand || !!statusError || !mode}
+            onPause={() => void command("Pause", pauseRuntime)} onResume={() => void command("Resume", resumeRuntime)} onStep={() => void command("Step", () => stepRuntime(1))} />}
+          {attached && <span className="text-xs text-muted-foreground">Remote values · read only</span>}
+        </div>}
+        {error && <div role="alert" className="shrink-0 border-y border-destructive/20 bg-destructive/5 px-4 py-2 text-xs text-destructive">{error}</div>}
+        {pendingCommand && <div role="status" className="shrink-0 px-4 pb-2 text-xs text-muted-foreground">{pendingCommand}… waiting for confirmation</div>}
+        <div className="min-h-0 flex-1 overflow-auto">
+          {isRunning && <AlarmsSection onStandingChange={setAlarmCount} onErrorChange={setAlarmStatusError} />}
+          {pinnedSeries.length > 0 && <div className="border-b border-border px-4 py-3"><TrendChart series={pinnedSeries} windowS={MONITOR_TREND_WINDOW_S} /></div>}
+          {!lastSnapshot ? <EmptyState className="px-4 py-4 [&_h2+div]:mt-1" icon={<Play />} title={isRunning ? "Waiting for live values" : "No program running"} description={isRunning ? "The first scan snapshot will appear here." : "Run a program to inspect values and trace variables."} />
+            : vars.length === 0 ? <EmptyState className="px-4 py-4 [&_h2+div]:mt-1" title="No variables in this snapshot" description="The monitor will update when variables become available." />
+            : visibleVars.length === 0 ? <EmptyState className="px-4 py-4 [&_h2+div]:mt-1" title="No matching variables" description="Search by variable name or IEC type." />
+            : <table className="w-full min-w-[520px] border-collapse text-[13px]">
+              <thead className="sticky top-0 z-10 bg-muted text-left text-xs text-muted-foreground"><tr>
+                <th className="w-10 px-2 py-2"><span className="sr-only">Trend</span></th><th className="px-2 py-2 font-medium">Variable</th><th className="px-2 py-2 font-medium">Type</th><th className="px-2 py-2 font-medium">Recent history</th><th className="px-2 py-2 text-right font-medium">Value</th><th className="w-16 px-2 py-2 text-center font-medium">Force</th>
+              </tr></thead>
+              <tbody>{visibleVars.map((variable, index) => <VarRow key={`${index}:${variable.name}`} v={variable}
+                history={historyRef.current.get(variable.name) ?? []} isPinned={pinned.has(variable.name)} sparkColor={colorByName[variable.name]} onPin={togglePin}
+                stale={stale} canWrite={canWrite && !pendingCommand} forced={forces.has(variable.name)} onToggleForce={onToggleForce}
+                onWrite={(value) => command(`Write ${variable.name}`, () => writeVariable(variable.name, value, variable.type_name))} />)}</tbody>
+            </table>}
         </div>
-      )}
-
-      {isRunning && <AlarmsSection />}
-
-      <div className="flex-1 overflow-auto">
-        {!lastSnapshot ? (
-          <div className="flex h-full items-center justify-center p-4 text-xs text-muted-foreground">
-            <span>
-              Click{" "}
-              <span className="font-mono text-highlight">Run</span>{" "}
-              to start the program.
-            </span>
-          </div>
-        ) : vars.length === 0 ? (
-          <div className="flex h-full items-center justify-center p-4 text-xs text-muted-foreground">
-            Waiting for first snapshot…
-          </div>
-        ) : (
-          <ul className="divide-y divide-border/60">
-            {vars.map((v, i) => (
-              <VarRow
-                key={`${i}:${v.name}`}
-                v={v}
-                history={historyRef.current.get(v.name) ?? []}
-                isPinned={pinned.has(v.name)}
-                sparkColor={colorByName[v.name]}
-                onPin={togglePin}
-                stale={stale}
-                canWrite={canWrite}
-                forced={forces.has(v.name)}
-                onToggleForce={onToggleForce}
-              />
-            ))}
-          </ul>
-        )}
       </div>
     </section>
   )
@@ -391,53 +375,19 @@ function RunningPill({
  * mode badge ("PAUSED" / "STEP") shows up only when off the default
  * Running state, so the toolbar stays quiet during normal operation.
  */
-function DebugToolbar({
-  mode,
-  onPause,
-  onResume,
-  onStep,
-}: {
-  mode: "running" | "paused" | "step"
+function DebugToolbar({ mode, pending, disabled, onPause, onResume, onStep }: {
+  mode: "running" | "paused" | "step" | null
+  pending: string | null
+  disabled: boolean
   onPause: () => void
   onResume: () => void
   onStep: () => void
 }) {
-  return (
-    <span className="ml-2 flex items-center gap-2">
-      {mode === "running" ? (
-        <button
-          type="button"
-          onClick={onPause}
-          title="Pause scan loop (freeze IO + program)"
-          className="rounded p-1.5 -m-1 text-muted-foreground hover:bg-accent/40 hover:text-foreground"
-        >
-          <Pause className="size-3" />
-        </button>
-      ) : (
-        <button
-          type="button"
-          onClick={onResume}
-          title="Resume continuous scanning"
-          className="rounded p-1.5 -m-1 text-highlight hover:bg-highlight/15"
-        >
-          <Play className="size-3" />
-        </button>
-      )}
-      <button
-        type="button"
-        onClick={onStep}
-        title="Step one scan cycle (auto-pause after)"
-        className="rounded p-1.5 -m-1 text-muted-foreground hover:bg-accent/40 hover:text-foreground"
-      >
-        <StepForward className="size-3" />
-      </button>
-      {mode !== "running" && (
-        <Tag color="muted" title={`scan mode: ${mode}`}>
-          {mode}
-        </Tag>
-      )}
-    </span>
-  )
+  return <div className="flex items-center gap-2" aria-label="Scan controls" aria-busy={!!pending}>
+    {mode === "paused" || mode === "step" ? <Button size="sm" disabled={disabled} onClick={onResume} title="Resume continuous scanning"><Play />Resume</Button>
+      : <Button variant="outline" size="sm" disabled={disabled} onClick={onPause} title="Pause scan loop (freeze IO + program)"><Pause />Pause</Button>}
+    <Button variant="outline" size="sm" disabled={disabled} onClick={onStep} title="Step one scan cycle (auto-pause after)"><StepForward />Step</Button>
+  </div>
 }
 
 function Tag({
@@ -485,200 +435,65 @@ interface VarRowProps {
   forced: boolean
   /** Toggle the force state for this variable. */
   onToggleForce: (v: VarValue) => void
+  onWrite: (value: number) => Promise<boolean>
 }
 
-function VarRow({
-  v,
-  history,
-  isPinned,
-  sparkColor,
-  onPin,
-  stale,
-  canWrite,
-  forced,
-  onToggleForce,
-}: VarRowProps) {
-  const cat: VarCategory = classifyType(v.type_name)
-  const trendable = cat === "numeric" || cat === "bool" || cat === "bits"
-
-  return (
-    <li
-      className={cn(
-        "flex items-center gap-2 px-2 py-0.5",
-        stale && "opacity-60",
-      )}
-    >
-      {trendable ? (
-        <button
-          type="button"
-          onClick={() => onPin(v.name)}
-          className={cn(
-            "shrink-0 rounded p-1.5 -m-1 transition-colors",
-            isPinned
-              ? "text-foreground"
-              : "text-muted-foreground/30 hover:text-muted-foreground",
-          )}
-          title={isPinned ? "Unpin from trend" : "Pin to trend"}
-        >
-          <Pin
-            className={cn("size-3", isPinned && "fill-current rotate-45")}
-          />
-        </button>
-      ) : (
-        // Reserve the same width so name columns line up across categories.
-        <span className="size-4 shrink-0" />
-      )}
-
-      <span className="w-24 shrink-0 truncate font-mono text-xs">{v.name}</span>
-
-      <span className="block h-4 flex-1 min-w-0">
-        <CategoryVisual cat={cat} v={v} history={history} sparkColor={sparkColor} />
-      </span>
-
-      {v.type_name && (
-        <span className="hidden font-mono text-[9px] text-muted-foreground sm:inline">
-          {v.type_name}
-        </span>
-      )}
-
-      {canWrite && (cat === "bool" || cat === "numeric" || cat === "bits") && (
-        <button
-          type="button"
-          onClick={() => onToggleForce(v)}
-          className={cn(
-            "shrink-0 rounded p-1.5 -m-1 transition-colors",
-            forced
-              ? "text-destructive hover:text-destructive/80"
-              : "text-muted-foreground/30 hover:text-muted-foreground",
-          )}
-          title={
-            forced
-              ? `Unforce ${v.name} (resume normal program-driven behaviour)`
-              : `Force ${v.name} = current value (pin across scans)`
-          }
-        >
-          {forced ? <Lock className="size-3" /> : <Unlock className="size-3" />}
-        </button>
-      )}
-      {/* Reserve width so rows align even when the force button is
-          hidden (read-only categories or remote attach mode). */}
-      {!(canWrite && (cat === "bool" || cat === "numeric" || cat === "bits")) && (
-        <span className="size-4 shrink-0" />
-      )}
-
-      <ValueCell v={v} cat={cat} canWrite={canWrite} />
-    </li>
-  )
+function VarRow({ v, history, isPinned, sparkColor, onPin, stale, canWrite, forced, onToggleForce, onWrite }: VarRowProps) {
+  const category = classifyType(v.type_name)
+  const trendable = category === "numeric" || category === "bool" || category === "bits"
+  const writable = canWrite && canWriteMonitorType(v.type_name)
+  return <tr className={cn("h-9 border-b border-border/50 hover:bg-muted/50", stale && "text-muted-foreground", isPinned && "bg-selection/50")}>
+    <td className="px-2">{trendable && <Button variant="ghost" size="icon-xs" aria-label={`${isPinned ? "Unpin" : "Pin"} ${v.name} ${isPinned ? "from" : "to"} trend`} aria-pressed={isPinned} onClick={() => onPin(v.name)} title={isPinned ? "Unpin from trend" : "Pin to trend"}><Pin className={cn(isPinned ? "text-foreground" : "text-muted-foreground", isPinned && "fill-current rotate-45")} /></Button>}</td>
+    <th scope="row" className="max-w-56 truncate px-2 text-left font-mono font-normal" title={v.name}>{v.name}</th>
+    <td className="px-2 font-mono text-xs text-muted-foreground">{v.type_name}</td>
+    <td className="w-1/3 min-w-24 px-2"><div className="h-5 max-w-72"><CategoryVisual cat={category} v={v} history={history} sparkColor={sparkColor} /></div></td>
+    <td className="px-2 text-right"><ValueCell v={v} cat={category} canWrite={writable} onWrite={onWrite} /></td>
+    <td className="px-2 text-center">{writable ? <Button variant="ghost" size="icon-xs" aria-label={`${forced ? "Unforce" : "Force"} ${v.name}`} aria-pressed={forced} onClick={() => onToggleForce(v)} title={forced ? `Unforce ${v.name} (resume program control)` : `Force ${v.name} = current value`}>
+      {forced ? <Lock className="text-destructive" /> : <Unlock className="text-muted-foreground" />}
+    </Button> : forced ? <Lock aria-label={`${v.name} is forced`} className="mx-auto size-4 text-destructive" /> : <span className="text-muted-foreground">—</span>}</td>
+  </tr>
 }
 
-/** Right-hand value cell. Interactive when the program is running
- *  (clickable BOOL toggle / inline numeric input that writes via
- *  `/api/runtime/variables`). Falls back to plain text otherwise.
- *  This is what turns the Monitor into a no-code HMI for driving an
- *  LD POU during dev — without a real plant simulator, the operator
- *  IS the simulator. */
-function ValueCell({
-  v,
-  cat,
-  canWrite,
-}: {
-  v: VarValue
-  cat: VarCategory
-  canWrite: boolean
-}) {
+function ValueCell({ v, cat, canWrite, onWrite }: { v: VarValue; cat: VarCategory; canWrite: boolean; onWrite: (value: number) => Promise<boolean> }) {
   if (canWrite && cat === "bool") {
     const on = v.value === "TRUE"
-    return (
-      <button
-        type="button"
-        onClick={() => {
-          void writeVariable(v.name, on ? 0 : 1, "BOOL").catch(() => {
-            /* swallow — UI will refresh from next SSE snapshot */
-          })
-        }}
-        className={cn(
-          "w-20 shrink-0 rounded px-1 text-right font-mono text-xs tabular-nums transition-colors",
-          on
-            ? "bg-highlight/15 text-highlight hover:bg-highlight/25"
-            : "text-muted-foreground hover:bg-accent/40 hover:text-foreground",
-        )}
-        title="Click to toggle"
-      >
-        {on ? "on" : "off"}
-      </button>
-    )
+    return <button type="button" onClick={() => void onWrite(on ? 0 : 1)} className={cn("h-7 min-w-20 rounded px-2 text-right font-mono text-[13px]", on ? "bg-highlight/10 text-highlight" : "bg-muted text-foreground")} aria-label={`Toggle ${v.name}`} title="Click to toggle">{on ? "TRUE" : "FALSE"}</button>
   }
-  if (canWrite && cat === "numeric") {
-    return <NumericEditor name={v.name} typeName={v.type_name} value={v.value} />
-  }
-  return (
-    <span
-      className={cn(
-        "w-20 shrink-0 text-right font-mono text-xs tabular-nums",
-        cat === "fb" && "text-muted-foreground/50",
-      )}
-    >
-      {renderValue(cat, v)}
-    </span>
-  )
+  if (canWrite && cat === "numeric") return <NumericEditor name={v.name} typeName={v.type_name} value={v.value} onWrite={onWrite} />
+  return <span className="inline-block min-w-20 font-mono text-[13px] tabular-nums" title={!canWriteMonitorType(v.type_name) ? "Read only" : undefined}>{renderValue(cat, v)}</span>
 }
 
-/** Numeric editor — committed on blur or Enter, reverts on Escape.
- *  Holds a local draft so the SSE snapshots arriving between
- *  keystrokes don't blow away mid-typed values. The `typeName` is
- *  threaded so writeVariable() can do the right encoding (REAL → f32
- *  bit pattern, integers → truncated i32). */
-function NumericEditor({
-  name,
-  typeName,
-  value,
-}: {
-  name: string
-  typeName: string
-  value: string
+/** Draft state stays local while snapshots continue. A ref consumes the draft
+ * before blur fires, so Escape cannot submit and Enter cannot submit twice. */
+export function NumericEditor({ name, typeName, value, onWrite }: {
+  name: string; typeName: string; value: string; onWrite: (value: number) => Promise<boolean>
 }) {
   const [draft, setDraft] = useState(value)
   const [editing, setEditing] = useState(false)
-  useEffect(() => {
-    if (!editing) setDraft(value)
-  }, [value, editing])
-  const commit = () => {
+  const [error, setError] = useState<string | null>(null)
+  const dirty = useRef(false)
+  useEffect(() => { if (!editing) setDraft(value) }, [value, editing])
+  const commit = async () => {
+    if (!dirty.current) return
+    dirty.current = false
     setEditing(false)
-    const parsed = parseFloat(draft)
-    if (!Number.isFinite(parsed)) {
-      setDraft(value)
-      return
-    }
-    void writeVariable(name, parsed, typeName).catch(() => {
-      setDraft(value)
-    })
+    try {
+      const parsed = monitorWriteValue(draft, typeName)
+      if (!await onWrite(parsed)) setDraft(value)
+      else setError(null)
+    } catch (cause) { setDraft(value); setError(String(cause)) }
   }
-  return (
-    <input
-      type="text"
-      value={draft}
-      onChange={(e) => {
-        setDraft(e.target.value)
-        setEditing(true)
+  return <div className="inline-flex max-w-48 flex-col items-end">
+    <input type="text" inputMode="decimal" aria-label={`Value for ${name}`} aria-invalid={!!error} value={draft}
+      onFocus={() => setEditing(true)} onChange={event => { dirty.current = true; setDraft(event.target.value); setEditing(true); setError(null) }}
+      onBlur={() => { setEditing(false); void commit() }} onKeyDown={event => {
+        if (event.key === "Enter") { event.preventDefault(); void commit(); event.currentTarget.blur() }
+        if (event.key === "Escape") { event.preventDefault(); dirty.current = false; setDraft(value); setEditing(false); setError(null); event.currentTarget.blur() }
       }}
-      onBlur={commit}
-      onKeyDown={(e) => {
-        if (e.key === "Enter") commit()
-        else if (e.key === "Escape") {
-          setDraft(value)
-          setEditing(false)
-          ;(e.target as HTMLInputElement).blur()
-        }
-      }}
-      className={cn(
-        "w-20 shrink-0 rounded bg-transparent px-1 text-right font-mono text-xs tabular-nums",
-        editing
-          ? "ring-1 ring-highlight bg-highlight/5"
-          : "hover:bg-accent/40",
-      )}
-      title="Click to edit; Enter to commit"
-    />
-  )
+      className={cn("h-7 w-24 rounded border border-transparent bg-transparent px-2 text-right font-mono text-[13px] tabular-nums hover:border-input focus:border-ring focus:bg-background focus:outline-none", error && "border-destructive")}
+      title="Enter to write · Escape to cancel" />
+    {error && <span role="alert" className="text-xs text-destructive">{error}</span>}
+  </div>
 }
 
 /** The middle column — the visual that conveys "what's happening
@@ -735,7 +550,7 @@ function BoolStrip({
   return (
     <span className="flex h-4 w-full items-center gap-px overflow-hidden">
       {last.length === 0 ? (
-        <span className="text-[10px] text-muted-foreground/60">—</span>
+        <span className="text-xs text-muted-foreground/60">—</span>
       ) : (
         last.map((v, i) => (
           <span
@@ -763,7 +578,7 @@ function BitsVisual({ hex }: { hex: string }) {
   const digits = stripHexPrefix(hex)
   return (
     <span className="flex h-4 items-center">
-      <span className="rounded border border-border bg-muted/40 px-1.5 font-mono text-[10px] tracking-wider text-foreground">
+      <span className="rounded border border-border bg-muted/40 px-1.5 font-mono text-xs tracking-wider text-foreground">
         {digits}
       </span>
     </span>
@@ -791,7 +606,7 @@ function renderValue(cat: VarCategory, v: VarValue): string {
 //   Alarms — a calm summary that only takes on colour when
 //   something is standing (ISA-101). Polls GET /api/runtime/alarms
 //   every 2 s while the Monitor is running; the backend pre-sorts
-//   standing-first. Acid green is never used here (agent chrome only).
+//   standing-first. Status colours retain their alarm meanings.
 // ============================================================
 
 const ALARM_TONE_CLS: Record<AlarmTone, { chip: string; text: string }> = {
@@ -806,16 +621,21 @@ const ALARM_TONE_CLS: Record<AlarmTone, { chip: string; text: string }> = {
   },
 }
 
-function AlarmsSection() {
+function AlarmsSection({ onStandingChange, onErrorChange }: { onStandingChange: (count: number) => void; onErrorChange: (error: string | null) => void }) {
   const [alarms, setAlarms] = useState<AlarmState[]>([])
+  const [pollError, setPollError] = useState<string | null>(null)
+  const [ackError, setAckError] = useState<string | null>(null)
+  const [acking, setAcking] = useState<string | null>(null)
+  const [showAll, setShowAll] = useState(false)
+  const alarmError = ackError || pollError
   useEffect(() => {
     let cancelled = false
     const tick = async () => {
       try {
         const a = await fetchRuntimeAlarms()
-        if (!cancelled) setAlarms(a)
-      } catch {
-        /* keep last list; runtime may be mid-restart */
+        if (!cancelled) { setAlarms(a); setPollError(null) }
+      } catch (error) {
+        if (!cancelled) setPollError(`Alarm status unavailable: ${String(error)}`)
       }
     }
     void tick()
@@ -827,27 +647,27 @@ function AlarmsSection() {
   }, [])
 
   const standing = standingCount(alarms)
+  useEffect(() => { onStandingChange(standing); return () => onStandingChange(0) }, [standing, onStandingChange])
+  useEffect(() => { onErrorChange(alarmError); return () => onErrorChange(null) }, [alarmError, onErrorChange])
   const hasCritical = alarms.some(
     (a) => alarmStanding(a) && severityTone(a.severity, true) === "alert",
   )
 
   const ack = useCallback(async (id: string) => {
-    // Optimistic: flip acked now; the 2 s poll reconciles the truth.
-    setAlarms((prev) =>
-      prev.map((a) => (a.id === id ? { ...a, acked: true } : a)),
-    )
+    setAcking(id)
+    setAckError(null)
     try {
-      await ackRuntimeAlarm(id)
-    } catch {
-      /* next poll re-syncs */
-    }
+      const updated = await ackRuntimeAlarm(id)
+      setAlarms(previous => previous.map(alarm => alarm.id === id ? updated : alarm))
+    } catch (error) { setAckError(`Acknowledge failed: ${String(error)}`) }
+    finally { setAcking(null) }
   }, [])
 
   return (
     <div className="shrink-0 border-b border-border bg-background/40">
-      <div className="flex h-6 items-center justify-between px-3 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-        <span>Alarms</span>
-        {standing > 0 && (
+      <div className="flex min-h-9 items-center justify-between gap-3 px-4 text-xs text-muted-foreground">
+        <span className="flex items-center gap-3"><span className="font-medium">Alarms</span>
+        {standing === 0 ? <span>No standing alarms</span> : (
           <span
             className={cn(
               "rounded px-1.5 py-0.5 font-mono normal-case tracking-normal",
@@ -858,16 +678,14 @@ function AlarmsSection() {
           >
             {standing} standing
           </span>
-        )}
+        )}</span>
+        {alarms.length > standing && <Button variant="ghost" size="sm" aria-expanded={showAll} onClick={() => setShowAll(value => !value)}>{showAll ? "Standing only" : `Show all ${alarms.length}`}</Button>}
       </div>
-      {alarms.length === 0 ? (
-        <div className="px-3 pb-1.5 text-[11px] text-muted-foreground/60">
-          No active alarms.
-        </div>
-      ) : (
+      {alarmError && <div role="alert" className="px-4 py-2 text-xs text-destructive">{alarmError}</div>}
+      {(showAll || standing > 0) && (
         <ul className="max-h-40 divide-y divide-border/50 overflow-auto pb-1">
-          {alarms.map((a) => (
-            <AlarmRow key={a.id} a={a} onAck={ack} />
+          {(showAll ? alarms : alarms.filter(alarmStanding)).map((a) => (
+            <AlarmRow key={a.id} a={a} onAck={ack} disabled={acking !== null} />
           ))}
         </ul>
       )}
@@ -878,22 +696,24 @@ function AlarmsSection() {
 function AlarmRow({
   a,
   onAck,
+  disabled,
 }: {
   a: AlarmState
   onAck: (id: string) => void
+  disabled: boolean
 }) {
   const standing = alarmStanding(a)
   const tone = ALARM_TONE_CLS[severityTone(a.severity, standing)]
   return (
     <li
       className={cn(
-        "flex items-center gap-2 px-3 py-0.5 text-[11px]",
+        "flex min-h-9 items-center gap-3 px-4 py-1 text-xs",
         !standing && "opacity-60",
       )}
     >
       <span
         className={cn(
-          "shrink-0 rounded px-1 py-px font-mono text-[9px] uppercase tracking-wider",
+          "shrink-0 rounded px-1 py-px font-mono text-xs",
           tone.chip,
         )}
       >
@@ -906,20 +726,20 @@ function AlarmRow({
         {a.message}
       </span>
       <span
-        className="shrink-0 font-mono text-[9px] tabular-nums text-muted-foreground"
+        className="shrink-0 font-mono text-xs tabular-nums text-muted-foreground"
         title="raised at"
       >
-        {fmtAlarmClock(a.raised_at_us)}
+        {a.count === 0 ? "Never raised" : fmtAlarmClock(a.raised_at_us)}
       </span>
       <span
-        className="hidden shrink-0 font-mono text-[9px] tabular-nums text-muted-foreground sm:inline"
+        className="hidden shrink-0 font-mono text-xs tabular-nums text-muted-foreground sm:inline"
         title="value at raise"
       >
-        {fmtAlarmValue(a.value_at_raise)}
+        {a.count === 0 ? "—" : fmtAlarmValue(a.value_at_raise)}
       </span>
       {a.count > 1 && (
         <span
-          className="shrink-0 font-mono text-[9px] tabular-nums text-muted-foreground/70"
+          className="shrink-0 font-mono text-xs tabular-nums text-muted-foreground/70"
           title="times raised"
         >
           ×{a.count}
@@ -929,14 +749,15 @@ function AlarmRow({
         <button
           type="button"
           onClick={() => onAck(a.id)}
-          className="shrink-0 rounded border border-border bg-card px-1.5 py-px font-mono text-[9px] uppercase tracking-wider text-muted-foreground hover:text-foreground"
+          disabled={disabled}
+          className="shrink-0 rounded border border-border bg-card px-1.5 py-px font-mono text-xs text-muted-foreground hover:text-foreground"
           title="Acknowledge"
         >
           ack
         </button>
       ) : (
         <span
-          className="shrink-0 font-mono text-[9px] uppercase tracking-wider text-muted-foreground/40"
+          className="shrink-0 font-mono text-xs text-muted-foreground/40"
           title="acknowledged"
         >
           ackd

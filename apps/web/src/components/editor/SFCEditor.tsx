@@ -31,7 +31,7 @@
  * next tick. No internal mutable state to drift.
  */
 
-import { Plus, Trash2, X } from "lucide-react"
+import { Plus, Trash2, X } from "@/components/ui/icons"
 import { useEffect, useMemo, useState } from "react"
 
 import { DiagnosticsBanner } from "@/components/editor/DiagnosticsBanner"
@@ -47,6 +47,7 @@ import {
   useProgramEditor,
   type ParseResult,
 } from "@/components/editor/shared/useProgramEditor"
+import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import {
   Select,
@@ -180,7 +181,7 @@ export function SFCEditor({
         }
       >
         {activeStep && (
-          <span className="ml-3 rounded bg-highlight/15 px-1.5 py-0.5 font-mono text-[9px] normal-case text-foreground">
+          <span className="ml-3 rounded bg-highlight/15 px-1.5 py-0.5 font-mono text-xs normal-case text-foreground">
             → {activeStep}
           </span>
         )}
@@ -338,21 +339,21 @@ function Toolbar({
 }) {
   if (readOnly) return null
   return (
-    <div className="flex items-center gap-2 border-b border-border bg-muted/10 px-3 py-1 text-xs">
-      <button
+    <div className="flex flex-wrap items-center gap-2 border-b border-border bg-background px-4 pb-2 text-[13px]">
+      <Button
         type="button"
         onClick={onAddStep}
-        className="flex h-7 items-center gap-1 rounded border border-input bg-card px-2 hover:bg-accent/30"
+        variant="secondary" size="sm"
         title="Append a new step"
       >
         <Plus className="size-3" />
         Step
-      </button>
-      <button
+      </Button>
+      <Button
         type="button"
         onClick={onAddTransition}
         disabled={!canAddTransition}
-        className="flex h-7 items-center gap-1 rounded border border-input bg-card px-2 hover:bg-accent/30 disabled:cursor-not-allowed disabled:opacity-50"
+        variant="secondary" size="sm"
         title={
           canAddTransition
             ? "Add a transition between two steps"
@@ -361,8 +362,8 @@ function Toolbar({
       >
         <Plus className="size-3" />
         Transition
-      </button>
-      <span className="text-[10px] text-muted-foreground">
+      </Button>
+      <span className="text-xs text-muted-foreground">
         click any element to edit · double frame = initial step ·
         transitions evaluate top-to-bottom (first match wins)
       </span>
@@ -516,7 +517,7 @@ function ActionList({
                 <span className="border-r-2 border-foreground bg-muted/30 px-1.5 py-0.5 font-mono text-xs font-bold text-foreground">
                   {a.qualifier}
                 </span>
-                <pre className="max-w-xs whitespace-pre-wrap px-2 py-0.5 font-mono text-[11px] text-foreground">
+                <pre className="max-w-xs whitespace-pre-wrap px-2 py-0.5 font-mono text-[13px] text-foreground">
                   {a.body || (
                     // An empty body compiles to a transpile error — flag
                     // it as something to fill, not a neutral placeholder.
@@ -534,7 +535,7 @@ function ActionList({
             <button
               type="button"
               onClick={onAddAction}
-              className="flex items-center gap-1 border border-dashed border-muted-foreground/50 bg-transparent px-2 py-0.5 text-[10px] text-muted-foreground hover:bg-accent/30 hover:text-foreground"
+              className="flex items-center gap-1 border border-dashed border-muted-foreground/50 bg-transparent px-2 py-0.5 text-xs text-muted-foreground hover:bg-accent/30 hover:text-foreground"
               title={`Add an action to ${step}`}
             >
               <Plus className="size-3" />
@@ -594,7 +595,7 @@ function TransitionRow({
           )}
         />
       </div>
-      <div className="flex-1 self-center pl-3 font-mono text-[11px]">
+      <div className="flex-1 self-center pl-3 font-mono text-[13px]">
         <span className="text-foreground">{transition.condition}</span>
         <span className="ml-2 text-muted-foreground">→ {transition.to}</span>
       </div>
@@ -684,7 +685,7 @@ function StepDetail({
         onClick={() => onCommit(setInitialStep(prog, name))}
         disabled={isInitial}
         className={cn(
-          "h-7 rounded px-2 text-[11px]",
+          "h-7 rounded px-2 text-[13px]",
           isInitial
             ? "cursor-default bg-highlight/15 text-foreground"
             : "border border-input hover:bg-accent/30",
@@ -737,7 +738,7 @@ function ActionDetail({
   return (
     <DetailContainer>
       <DetailLabel>action</DetailLabel>
-      <span className="font-mono text-[10px] text-muted-foreground">
+      <span className="font-mono text-xs text-muted-foreground">
         {step} · #{index}
       </span>
       <Select
@@ -794,7 +795,7 @@ function TransitionDetail({
   return (
     <DetailContainer>
       <DetailLabel>transition</DetailLabel>
-      <span className="font-mono text-[10px] text-muted-foreground">
+      <span className="font-mono text-xs text-muted-foreground">
         #{index}
       </span>
       <Select
@@ -894,7 +895,7 @@ function DangerBtn({
       type="button"
       onClick={onClick}
       title={title}
-      className="flex h-7 items-center gap-1 rounded border border-destructive/40 bg-destructive/5 px-2 text-[11px] text-destructive hover:bg-destructive/15"
+      className="flex h-7 items-center gap-1 rounded border border-destructive/40 bg-destructive/5 px-2 text-[13px] text-destructive hover:bg-destructive/15"
     >
       {children}
     </button>

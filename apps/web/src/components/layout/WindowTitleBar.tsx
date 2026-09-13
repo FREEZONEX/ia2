@@ -1,256 +1,104 @@
-import { ChevronDown, Plus } from "lucide-react"
-import { useCallback, useEffect, useRef, useState } from "react"
-
-import {
-  currentProject,
-  fetchOpenProjects,
-  fetchProjects as fetchProjectListings,
-  openProject as apiOpenProject,
-} from "@/lib/api"
-import { cn } from "@/lib/utils"
+import { useEffect, useState } from "react"
+import { Check, ChevronDown, FolderOpen, Moon, PanelLeftOpen, Plus, Search, Settings, Sun, MonitorDot } from "@/components/ui/icons"
+import { NewProjectDialog } from "@/components/dialogs/NewProjectDialog"
+import { OpenProjectDialog } from "@/components/dialogs/OpenProjectDialog"
+import { Button } from "@/components/ui/button"
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu"
+import { fetchOpenProjects, fetchProjects } from "@/lib/api"
+import { setTheme, useDarkMode } from "@/lib/dark-mode"
+import { shortcut } from "@/lib/platform"
 import { useRuntime } from "@/state/runtime"
 import type { OpenProjectInfo } from "@/types/generated/OpenProjectInfo"
 import type { ProjectListing } from "@/types/generated/ProjectListing"
 
-/**
- * The thin strip at the top of the workbench — also doubles as the
- * macOS title-bar drag region. Hosts the project name + a small
- * picker for switching between open projects or spawning a new
- * window pinned to one.
- *
- * Multi-project model recap (server side): every project the server
- * has open lives in a single registry; each window of the IDE
- * identifies its current project via `?project=<name>` in the URL.
- * Requests carry that name in the `X-IA2-Project` header (set
- * automatically by `apiFetch`).
- *
- * Behaviours implemented here:
- *  - "Switch this window" picks a different project in the same
- *    window (history.pushState + reload runtime, no full navigation
- *    so the takeover overlay / SSE connection persist).
- *  - "Open in new window" calls `window.open(url)`. In the browser
- *    that's a new tab; in the Mac shell, the WebViewHost intercepts
- *    same-origin `window.open` and spawns a real new IA2 window.
- *  - "Open another project…" loads the disk-scanned project list and
- *    lets the user open one that isn't currently in the server's
- *    open set (adds it AND switches this window to it).
- */
-export function WindowTitleBar() {
-  const { project } = useRuntime()
-  const projectName = project?.name ?? currentProject() ?? null
-
-  return (
-    <div className="flex h-7 shrink-0 items-center justify-center gap-2 px-2 text-xs">
-      {/* Picker sits centred — the document-name-in-titlebar convention
-       * (Finder, Mail, Linear), kept for the browser IDE. */}
-      <ProjectPicker currentName={projectName} />
-    </div>
-  )
+export function Ia2Mark() {
+  return <svg aria-hidden viewBox="0 0 24 24" className="size-6 shrink-0"><rect width="24" height="24" rx="4" fill="#050b14" /><path d="M4 15h5V7h6v10h5" fill="none" stroke="var(--agent)" strokeWidth="2" strokeLinejoin="round" /></svg>
 }
 
-function ProjectPicker({ currentName }: { currentName: string | null }) {
-  const [open, setOpen] = useState(false)
-  const [openList, setOpenList] = useState<OpenProjectInfo[] | null>(null)
-  const [diskList, setDiskList] = useState<ProjectListing[] | null>(null)
-  // Name of the project a switch is in flight for. Drives the button
-  // label so a slow server-side open reads as "Opening…", never as a
-  // dead click.
-  const [switching, setSwitching] = useState<string | null>(null)
-  const containerRef = useRef<HTMLDivElement | null>(null)
-
-  // Refresh lists each time the dropdown opens so a project opened
-  // in another window shows up here without a manual reload.
-  useEffect(() => {
-    if (!open) return
-    void fetchOpenProjects().then((r) => setOpenList(r.projects))
-    void fetchProjectListings().then(setDiskList)
-  }, [open])
-
-  // Click-outside to close. Pointerdown so the focused button's
-  // own click event still fires before we hide.
-  useEffect(() => {
-    if (!open) return
-    function onDoc(e: PointerEvent) {
-      const root = containerRef.current
-      if (!root) return
-      if (!root.contains(e.target as Node)) setOpen(false)
-    }
-    document.addEventListener("pointerdown", onDoc)
-    return () => document.removeEventListener("pointerdown", onDoc)
-  }, [open])
-
-  const switchTo = useCallback(async (name: string, path: string) => {
-    // Same-window switch: update the URL search param then trigger
-    // a hard reload so RuntimeProvider re-mounts with the new
-    // project name. We don't soft-reload because half the state
-    // (currentPou, editor source, attachment) is project-scoped and
-    // teasing it apart cleanly is more code than it's worth — the
-    // page is local and reloads in ~100 ms.
-    const url = new URL(window.location.href)
-    url.searchParams.set("project", name)
-    // Ensure the server has this project open before we navigate —
-    // the picker only lists open + disk-scanned projects, so the
-    // explicit `openProject` round-trip costs at most one extra
-    // request on first switch. The timeout is the difference between
-    // "Opening…" and a dead click: a server stuck opening a project
-    // (an iCloud-evicted file can block the read indefinitely) must
-    // not hang the switch forever — after 8 s we navigate anyway and
-    // let the target page surface whatever is wrong.
-    setSwitching(name)
-    try {
-      await apiOpenProject(path, { signal: AbortSignal.timeout(8000) })
-    } catch {
-      /* ignore — server may already have it open, or the open timed
-       * out; either way the navigation below tells the truth */
-    }
-    window.location.href = url.toString()
-  }, [])
-
-  const openInNewWindow = useCallback(async (name: string, path: string) => {
-    try {
-      await apiOpenProject(path, { signal: AbortSignal.timeout(8000) })
-    } catch {
-      /* already open is fine */
-    }
-    const url = new URL(window.location.href)
-    url.searchParams.set("project", name)
-    // The Mac shell's WebViewHost intercepts same-origin
-    // `window.open` and spawns a fresh IA2 NSWindow with the URL;
-    // in a regular browser it's a new tab. Pass `noopener` so the
-    // new window doesn't get a Window opener handle back to us —
-    // each window is its own session.
-    window.open(url.toString(), "_blank", "noopener")
-  }, [])
-
-  return (
-    <div ref={containerRef} className="relative">
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        className="flex items-center gap-1.5 rounded px-2 py-0.5 text-xs font-medium text-foreground/80 hover:bg-accent/40 hover:text-foreground"
-        title="Switch project / open another window"
-      >
-        <span className="truncate">
-          {switching !== null
-            ? `Opening ${switching}…`
-            : (currentName ?? "No project")}
-        </span>
-        <ChevronDown className="size-3 opacity-60" />
-      </button>
-      {open && (
-        <div
-          // Width caps so very long project names don't blow the
-          // dropdown across the whole window; min-width keeps short
-          // names visually consistent.
-          className="absolute left-1/2 top-full z-50 mt-1 min-w-[18rem] max-w-[26rem] -translate-x-1/2 rounded-md border border-border bg-popover py-1 text-xs shadow-lg"
-        >
-          {/* Section header: open in this server right now */}
-          <div className="px-3 pb-1 pt-1.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-            Open projects
-          </div>
-          {openList === null ? (
-            <div className="px-3 py-1.5 text-muted-foreground">Loading…</div>
-          ) : openList.length === 0 ? (
-            <div className="px-3 py-1.5 text-muted-foreground">
-              No projects open yet
-            </div>
-          ) : (
-            <ul>
-              {openList.map((p) => (
-                <ProjectRow
-                  key={p.name}
-                  name={p.name}
-                  path={p.path}
-                  active={p.name === currentName}
-                  onSwitch={() => {
-                    setOpen(false)
-                    void switchTo(p.name, p.path)
-                  }}
-                  onOpenInNewWindow={() => {
-                    setOpen(false)
-                    void openInNewWindow(p.name, p.path)
-                  }}
-                />
-              ))}
-            </ul>
-          )}
-
-          {/* Section: projects on disk not currently open. Letting
-           * the user open one without bouncing through the modal
-           * dialog keeps the multi-window flow fast. */}
-          {diskList && diskList.length > 0 && (
-            <>
-              <div className="mx-2 my-1 border-t border-border" />
-              <div className="px-3 pb-1 pt-1.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-                Other projects on disk
-              </div>
-              <ul>
-                {diskList
-                  .filter(
-                    (p) =>
-                      !(openList ?? []).some((open) => open.path === p.path),
-                  )
-                  .slice(0, 8)
-                  .map((p) => (
-                    <ProjectRow
-                      key={p.path}
-                      name={p.name}
-                      path={p.path}
-                      active={false}
-                      onSwitch={() => {
-                        setOpen(false)
-                        void switchTo(p.name, p.path)
-                      }}
-                      onOpenInNewWindow={() => {
-                        setOpen(false)
-                        void openInNewWindow(p.name, p.path)
-                      }}
-                    />
-                  ))}
-              </ul>
-            </>
-          )}
-        </div>
-      )}
-    </div>
-  )
-}
-
-function ProjectRow(props: {
-  name: string
-  path: string
-  active: boolean
-  onSwitch: () => void
-  onOpenInNewWindow: () => void
+/** App navigation is opaque on every platform. The OS owns its title bar. */
+export function WindowTitleBar({ onSearch, onToggleSidebar, sidebarCollapsed, onToggleMonitor, monitorCollapsed }: {
+  onSearch?: () => void
+  onToggleSidebar?: () => void
+  sidebarCollapsed?: boolean
+  onToggleMonitor?: () => void
+  monitorCollapsed?: boolean
 }) {
+  const { project } = useRuntime()
+  const theme = useDarkMode()
   return (
-    <li className="group flex items-stretch">
-      <button
-        type="button"
-        onClick={props.onSwitch}
-        className={cn(
-          "flex-1 truncate px-3 py-1.5 text-left transition-colors",
-          props.active
-            ? "font-medium text-highlight"
-            : "text-foreground/90 hover:bg-accent/40",
-        )}
-        title={props.path}
-      >
-        {props.name}
-        {props.active && (
-          <span className="ml-2 text-[10px] uppercase tracking-wider text-muted-foreground">
-            current
-          </span>
-        )}
-      </button>
-      <button
-        type="button"
-        onClick={props.onOpenInNewWindow}
-        title="Open in a new window"
-        className="flex shrink-0 items-center justify-center px-2 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover:opacity-100"
-      >
-        <Plus className="size-3.5" />
-      </button>
-    </li>
+    <header data-testid="workspace-header" className="flex h-12 min-h-12 shrink-0 items-center gap-3 border-b border-border bg-background px-3 text-foreground">
+      {project && <Button variant="ghost" size="icon-sm" onClick={onToggleSidebar} aria-label={sidebarCollapsed ? "Show project explorer" : "Hide project explorer"} aria-pressed={!sidebarCollapsed}><PanelLeftOpen className="size-4" /></Button>}
+      <div className="flex shrink-0 items-center gap-2"><Ia2Mark /><span className="text-[15px] font-medium">IA2</span></div>
+      <span aria-hidden className="h-4 w-px bg-border" />
+      <ProjectPicker />
+      <div className="flex-1" />
+      {project && <button type="button" onClick={onSearch} title={`Search (${shortcut("P")})`} aria-label="Search project" className="flex h-8 w-8 min-[1000px]:w-64 max-w-[24vw] items-center gap-2 rounded border border-border bg-secondary px-2 min-[1000px]:px-2.5 text-xs text-muted-foreground hover:border-input hover:text-foreground"><Search className="size-4 shrink-0" /><span className="hidden min-w-0 flex-1 truncate text-left min-[1000px]:block">Find in project</span><kbd className="ml-auto hidden shrink-0 font-sans min-[1000px]:block">{shortcut("P")}</kbd></button>}
+      {project && <Button variant="ghost" size="sm" onClick={onToggleMonitor} aria-label={monitorCollapsed ? "Expand monitor" : "Collapse monitor"} aria-pressed={!monitorCollapsed}><MonitorDot className="size-4" /><span className="hidden min-[1000px]:inline">Monitor</span></Button>}
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild><Button variant="ghost" size="icon-sm" aria-label="Appearance" title="Appearance"><Settings className="size-4" /></Button></DropdownMenuTrigger>
+        <DropdownMenuContent align="end" className="w-44">
+          <DropdownMenuLabel>Appearance</DropdownMenuLabel>
+          <DropdownMenuItem onSelect={() => setTheme("light")}><Sun className="size-4" />Light{theme === "light" && <Check className="ml-auto size-4" />}</DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => setTheme("dark")}><Moon className="size-4" />Dark{theme === "dark" && <Check className="ml-auto size-4" />}</DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </header>
+  )
+}
+
+function ProjectPicker() {
+  const { project, openProject, closeProject } = useRuntime()
+  const [open, setOpen] = useState(false)
+  const [projectDialog, setProjectDialog] = useState<"new" | "open" | null>(null)
+  const [projects, setProjects] = useState<OpenProjectInfo[] | null>(null)
+  const [listings, setListings] = useState<ProjectListing[]>([])
+  const [busy, setBusy] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  useEffect(() => {
+    if (!open) return
+    let active = true
+    setError(null)
+    void Promise.all([fetchOpenProjects(), fetchProjects()]).then(([a, b]) => {
+      if (active) { setProjects(a.projects); setListings(b) }
+    }).catch((e) => { if (active) setError(String(e)) })
+    return () => { active = false }
+  }, [open])
+
+  const select = async (name: string, path: string) => {
+    if (busy) return
+    if (name === project?.name) { setOpen(false); return }
+    setBusy(name)
+    try { if (await openProject(path)) setOpen(false) } finally { setBusy(null) }
+  }
+  const projectUrl = (name: string) => {
+    const url = new URL(window.location.href)
+    url.searchParams.set("project", name)
+    return url.toString()
+  }
+  const other = listings.filter((p) => !(projects ?? []).some((o) => o.path === p.path))
+  return (
+    <>
+    <DropdownMenu open={open} onOpenChange={setOpen}>
+      <DropdownMenuTrigger asChild>
+        <button type="button" title="Switch project / open another window" className="flex h-8 min-w-0 max-w-[34vw] items-center gap-2 rounded px-2 text-[13px] font-medium hover:bg-accent"><span className="truncate">{busy ? `Opening ${busy}…` : project?.name ?? "Projects"}</span><ChevronDown className="size-4 shrink-0 text-muted-foreground" /></button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start" className="w-80 max-w-[calc(100vw-2rem)]">
+        <DropdownMenuLabel>Open projects</DropdownMenuLabel>
+        {error && <div role="alert" className="px-2 py-2 text-xs text-destructive">{error}</div>}
+        {!projects && !error && <div className="px-2 py-2 text-xs text-muted-foreground">Loading projects…</div>}
+        {projects?.map((p) => <div key={p.name} className="flex items-center gap-1">
+          <DropdownMenuItem disabled={busy !== null} onSelect={(e) => { e.preventDefault(); void select(p.name, p.path) }} className="min-w-0 flex-1" title={p.path}><FolderOpen className="size-4 shrink-0" /><span className="truncate">{p.name}</span>{p.name === project?.name && <Check className="ml-auto size-4 shrink-0 text-selection-foreground" />}</DropdownMenuItem>
+          <a href={projectUrl(p.name)} target="_blank" rel="noopener noreferrer" title="Open in a new window" aria-label={`Open ${p.name} in a new window`} className="grid size-8 shrink-0 place-items-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"><Plus className="size-4" /></a>
+        </div>)}
+        {other.length > 0 && <><DropdownMenuSeparator /><DropdownMenuLabel>Recent projects</DropdownMenuLabel>{other.slice(0, 6).map((p) => <DropdownMenuItem key={p.path} disabled={busy !== null} title={p.path} onSelect={(e) => { e.preventDefault(); void select(p.name, p.path) }}><FolderOpen className="size-4" /><span className="truncate">{p.name}</span></DropdownMenuItem>)}</>}
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onSelect={() => setProjectDialog("new")}>New project…</DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => setProjectDialog("open")}>Open project…</DropdownMenuItem>
+        {project && <DropdownMenuItem onSelect={(e) => { e.preventDefault(); setOpen(false); void closeProject() }}>Close project</DropdownMenuItem>}
+      </DropdownMenuContent>
+    </DropdownMenu>
+    <NewProjectDialog open={projectDialog === "new"} onOpenChange={(value) => setProjectDialog(value ? "new" : null)} />
+    <OpenProjectDialog open={projectDialog === "open"} onOpenChange={(value) => setProjectDialog(value ? "open" : null)} />
+    </>
   )
 }

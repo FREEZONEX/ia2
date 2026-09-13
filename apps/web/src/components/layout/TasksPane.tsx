@@ -8,12 +8,14 @@ import {
   Save,
   Square,
   Trash2,
-} from "lucide-react"
+} from "@/components/ui/icons"
 import { useEffect, useState } from "react"
 
 import { Button } from "@/components/ui/button"
 import { Field } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
+import { PaneHeader } from "@/components/ui/pane-header"
+import { EmptyState as PaneEmptyState } from "@/components/ui/empty-state"
 import {
   Select,
   SelectContent,
@@ -222,10 +224,10 @@ export function TasksPane() {
     (project?.pous.length ?? 0) > 0 && draft.tasks.length === 0
 
   return (
-    <main className="flex h-full min-h-0 min-w-0 flex-col">
-      <Header dirty={dirty} isRunning={isRunning} run={run} stop={stop} save={() => void saveTasks(draft)} />
+    <main className="ia2-pane">
+      <Header dirty={dirty} isRunning={isRunning} run={run} stop={stop} save={() => saveTasks(draft)} />
 
-      <div className="flex-1 space-y-4 overflow-auto p-5">
+      <div className="min-h-0 flex-1 space-y-5 overflow-auto p-4">
         {offerMigration && (
           <MigrateBanner migrating={migrating} onMigrate={migrate} />
         )}
@@ -297,80 +299,44 @@ export function TasksPane() {
 //  Subcomponents
 // ============================================================
 
-function Header({
-  dirty,
-  isRunning,
-  run,
-  stop,
-  save,
-}: {
+function Header({ dirty, isRunning, run, stop, save }: {
   dirty: boolean
   isRunning: boolean
   run: () => Promise<void>
   stop: () => Promise<void>
-  save: () => void
+  save: () => Promise<void>
 }) {
+  const [pending, setPending] = useState<"save" | "run" | "stop" | null>(null)
+  const act = async (action: "save" | "run" | "stop") => {
+    if (pending) return
+    setPending(action)
+    try { await ({ save, run, stop })[action]() } finally { setPending(null) }
+  }
   return (
-    <div className="flex h-9 items-center justify-between border-b border-border pl-3 pr-2 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-      <span className="flex items-center gap-2 truncate normal-case tracking-normal text-foreground">
-        <span className="truncate">Tasks</span>
-        <span className="rounded border border-border bg-muted/50 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wider text-muted-foreground">
-          project-level
-        </span>
-        {dirty && (
-          <span className="rounded bg-warn/15 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wider text-warn">
-            modified
-          </span>
-        )}
-      </span>
-      <div className="flex items-center gap-1">
-        <Button size="sm" variant="outline" onClick={save} disabled={!dirty}>
-          <Save className="mr-1.5 size-3" />
-          Save
+    <PaneHeader
+      title="Tasks"
+      description="Schedule programs and set their scan intervals"
+      meta={dirty ? <span className="text-warn">Unsaved changes</span> : undefined}
+      actions={<>
+        <Button size="sm" variant={dirty ? "default" : "outline"} disabled={!dirty || pending !== null} onClick={() => void act("save")}>
+          <Save className="size-4" /> {pending === "save" ? "Saving…" : "Save changes"}
         </Button>
         {isRunning ? (
-          <button
-            type="button"
-            onClick={stop}
-            className="flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium tracking-normal text-destructive normal-case hover:bg-destructive/10"
-          >
-            <Square className="size-3 fill-current" />
-            Stop
-          </button>
+          <Button size="sm" variant="outline" className="text-destructive" disabled={pending !== null} onClick={() => void act("stop")}>
+            <Square className="size-4" /> {pending === "stop" ? "Stopping…" : "Stop project"}
+          </Button>
         ) : (
-          <button
-            type="button"
-            onClick={run}
-            disabled={dirty}
-            title={dirty ? "Save first" : "Compile and run the whole project"}
-            className="flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium tracking-normal text-highlight normal-case hover:bg-highlight/10 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            <Play className="size-3 fill-current" />
-            Run
-          </button>
+          <Button size="sm" disabled={dirty || pending !== null} title={dirty ? "Save changes before running" : "Compile and run all scheduled programs"} onClick={() => void act("run")}>
+            <Play className="size-4" /> {pending === "run" ? "Starting…" : "Run project"}
+          </Button>
         )}
-      </div>
-    </div>
+      </>}
+    />
   )
 }
 
 function EmptyState({ onAdd }: { onAdd: () => void }) {
-  return (
-    <div className="grid place-items-center rounded-md border border-dashed border-border p-8 text-center text-sm text-muted-foreground">
-      <div className="space-y-2">
-        <Clock className="mx-auto size-6 text-muted-foreground/60" />
-        <div>
-          No tasks yet. A task is a scheduling slot —{" "}
-          <span className="font-mono">10 ms / priority 1</span> etc. — that
-          runs one or more PROGRAM instances every cycle.
-        </div>
-        <Button size="sm" variant="outline" onClick={onAdd}>
-          <Plus className="mr-1.5 size-3" />
-          Create first task
-        </Button>
-      </div>
-    </div>
-  )
+  return <PaneEmptyState icon={<Clock className="size-6" />} title="No tasks scheduled" description="A task runs its assigned programs at a fixed interval. Create a task, then add a program to it." actions={<Button size="sm" onClick={onAdd}><Plus className="size-4" /> Create task</Button>} />
 }
 
 function TaskCard({
@@ -400,8 +366,8 @@ function TaskCard({
   onAddProgram: () => void
 }) {
   return (
-    <div className="overflow-hidden rounded-md border border-border bg-background/40">
-      <div className="flex flex-wrap items-end gap-3 border-b border-border bg-muted/30 px-3 py-2.5">
+    <div className="overflow-hidden border-y border-border bg-background">
+      <div className="flex flex-wrap items-end gap-3 bg-muted/40 px-3 py-3">
         <Field label="Task name" className="w-44">
           <Input
             value={task.name}
@@ -422,7 +388,7 @@ function TaskCard({
               }
               className="h-8 pr-8 tabular-nums"
             />
-            <span className="pointer-events-none absolute inset-y-0 right-2 flex items-center font-mono text-[10px] text-muted-foreground">
+            <span className="pointer-events-none absolute inset-y-0 right-2 flex items-center font-mono text-xs text-muted-foreground">
               ms
             </span>
           </div>
@@ -437,13 +403,13 @@ function TaskCard({
             className="h-8 tabular-nums"
           />
         </Field>
-        <span className="ml-auto inline-flex items-center gap-1 font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
+        <span className="ml-auto inline-flex items-center gap-1 font-mono text-xs text-muted-foreground">
           {programs.length} program{programs.length === 1 ? "" : "s"}
         </span>
         <button
           type="button"
           onClick={onTaskRemove}
-          className="rounded p-1 text-muted-foreground hover:bg-accent/40 hover:text-destructive"
+          className="inline-flex size-7 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-accent/40 hover:text-destructive"
           title="Remove this task"
         >
           <Trash2 className="size-3.5" />
@@ -483,7 +449,7 @@ function TaskCard({
               ? "Create a PROGRAM-kind POU first"
               : "Schedule a PROGRAM on this task"
           }
-          className="mt-1 flex w-full items-center justify-center gap-1.5 rounded py-1.5 text-[11px] text-muted-foreground transition-colors hover:bg-accent/40 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+          className="mt-1 flex w-full items-center justify-center gap-1.5 rounded py-1.5 text-xs text-muted-foreground transition-colors hover:bg-accent/40 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
         >
           <Plus className="size-3" />
           Add program to this task
@@ -546,7 +512,7 @@ function ProgramRow({
           )}
         </SelectContent>
       </Select>
-      <span className="font-mono text-[11px] text-muted-foreground">as</span>
+      <span className="font-mono text-xs text-muted-foreground">as</span>
       <Input
         value={program.instance}
         onChange={(e) => onChange({ instance: e.target.value })}
@@ -563,7 +529,7 @@ function ProgramRow({
       <button
         type="button"
         onClick={onRemove}
-        className="ml-auto rounded p-1 text-muted-foreground hover:bg-accent/40 hover:text-destructive"
+        className="ml-auto inline-flex size-7 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-accent/40 hover:text-destructive"
         title="Unschedule"
       >
         <Trash2 className="size-3.5" />
@@ -594,7 +560,7 @@ function UnscheduledGroup({
 }) {
   return (
     <div className="overflow-hidden rounded-md border border-destructive/40 bg-destructive/5">
-      <div className="flex items-center gap-2 border-b border-destructive/30 bg-destructive/10 px-3 py-2 text-[11px] font-medium uppercase tracking-wider text-destructive">
+      <div className="flex items-center gap-2 border-b border-destructive/30 bg-destructive/10 px-3 py-2 text-xs font-medium text-destructive">
         <AlertCircle className="size-3.5" />
         Unscheduled program instances — Run / Deploy will fail until these are fixed.
       </div>
@@ -632,7 +598,7 @@ function UnscheduledGroup({
                   )}
                 </SelectContent>
               </Select>
-              <span className="font-mono text-[11px] text-muted-foreground">
+              <span className="font-mono text-xs text-muted-foreground">
                 as
               </span>
               <Input
@@ -640,7 +606,7 @@ function UnscheduledGroup({
                 onChange={(e) => onProgramChange(p, { instance: e.target.value })}
                 className="h-7 w-44 font-mono text-[12px]"
               />
-              <span className="font-mono text-[11px] text-muted-foreground">→</span>
+              <span className="font-mono text-xs text-muted-foreground">→</span>
               <Select
                 value={p.task || ""}
                 onValueChange={(v) => onProgramChange(p, { task: v })}
@@ -659,7 +625,7 @@ function UnscheduledGroup({
               <button
                 type="button"
                 onClick={() => onProgramRemove(p)}
-                className="ml-auto rounded p-1 text-muted-foreground hover:bg-accent/40 hover:text-destructive"
+                className="ml-auto inline-flex size-7 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-accent/40 hover:text-destructive"
                 title="Remove"
               >
                 <Trash2 className="size-3.5" />
@@ -695,7 +661,7 @@ function MigrateBanner({
       <ArrowDownToLine className="mt-0.5 size-4 shrink-0" />
       <div className="flex-1 space-y-1">
         <div className="font-medium">Legacy project — needs migration</div>
-        <p className="text-[11px] text-warn/80">
+        <p className="text-xs text-warn/80">
           This project's POU files still carry inline CONFIGURATION blocks.
           Migration extracts them into <span className="font-mono">tasks.toml</span>{" "}
           and strips them from the POU source files. Files are rewritten in

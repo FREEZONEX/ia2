@@ -11,7 +11,7 @@ import {
   Network,
   Plus,
   Server,
-} from "lucide-react"
+} from "@/components/ui/icons"
 
 import { ImportLibraryDialog } from "@/components/dialogs/ImportLibraryDialog"
 import { NewDeviceDialog } from "@/components/dialogs/NewDeviceDialog"
@@ -65,7 +65,7 @@ export function ProjectTree() {
   // Folder open-state keyed by `section/path` so each section is independent.
   const [openFolders, setOpenFolders] = useState<Record<string, boolean>>({})
   const toggleFolder = (key: string) =>
-    setOpenFolders((prev) => ({ ...prev, [key]: !prev[key] }))
+    setOpenFolders((prev) => ({ ...prev, [key]: !(prev[key] ?? true) }))
 
   // Controlled NewFolder / NewPou / NewDevice dialogs — opened from the
   // folder context menu with a known parent path.
@@ -135,7 +135,7 @@ export function ProjectTree() {
   if (!project) return null
 
   return (
-    <div className="py-1 text-sm">
+    <div className="py-1 text-[13px]">
       <SectionHeader
         label="POUs"
         open={appsOpen}
@@ -207,11 +207,12 @@ export function ProjectTree() {
           <button
             type="button"
             title="Import library blocks…"
+            aria-label="Import library blocks"
             onClick={(e) => {
               e.stopPropagation()
               setImportDialogOpen(true)
             }}
-            className="flex size-5 items-center justify-center rounded text-muted-foreground hover:bg-accent/40 hover:text-foreground"
+            className="flex size-7 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring"
           >
             <Plus className="size-3.5" />
           </button>
@@ -221,7 +222,7 @@ export function ProjectTree() {
         <>
           {libraryGroups.length === 0 && (
             <div
-              className="py-1 text-[11px] italic text-muted-foreground"
+              className="px-2 py-2 text-xs leading-relaxed text-muted-foreground"
               style={{ paddingLeft: pad(1) }}
             >
               No libraries imported — click + to browse.
@@ -484,7 +485,8 @@ function LibraryGroup({
           <button
             type="button"
             onClick={onToggle}
-            className="flex w-full items-center gap-1 py-1 text-left text-sm text-muted-foreground transition-colors hover:bg-accent/40 hover:text-foreground"
+            aria-expanded={open}
+            className="flex h-8 w-full min-w-0 items-center gap-1.5 pr-2 text-left text-[13px] text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring"
             style={{ paddingLeft: pad(0) }}
           >
             {open ? (
@@ -493,10 +495,10 @@ function LibraryGroup({
               <ChevronRight className="size-3 shrink-0" />
             )}
             <Library className="size-3.5 shrink-0 text-muted-foreground" />
-            <span className="flex-1 truncate text-foreground" title={name}>
+            <span className="min-w-0 flex-1 truncate text-foreground" title={name}>
               {name}
             </span>
-            <span className="pr-2 font-mono text-[9px] uppercase tracking-wider text-muted-foreground">
+            <span className="shrink-0 text-xs text-muted-foreground">
               {blocks.length} blocks
             </span>
           </button>
@@ -561,7 +563,7 @@ function TreeChildren<T>({
   if (nodes.length === 0) {
     return emptyHint ? (
       <div
-        className="py-1 text-[11px] italic text-muted-foreground"
+        className="px-2 py-2 text-xs leading-relaxed text-muted-foreground"
         style={{ paddingLeft: pad(depth + 1) }}
       >
         {emptyHint}
@@ -582,7 +584,8 @@ function TreeChildren<T>({
                   <button
                     type="button"
                     onClick={() => toggleFolder(key)}
-                    className="flex w-full items-center gap-1 py-1 text-left text-sm text-muted-foreground transition-colors hover:bg-accent/40 hover:text-foreground"
+                    aria-expanded={isOpen}
+                    className="flex h-8 w-full min-w-0 items-center gap-1.5 pr-2 text-left text-[13px] text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring"
                     style={{ paddingLeft: pad(depth) }}
                   >
                     {isOpen ? (
@@ -596,7 +599,7 @@ function TreeChildren<T>({
                       <Folder className="size-3.5 shrink-0 text-muted-foreground" />
                     )}
                     <span
-                      className="flex-1 truncate text-foreground"
+                      className="min-w-0 flex-1 truncate text-foreground"
                       title={node.name}
                     >
                       {node.name}
@@ -653,11 +656,12 @@ function SectionHeader({
   action: React.ReactNode
 }) {
   return (
-    <div className="flex items-center justify-between pl-1 pr-1.5">
+    <div className="flex min-h-8 items-center justify-between gap-1 pl-1 pr-1.5">
       <button
         type="button"
         onClick={onToggle}
-        className="flex flex-1 items-center gap-1 py-1 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground hover:text-foreground"
+        aria-expanded={open}
+        className="flex h-8 min-w-0 flex-1 items-center gap-1.5 text-left text-xs font-medium text-foreground focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring"
       >
         {open ? (
           <ChevronDown className="size-3" />
@@ -665,7 +669,7 @@ function SectionHeader({
           <ChevronRight className="size-3" />
         )}
         {label}
-        <span className="font-mono text-[10px] tracking-normal opacity-60">
+        <span className="shrink-0 text-xs font-normal text-muted-foreground">
           {count}
         </span>
       </button>
@@ -698,13 +702,14 @@ function SingletonSectionHeader({
   onOpen: () => void
 }) {
   return (
-    <div className="flex items-center justify-between pl-1 pr-1.5">
+    <div className="flex min-h-8 items-center justify-between gap-1 pl-1 pr-1.5">
       <button
         type="button"
         onClick={onOpen}
+        aria-current={active ? "page" : undefined}
         className={cn(
-          "flex flex-1 items-center gap-1 py-1 text-left text-[11px] font-medium uppercase tracking-wider hover:text-foreground",
-          active ? "text-foreground" : "text-muted-foreground",
+          "flex h-8 min-w-0 flex-1 items-center gap-1.5 text-left text-xs font-medium hover:bg-accent/50 focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring",
+          active ? "bg-accent text-foreground" : "text-foreground",
         )}
       >
         {/* Spacer matching the chevron in SectionHeader so the labels
@@ -712,7 +717,7 @@ function SingletonSectionHeader({
         <span className="size-3 shrink-0" />
         {label}
         <span
-          className="font-mono text-[10px] tracking-normal opacity-60"
+          className="shrink-0 text-xs font-normal text-muted-foreground"
           title={countTitle}
         >
           {count}
@@ -738,22 +743,24 @@ function SectionActions({
       <button
         type="button"
         title={folderTitle}
+        aria-label={folderTitle}
         onClick={(e) => {
           e.stopPropagation()
           onAddFolder()
         }}
-        className="flex size-5 items-center justify-center rounded text-muted-foreground hover:bg-accent/40 hover:text-foreground"
+        className="flex size-7 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring"
       >
         <FolderPlus className="size-3.5" />
       </button>
       <button
         type="button"
         title={itemTitle}
+        aria-label={itemTitle}
         onClick={(e) => {
           e.stopPropagation()
           onAddItem()
         }}
-        className="flex size-5 items-center justify-center rounded text-muted-foreground hover:bg-accent/40 hover:text-foreground"
+        className="flex size-7 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring"
       >
         <Plus className="size-3.5" />
       </button>
@@ -796,9 +803,10 @@ function PouItem({
           <button
             type="button"
             onClick={onOpen}
+            aria-current={active ? "page" : undefined}
             className={cn(
-              "flex w-full items-center gap-1.5 py-1 pl-3 pr-2 text-left transition-colors hover:bg-accent/40",
-              active && "bg-highlight/10",
+              "flex h-8 w-full min-w-0 items-center gap-1.5 pl-3 pr-2 text-left text-[13px] transition-colors hover:bg-accent/50 focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring",
+              active && "bg-accent text-foreground",
             )}
           >
             {simple ? (
@@ -806,17 +814,17 @@ function PouItem({
             ) : (
               <FileCode2 className="size-3.5 shrink-0 text-muted-foreground" />
             )}
-            <span className="flex-1 truncate" title={node.name}>
+            <span className="min-w-0 flex-1 truncate" title={node.name}>
               {node.name}
             </span>
             {simple ? (
               <PouTypeBadge type={decls[0].type} language={decls[0].language} />
             ) : decls.length === 0 ? (
-              <span className="font-mono text-[9px] uppercase text-muted-foreground">
+              <span className="shrink-0 text-xs text-muted-foreground">
                 empty
               </span>
             ) : (
-              <span className="font-mono text-[9px] uppercase text-muted-foreground">
+              <span className="shrink-0 text-xs text-muted-foreground">
                 {decls.length} POUs
               </span>
             )}
@@ -830,10 +838,11 @@ function PouItem({
                   <button
                     type="button"
                     onClick={onOpen}
-                    className="flex w-full items-center gap-1.5 py-0.5 pl-9 pr-2 text-left text-[12px] text-muted-foreground transition-colors hover:bg-accent/40 hover:text-foreground"
+                    aria-current={active ? "page" : undefined}
+                    className="flex h-8 w-full min-w-0 items-center gap-1.5 pl-9 pr-2 text-left text-xs text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring"
                   >
                     <PouTypeIcon type={d.type} />
-                    <span className="flex-1 truncate" title={d.name}>
+                    <span className="min-w-0 flex-1 truncate" title={d.name}>
                       {d.name}
                     </span>
                     <PouTypeBadge type={d.type} language={d.language} />
@@ -877,12 +886,12 @@ function PouTypeBadge({
   language: string
 }) {
   const label =
-    type === "function_block" ? "fb" : type === "function" ? "fn" : "prg"
+    type === "function_block" ? "FB" : type === "function" ? "FN" : "PRG"
   return (
-    <span className="flex items-center gap-1 font-mono text-[9px] uppercase tracking-wider text-muted-foreground">
+    <span className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
       <span>{label}</span>
-      <span className="rounded bg-muted/60 px-1 text-[8px] uppercase">
-        {language}
+      <span className="text-xs">
+        {language.toUpperCase()}
       </span>
     </span>
   )
@@ -905,14 +914,15 @@ function DeviceItem({
         <button
           type="button"
           onClick={onOpen}
+          aria-current={active ? "page" : undefined}
           className={cn(
-            "flex w-full items-center gap-1.5 py-1 pl-3 pr-2 text-left transition-colors hover:bg-accent/40",
-            active && "bg-highlight/10",
+            "flex h-8 w-full min-w-0 items-center gap-1.5 pl-3 pr-2 text-left text-[13px] transition-colors hover:bg-accent/50 focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring",
+            active && "bg-accent text-foreground",
           )}
         >
           <ProtocolIcon protocol={node.item.protocol} />
-          <span className="flex-1 truncate">{node.name}</span>
-          <span className="font-mono text-[9px] uppercase text-muted-foreground">
+          <span className="min-w-0 flex-1 truncate" title={node.name}>{node.name}</span>
+          <span className="shrink-0 text-xs text-muted-foreground">
             {node.item.protocol}
           </span>
         </button>
@@ -947,22 +957,24 @@ function EdgeItem({
         <button
           type="button"
           onClick={onOpen}
+          aria-current={active ? "page" : undefined}
           className={cn(
-            "flex w-full items-center gap-1.5 py-1 pl-3 pr-2 text-left transition-colors hover:bg-accent/40",
-            active && "bg-highlight/10",
+            "flex h-8 w-full min-w-0 items-center gap-1.5 pl-3 pr-2 text-left text-[13px] transition-colors hover:bg-accent/50 focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring",
+            active && "bg-accent text-foreground",
           )}
         >
           <Server className="size-3.5 shrink-0 text-muted-foreground" />
-          <span className="flex-1 truncate">{node.name}</span>
+          <span className="min-w-0 flex-1 truncate" title={node.name}>{node.name}</span>
           {attached && (
             <span
-              className="font-mono text-[9px] uppercase tracking-wider text-highlight"
+              className="shrink-0 text-xs text-highlight"
               title="IDE is attached to this edge"
             >
               attached
             </span>
           )}
-          <span className="truncate font-mono text-[9px] lowercase text-muted-foreground">
+          <span className="max-w-[45%] truncate text-xs text-muted-foreground"
+            title={node.item.host}>
             {node.item.host}
           </span>
         </button>

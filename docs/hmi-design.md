@@ -369,3 +369,18 @@ expressions span variables, screens start hiding logic that belongs in a
 POU); and where the line sits between symbol props and full user components
 when P3 opens that door. Each is answerable with field evidence from P0/P2
 deployments rather than speculation now.
+
+## Operator workspace controls
+
+The IDE and standalone HMI expose **Fit**, **100%**, and zoom controls above
+the scrollable canvas. Fit considers both width and height; 100% preserves the
+authored size with scrolling. Trend plots stay within the bounds of their node.
+
+**Operate** enables configured actions and locks the layout. **Arrange** enables
+layout editing and suppresses operator writes. Changing mode or screen cancels
+pending action confirmations. Failed writes, layout saves and alarm acknowledgments
+remain visible and do not imply success. A runtime watchdog lock disables writes.
+
+Alarm lists initially show active or unacknowledged alarms. **Show all** includes
+cleared and never-raised definitions; never-raised timestamps display a dash.
+See [the product design contract](../DESIGN.md) for common typography and themes.

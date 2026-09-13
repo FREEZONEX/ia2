@@ -13,7 +13,9 @@
  */
 
 import { useCallback, useEffect, useMemo, useState } from "react"
-import { Moon, Sun } from "lucide-react"
+import { Moon, Sun } from "@/components/ui/icons"
+import { EmptyState } from "@/components/ui/empty-state"
+import { Button } from "@/components/ui/button"
 
 import { HmiCanvas } from "@/components/hmi/HmiCanvas"
 import {
@@ -200,18 +202,18 @@ export function HmiStandalone() {
 
   return (
     <div className="flex h-dvh flex-col bg-background text-foreground">
-      <header className="flex h-10 shrink-0 items-center justify-between border-b border-border pl-3 pr-2">
+      <header className="flex min-h-12 shrink-0 flex-wrap items-center justify-between gap-3 border-b border-border bg-background px-4 py-2">
         <div className="flex min-w-0 items-baseline gap-2">
           {slug ? (
             <button
               type="button"
               onClick={() => navigate(null)}
-              className="shrink-0 font-mono text-[11px] text-muted-foreground hover:text-foreground"
+              className="shrink-0 font-mono text-xs text-muted-foreground hover:text-foreground"
             >
               ← Screens
             </button>
           ) : (
-            <span className="font-mono text-[11px] uppercase tracking-wider text-muted-foreground">
+            <span className="font-mono text-xs text-muted-foreground">
               HMI
             </span>
           )}
@@ -219,7 +221,7 @@ export function HmiStandalone() {
             {slug ? title : project}
           </span>
           {slug && project && (
-            <span className="truncate font-mono text-[11px] text-muted-foreground">
+            <span className="truncate font-mono text-xs text-muted-foreground">
               {project}
             </span>
           )}
@@ -234,7 +236,7 @@ export function HmiStandalone() {
                   ?.scrollIntoView({ behavior: "smooth", block: "center" })
               }
               title="Standing alarms — jump to the alarm list if this screen has one"
-              className="rounded bg-warn/15 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wider text-warn"
+              className="rounded bg-warn/15 px-1.5 py-0.5 font-mono text-xs text-warn"
             >
               {alarmsStanding} {alarmsStanding === 1 ? "alarm" : "alarms"}
             </button>
@@ -242,7 +244,7 @@ export function HmiStandalone() {
           {showBadge && (
             <span
               className={cn(
-                "rounded px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wider",
+                "rounded px-1.5 py-0.5 font-mono text-xs",
                 HEADER_TONES[health.tone],
               )}
             >
@@ -260,7 +262,7 @@ export function HmiStandalone() {
             type="button"
             onClick={toggle}
             title="Toggle theme"
-            className="grid size-7 place-items-center rounded text-muted-foreground hover:bg-accent/50 hover:text-foreground"
+            className="grid size-8 place-items-center rounded text-muted-foreground hover:bg-accent/50 hover:text-foreground"
           >
             {theme === "dark" ? <Sun className="size-3.5" /> : <Moon className="size-3.5" />}
           </button>
@@ -304,44 +306,38 @@ function ScreenIndex({
 }) {
   if (error) {
     return (
-      <div className="grid flex-1 place-items-center p-6 text-center text-sm text-muted-foreground">
-        Could not load screens: {error}
-      </div>
+      <EmptyState title="Screens unavailable" description={error} actions={<Button variant="outline" onClick={() => window.location.reload()}>Retry</Button>} />
     )
   }
   if (!screens) {
     return (
-      <div className="grid flex-1 place-items-center text-sm text-muted-foreground">
-        Loading…
-      </div>
+      <EmptyState title="Loading screens…" />
     )
   }
   if (screens.length === 0) {
     return (
-      <div className="grid flex-1 place-items-center p-6 text-center text-sm text-muted-foreground">
-        The deployed project has no HMI screens yet.
-      </div>
+      <EmptyState title="No screens deployed" description="Add an HMI screen to the project and deploy it to this runtime." />
     )
   }
   return (
     <div className="flex-1 overflow-auto p-6">
-      <div className="mx-auto grid max-w-3xl gap-3 sm:grid-cols-2">
+      <div className="mx-auto flex max-w-4xl flex-col divide-y divide-border">
         {screens.map((s) => (
           <button
             key={s.path}
             type="button"
             onClick={() => onOpen(s.path)}
-            className="rounded-lg border border-border bg-card p-4 text-left hover:border-ring"
+            className="flex min-h-16 items-center justify-between gap-4 rounded px-4 py-3 text-left hover:bg-selection"
           >
-            <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
               <span className="font-mono text-[12px] text-muted-foreground">
                 {s.path}
               </span>
-              <span className="rounded bg-muted/60 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wider text-muted-foreground">
+              <span className="rounded bg-muted/60 px-1.5 py-0.5 font-mono text-xs text-muted-foreground">
                 L{s.level}
               </span>
             </div>
-            <div className="mt-1 text-[14px] font-medium text-foreground">
+            <div className="text-[14px] font-medium text-foreground">
               {s.title}
             </div>
           </button>

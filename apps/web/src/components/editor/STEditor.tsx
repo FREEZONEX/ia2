@@ -265,7 +265,15 @@ export function STEditor({
       beforeMount={defineAcidThemes}
       onChange={(v) => onChange(v ?? "")}
       onMount={handleMount}
-      options={{ ...editorOptions, readOnly, domReadOnly: readOnly }}
+      loading={<div role="status" className="p-4 text-[13px] text-muted-foreground">Loading code editor…</div>}
+      options={{
+        ...editorOptions,
+        fontFamily: '"IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace',
+        fontSize: 14,
+        lineHeight: 22,
+        readOnly,
+        domReadOnly: readOnly,
+      }}
     />
   )
 }

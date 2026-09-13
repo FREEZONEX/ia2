@@ -1,5 +1,5 @@
 import { useState } from "react"
-import { ChevronRight, FolderTree, Plus, Trash2, X } from "lucide-react"
+import { ChevronRight, FolderTree, Plus, Trash2, X } from "@/components/ui/icons"
 
 import { Button } from "@/components/ui/button"
 import { EnumSelect } from "@/components/ui/enum-select"
@@ -95,15 +95,15 @@ export function OpcuaDeviceEditor({ device, onSave, link }: DeviceEditorProps) {
     <>
       <DeviceSaveBar
         name={device.name}
-        protocol="opc ua"
+        protocol="OPC UA"
         dirty={dirty}
-        onSave={() => void onSave(draft)}
+        onSave={() => onSave(draft)}
       />
 
-      <div className="flex-1 space-y-6 overflow-auto p-5">
+      <div className="min-h-0 flex-1 space-y-6 overflow-auto p-4">
         <section>
           <SectionHeader title="Server" />
-          <div className="grid grid-cols-2 gap-3 max-w-2xl">
+          <div className="ia2-field-grid">
             <Field label="Endpoint URL">
               <Input
                 value={draft.endpoint_url}
@@ -181,95 +181,97 @@ export function OpcuaDeviceEditor({ device, onSave, link }: DeviceEditorProps) {
               channel.
             </EmptyBox>
           ) : (
-            <table className="w-full text-sm">
-              <thead className="text-[10px] uppercase tracking-wider text-muted-foreground">
-                <tr className="border-b border-border">
-                  <th className="px-2 py-1.5 text-left">Name</th>
-                  <th className="px-2 py-1.5 text-left">NodeId</th>
-                  <th className="px-2 py-1.5 text-left">Type</th>
-                  <th className="px-2 py-1.5 text-left">Access</th>
-                  <th
-                    className="px-2 py-1.5 text-left"
-                    title="Optional value written on runtime shutdown/trip. Empty = leave the DCS tag untouched (recommended for a supervisory layer)."
-                  >
-                    Failsafe
-                  </th>
-                  <th className="px-2 py-1.5 text-left">Linked to</th>
-                  <th className="px-2 py-1.5"></th>
-                </tr>
-              </thead>
-              <tbody>
-                {draft.channels.map((ch, i) => (
-                  <tr
-                    key={i}
-                    className="border-b border-border align-top last:border-0"
-                  >
-                    <td className="px-2 py-1.5">
-                      <Input
-                        value={ch.name}
-                        onChange={(e) => setChannel(i, { name: e.target.value })}
-                        className="h-8 w-36"
-                      />
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <Input
-                        value={ch.node_id}
-                        onChange={(e) =>
-                          setChannel(i, { node_id: e.target.value })
-                        }
-                        className="h-8 w-56 font-mono"
-                        placeholder="ns=2;s=FT0202.PV"
-                      />
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <EnumSelect<OpcuaDataType>
-                        value={ch.data_type}
-                        onValueChange={(v) => setChannel(i, { data_type: v })}
-                        options={OPCUA_DATA_TYPES}
-                        className="h-8 w-32"
-                      />
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <EnumSelect<OpcuaAccess>
-                        value={ch.access ?? "read"}
-                        onValueChange={(v) => setChannel(i, { access: v })}
-                        options={[
-                          { value: "read", label: "read" },
-                          { value: "write", label: "write" },
-                        ]}
-                        className="h-8 w-28"
-                      />
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <Input
-                        value={ch.failsafe ?? ""}
-                        onChange={(e) => {
-                          const t = e.target.value.trim()
-                          setChannel(i, {
-                            failsafe: t === "" ? null : Number(t),
-                          })
-                        }}
-                        className="h-8 w-20"
-                        placeholder="—"
-                      />
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <LinkedToCell channelName={ch.name} link={link} />
-                    </td>
-                    <td className="px-2 py-1.5 text-right">
-                      <button
-                        type="button"
-                        onClick={() => removeChannel(i)}
-                        className="rounded p-1 text-muted-foreground hover:bg-accent/40 hover:text-destructive"
-                        title="Remove"
-                      >
-                        <Trash2 className="size-3.5" />
-                      </button>
-                    </td>
+            <div className="min-w-0 overflow-x-auto">
+              <table className="ia2-table w-full min-w-[800px]">
+                <thead className="text-xs text-muted-foreground">
+                  <tr className="border-b border-border">
+                    <th className="px-2 py-1.5 text-left">Name</th>
+                    <th className="px-2 py-1.5 text-left">NodeId</th>
+                    <th className="px-2 py-1.5 text-left">Type</th>
+                    <th className="px-2 py-1.5 text-left">Access</th>
+                    <th
+                      className="px-2 py-1.5 text-left"
+                      title="Optional value written on runtime shutdown/trip. Empty = leave the DCS tag untouched (recommended for a supervisory layer)."
+                    >
+                      Failsafe
+                    </th>
+                    <th className="px-2 py-1.5 text-left">Linked to</th>
+                    <th className="px-2 py-1.5"></th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {draft.channels.map((ch, i) => (
+                    <tr
+                      key={i}
+                      className="border-b border-border align-top last:border-0"
+                    >
+                      <td className="px-2 py-1.5">
+                        <Input
+                          value={ch.name}
+                          onChange={(e) => setChannel(i, { name: e.target.value })}
+                          className="h-8 w-36"
+                        />
+                      </td>
+                      <td className="px-2 py-1.5">
+                        <Input
+                          value={ch.node_id}
+                          onChange={(e) =>
+                            setChannel(i, { node_id: e.target.value })
+                          }
+                          className="h-8 w-56 font-mono"
+                          placeholder="ns=2;s=FT0202.PV"
+                        />
+                      </td>
+                      <td className="px-2 py-1.5">
+                        <EnumSelect<OpcuaDataType>
+                          value={ch.data_type}
+                          onValueChange={(v) => setChannel(i, { data_type: v })}
+                          options={OPCUA_DATA_TYPES}
+                          className="h-8 w-32"
+                        />
+                      </td>
+                      <td className="px-2 py-1.5">
+                        <EnumSelect<OpcuaAccess>
+                          value={ch.access ?? "read"}
+                          onValueChange={(v) => setChannel(i, { access: v })}
+                          options={[
+                            { value: "read", label: "read" },
+                            { value: "write", label: "write" },
+                          ]}
+                          className="h-8 w-28"
+                        />
+                      </td>
+                      <td className="px-2 py-1.5">
+                        <Input
+                          value={ch.failsafe ?? ""}
+                          onChange={(e) => {
+                            const t = e.target.value.trim()
+                            setChannel(i, {
+                              failsafe: t === "" ? null : Number(t),
+                            })
+                          }}
+                          className="h-8 w-20"
+                          placeholder="—"
+                        />
+                      </td>
+                      <td className="px-2 py-1.5">
+                        <LinkedToCell channelName={ch.name} link={link} />
+                      </td>
+                      <td className="px-2 py-1.5 text-right">
+                        <button
+                          type="button"
+                          onClick={() => removeChannel(i)}
+                          className="inline-flex size-7 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-accent/40 hover:text-destructive"
+                          title="Remove"
+                        >
+                          <Trash2 className="size-3.5" />
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           )}
         </section>
       </div>
@@ -344,7 +346,7 @@ function BrowsePanel({
   return (
     <section className="rounded-md border border-border bg-secondary/30 p-3">
       <div className="flex items-center justify-between">
-        <div className="flex min-w-0 items-center gap-1 text-[11px]">
+        <div className="flex min-w-0 items-center gap-1 text-xs">
           <FolderTree className="size-3.5 shrink-0 text-muted-foreground" />
           {trail.map((t, i) => (
             <span key={i} className="flex min-w-0 items-center gap-1">
@@ -365,19 +367,19 @@ function BrowsePanel({
         <button
           type="button"
           onClick={() => setOpen(false)}
-          className="rounded p-1 text-muted-foreground hover:text-foreground"
+          className="inline-flex size-7 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-accent/40 hover:text-foreground"
           title="Close browser"
         >
           <X className="size-3.5" />
         </button>
       </div>
       {error && (
-        <div className="mt-2 rounded border border-destructive/40 bg-destructive/10 px-2 py-1 text-[11px] text-destructive">
+        <div className="mt-2 rounded border border-destructive/40 bg-destructive/10 px-2 py-1 text-xs text-destructive">
           {error}
         </div>
       )}
       {nodes && nodes.length === 0 && !error && (
-        <div className="mt-2 text-[11px] text-muted-foreground">
+        <div className="mt-2 text-xs text-muted-foreground">
           No child nodes here.
         </div>
       )}
@@ -404,7 +406,7 @@ function BrowsePanel({
                   <span className="truncate text-foreground">
                     {n.display_name}
                   </span>
-                  <span className="truncate font-mono text-[10px] text-muted-foreground">
+                  <span className="truncate font-mono text-xs text-muted-foreground">
                     {n.node_id}
                     {n.data_type && ` · ${n.data_type}`}
                   </span>
@@ -414,7 +416,7 @@ function BrowsePanel({
                 <button
                   type="button"
                   onClick={() => onAdd(n)}
-                  className="shrink-0 rounded border border-border bg-card px-1.5 py-0.5 text-[10px] text-muted-foreground hover:text-foreground"
+                  className="shrink-0 rounded border border-border bg-card px-1.5 py-0.5 text-xs text-muted-foreground hover:text-foreground"
                   title="Add as tag"
                 >
                   + Add

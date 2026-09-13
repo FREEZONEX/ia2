@@ -13,6 +13,9 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from "react"
+import { Button } from "@/components/ui/button"
+import { EmptyState } from "@/components/ui/empty-state"
+import { fitCanvasScale } from "./canvas-viewport"
 
 import {
   clampNotice,
@@ -89,22 +92,29 @@ export function HmiCanvas({
   const snapshot = useLastSnapshot()
   const connected = useConnected()
   const mutation = useHmiMutation()
+  const loadRevision = useRef(0)
 
   // ---- document load + live reload --------------------------------
   const load = useCallback(async () => {
+    const revision = ++loadRevision.current
     try {
       const d = await host.fetchDoc(path)
+      if (revision !== loadRevision.current) return
       setDoc(d)
       setLoadError(null)
       onDocLoaded?.(d)
     } catch (e) {
+      if (revision !== loadRevision.current) return
       setLoadError(String(e))
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [path, host])
 
   useEffect(() => {
+    setDoc(null)
+    setLoadError(null)
     void load()
+    return () => { loadRevision.current++ }
   }, [load])
 
   // Spawn animation bookkeeping: ids touched by the latest mutation get
@@ -142,24 +152,24 @@ export function HmiCanvas({
     }
   }, [mutation, path, load])
 
-  // ---- letterbox scaling ------------------------------------------
+  // The scaled footprint owns scrolling; the transformed document is
+  // positioned inside it so its unscaled box cannot create phantom overflow.
   const wrapRef = useRef<HTMLDivElement | null>(null)
-  const [scale, setScale] = useState(1)
+  const [zoom, setZoom] = useState<"fit" | number>("fit")
+  const [viewport, setViewport] = useState({ width: 0, height: 0 })
   useEffect(() => {
-    const el = wrapRef.current
-    if (!el || !doc) return
-    const ro = new ResizeObserver(() => {
-      const availW = el.clientWidth
-      if (availW === 0) return
-      // Width-fit with a readability floor: the screen scrolls vertically
-      // rather than shrinking into an unreadable thumbnail when the pane
-      // is short (Monitor keeps the bottom third). Operator tablets get
-      // the full-height fit naturally because their pane IS the window.
-      setScale(Math.min(Math.max(availW / doc.grid.w, 0.5), 1.25))
-    })
-    ro.observe(el)
-    return () => ro.disconnect()
-  }, [doc])
+    const element = wrapRef.current
+    if (!element || !doc) return
+    const measure = () => setViewport({ width: Math.max(0, element.clientWidth - 24), height: Math.max(0, element.clientHeight - 24) })
+    measure()
+    const observer = new ResizeObserver(measure)
+    observer.observe(element)
+    return () => observer.disconnect()
+  }, [doc?.grid.w, doc?.grid.h])
+  useEffect(() => { setZoom("fit") }, [path])
+  const scale = zoom === "fit" && doc
+    ? fitCanvasScale(viewport.width, viewport.height, doc.grid.w, doc.grid.h)
+    : zoom === "fit" ? 1 : zoom
 
   // ---- trend history (one timed ring buffer per referenced variable,
   // retained for the widest window_s among the nodes referencing it;
@@ -261,7 +271,7 @@ export function HmiCanvas({
   }
   const onPointerMove = (e: React.PointerEvent) => {
     const d = dragRef.current
-    if (!d || !doc) return
+    if (mode !== "arrange" || !d || !doc) return
     const snap = Math.max(1, doc.grid.snap)
     const nx =
       Math.round((d.origX + (e.clientX - d.startX) / scale) / snap) * snap
@@ -276,7 +286,7 @@ export function HmiCanvas({
     const d = dragRef.current
     dragRef.current = null
     setDragPos(null)
-    if (!d || !doc || !d.moved || !host.saveDoc) return
+    if (mode !== "arrange" || !d || !doc || !d.moved || !host.saveDoc) return
     const next = structuredClone(doc)
     const target = findNode(next.root, d.id)
     if (target) {
@@ -285,7 +295,8 @@ export function HmiCanvas({
       setDoc(next)
       try {
         await host.saveDoc(path, next)
-      } catch {
+      } catch (error) {
+        setActionError(`Layout was not saved: ${String(error)}`)
         void load() // server rejected — resync to truth
       }
     }
@@ -294,6 +305,11 @@ export function HmiCanvas({
   // ---- actions (Operate mode) -------------------------------------
   const [pending, setPending] = useState<PendingConfirm | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
+  useEffect(() => {
+    setPending(null)
+    dragRef.current = null
+    setDragPos(null)
+  }, [mode, path])
 
   // The write itself. `write` was resolved at request time, so the
   // confirm path sends exactly what the dialog showed. A pulse's reset
@@ -348,16 +364,12 @@ export function HmiCanvas({
   // ---- render ------------------------------------------------------
   if (loadError) {
     return (
-      <div className="grid h-full place-items-center p-6 text-center text-sm text-muted-foreground">
-        {loadError}
-      </div>
+      <EmptyState title="Screen unavailable" description={loadError} actions={<Button variant="outline" onClick={() => void load()}>Retry</Button>} />
     )
   }
   if (!doc) {
     return (
-      <div className="grid h-full place-items-center text-sm text-muted-foreground">
-        Loading…
-      </div>
+      <EmptyState title="Loading screen…" />
     )
   }
 
@@ -370,29 +382,23 @@ export function HmiCanvas({
   const stale = !connected && snapshot != null
 
   return (
-    <div
-      ref={wrapRef}
-      className="relative h-full w-full overflow-auto bg-muted/20"
-      onPointerMove={onPointerMove}
-      onPointerUp={onPointerUp}
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onSelect(null)
-      }}
-    >
-      <div
-        className={cn(
-          "relative origin-top-left border-b border-r border-border/60 bg-background",
-          stale && "opacity-60",
-        )}
-        style={{
-          width: doc.grid.w,
-          height: doc.grid.h,
-          transform: `scale(${scale})`,
-        }}
-        onClick={(e) => {
-          if (e.target === e.currentTarget) onSelect(null)
-        }}
-      >
+    <div className="relative flex h-full min-h-0 min-w-0 flex-col bg-muted">
+      <div className="flex min-h-10 shrink-0 flex-wrap items-center justify-between gap-2 border-b border-border bg-background px-3 py-1" aria-label="Canvas view controls">
+        <span className="text-xs text-muted-foreground">{mode === "operate" ? "Live controls · layout locked" : "Edit layout · controls disabled"}{stale && <span className="ml-2 text-warn">Live connection lost · values frozen</span>}</span>
+        <div className="flex items-center gap-1">
+          <Button size="sm" variant={zoom === "fit" ? "highlight" : "ghost"} aria-pressed={zoom === "fit"} onClick={() => setZoom("fit")} title="Fit the whole screen">Fit</Button>
+          <Button size="sm" variant={zoom === 1 ? "highlight" : "ghost"} aria-pressed={zoom === 1} onClick={() => setZoom(1)} title="Actual size · scroll to pan">100%</Button>
+          <Button size="icon-sm" variant="ghost" aria-label="Zoom out" disabled={scale <= 0.1} onClick={() => setZoom(Math.max(0.1, Math.round((scale - 0.1) * 10) / 10))}>−</Button>
+          <span className="min-w-10 text-center font-mono text-xs" aria-label="Canvas zoom">{Math.round(scale * 100)}%</span>
+          <Button size="icon-sm" variant="ghost" aria-label="Zoom in" disabled={scale >= 2} onClick={() => setZoom(Math.min(2, Math.round((scale + 0.1) * 10) / 10))}>+</Button>
+        </div>
+      </div>
+      <div ref={wrapRef} data-testid="hmi-viewport" className="relative min-h-0 min-w-0 flex-1 overflow-auto p-3" onPointerMove={onPointerMove} onPointerUp={onPointerUp}
+        onClick={event => { if (event.target === event.currentTarget) onSelect(null) }}>
+        <div data-testid="hmi-footprint" className="relative mx-auto overflow-hidden" style={{ width: doc.grid.w * scale, height: doc.grid.h * scale }}>
+          <div data-testid="hmi-screen" className={cn("absolute left-0 top-0 origin-top-left bg-background", stale && "opacity-60")}
+            style={{ width: doc.grid.w, height: doc.grid.h, transform: `scale(${scale})` }}
+            onClick={event => { if (event.target === event.currentTarget) onSelect(null) }}>
         {rootChildren.map((n) => (
           <CanvasNode
             key={n.id}
@@ -430,13 +436,16 @@ export function HmiCanvas({
             />
           )
         })}
+          </div>
+        </div>
       </div>
 
-      {pending && (
+      {pending && mode === "operate" && (
         <ConfirmCard
           pending={pending}
           onCancel={() => setPending(null)}
           onConfirm={() => {
+            if (mode !== "operate") return
             const p = pending
             setPending(null)
             void performWrite(p.action, p.write)
@@ -444,7 +453,7 @@ export function HmiCanvas({
         />
       )}
       {actionError && (
-        <div className="absolute bottom-3 left-3 rounded border border-destructive/40 bg-destructive/10 px-2 py-1 text-[11px] text-destructive">
+        <div role="alert" className="shrink-0 border-t border-destructive/30 bg-background px-4 py-2 text-xs text-destructive">
           {actionError}
         </div>
       )}
@@ -594,9 +603,9 @@ function renderKind(
         node.style === "title"
           ? "text-[16px] font-semibold text-foreground"
           : node.style === "section"
-            ? "text-[11px] font-medium uppercase tracking-wider text-muted-foreground"
+            ? "text-xs font-medium text-muted-foreground"
             : node.style === "caption"
-              ? "text-[10px] text-muted-foreground"
+              ? "text-xs text-muted-foreground"
               : "text-[12px] text-foreground"
       // Live text (a mapped state label) wins over the static string;
       // a live color (map output) wins over the prop color.
@@ -630,7 +639,7 @@ function renderKind(
       return (
         <div className="flex h-full w-full items-baseline justify-between gap-2 overflow-hidden">
           {node.label && (
-            <span className="truncate font-mono text-[11px] text-muted-foreground">
+            <span className="truncate font-mono text-xs text-muted-foreground">
               {node.label}
             </span>
           )}
@@ -640,7 +649,7 @@ function renderKind(
           >
             {display ?? "—"}
             {node.unit && (
-              <span className="ml-0.5 text-[10px] text-muted-foreground">
+              <span className="ml-0.5 text-xs text-muted-foreground">
                 {node.unit}
               </span>
             )}
@@ -693,7 +702,7 @@ function renderKind(
         <div className="h-full w-full rounded border border-border bg-card/60 p-2">
           <TrendChart
             series={series}
-            height={Math.max(60, (node.h || 160) - 34)}
+            fit
             windowS={node.window_s}
           />
         </div>
@@ -825,7 +834,7 @@ function InputNode({
   return (
     <div className="flex h-full w-full items-center gap-1.5 overflow-hidden">
       {node.label && (
-        <span className="truncate font-mono text-[11px] text-muted-foreground">
+        <span className="truncate font-mono text-xs text-muted-foreground">
           {node.label}
         </span>
       )}
@@ -850,7 +859,7 @@ function InputNode({
         )}
       />
       {node.unit && (
-        <span className="font-mono text-[10px] text-muted-foreground">
+        <span className="font-mono text-xs text-muted-foreground">
           {node.unit}
         </span>
       )}
@@ -865,11 +874,11 @@ function InputNode({
  *  keeping the last green state over frozen values. */
 const ALARM_TONES: Record<PanelTone, { bar: string; dot: string }> = {
   ok: {
-    bar: "border-border bg-card/50 text-[11px] text-muted-foreground",
+    bar: "border-border bg-card/50 text-xs text-muted-foreground",
     dot: "bg-highlight",
   },
   idle: {
-    bar: "border-border bg-card/50 text-[11px] text-muted-foreground",
+    bar: "border-border bg-card/50 text-xs text-muted-foreground",
     dot: "bg-muted-foreground/40",
   },
   warn: {
@@ -948,6 +957,9 @@ function AlarmList({
 }) {
   const [alarms, setAlarms] = useState<AlarmState[]>([])
   const [failed, setFailed] = useState(false)
+  const [acking, setAcking] = useState<string | null>(null)
+  const [ackError, setAckError] = useState<string | null>(null)
+  const [showAll, setShowAll] = useState(false)
   useEffect(() => {
     let cancelled = false
     const tick = async () => {
@@ -970,34 +982,32 @@ function AlarmList({
   }, [host])
 
   const ack = async (id: string) => {
-    // Optimistic; the 2 s poll reconciles.
-    setAlarms((prev) =>
-      prev.map((a) => (a.id === id ? { ...a, acked: true } : a)),
-    )
+    if (!operate || acking) return
+    setAcking(id)
+    setAckError(null)
     try {
-      await host.ackAlarm(id)
-    } catch {
-      /* next poll re-syncs */
-    }
+      const updated = await host.ackAlarm(id)
+      setAlarms(previous => previous.map(alarm => alarm.id === id ? updated : alarm))
+    } catch (error) { setAckError(`Acknowledge failed: ${String(error)}`) }
+    finally { setAcking(null) }
   }
 
   const cap = maxRows > 0 ? maxRows : 8
-  const rows = alarms.slice(0, cap)
-  const hidden = alarms.length - rows.length
+  const standing = standingCount(alarms)
+  const displayed = showAll ? alarms : alarms.filter(alarmStanding)
+  const rows = displayed.slice(0, cap)
+  const hidden = displayed.length - rows.length
 
   return (
     <div className="flex h-full w-full flex-col overflow-hidden rounded border border-border bg-card/60">
-      <div className="flex shrink-0 items-center justify-between border-b border-border/70 px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-        <span>Alarms</span>
-        {alarms.length > 0 && (
-          <span className="font-mono normal-case tracking-normal">
-            {standingCount(alarms)}/{alarms.length}
-          </span>
-        )}
+      <div className="flex shrink-0 items-center justify-between border-b border-border/70 px-2 py-1 text-xs font-medium text-muted-foreground">
+        <span>Alarms{standing > 0 && <span className="ml-2 font-mono">{standing} standing</span>}</span>
+        {alarms.length > standing && <Button variant="ghost" size="sm" aria-expanded={showAll} onClick={() => setShowAll(value => !value)}>{showAll ? "Standing only" : `Show all ${alarms.length}`}</Button>}
       </div>
+      {(ackError || failed) && <div role="alert" className="shrink-0 border-b border-border px-2 py-1 text-xs text-destructive">{ackError || "Alarm status unavailable · showing last known values"}</div>}
       {rows.length === 0 ? (
-        <div className="flex flex-1 items-center px-2 py-1 text-[11px] text-muted-foreground/60">
-          {failed ? "Alarms unavailable" : "No active alarms"}
+        <div className="flex flex-1 items-center px-2 py-1 text-xs text-muted-foreground/60">
+          {failed ? "Alarms unavailable" : "No standing alarms"}
         </div>
       ) : (
         <ul className="min-h-0 flex-1 divide-y divide-border/50 overflow-auto">
@@ -1008,13 +1018,13 @@ function AlarmList({
               <li
                 key={a.id}
                 className={cn(
-                  "flex items-center gap-2 px-2 py-1 text-[11px]",
+                  "flex items-center gap-2 px-2 py-1 text-xs",
                   !standing && "opacity-60",
                 )}
               >
                 <span
                   className={cn(
-                    "shrink-0 rounded px-1 py-px font-mono text-[9px] uppercase tracking-wider",
+                    "shrink-0 rounded px-1 py-px font-mono text-xs",
                     tone.chip,
                   )}
                 >
@@ -1026,14 +1036,15 @@ function AlarmList({
                 >
                   {a.message}
                 </span>
-                <span className="shrink-0 font-mono text-[9px] tabular-nums text-muted-foreground">
-                  {fmtAlarmClock(a.raised_at_us)}
+                <span className="shrink-0 font-mono text-xs tabular-nums text-muted-foreground">
+                  {a.count === 0 ? "Never raised" : fmtAlarmClock(a.raised_at_us)}
                 </span>
                 {operate && !a.acked && (
                   <button
                     type="button"
                     onClick={() => void ack(a.id)}
-                    className="shrink-0 rounded border border-border bg-card px-1.5 py-px font-mono text-[9px] uppercase tracking-wider text-muted-foreground hover:text-foreground"
+                    disabled={acking !== null}
+                    className="shrink-0 rounded border border-border bg-card px-1.5 py-px font-mono text-xs text-muted-foreground hover:text-foreground"
                     title="Acknowledge"
                   >
                     ack
@@ -1045,7 +1056,7 @@ function AlarmList({
         </ul>
       )}
       {hidden > 0 && (
-        <div className="shrink-0 border-t border-border/60 px-2 py-0.5 text-[9px] text-muted-foreground/60">
+        <div className="shrink-0 border-t border-border/60 px-2 py-0.5 text-xs text-muted-foreground/60">
           +{hidden} more
         </div>
       )}
@@ -1083,8 +1094,8 @@ function ConfirmCard({
         }
       }}
     >
-      <div className="w-[300px] rounded-lg border border-border bg-popover p-4 shadow-2xl">
-        <div className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+      <div className="w-[360px] max-w-[calc(100%_-_32px)] rounded border border-border bg-popover p-5 shadow-lg">
+        <div className="text-xs font-medium text-muted-foreground">
           Confirm action
         </div>
         <div className="mt-2 font-mono text-[13px] text-foreground">
@@ -1168,4 +1179,3 @@ function trendWindows(doc: HmiDoc): Map<string, number> {
   walk(doc.root)
   return out
 }
-

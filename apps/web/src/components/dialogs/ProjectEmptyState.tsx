@@ -1,78 +1,29 @@
-import { FolderPlus, FolderOpen, Box } from "lucide-react"
-
+import { useState } from "react"
+import { FolderPlus, FolderOpen } from "@/components/ui/icons"
 import { Button } from "@/components/ui/button"
+import { WindowTitleBar } from "@/components/layout/WindowTitleBar"
 import { useRuntime } from "@/state/runtime"
 import { NewProjectDialog } from "./NewProjectDialog"
 import { OpenProjectDialog } from "./OpenProjectDialog"
 
 export function ProjectEmptyState() {
   const { availableProjects, openProject } = useRuntime()
-
+  const [opening, setOpening] = useState<string | null>(null)
   return (
-    <div className="flex h-screen flex-col text-foreground">
-      <div className="grid flex-1 place-items-center bg-background">
-      <div className="w-full max-w-md space-y-6 p-8">
-        <div className="space-y-1">
-          <div className="flex items-center gap-2 text-xs uppercase tracking-widest text-muted-foreground">
-            <Box className="size-4" />
-            IA2
+    <div className="flex h-dvh flex-col bg-background text-foreground">
+      <WindowTitleBar />
+      <main className="min-h-0 flex-1 overflow-auto">
+        <div className="mx-auto w-full max-w-4xl px-8 py-12">
+          <div className="flex flex-wrap items-start justify-between gap-6">
+            <div className="max-w-md"><h1 className="text-xl font-medium">Your projects</h1><p className="mt-2 text-[13px] leading-relaxed text-muted-foreground">Open a project to edit programs, configure devices and run your controller.</p></div>
+            <div className="flex items-center gap-2"><OpenProjectDialog trigger={<Button variant="outline"><FolderOpen className="size-4" />Open project</Button>} /><NewProjectDialog trigger={<Button><FolderPlus className="size-4" />New project</Button>} /></div>
           </div>
-          <h1 className="text-2xl font-semibold tracking-tight">
-            No project open
-          </h1>
-          <p className="text-sm text-muted-foreground">
-            Create a new project or open one to start writing IEC 61131-3
-            programs and wiring devices.
-          </p>
+          <section className="mt-10" aria-label="Recent projects">
+            <h2 className="mb-3 text-xs font-medium text-muted-foreground">Recent projects</h2>
+            {availableProjects.length > 0 ? <ul className="divide-y divide-border border-y border-border">{availableProjects.map((p) => <li key={p.path}><button type="button" disabled={opening !== null} onClick={() => { setOpening(p.path); void openProject(p.path).finally(() => setOpening(null)) }} className="flex w-full items-center gap-4 px-2 py-4 text-left hover:bg-secondary disabled:opacity-50"><FolderOpen className="size-5 shrink-0 text-muted-foreground" /><span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium">{opening === p.path ? `Opening ${p.name}…` : p.name}</span><span className="mt-1 block truncate font-mono text-xs text-muted-foreground" title={p.path}>{p.path}</span></span></button></li>)}</ul> : <div className="border-y border-border py-8 text-[13px] text-muted-foreground">No recent projects. Open an existing folder or create a project.</div>}
+          </section>
         </div>
-
-        <div className="flex gap-2">
-          <NewProjectDialog
-            trigger={
-              <Button>
-                <FolderPlus className="mr-2 size-4" />
-                New project
-              </Button>
-            }
-          />
-          <OpenProjectDialog
-            trigger={
-              <Button variant="outline">
-                <FolderOpen className="mr-2 size-4" />
-                Open project
-              </Button>
-            }
-          />
-        </div>
-
-        {availableProjects.length > 0 && (
-          <div className="space-y-2">
-            <div className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-              Recent
-            </div>
-            <ul className="divide-y divide-border rounded-md border border-border">
-              {availableProjects.map((p) => (
-                <li key={p.path}>
-                  <button
-                    type="button"
-                    onClick={() => openProject(p.path)}
-                    className="flex w-full items-center gap-3 px-3 py-2 text-left text-sm hover:bg-accent/40"
-                  >
-                    <FolderOpen className="size-4 shrink-0 text-muted-foreground" />
-                    <span className="flex-1 truncate font-medium">
-                      {p.name}
-                    </span>
-                    <span className="truncate font-mono text-[10px] text-muted-foreground">
-                      {p.path.replace(/^.*\//, "")}
-                    </span>
-                  </button>
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
-      </div>
-      </div>
+      </main>
     </div>
   )
 }

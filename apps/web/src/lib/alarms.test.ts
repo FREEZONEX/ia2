@@ -68,9 +68,16 @@ describe("severityTone", () => {
 describe("fmtAlarmClock", () => {
   it("shows an em-dash for never-raised", () => {
     expect(fmtAlarmClock(0n)).toBe("—")
+    expect(fmtAlarmClock(0)).toBe("—")
+  })
+  it("does not turn missing or invalid timestamps into a clock", () => {
+    for (const invalid of [null, undefined, NaN, Infinity, -Infinity, -1, -1n, Number.MAX_VALUE]) {
+      expect(fmtAlarmClock(invalid)).toBe("—")
+    }
   })
   it("renders a HH:MM:SS-shaped time for a real stamp", () => {
     expect(fmtAlarmClock(1_700_000_000_000_000n)).toMatch(/\d{1,2}:\d{2}:\d{2}/)
+    expect(fmtAlarmClock(1_700_000_000_000_000)).toBe(fmtAlarmClock(1_700_000_000_000_000n))
   })
 })
 

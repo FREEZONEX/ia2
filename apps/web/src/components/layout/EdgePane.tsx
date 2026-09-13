@@ -17,7 +17,7 @@ import {
   Save,
   ScrollText,
   StepForward,
-} from "lucide-react"
+} from "@/components/ui/icons"
 import { useEffect, useRef, useState } from "react"
 
 import { UppercaseBadge } from "@/components/ui/badge"
@@ -25,6 +25,8 @@ import { Button } from "@/components/ui/button"
 import { ErrorBox } from "@/components/ui/error-box"
 import { Field } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
+import { PaneHeader } from "@/components/ui/pane-header"
+import { EmptyState } from "@/components/ui/empty-state"
 import { Label } from "@/components/ui/label"
 import {
   deployEdge,
@@ -56,20 +58,15 @@ export function EdgePane() {
 
   if (!currentEdge) {
     return (
-      <main className="flex h-full min-h-0 min-w-0 flex-col">
-        <div className="flex h-9 items-center border-b border-border px-3 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-          Edge
-        </div>
-        <div className="grid flex-1 place-items-center p-6 text-center text-sm text-muted-foreground">
-          Select an edge from the project tree, or create one with the&nbsp;
-          <span className="font-mono">+</span> button next to "Edges".
-        </div>
+      <main className="ia2-pane">
+        <PaneHeader title="Edges" description="Deploy and monitor remote controllers" />
+        <EmptyState title="Select an edge" description="Choose an edge in the project tree to configure its connection or inspect its runtime." />
       </main>
     )
   }
 
   return (
-    <main className="flex h-full min-h-0 min-w-0 flex-col">
+    <main className="ia2-pane">
       <Editor
         key={currentEdge.name}
         edge={currentEdge}
@@ -100,6 +97,8 @@ function Editor({
   const [probe, setProbe] = useState<EdgeProbe | null>(null)
   const [probing, setProbing] = useState(false)
   const [deploying, setDeploying] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [attachmentPending, setAttachmentPending] = useState(false)
   const [deployLog, setDeployLog] = useState<DeployReport | null>(null)
   const [deployError, setDeployError] = useState<string | null>(null)
 
@@ -157,6 +156,17 @@ function Editor({
     }
   }
 
+  const changeAttachment = async () => {
+    if (attachmentPending) return
+    setAttachmentPending(true)
+    try {
+      if (attached) await onDetach()
+      else await onAttach()
+    } finally {
+      setAttachmentPending(false)
+    }
+  }
+
   const deploy = async () => {
     if (!confirm(
       `Deploy this project to ${edge.host}?\n` +
@@ -181,41 +191,26 @@ function Editor({
 
   return (
     <>
-      <div className="flex h-9 items-center justify-between border-b border-border pl-3 pr-2 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-        <span className="flex items-center gap-2 truncate normal-case tracking-normal text-foreground">
-          <span className="truncate font-mono">{edge.name}</span>
-          <span className="rounded border border-border bg-muted/50 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wider text-muted-foreground">
-            edge
-          </span>
-          {dirty && (
-            <span className="rounded bg-warn/15 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wider text-warn">
-              modified
-            </span>
-          )}
-        </span>
-        <div className="flex items-center gap-2">
-          <ReachBadge probe={probe} probing={probing} />
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={() => void onSave(draft)}
-            disabled={!dirty}
-          >
-            <Save className="mr-1.5 size-3" />
-            Save
-          </Button>
-        </div>
-      </div>
+      <PaneHeader
+        title={<span title={edge.name}>{edge.name}</span>}
+        description={<span className="font-mono" title={edge.host}>{edge.host}</span>}
+        meta={<><ReachBadge probe={probe} probing={probing} />{dirty && <span className="text-warn">Unsaved changes</span>}</>}
+        actions={<Button size="sm" disabled={!dirty || saving} aria-busy={saving} onClick={async () => {
+          if (saving) return
+          setSaving(true)
+          try { await onSave(draft) } finally { setSaving(false) }
+        }}><Save className="size-4" />{saving ? "Saving…" : "Save changes"}</Button>}
+      />
 
       <EdgeTabs tab={tab} setTab={setTab} />
 
       {tab === "config" && (
-      <div className="flex-1 space-y-6 overflow-auto p-5">
+      <div className="min-h-0 flex-1 space-y-6 overflow-auto p-4">
         <section>
-          <div className="mb-3 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+          <div className="mb-3 text-xs font-medium text-muted-foreground">
             Connection
           </div>
-          <div className="grid max-w-2xl grid-cols-2 gap-3">
+          <div className="ia2-field-grid">
             <Field label="SSH host / alias">
               <Input
                 value={draft.host}
@@ -255,7 +250,7 @@ function Editor({
               />
             </Field>
           </div>
-          <p className="mt-3 max-w-2xl text-[11px] text-muted-foreground">
+          <p className="mt-3 max-w-2xl text-xs text-muted-foreground">
             What runs on this edge is the project's <span className="font-mono">tasks.toml</span>{" "}
             (every PROGRAM instance declared there, on its bound task) — not a
             single POU. Edit the Tasks pane to change the schedule.
@@ -263,20 +258,21 @@ function Editor({
         </section>
 
         <section>
-          <Label className="text-[11px] uppercase tracking-wider text-muted-foreground">
+          <Label htmlFor="edge-notes" className="text-xs text-muted-foreground">
             Notes
           </Label>
           <textarea
+            id="edge-notes"
             value={draft.notes}
             onChange={(e) => update({ notes: e.target.value })}
             placeholder="Free-form: production line 1, hardware revision, on-site contacts…"
             rows={3}
-            className="mt-1.5 block w-full max-w-2xl resize-y rounded-md border border-border bg-background px-2 py-1.5 text-sm placeholder:text-muted-foreground"
+            className="mt-1.5 block w-full max-w-2xl resize-y rounded-md border border-border bg-background px-2 py-1.5 text-[13px] placeholder:text-muted-foreground"
           />
         </section>
 
         <section>
-          <div className="mb-3 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+          <div className="mb-3 text-xs font-medium text-muted-foreground">
             Actions
           </div>
           <div className="flex flex-wrap gap-2">
@@ -310,18 +306,19 @@ function Editor({
               <Button
                 size="sm"
                 variant="outline"
-                onClick={() => void onDetach()}
+                onClick={() => void changeAttachment()}
+                disabled={attachmentPending}
                 className="border-highlight/40 text-highlight"
               >
                 <Link2Off className="mr-1.5 size-3" />
-                Detach
+                {attachmentPending ? "Detaching…" : "Detach"}
               </Button>
             ) : (
               <Button
                 size="sm"
                 variant="outline"
-                onClick={() => void onAttach()}
-                disabled={probe?.reachable !== true}
+                onClick={() => void changeAttachment()}
+                disabled={probe?.reachable !== true || attachmentPending}
                 title={
                   probe?.reachable
                     ? "Open SSH port-forward and stream live variables from the edge runtime"
@@ -329,14 +326,14 @@ function Editor({
                 }
               >
                 <Link2 className="mr-1.5 size-3" />
-                Attach
+                {attachmentPending ? "Attaching…" : "Attach"}
               </Button>
             )}
           </div>
         </section>
 
         <section>
-          <div className="mb-3 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+          <div className="mb-3 text-xs font-medium text-muted-foreground">
             Runtime status
           </div>
           {probe ? (
@@ -357,7 +354,7 @@ function Editor({
 
         {(deployLog || deployError) && (
           <section>
-            <div className="mb-2 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+            <div className="mb-2 text-xs font-medium text-muted-foreground">
               Last deploy
             </div>
             {deployError ? (
@@ -369,7 +366,7 @@ function Editor({
                   Version{" "}
                   <span className="font-mono">{deployLog.version}</span> live
                 </div>
-                <pre className="max-h-64 max-w-full overflow-auto rounded-md border border-border bg-muted/40 p-3 text-[11px] text-muted-foreground">
+                <pre className="max-h-64 max-w-full overflow-auto rounded-md border border-border bg-muted/40 p-3 text-xs text-muted-foreground">
                   {deployLog.log}
                 </pre>
               </div>
@@ -402,12 +399,14 @@ function EdgeTabs({
     ["debug", "Debug", Gauge],
   ]
   return (
-    <div className="flex items-center gap-0.5 border-b border-border px-2">
+    <div className="ia2-toolbar overflow-x-auto">
       {tabs.map(([id, label, Icon]) => (
         <button
           key={id}
+          type="button"
+          aria-pressed={tab === id}
           onClick={() => setTab(id)}
-          className={`-mb-px flex items-center gap-1.5 border-b-2 px-2.5 py-1.5 text-xs transition-colors ${
+          className={`-mb-px flex items-center gap-1.5 border-b-2 px-2.5 py-1.5 whitespace-nowrap text-[13px] transition-colors ${
             tab === id
               ? "border-foreground text-foreground"
               : "border-transparent text-muted-foreground hover:text-foreground"
@@ -451,8 +450,8 @@ function LogsPanel({ name }: { name: string }) {
   }, [name])
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div className="flex items-center justify-between border-b border-border px-3 py-1.5 text-[11px] text-muted-foreground">
-        <span className="font-mono">runtime log · polling /logs every 2s</span>
+      <div className="flex items-center justify-between border-b border-border px-3 py-1.5 text-xs text-muted-foreground">
+        <span className="font-mono">Runtime log · updates every 2 seconds</span>
         <button
           onClick={() => setPaused((p) => !p)}
           className="rounded border border-border px-1.5 py-0.5 hover:text-foreground"
@@ -461,11 +460,11 @@ function LogsPanel({ name }: { name: string }) {
         </button>
       </div>
       {error && (
-        <div className="border-b border-destructive/30 bg-destructive/5 px-3 py-1.5 text-[11px] text-destructive">
+        <div className="border-b border-destructive/30 bg-destructive/5 px-3 py-1.5 text-xs text-destructive">
           {error}
         </div>
       )}
-      <pre className="flex-1 overflow-auto whitespace-pre-wrap break-all bg-muted/20 p-3 font-mono text-[11px] leading-relaxed">
+      <pre className="flex-1 overflow-auto whitespace-pre-wrap break-all bg-muted/20 p-3 font-mono text-xs leading-relaxed">
         {lines.length ? lines.join("\n") : "(no log lines yet)"}
       </pre>
     </div>
@@ -495,7 +494,7 @@ function DiscoverPanel({ name }: { name: string }) {
   return (
     <div className="flex-1 space-y-4 overflow-auto p-4">
       <div className="flex items-center justify-between">
-        <span className="text-[11px] uppercase tracking-wider text-muted-foreground">
+        <span className="text-xs text-muted-foreground">
           Bus discovery
         </span>
         <Button size="sm" variant="outline" onClick={() => void load()} disabled={loading}>
@@ -510,14 +509,14 @@ function DiscoverPanel({ name }: { name: string }) {
       {error && <ErrorBox>{error}</ErrorBox>}
       {devs?.map((d) => (
         <div key={d.name} className="overflow-hidden rounded-md border border-border">
-          <div className="flex items-center gap-2 border-b border-border bg-muted/30 px-3 py-2 text-sm">
+          <div className="flex items-center gap-2 border-b border-border bg-muted/30 px-3 py-2 text-[13px]">
             {d.connected ? (
               <CheckCircle2 className="size-3.5 text-highlight" />
             ) : (
               <AlertCircle className="size-3.5 text-destructive" />
             )}
             <span className="font-mono">{d.name}</span>
-            <span className="rounded border border-border px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wider text-muted-foreground">
+            <span className="rounded border border-border px-1.5 py-0.5 font-mono text-xs text-muted-foreground">
               {d.protocol}
             </span>
             {!d.connected && d.error && (
@@ -531,34 +530,36 @@ function DiscoverPanel({ name }: { name: string }) {
           </div>
           {d.connected &&
             (d.slaves.length ? (
-              <table className="w-full text-xs">
-                <thead>
-                  <tr className="text-left text-[10px] uppercase tracking-wider text-muted-foreground">
-                    <th className="px-3 py-1 font-medium">#</th>
-                    <th className="py-1 font-medium">Name</th>
-                    <th className="py-1 font-medium">Vendor</th>
-                    <th className="py-1 font-medium">Product</th>
-                    <th className="py-1 font-medium">In</th>
-                    <th className="py-1 pr-3 font-medium">Out</th>
-                  </tr>
-                </thead>
-                <tbody className="font-mono">
-                  {d.slaves.map((s) => (
-                    <tr key={s.index} className="border-t border-border/50">
-                      <td className="px-3 py-1">{s.index}</td>
-                      <td className="py-1">{s.name}</td>
-                      <td className="py-1">
-                        0x{s.vendor_id.toString(16).padStart(8, "0")}
-                      </td>
-                      <td className="py-1">
-                        0x{s.product_id.toString(16).padStart(8, "0")}
-                      </td>
-                      <td className="py-1">{s.input_bytes}B</td>
-                      <td className="py-1 pr-3">{s.output_bytes}B</td>
+              <div className="min-w-0 overflow-x-auto">
+                <table className="ia2-table w-full min-w-[640px]">
+                  <thead>
+                    <tr className="text-left text-xs text-muted-foreground">
+                      <th className="px-3 py-1 font-medium">#</th>
+                      <th className="py-1 font-medium">Name</th>
+                      <th className="py-1 font-medium">Vendor</th>
+                      <th className="py-1 font-medium">Product</th>
+                      <th className="py-1 font-medium">In</th>
+                      <th className="py-1 pr-3 font-medium">Out</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody className="font-mono">
+                    {d.slaves.map((s) => (
+                      <tr key={s.index} className="border-t border-border/50">
+                        <td className="px-3 py-1">{s.index}</td>
+                        <td className="py-1">{s.name}</td>
+                        <td className="py-1">
+                          0x{s.vendor_id.toString(16).padStart(8, "0")}
+                        </td>
+                        <td className="py-1">
+                          0x{s.product_id.toString(16).padStart(8, "0")}
+                        </td>
+                        <td className="py-1">{s.input_bytes}B</td>
+                        <td className="py-1 pr-3">{s.output_bytes}B</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             ) : (
               <div className="px-3 py-2 text-xs text-muted-foreground">
                 no slaves on the bus
@@ -596,7 +597,7 @@ function SystemPanel({ name }: { name: string }) {
   return (
     <div className="flex-1 space-y-4 overflow-auto p-4">
       <div className="flex items-center justify-between">
-        <span className="text-[11px] uppercase tracking-wider text-muted-foreground">
+        <span className="text-xs text-muted-foreground">
           System
           {sys && (
             <span className="ml-1 font-mono normal-case lowercase">
@@ -617,34 +618,36 @@ function SystemPanel({ name }: { name: string }) {
       {sys && (
         <>
           <div>
-            <div className="mb-1.5 text-[10px] uppercase tracking-wider text-muted-foreground">
+            <div className="mb-1.5 text-xs text-muted-foreground">
               Network interfaces (pick one for an EtherCAT nic)
             </div>
             <div className="overflow-hidden rounded-md border border-border">
-              <table className="w-full text-xs">
-                <tbody className="font-mono">
-                  {sys.nics.map((n) => (
-                    <tr key={n.name} className="border-b border-border/50 last:border-0">
-                      <td className="px-3 py-1.5">{n.name}</td>
-                      <td className="py-1.5 text-muted-foreground">{n.operstate}</td>
-                      <td className="py-1.5">
-                        {n.carrier ? (
-                          <span className="text-highlight">
-                            carrier
-                          </span>
-                        ) : (
-                          <span className="text-muted-foreground">no-carrier</span>
-                        )}
-                      </td>
-                      <td className="py-1.5 pr-3 text-muted-foreground">{n.mac}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+              <div className="min-w-0 overflow-x-auto">
+                <table className="ia2-table w-full min-w-[640px]">
+                  <tbody className="font-mono">
+                    {sys.nics.map((n) => (
+                      <tr key={n.name} className="border-b border-border/50 last:border-0">
+                        <td className="px-3 py-1.5">{n.name}</td>
+                        <td className="py-1.5 text-muted-foreground">{n.operstate}</td>
+                        <td className="py-1.5">
+                          {n.carrier ? (
+                            <span className="text-highlight">
+                              carrier
+                            </span>
+                          ) : (
+                            <span className="text-muted-foreground">no-carrier</span>
+                          )}
+                        </td>
+                        <td className="py-1.5 pr-3 text-muted-foreground">{n.mac}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             </div>
           </div>
           <div>
-            <div className="mb-1.5 text-[10px] uppercase tracking-wider text-muted-foreground">
+            <div className="mb-1.5 text-xs text-muted-foreground">
               Serial ports (pick one for a Modbus RTU device)
             </div>
             {sys.serial_ports.length ? (
@@ -760,60 +763,62 @@ function DebugPanel({ name }: { name: string }) {
       {error && <ErrorBox>{error}</ErrorBox>}
 
       <div className="overflow-hidden rounded-md border border-border">
-        <table className="w-full text-xs">
-          <thead>
-            <tr className="text-left text-[10px] uppercase tracking-wider text-muted-foreground">
-              <th className="px-3 py-1 font-medium">Variable</th>
-              <th className="py-1 font-medium">Type</th>
-              <th className="py-1 font-medium">Value</th>
-              <th className="py-1 pr-3" />
-            </tr>
-          </thead>
-          <tbody className="font-mono">
-            {vars.length === 0 && (
-              <tr>
-                <td colSpan={4} className="px-3 py-2 text-muted-foreground">
-                  no variables yet (runtime not reporting a snapshot)
-                </td>
+        <div className="min-w-0 overflow-x-auto">
+          <table className="ia2-table w-full min-w-[640px]">
+            <thead>
+              <tr className="text-left text-xs text-muted-foreground">
+                <th className="px-3 py-1 font-medium">Variable</th>
+                <th className="py-1 font-medium">Type</th>
+                <th className="py-1 font-medium">Value</th>
+                <th className="py-1 pr-3" />
               </tr>
-            )}
-            {vars.map((v) => (
-              <tr key={v.name} className="border-t border-border/50">
-                <td className="px-3 py-1">{v.name}</td>
-                <td className="py-1 text-muted-foreground">{v.type_name}</td>
-                <td className="py-1">
-                  {v.value}
-                  {forced.has(v.name) && (
-                    <span className="ml-1.5 text-warn">forced</span>
-                  )}
-                </td>
-                <td className="py-1 pr-3 text-right">
-                  {forced.has(v.name) && (
-                    <button
-                      title="Unforce"
-                      disabled={busy}
-                      onClick={() => void op("unforce", { name: v.name })}
-                      className="text-muted-foreground hover:text-foreground"
-                    >
-                      <PinOff className="size-3.5" />
-                    </button>
-                  )}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody className="font-mono">
+              {vars.length === 0 && (
+                <tr>
+                  <td colSpan={4} className="px-3 py-2 text-muted-foreground">
+                    no variables yet (runtime not reporting a snapshot)
+                  </td>
+                </tr>
+              )}
+              {vars.map((v) => (
+                <tr key={v.name} className="border-t border-border/50">
+                  <td className="px-3 py-1">{v.name}</td>
+                  <td className="py-1 text-muted-foreground">{v.type_name}</td>
+                  <td className="py-1">
+                    {v.value}
+                    {forced.has(v.name) && (
+                      <span className="ml-1.5 text-warn">forced</span>
+                    )}
+                  </td>
+                  <td className="py-1 pr-3 text-right">
+                    {forced.has(v.name) && (
+                      <button
+                        title="Unforce"
+                        disabled={busy}
+                        onClick={() => void op("unforce", { name: v.name })}
+                        className="text-muted-foreground hover:text-foreground"
+                      >
+                        <PinOff className="size-3.5" />
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       </div>
 
       <div className="flex items-end gap-2">
         <div className="flex-1 space-y-1.5">
-          <Label className="text-[11px] uppercase tracking-wider text-muted-foreground">
+          <Label className="text-xs text-muted-foreground">
             Force a variable (integer value)
           </Label>
           <select
             value={forceVar}
             onChange={(e) => setForceVar(e.target.value)}
-            className="block w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm"
+            className="block w-full rounded-md border border-border bg-background px-2 py-1.5 text-[13px]"
           >
             <option value="">Select…</option>
             {vars.map((v) => (
@@ -907,7 +912,7 @@ function ReachBadge({
 
 function StatusGrid({ probe }: { probe: EdgeProbe }) {
   return (
-    <dl className="grid max-w-2xl grid-cols-3 gap-3 text-sm">
+    <dl className="ia2-field-grid text-[13px]">
       <Stat
         label="Uptime"
         value={
@@ -924,7 +929,7 @@ function StatusGrid({ probe }: { probe: EdgeProbe }) {
       />
       <Stat label="Runtime version" value={probe.runtime_version ?? "—"} />
       {!probe.reachable && probe.error && (
-        <div className="col-span-3">
+        <div className="col-span-full">
           <ErrorBox>{probe.error}</ErrorBox>
         </div>
       )}
@@ -934,11 +939,11 @@ function StatusGrid({ probe }: { probe: EdgeProbe }) {
 
 function Stat({ label, value }: { label: string; value: React.ReactNode }) {
   return (
-    <div className="rounded-md border border-border bg-muted/30 p-2">
-      <dt className="text-[10px] uppercase tracking-wider text-muted-foreground">
+    <div className="min-w-0 border-b border-border py-3">
+      <dt className="text-xs text-muted-foreground">
         {label}
       </dt>
-      <dd className="font-mono text-sm tabular-nums">{value}</dd>
+      <dd className="mt-1 break-words font-mono text-[13px] tabular-nums">{value}</dd>
     </div>
   )
 }

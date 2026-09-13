@@ -30,6 +30,8 @@ export function EnumSelect<T extends string>({
   className,
   disabled,
   placeholder,
+  id,
+  "aria-labelledby": labelledBy,
 }: {
   value: T
   onValueChange: (value: T) => void
@@ -37,10 +39,12 @@ export function EnumSelect<T extends string>({
   className?: string
   disabled?: boolean
   placeholder?: string
+  id?: string
+  "aria-labelledby"?: string
 }) {
   return (
     <Select value={value} onValueChange={(v) => onValueChange(v as T)}>
-      <SelectTrigger className={className} disabled={disabled}>
+      <SelectTrigger id={id} aria-labelledby={labelledBy} className={className} disabled={disabled}>
         <SelectValue placeholder={placeholder} />
       </SelectTrigger>
       <SelectContent>

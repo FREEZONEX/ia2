@@ -1,4 +1,4 @@
-import { ChevronRight, Lock } from "lucide-react"
+import { ChevronRight, Lock } from "@/components/ui/icons"
 import { useMemo, useState } from "react"
 
 import { STEditor } from "@/components/editor/STEditor"
@@ -30,32 +30,32 @@ export function DatasheetView({
 
   return (
     <div className="h-full min-h-0 overflow-auto">
-      <div className="mx-auto max-w-3xl px-6 py-5">
+      <div className="max-w-5xl px-4 py-5">
         {/* Header */}
         <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-          <span className="font-mono text-lg font-medium text-foreground">
+          <span className="break-words font-mono text-base font-medium text-foreground">
             {sheet.name}
           </span>
           {sheet.brief && (
-            <span className="text-sm text-muted-foreground">{sheet.brief}</span>
+            <span className="text-[13px] text-muted-foreground">{sheet.brief}</span>
           )}
         </div>
         <div className="mt-2 flex flex-wrap items-center gap-1.5">
-          <span className="rounded bg-muted px-2 py-0.5 font-mono text-[11px] text-muted-foreground">
+          <span className="rounded bg-muted px-2 py-0.5 font-mono text-xs text-muted-foreground">
             {libraryName}
           </span>
-          <span className="inline-flex items-center gap-1 rounded bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
+          <span className="inline-flex items-center gap-1 rounded bg-muted px-2 py-0.5 text-xs text-muted-foreground">
             <Lock className="size-2.5" />
             read-only
           </span>
         </div>
 
         {/* Graphic preview + interface table */}
-        <div className="mt-5 grid grid-cols-1 gap-5 md:grid-cols-[200px_minmax(0,1fr)]">
-          <div className="rounded-md bg-muted/40 p-3">
+        <div className="mt-5 flex flex-wrap items-start gap-5">
+          <div className="w-[220px] max-w-full shrink-0 bg-muted/40 p-3">
             <BlockPreview sheet={sheet} />
           </div>
-          <div>
+          <div className="min-w-0 flex-1 basis-[360px]">
             <PinTable title="Inputs" pins={sheet.inputs} showDefault />
             {sheet.outputs.length > 0 && (
               <div className="mt-3">
@@ -74,7 +74,7 @@ export function DatasheetView({
                 className={cn(
                   "text-[13px] leading-relaxed",
                   s.equivalence
-                    ? "text-muted-foreground/80 italic"
+                    ? "text-muted-foreground italic"
                     : "text-muted-foreground",
                 )}
               >
@@ -91,7 +91,7 @@ export function DatasheetView({
         )}
 
         {/* Usage hint — how to actually place / call the block */}
-        <div className="mt-6 rounded-md border border-border bg-muted/30 px-3 py-2 text-[13px] text-muted-foreground">
+        <div className="mt-6 bg-muted/40 px-3 py-2 text-[13px] text-muted-foreground">
           <span className="font-medium text-foreground">Use it: </span>
           add it from the <span className="font-mono">+ Block</span> palette in
           an FBD or LD editor, or declare{" "}
@@ -104,6 +104,7 @@ export function DatasheetView({
           <button
             type="button"
             onClick={() => setSourceOpen((v) => !v)}
+            aria-expanded={sourceOpen}
             className="flex items-center gap-1.5 text-[13px] text-muted-foreground hover:text-foreground"
           >
             <ChevronRight
@@ -113,7 +114,7 @@ export function DatasheetView({
               )}
             />
             View ST source
-            <span className="font-mono text-[11px] text-muted-foreground/60">
+            <span className="font-mono text-xs text-muted-foreground">
               ({sheet.name.toLowerCase()}.st — read-only)
             </span>
           </button>
@@ -145,27 +146,29 @@ function PinTable({
   if (pins.length === 0) return null
   return (
     <div>
-      <div className="mb-1 text-[11px] uppercase tracking-wider text-muted-foreground/70">
+      <div className="mb-1 text-xs text-muted-foreground">
         {title}
       </div>
-      <table className="w-full text-[13px]">
-        <tbody>
-          {pins.map((p) => (
-            <tr key={p.name} className="border-b border-border/60 last:border-0 align-top">
-              <td className="py-1 pr-3 font-mono text-foreground">{p.name}</td>
-              <td className="py-1 pr-3 text-muted-foreground">{p.type}</td>
-              {showDefault && (
-                <td className="py-1 pr-3 font-mono text-[12px] text-muted-foreground/70">
-                  {p.default ?? "—"}
+      <div className="min-w-0 overflow-x-auto">
+        <table className="ia2-table w-full min-w-[400px]">
+          <tbody>
+            {pins.map((p) => (
+              <tr key={p.name} className="border-b border-border/60 last:border-0 align-top">
+                <td className="py-1 pr-3 font-mono text-foreground">{p.name}</td>
+                <td className="py-1 pr-3 text-muted-foreground">{p.type}</td>
+                {showDefault && (
+                  <td className="py-1 pr-3 font-mono text-[12px] text-muted-foreground">
+                    {p.default ?? "—"}
+                  </td>
+                )}
+                <td className="w-1/2 py-1 text-muted-foreground">
+                  {p.description ?? ""}
                 </td>
-              )}
-              <td className="w-1/2 py-1 text-muted-foreground">
-                {p.description ?? ""}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   )
 }

@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button"
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -51,7 +52,7 @@ export function NewEdgeDialog(props: Props) {
   const fullPath = parent ? `${parent}/${trimmedName}` : trimmedName
 
   const submit = async () => {
-    if (!trimmedName || !trimmedHost) return
+    if (!trimmedName || !trimmedHost || submitting) return
     setSubmitting(true)
     const ok = await createEdge(fullPath, trimmedHost)
     setSubmitting(false)
@@ -60,7 +61,7 @@ export function NewEdgeDialog(props: Props) {
   }
 
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
+    <Dialog open={open} onOpenChange={(next) => { if (!submitting) setOpen(next) }}>
       {props.trigger ? (
         <DialogTrigger asChild>{props.trigger}</DialogTrigger>
       ) : null}
@@ -69,11 +70,12 @@ export function NewEdgeDialog(props: Props) {
           <DialogTitle>
             New edge{" "}
             {parent && (
-              <span className="font-mono text-xs text-muted-foreground">
+              <span className="break-all font-mono text-xs text-muted-foreground">
                 under {parent}
               </span>
             )}
           </DialogTitle>
+          <DialogDescription>Add a remote controller for deployment and monitoring.</DialogDescription>
         </DialogHeader>
         <div className="space-y-3">
           <div className="space-y-2">
@@ -86,7 +88,7 @@ export function NewEdgeDialog(props: Props) {
               autoFocus
             />
             {trimmedName && parent && (
-              <div className="font-mono text-[11px] text-muted-foreground">
+              <div className="break-all font-mono text-xs text-muted-foreground">
                 edges/{fullPath}.toml
               </div>
             )}
@@ -102,7 +104,7 @@ export function NewEdgeDialog(props: Props) {
                 if (e.key === "Enter") submit()
               }}
             />
-            <p className="text-[11px] text-muted-foreground">
+            <p className="text-xs text-muted-foreground">
               The IDE runs <span className="font-mono">ssh {host || "<host>"}</span>{" "}
               — credentials come from your SSH agent / ~/.ssh/config, never
               stored in the project.
@@ -110,14 +112,14 @@ export function NewEdgeDialog(props: Props) {
           </div>
         </div>
         <DialogFooter>
-          <Button variant="ghost" onClick={() => setOpen(false)}>
+          <Button variant="ghost" disabled={submitting} onClick={() => setOpen(false)}>
             Cancel
           </Button>
           <Button
             onClick={submit}
             disabled={!trimmedName || !trimmedHost || submitting}
           >
-            Create
+            {submitting ? "Creating…" : "Create"}
           </Button>
         </DialogFooter>
       </DialogContent>

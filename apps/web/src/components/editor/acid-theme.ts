@@ -1,49 +1,37 @@
 import type { Monaco } from "@monaco-editor/react"
 
-/**
- * Monaco themes for the acid-green tune.
- *
- * Monaco's stock `light` / `vs-dark` fight the design on two axes: they
- * paint a pure-white (#FFFFFF) / blue-black (#1E1E1E) canvas into the
- * middle of our warm neutrals, and their syntax palette is the VS Code
- * blue/orange family. Both read as "an editor someone embedded", which
- * is exactly the seam the design removes — the code surface is supposed
- * to be the same material as the panes around it.
- *
- * Colours below are sampled from the Figma frames, not invented:
- * identifiers sit near the foreground, keywords are violet, IEC types
- * teal, numerics olive. The pairs are luminance-mirrored across themes
- * so code has the same "shape" (which tokens pop) in light and dark.
- */
+/** Monaco uses the same opaque surfaces as the Tier0 workbench.
+ * Syntax colors carry language roles; comments and line numbers stay readable.
+ * Theme IDs are stable so existing editor instances keep their selection. */
 
 const LIGHT = {
-  bg: "#FAFAF8",
-  fg: "#2C2B27",
-  comment: "#8C8980",
+  bg: "#FFFFFF",
+  fg: "#050B14",
+  comment: "#626A66",
   keyword: "#6E3C9C",
   type: "#1E7A66",
   number: "#4E7A2C",
-  operator: "#6A6963",
+  operator: "#585C62",
   string: "#4E7A2C",
-  lineNr: "#ABAAA2",
-  lineNrActive: "#575651",
-  selection: "#DDE9C9",
-  lineHighlight: "#F2F2F0",
+  lineNr: "#6F7773",
+  lineNrActive: "#353D38",
+  selection: "#DDF59C",
+  lineHighlight: "#F9F9F9",
 } as const
 
 const DARK = {
-  bg: "#1C1C1B",
-  fg: "#D6D4CF",
-  comment: "#7C7A73",
+  bg: "#151A19",
+  fg: "#F9F9F9",
+  comment: "#ABB5AF",
   keyword: "#C49AD8",
   type: "#6FC1A8",
   number: "#A9CE80",
-  operator: "#9A988F",
+  operator: "#B5BAB7",
   string: "#A9CE80",
-  lineNr: "#5F5E57",
-  lineNrActive: "#A3A199",
-  selection: "#3A4426",
-  lineHighlight: "#232322",
+  lineNr: "#88958D",
+  lineNrActive: "#CDD5D0",
+  selection: "#354528",
+  lineHighlight: "#1C211F",
 } as const
 
 export const ACID_LIGHT = "ia2-acid-light"

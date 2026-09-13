@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button"
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -39,7 +40,7 @@ export function NewFolderDialog({ open, onOpenChange, section, parent }: Props) 
   const fullPath = parent ? `${parent}/${trimmed}` : trimmed
 
   const submit = async () => {
-    if (!trimmed) return
+    if (!trimmed || submitting) return
     setSubmitting(true)
     const ok =
       section === "applications"
@@ -53,15 +54,16 @@ export function NewFolderDialog({ open, onOpenChange, section, parent }: Props) 
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={(next) => { if (!submitting) onOpenChange(next) }}>
       <DialogContent>
         <DialogHeader>
           <DialogTitle>
             New folder{" "}
-            <span className="font-mono text-xs text-muted-foreground">
+            <span className="break-all font-mono text-xs text-muted-foreground">
               under {parent || "/"}
             </span>
           </DialogTitle>
+          <DialogDescription>Organize project resources in a folder.</DialogDescription>
         </DialogHeader>
         <div className="space-y-2">
           <Label htmlFor="folder-leaf">Folder name</Label>
@@ -76,17 +78,17 @@ export function NewFolderDialog({ open, onOpenChange, section, parent }: Props) 
             autoFocus
           />
           {trimmed && (
-            <div className="font-mono text-[11px] text-muted-foreground">
+            <div className="break-all font-mono text-xs text-muted-foreground">
               {section}/{fullPath}
             </div>
           )}
         </div>
         <DialogFooter>
-          <Button variant="ghost" onClick={() => onOpenChange(false)}>
+          <Button variant="ghost" disabled={submitting} onClick={() => onOpenChange(false)}>
             Cancel
           </Button>
           <Button onClick={submit} disabled={!trimmed || submitting}>
-            Create
+            {submitting ? "Creating…" : "Create"}
           </Button>
         </DialogFooter>
       </DialogContent>

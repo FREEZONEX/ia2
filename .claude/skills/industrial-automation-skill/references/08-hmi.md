@@ -172,3 +172,16 @@ trust perimeter), so reach it through the tunnel `cs api POST
 `--bind` in the unit as a deliberate ops decision when operator tablets
 need direct access. The panel is read-only as a document (no arrange, no
 ops); to change a screen, edit it in the project and redeploy.
+
+## Visual validation in the IDE
+
+Use **Fit** to inspect the entire authored screen, then **100%** to check text and
+controls at their authored size. Both axes must fit without a stray scrollbar;
+100% may scroll. **Operate** permits configured writes, while **Arrange** only
+edits layout. Switching modes clears pending write confirmations. An unsuccessful
+write, layout save or alarm acknowledgment stays visibly failed.
+
+Alarm lists show active or unacknowledged alarms by default. **Show all** includes
+cleared and never-raised definitions; a never-raised timestamp is a dash. Check
+both themes, the smallest intended window, trend bounds, and real changing values
+before calling an HMI visually validated. Software simulation is not fieldbus proof.

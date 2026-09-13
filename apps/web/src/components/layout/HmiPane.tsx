@@ -8,7 +8,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useState } from "react"
-import { Hand, MousePointerClick, ShieldAlert } from "lucide-react"
+import { Hand, MousePointerClick, ShieldAlert } from "@/components/ui/icons"
 
 import { findNode, HmiCanvas, type CanvasMode } from "@/components/hmi/HmiCanvas"
 import { HmiInspector, HmiPalette } from "@/components/hmi/HmiEditorPanel"
@@ -24,6 +24,9 @@ import {
   saveHmi,
   writeVariable,
 } from "@/lib/api"
+import { PaneHeader } from "@/components/ui/pane-header"
+import { EmptyState } from "@/components/ui/empty-state"
+import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
 import { useHmiMutation } from "@/state/hmi-live"
 import { useRuntime } from "@/state/runtime"
@@ -37,6 +40,7 @@ export function HmiPane() {
   const [doc, setDoc] = useState<HmiDoc | null>(null)
   const [issues, setIssues] = useState<HmiIssue[]>([])
   const [variables, setVariables] = useState<string[]>([])
+  const [checkError, setCheckError] = useState<string | null>(null)
   const mutation = useHmiMutation()
 
   // The IDE-side host: documents and writes go through the project
@@ -58,7 +62,7 @@ export function HmiPane() {
         // the standalone edge panel has always shown it.
         return {
           running: s.running,
-          alarm: s.last_error ?? null,
+          alarm: s.watchdog_tripped ? "Watchdog tripped — outputs are locked" : s.last_error ?? null,
           mode: s.mode?.kind,
           unhealthyDevices: s.device_health
             .filter((d) => !d.healthy)
@@ -82,13 +86,13 @@ export function HmiPane() {
     if (!currentHmi) return
     try {
       setIssues(await checkHmi(currentHmi))
-    } catch {
-      /* screen may not exist yet */
-    }
+      setCheckError(null)
+    } catch (error) { setCheckError(`Screen validation unavailable: ${String(error)}`) }
   }, [currentHmi])
 
   useEffect(() => {
     setSelected(null)
+    setDoc(null)
     void refreshIssues()
   }, [refreshIssues])
 
@@ -98,9 +102,7 @@ export function HmiPane() {
 
   if (!currentHmi) {
     return (
-      <main className="grid h-full place-items-center text-sm text-muted-foreground">
-        Select a screen from the HMI section of the project tree.
-      </main>
+      <EmptyState title="No screen selected" description="Choose a screen in the HMI section to operate it or edit its layout." />
     )
   }
 
@@ -110,46 +112,12 @@ export function HmiPane() {
 
   return (
     <main className="flex h-full min-h-0 min-w-0 flex-col">
-      <div className="flex h-9 shrink-0 items-center justify-between border-b border-border pl-3 pr-2 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-        <span className="flex min-w-0 items-center gap-2 normal-case tracking-normal">
-          <span className="truncate font-mono text-foreground">
-            {currentHmi}
-          </span>
-          {doc && (
-            <>
-              <span className="truncate text-muted-foreground">
-                {doc.title}
-              </span>
-              <span className="rounded bg-muted/60 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wider">
-                L{doc.level}
-              </span>
-            </>
-          )}
-          {issues.length > 0 && (
-            <span
-              title={issues.map((i) => i.message).join("\n")}
-              className={cn(
-                "flex items-center gap-1 rounded px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wider",
-                errors > 0
-                  ? "bg-destructive/15 text-destructive"
-                  : "bg-warn/15 text-warn",
-              )}
-            >
-              <ShieldAlert className="size-3" />
-              {errors > 0 ? `${errors} errors` : `${warnings} warnings`}
-            </span>
-          )}
-        </span>
-        <ModeSwitch
-          mode={mode}
-          onChange={(m) => {
-            setMode(m)
-            // Selection is Arrange-only; entering Operate drops it so
-            // no inspector lingers over the operator surface.
-            if (m === "operate") setSelected(null)
-          }}
-        />
-      </div>
+      <PaneHeader title={doc?.title || currentHmi} meta={<>
+        <span className="font-mono">{currentHmi}</span>
+        {doc && <span>Level {doc.level}</span>}
+        {issues.length > 0 && <span title={issues.map(issue => issue.message).join("\n")} className={cn("flex items-center gap-1", errors > 0 ? "text-destructive" : "text-warn")}><ShieldAlert className="size-4" />{errors > 0 ? `${errors} errors` : `${warnings} warnings`}</span>}
+      </>} actions={<ModeSwitch mode={mode} onChange={next => { setMode(next); setSelected(null) }} />} />
+      {checkError && <div role="alert" className="border-b border-border px-4 py-2 text-xs text-destructive">{checkError}</div>}
 
       {mode === "arrange" && <HmiPalette path={currentHmi} doc={doc} />}
       <div className="flex min-h-0 flex-1">
@@ -185,7 +153,10 @@ function ModeSwitch({
   onChange: (m: CanvasMode) => void
 }) {
   const btn = (m: CanvasMode, icon: React.ReactNode, label: string) => (
-    <button
+    <Button
+      size="sm"
+      variant={mode === m ? "highlight" : "ghost"}
+      aria-pressed={mode === m}
       type="button"
       onClick={() => onChange(m)}
       title={
@@ -193,22 +164,15 @@ function ModeSwitch({
           ? "Operate: actions are live; layout is locked"
           : "Arrange: drag elements (snap to grid); actions are inert"
       }
-      className={cn(
-        "flex items-center gap-1 rounded-[4px] px-2 py-[3px] text-[11px] font-medium normal-case tracking-normal",
-        mode === m
-          ? "bg-card text-foreground shadow-sm"
-          : "text-muted-foreground hover:text-foreground",
-      )}
     >
       {icon}
       {label}
-    </button>
+    </Button>
   )
   return (
-    <div className="flex items-center gap-0.5 rounded-md bg-muted/60 p-0.5">
+    <div className="flex items-center gap-1" role="group" aria-label="HMI mode">
       {btn("operate", <MousePointerClick className="size-3" />, "Operate")}
       {btn("arrange", <Hand className="size-3" />, "Arrange")}
     </div>
   )
 }
-

@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button"
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -72,7 +73,7 @@ export function NewPouDialog(props: Props) {
           : "st"
 
   const submit = async () => {
-    if (!trimmed) return
+    if (!trimmed || submitting) return
     setSubmitting(true)
     const ok = await createPou(fullPath, kind, language)
     setSubmitting(false)
@@ -82,18 +83,19 @@ export function NewPouDialog(props: Props) {
   }
 
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
+    <Dialog open={open} onOpenChange={(next) => { if (!submitting) setOpen(next) }}>
       {props.trigger ? <DialogTrigger asChild>{props.trigger}</DialogTrigger> : null}
       <DialogContent>
         <DialogHeader>
           <DialogTitle>
             New POU{" "}
             {parent && (
-              <span className="font-mono text-xs text-muted-foreground">
+              <span className="break-all font-mono text-xs text-muted-foreground">
                 under {parent}
               </span>
             )}
           </DialogTitle>
+          <DialogDescription>Choose the program type and language. It will be added to this project.</DialogDescription>
         </DialogHeader>
         <div className="space-y-3">
           <div className="space-y-2">
@@ -109,19 +111,19 @@ export function NewPouDialog(props: Props) {
               autoFocus
             />
             {trimmed && (
-              <div className="font-mono text-[11px] text-muted-foreground">
+              <div className="break-all font-mono text-xs text-muted-foreground">
                 pous/{fullPath}.{extension}
               </div>
             )}
           </div>
           <div className="grid grid-cols-2 gap-3">
             <div className="space-y-2">
-              <Label>Type</Label>
+              <Label htmlFor="pou-kind">Type</Label>
               <Select
                 value={kind}
                 onValueChange={(v) => setKind(v as PouType)}
               >
-                <SelectTrigger>
+                <SelectTrigger id="pou-kind">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -133,12 +135,12 @@ export function NewPouDialog(props: Props) {
               </Select>
             </div>
             <div className="space-y-2">
-              <Label>Language</Label>
+              <Label htmlFor="pou-language">Language</Label>
               <Select
                 value={language}
                 onValueChange={(v) => setLanguage(v as PouLanguage)}
               >
-                <SelectTrigger>
+                <SelectTrigger id="pou-language">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -152,11 +154,11 @@ export function NewPouDialog(props: Props) {
           </div>
         </div>
         <DialogFooter>
-          <Button variant="ghost" onClick={() => setOpen(false)}>
+          <Button variant="ghost" disabled={submitting} onClick={() => setOpen(false)}>
             Cancel
           </Button>
           <Button onClick={submit} disabled={!trimmed || submitting}>
-            Create
+            {submitting ? "Creating…" : "Create"}
           </Button>
         </DialogFooter>
       </DialogContent>

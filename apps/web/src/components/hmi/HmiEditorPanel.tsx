@@ -7,7 +7,8 @@
  */
 
 import { useEffect, useMemo, useState } from "react"
-import { Plus, Trash2 } from "lucide-react"
+import { Plus, Trash2, X } from "@/components/ui/icons"
+import { Button } from "@/components/ui/button"
 
 import { fetchHmiSymbols, hmiOps } from "@/lib/api"
 import { canHostAction } from "@/lib/hmi-actions"
@@ -47,6 +48,8 @@ export function HmiPalette({
 }) {
   const [symbols, setSymbols] = useState<HmiSymbolInfo[]>([])
   const [error, setError] = useState<string | null>(null)
+  const [kind, setKind] = useState("text")
+  const [adding, setAdding] = useState(false)
   useEffect(() => {
     void fetchHmiSymbols().then(setSymbols).catch(() => {})
   }, [])
@@ -57,6 +60,8 @@ export function HmiPalette({
     h: number,
     prefix: string,
   ) => {
+    if (adding || !doc) return
+    setAdding(true)
     setError(null)
     const id = freshId(doc, prefix)
     // Stagger placements so consecutive adds don't stack invisibly.
@@ -75,63 +80,28 @@ export function HmiPalette({
       ])
     } catch (e) {
       setError(String(e))
-    }
+    } finally { setAdding(false) }
   }
 
   return (
-    <div className="flex flex-wrap items-center gap-1 border-b border-border bg-secondary/60 px-2 py-1.5">
-      <span className="mr-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-        Add
-      </span>
-      {symbols.map((s) => (
-        <PaletteChip
-          key={s.name}
-          label={s.name}
-          title={s.description}
-          onClick={() =>
-            void add(
-              { type: "symbol", symbol: s.name, props: {} },
-              s.default_size[0],
-              s.default_size[1],
-              s.name,
-            )
-          }
-        />
-      ))}
-      <span className="mx-1 h-4 w-px bg-border" />
-      {BASE_KINDS.map((k) => (
-        <PaletteChip
-          key={k.label}
-          label={k.label}
-          onClick={() => void add(k.make(), k.w, k.h, k.label)}
-        />
-      ))}
-      {error && (
-        <span className="ml-2 truncate text-[10px] text-destructive">{error}</span>
-      )}
+    <div className="flex shrink-0 flex-wrap items-center gap-3 border-b border-border bg-background px-4 py-2">
+      <label htmlFor="hmi-element-kind" className="text-xs font-medium">Insert element</label>
+      <select id="hmi-element-kind" value={kind} onChange={event => setKind(event.target.value)} className="h-8 min-w-44 rounded border border-input bg-background px-2 text-[13px]">
+        <optgroup label="Elements">{BASE_KINDS.map(item => <option key={item.label} value={item.label}>{item.label}</option>)}</optgroup>
+        <optgroup label="Process symbols">{symbols.map(symbol => <option key={symbol.name} value={`symbol:${symbol.name}`}>{symbol.name}</option>)}</optgroup>
+      </select>
+      <Button size="sm" disabled={!doc || adding} onClick={() => {
+        if (kind.startsWith("symbol:")) {
+          const symbol = symbols.find(item => item.name === kind.slice(7))
+          if (symbol) void add({ type: "symbol", symbol: symbol.name, props: {} }, symbol.default_size[0], symbol.default_size[1], symbol.name)
+        } else {
+          const item = BASE_KINDS.find(item => item.label === kind)
+          if (item) void add(item.make(), item.w, item.h, item.label)
+        }
+      }}><Plus />{adding ? "Adding…" : "Add element"}</Button>
+      <span className="text-xs text-muted-foreground">Select an element to edit its properties.</span>
+      {error && <span role="alert" className="w-full text-xs text-destructive">{error}</span>}
     </div>
-  )
-}
-
-function PaletteChip({
-  label,
-  title,
-  onClick,
-}: {
-  label: string
-  title?: string
-  onClick: () => void
-}) {
-  return (
-    <button
-      type="button"
-      title={title ?? `Add ${label}`}
-      onClick={onClick}
-      className="flex items-center gap-0.5 rounded border border-border bg-card px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground hover:bg-accent/50 hover:text-foreground"
-    >
-      <Plus className="size-2.5" />
-      {label}
-    </button>
   )
 }
 
@@ -191,7 +161,7 @@ export function HmiInspector({
   }
 
   return (
-    <aside className="flex w-[240px] shrink-0 flex-col gap-3 overflow-auto border-l border-border bg-secondary/40 p-3 text-[11px]">
+    <aside className="flex w-72 max-w-[40vw] shrink-0 flex-col gap-4 overflow-auto border-l border-border bg-background p-4 text-[13px]">
       <div className="flex items-center justify-between">
         <span className="truncate font-mono text-[12px] text-foreground">
           {node.id}
@@ -208,13 +178,15 @@ export function HmiInspector({
           <button
             type="button"
             onClick={onClose}
+            aria-label="Close properties"
+            title="Close properties"
             className="rounded px-1 text-muted-foreground hover:text-foreground"
           >
-            ×
+            <X className="size-4" />
           </button>
         </div>
       </div>
-      <div className="-mt-2 font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
+      <div className="-mt-2 font-mono text-xs text-muted-foreground">
         {node.type}
         {node.type === "symbol" && ` · ${node.symbol}`}
       </div>
@@ -247,7 +219,7 @@ export function HmiInspector({
         </Section>
       )}
 
-      {error && <div className="text-[10px] text-destructive">{error}</div>}
+      {error && <div role="alert" className="text-xs text-destructive">{error}</div>}
 
       {/* Shared datalist for every variable field in this panel. */}
       <datalist id="hmi-vars">
@@ -268,7 +240,7 @@ function Section({
 }) {
   return (
     <div>
-      <div className="mb-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+      <div className="mb-1 text-xs font-medium text-muted-foreground">
         {label}
       </div>
       {children}
@@ -293,7 +265,7 @@ function NumField({
   }
   return (
     <label className="flex items-center gap-1">
-      <span className="w-3 font-mono text-[10px] text-muted-foreground">
+      <span className="w-3 font-mono text-xs text-muted-foreground">
         {label}
       </span>
       <input
@@ -301,7 +273,7 @@ function NumField({
         onChange={(e) => setText(e.target.value)}
         onBlur={commit}
         onKeyDown={(e) => e.key === "Enter" && commit()}
-        className="h-6 w-full min-w-0 rounded border border-input bg-background px-1 font-mono text-[11px] text-foreground outline-none focus:border-ring"
+        className="h-6 w-full min-w-0 rounded border border-input bg-background px-1 font-mono text-xs text-foreground outline-none focus:border-ring"
       />
     </label>
   )
@@ -327,7 +299,7 @@ function TextField({
   }
   return (
     <label className="flex items-center gap-1.5">
-      <span className="w-10 shrink-0 font-mono text-[10px] text-muted-foreground">
+      <span className="w-10 shrink-0 font-mono text-xs text-muted-foreground">
         {label}
       </span>
       <input
@@ -337,7 +309,7 @@ function TextField({
         onChange={(e) => setText(e.target.value)}
         onBlur={commit}
         onKeyDown={(e) => e.key === "Enter" && commit()}
-        className="h-6 w-full min-w-0 rounded border border-input bg-background px-1 font-mono text-[11px] text-foreground outline-none focus:border-ring"
+        className="h-6 w-full min-w-0 rounded border border-input bg-background px-1 font-mono text-xs text-foreground outline-none focus:border-ring"
       />
     </label>
   )
@@ -549,7 +521,7 @@ function BindingsEditor({
 
   if (keys.length === 0) {
     return (
-      <div className="text-[10px] text-muted-foreground/70">
+      <div className="text-xs text-muted-foreground/70">
         This element has no bindable props.
       </div>
     )
@@ -662,13 +634,13 @@ function ActionsEditor({
   return (
     <div className="space-y-1.5">
       <label className="flex items-center gap-1.5">
-        <span className="w-10 shrink-0 font-mono text-[10px] text-muted-foreground">
+        <span className="w-10 shrink-0 font-mono text-xs text-muted-foreground">
           {gesture}
         </span>
         <select
           value={a?.kind ?? ""}
           onChange={(e) => setKind(e.target.value)}
-          className="h-6 w-full rounded border border-input bg-background px-1 font-mono text-[11px] text-foreground outline-none"
+          className="h-6 w-full rounded border border-input bg-background px-1 font-mono text-xs text-foreground outline-none"
         >
           <option value="">none</option>
           {kinds.map((k) => (
@@ -710,7 +682,7 @@ function ActionsEditor({
         />
       )}
       {a && a.kind !== "nav" && (
-        <label className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
+        <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
           <input
             type="checkbox"
             checked={"confirm" in a ? a.confirm : true}

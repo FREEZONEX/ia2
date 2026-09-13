@@ -5,7 +5,7 @@ import {
   RotateCw,
   Trash2,
   X,
-} from "lucide-react"
+} from "@/components/ui/icons"
 import { useEffect, useMemo, useRef, useState } from "react"
 
 import { DiagnosticsBanner } from "@/components/editor/DiagnosticsBanner"
@@ -346,12 +346,12 @@ function VariablePanel({
   } | null>(null)
 
   return (
-    <div className="grid grid-cols-3 gap-3 border-b border-border bg-muted/10 px-4 py-2 text-[11px]">
+    <div className="grid grid-cols-3 gap-3 border-b border-border bg-muted/10 px-4 py-2 text-[13px]">
       {groups.map((g) => {
         const vs = prog.variables.filter((v) => v.section === g.section)
         return (
           <div key={g.section}>
-            <div className="mb-1 flex items-center justify-between font-mono text-[9px] uppercase tracking-wider text-muted-foreground">
+            <div className="mb-1 flex items-center justify-between font-mono text-xs text-muted-foreground">
               <span>{g.label}</span>
               {!readOnly && (
                 <button
@@ -426,7 +426,7 @@ function VariablePanel({
                         setDrafting(null)
                       }
                     }}
-                    className="h-6 w-20 font-mono text-[11px]"
+                    className="h-6 w-20 font-mono text-[13px]"
                   />
                   <Input
                     placeholder="type"
@@ -434,7 +434,7 @@ function VariablePanel({
                     onChange={(e) =>
                       setDrafting({ ...drafting, type: e.target.value })
                     }
-                    className="h-6 w-16 font-mono text-[11px]"
+                    className="h-6 w-16 font-mono text-[13px]"
                   />
                 </li>
               )}
@@ -467,7 +467,7 @@ function VariableDetail({
   const v = prog.variables.find((x) => x.name === name)
   if (!v) return null
   return (
-    <div className="mt-2 space-y-1 rounded border border-highlight/30 bg-highlight/5 p-1.5 text-[10px]">
+    <div className="mt-2 space-y-1 rounded border border-highlight/30 bg-highlight/5 p-1.5 text-xs">
       <Row label="type">
         <Input
           value={v.type}
@@ -500,7 +500,7 @@ function Row({
 }) {
   return (
     <div className="flex items-center gap-1.5">
-      <span className="w-9 shrink-0 font-mono text-[9px] uppercase tracking-wider text-muted-foreground">
+      <span className="w-9 shrink-0 font-mono text-xs text-muted-foreground">
         {label}
       </span>
       <div className="flex-1">{children}</div>
@@ -799,7 +799,7 @@ function RungEditor({
             y={networkOutY + 4}
             className="fill-muted-foreground"
             fontSize="10"
-            fontFamily="ui-monospace, monospace"
+            fontFamily='"IBM Plex Mono", ui-monospace, monospace'
           >
             (no coil — add one →)
           </text>
@@ -852,7 +852,7 @@ function RungToolbar({
   return (
     <div
       className={cn(
-        "flex items-center gap-2 border-b border-border bg-muted/20 px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground",
+        "flex items-center gap-2 border-b border-border bg-muted/20 px-2 py-1 text-xs font-medium text-muted-foreground",
         hasError && "border-destructive/30 bg-destructive/5",
       )}
       onClick={onSelectRung}
@@ -1106,7 +1106,7 @@ function RenderNode(props: NodeRenderProps) {
             y={y + 12}
             className="fill-muted-foreground"
             fontSize="9"
-            fontFamily="ui-monospace, monospace"
+            fontFamily='"IBM Plex Mono", ui-monospace, monospace'
           >
             NOT
           </text>
@@ -1333,7 +1333,7 @@ function ContactGlyph({
         textAnchor="middle"
         className="fill-foreground"
         fontSize="10"
-        fontFamily="ui-monospace, monospace"
+        fontFamily='"IBM Plex Mono", ui-monospace, monospace'
       >
         {name}
       </text>
@@ -1406,7 +1406,7 @@ function ConstGlyph({
         textAnchor="middle"
         className="fill-muted-foreground"
         fontSize="9"
-        fontFamily="ui-monospace, monospace"
+        fontFamily='"IBM Plex Mono", ui-monospace, monospace'
       >
         {value ? "TRUE" : "FALSE"}
       </text>
@@ -1521,7 +1521,7 @@ function CompareGlyph({
         textAnchor="middle"
         className={labelClass}
         fontSize="10"
-        fontFamily="ui-monospace, monospace"
+        fontFamily='"IBM Plex Mono", ui-monospace, monospace'
       >
         {left}
       </text>
@@ -1531,7 +1531,7 @@ function CompareGlyph({
         textAnchor="middle"
         className={labelClass}
         fontSize="11"
-        fontFamily="ui-monospace, monospace"
+        fontFamily='"IBM Plex Mono", ui-monospace, monospace'
         fontWeight={700}
       >
         {cmp}
@@ -1542,7 +1542,7 @@ function CompareGlyph({
         textAnchor="middle"
         className={labelClass}
         fontSize="10"
-        fontFamily="ui-monospace, monospace"
+        fontFamily='"IBM Plex Mono", ui-monospace, monospace'
       >
         {right}
       </text>
@@ -1629,7 +1629,7 @@ function FbCallGlyph({
         textAnchor="middle"
         className="fill-foreground"
         fontSize="10"
-        fontFamily="ui-monospace, monospace"
+        fontFamily='"IBM Plex Mono", ui-monospace, monospace'
       >
         {instance}
       </text>
@@ -1670,7 +1670,7 @@ function FbCallGlyph({
         textAnchor="middle"
         className={labelClass}
         fontSize="13"
-        fontFamily="ui-monospace, monospace"
+        fontFamily='"IBM Plex Mono", ui-monospace, monospace'
         fontWeight={700}
       >
         {fbType}
@@ -1683,7 +1683,7 @@ function FbCallGlyph({
           textAnchor="end"
           className={labelClass}
           fontSize="9"
-          fontFamily="ui-monospace, monospace"
+          fontFamily='"IBM Plex Mono", ui-monospace, monospace'
         >
           .{outputPin}
         </text>
@@ -1756,7 +1756,7 @@ function CoilGlyph({
         textAnchor="middle"
         className="fill-foreground"
         fontSize="10"
-        fontFamily="ui-monospace, monospace"
+        fontFamily='"IBM Plex Mono", ui-monospace, monospace'
       >
         {coil.var}
       </text>
@@ -1781,7 +1781,7 @@ function CoilGlyph({
           textAnchor="middle"
           className={innerClass}
           fontSize="11"
-          fontFamily="ui-monospace, monospace"
+          fontFamily='"IBM Plex Mono", ui-monospace, monospace'
           fontWeight={600}
         >
           {inner}
@@ -2167,7 +2167,7 @@ function FbCallEditFields({
         return (
           <span key={pin.pin} className="inline-flex items-center gap-1">
             <span
-              className="font-mono text-[10px] text-muted-foreground"
+              className="font-mono text-xs text-muted-foreground"
               title={`${pin.doc} (${pin.type})`}
             >
               {pin.pin}:
@@ -2454,7 +2454,7 @@ function ToggleBtn({
       onClick={onClick}
       title={title}
       className={cn(
-        "inline-flex items-center gap-1 rounded px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider transition-colors",
+        "inline-flex items-center gap-1 rounded px-1.5 py-0.5 font-mono text-xs transition-colors",
         active
           ? "bg-highlight/15 text-highlight"
           : "text-muted-foreground hover:bg-accent/40 hover:text-foreground",
