@@ -75,17 +75,19 @@ fn cmd_agent_run(client: &Client, label: &str, cmd: Vec<String>) -> Result<i32> 
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    let status = child
-        .status()
-        .with_context(|| format!("spawning `{}`", cmd[0]))?;
+    let status = child.status();
 
     // Cleanup: stop the keeper, then close the session — even if the
-    // inner command crashed, so the overlay doesn't get stuck on.
+    // inner command crashed or could not be spawned (for example, bash
+    // is not installed on a Windows workstation), so the overlay clears.
     stop.store(true, Ordering::Relaxed);
     let _ = keeper.join();
     let _ = client.post("/api/agent/session/end", &serde_json::json!({ "id": id }));
 
-    Ok(status.code().unwrap_or(1))
+    Ok(status
+        .with_context(|| format!("spawning `{}`", cmd[0]))?
+        .code()
+        .unwrap_or(1))
 }
 
 /// Open a session on the server. Errors propagate so the caller can

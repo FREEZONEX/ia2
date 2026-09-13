@@ -14,13 +14,13 @@ Global flags (valid on every command):
 - `--json` — machine output. Commands whose output is inherently JSON
   (`get`, `api`, `runtime snapshot`, …) emit JSON regardless.
 
-Project selection over HTTP: the IDE sends UTF-8 percent-encoded
+Project selection over HTTP: the IDE and CLI send UTF-8 percent-encoded
 `X-IA2-Project` with `X-IA2-Project-Encoding: percent`, including for
 Chinese names. Raw HTTP clients can use the same pair. Without the
 encoding header, values remain literal (`a%20b` is that exact project
 name); malformed explicit encoding returns 400, never the active-project
-fallback. This CLI currently sends the literal `--project` value; it
-does not add the encoding marker.
+fallback. The CLI encodes `--project` names automatically, preserving
+Unicode and literal percent signs.
 
 Exit codes (uniform, enforced): `0` success · `1` problems in YOUR
 content (check diagnostics, failed probe, remote deploy failure, sim

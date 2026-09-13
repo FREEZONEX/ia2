@@ -591,12 +591,12 @@ pub struct CheckDiagnostic {
     /// Extra context fragments (e.g. `"variable=ghost"`). Comes from
     /// ironplc's `Diagnostic.described`. Empty for diagnostics without
     /// context (most syntax errors).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub context: Vec<String>,
     /// Secondary labels pointing at related source locations — the
     /// canonical "did you mean: counter?" / "first declared here"
     /// pattern. Empty for diagnostics without related info.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub related: Vec<DiagnosticRelated>,
     /// Embedded explanation from ironplc's problem-code documentation
     /// (RST body, title stripped). `None` if the code isn't in

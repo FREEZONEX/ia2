@@ -18,6 +18,7 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+percent-encoding.workspace = true
 anyhow = { workspace = true }
 # Sync HTTP client for the runtime debug subcommands. ureq is the
 # smallest mainstream option that doesn't drag tokio into the CLI's

@@ -179,7 +179,11 @@ impl Client {
             req = req.timeout(t);
         }
         if let Some(p) = &self.project {
-            req = req.set("X-IA2-Project", p);
+            let encoded =
+                percent_encoding::utf8_percent_encode(p, percent_encoding::NON_ALPHANUMERIC);
+            req = req
+                .set("X-IA2-Project", &encoded.to_string())
+                .set("X-IA2-Project-Encoding", "percent");
         }
         // Attribution convention (ADR-0002): mutating requests carry
         // their operator's origin so the server's takeover overlay and

@@ -38,6 +38,10 @@ What `cs agent run` does, in order:
 5. On exit — success, failure, **or Ctrl-C** — `POST /api/agent/session/end { id }`. Overlay drops.
 6. Exits with the inner command's exit code.
 
+If the inner command cannot start (for example, its executable is
+missing), `cs agent run` stops the heartbeat keeper and requests session
+closure before reporting the spawn error with exit code 3.
+
 Because `IA2_AGENT_SESSION` is in the child's env, every `cs` call inside the wrapped script attaches its heartbeats to *your* session instead of starting a competing transient one. No flicker, no races.
 
 ## Practical shape for heredocs inside `cs agent run`

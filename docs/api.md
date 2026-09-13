@@ -15,8 +15,8 @@ serves a smaller subset on its own port — see `docs/edge-deploy.md`.
 - All bodies are JSON unless noted. POU sources are `text/plain`.
 - Select an open project with `X-IA2-Project`. To send Unicode names,
   percent-encode the UTF-8 bytes and add `X-IA2-Project-Encoding: percent`
-  (for example, `demo%20line` selects `demo line`). The IDE applies this
-  encoding automatically. Without the encoding header, legacy values
+  (for example, `demo%20line` selects `demo line`). The IDE and CLI apply
+  this encoding automatically. Without the encoding header, legacy values
   remain literal: `a%20b` selects the name `a%20b`. Unsupported encodings
   and malformed encoded values return HTTP 400 instead of falling back
   to the active project.
@@ -151,6 +151,9 @@ or cached governance. Absent optional iomap/alarms files still mean none.
 | `PUT` | `/api/northbound` | Replace the northbound config. Body: `NorthboundConfig`. |
 
 ## Compile, run, observe
+
+Every `CheckDiagnostic` includes `context` and `related` arrays, even
+when empty, so clients can consume diagnostics without missing-field checks.
 
 | Method | Path | Purpose |
 |---|---|---|

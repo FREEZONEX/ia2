@@ -421,18 +421,24 @@ fn project_check_clean_exits_zero() {
 struct MockServer {
     addr: String,
     handle: Option<std::thread::JoinHandle<Vec<String>>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl MockServer {
     fn start(routes: Vec<(&'static str, &'static str, u16, String)>, max: usize) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = format!("http://{}", listener.local_addr().unwrap());
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_server = stop.clone();
         let handle = std::thread::spawn(move || {
             let mut seen = Vec::new();
             for _ in 0..max {
                 let Ok((mut stream, _)) = listener.accept() else {
                     break;
                 };
+                if stop_server.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
                 let mut buf = Vec::new();
                 let mut tmp = [0u8; 1024];
                 // Read until end of headers.
@@ -495,6 +501,7 @@ impl MockServer {
         MockServer {
             addr,
             handle: Some(handle),
+            stop,
         }
     }
 
@@ -502,9 +509,37 @@ impl MockServer {
     fn finish(mut self) -> Vec<String> {
         // Poke the listener so the accept loop can exit if it's still
         // waiting on an accept that will never come.
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = std::net::TcpStream::connect(self.addr.trim_start_matches("http://"));
         self.handle.take().unwrap().join().unwrap()
     }
+}
+
+#[test]
+fn agent_run_closes_session_when_command_cannot_start() {
+    let mock = MockServer::start(
+        vec![
+            ("POST", "/api/agent/session/start", 200, "{}".into()),
+            ("POST", "/api/agent/session/end", 200, "{}".into()),
+            ("POST", "/api/agent/heartbeat", 200, "{}".into()),
+        ],
+        8, // The heartbeat keeper may run before or after the failed spawn.
+    );
+    let missing = tempfile::tempdir().unwrap().path().join("missing-command");
+    cs().arg("--server")
+        .arg(&mock.addr)
+        .args(["agent", "run", "--label", "spawn failure", "--"])
+        .arg(missing)
+        .assert()
+        .code(3)
+        .stderr(contains("spawning"));
+    let seen = mock.finish();
+    assert!(seen
+        .iter()
+        .any(|r| r.starts_with("POST /api/agent/session/start ")));
+    assert!(seen
+        .iter()
+        .any(|r| r.starts_with("POST /api/agent/session/end ")));
 }
 
 #[test]
@@ -720,4 +755,28 @@ task = "t1"
     fs::create_dir(dir.path().join("edges")).unwrap();
     fs::write(dir.path().join("iomap.toml"), "[[mappings]]\n").unwrap();
     dir
+}
+
+#[test]
+fn project_flag_encodes_unicode_and_literal_percent_for_http_headers() {
+    let mock = MockServer::start(vec![("GET", "/api/project", 200, "{}".to_owned())], 1);
+    cs().arg("--server")
+        .arg(&mock.addr)
+        .arg("--project")
+        .arg("控制 %20")
+        .args(["get", "project"])
+        .assert()
+        .success();
+    let seen = mock.finish();
+    assert!(
+        seen.iter()
+            .any(|h| h.contains("%E6%8E%A7%E5%88%B6%20%2520")),
+        "{seen:?}"
+    );
+    assert!(
+        seen.iter().any(|h| h
+            .to_ascii_lowercase()
+            .contains("x-ia2-project-encoding: percent")),
+        "{seen:?}"
+    );
 }

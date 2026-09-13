@@ -172,7 +172,11 @@ Exit codes follow Unix and are enforced uniformly: `0` clean / `1` your
 content has problems (diagnostics, failed probe/deploy/sim) / `2` bad
 request — including HTTP 4xx, with the server's reason printed verbatim
 on stderr / `≥3` infrastructure. `--json`, `--server` and `--project`
-are global flags. Every command's `--help` explains when to call it and
+are global flags. `--project NAME` supports Unicode names and literal
+percent signs; the CLI encodes the HTTP project-selection headers.
+If the inner command cannot start, `cs agent run` requests session closure
+before reporting the spawn error with exit code 3.
+Every command's `--help` explains when to call it and
 what to call next — written for agent readers.
 
 ## Project on disk
