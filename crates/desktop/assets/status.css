@@ -1,0 +1,45 @@
+/* Self-contained: startup and backend errors must render without HTTP, fonts,
+   scripts or images being available. Match the workbench's Tier0 surfaces. */
+:root {
+  color-scheme: light;
+  --background: #fff;
+  --foreground: #050b14;
+  --chrome: #f9f9f9;
+  --secondary-text: #585c62;
+  --border: #ebebeb;
+}
+
+:root.dark {
+  color-scheme: dark;
+  --background: #151a19;
+  --foreground: #f9f9f9;
+  --chrome: #1c211f;
+  --secondary-text: #b5bab7;
+  --border: #343c38;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  min-height: 100%;
+  background: var(--background);
+  color: var(--foreground);
+  font: 14px/1.6 "IBM Plex Sans", "Segoe UI", "Microsoft YaHei", sans-serif;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  min-height: 48px;
+  padding: 8px 24px;
+  background: var(--chrome);
+  border-bottom: 1px solid var(--border);
+}
+
+strong { font-size: 16px; font-weight: 500; }
+header span { color: var(--secondary-text); font-size: 12px; }
+main { width: min(100%, 720px); margin: 64px auto; padding: 0 24px; }
+h1 { margin: 0 0 16px; font-size: 24px; line-height: 1.4; font-weight: 500; }
+p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--secondary-text); }

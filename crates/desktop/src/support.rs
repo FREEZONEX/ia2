@@ -125,6 +125,49 @@ pub fn external_url(candidate: &str) -> bool {
     })
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum DesktopTheme {
+    #[default]
+    Light,
+    Dark,
+}
+
+impl DesktopTheme {
+    pub fn background(self) -> (u8, u8, u8, u8) {
+        // Match the workbench content surface, including unpainted navigation
+        // and resize frames. Native window decorations remain OS-rendered.
+        match self {
+            Self::Light => (255, 255, 255, 255),
+            Self::Dark => (21, 26, 25, 255),
+        }
+    }
+
+    fn class(self) -> &'static str {
+        match self {
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+enum PageMessage {
+    #[serde(rename = "ia2-theme")]
+    Theme { theme: DesktopTheme },
+}
+
+/// The page can select only the two built-in visual themes. This bridge has
+/// no controller, filesystem, navigation, or arbitrary native-command access.
+pub fn page_theme(origin: &Origin, source: &str, body: &str) -> Option<DesktopTheme> {
+    if !origin.allows(source) || body.len() > 128 {
+        return None;
+    }
+    let PageMessage::Theme { theme } = serde_json::from_str(body).ok()?;
+    Some(theme)
+}
+
 #[derive(Deserialize)]
 struct Ready {
     url: String,
@@ -199,8 +242,14 @@ pub fn escaped(value: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-pub fn status_page(title: &str, detail: &str) -> String {
-    format!("<!doctype html><html lang=\"zh-CN\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>IA2</title><style>body{{margin:0;background:#14181c;color:#e8eeeb;font:16px 'Segoe UI',sans-serif;display:grid;min-height:100vh;place-content:center}}main{{max-width:680px;padding:48px}}b{{font-size:48px;color:#1fbe6c}}h1{{font-size:24px}}p{{line-height:1.7;white-space:pre-wrap;overflow-wrap:anywhere;color:#b8c8bf}}</style><main><b>IA2</b><h1>{}</h1><p>{}</p></main></html>", escaped(title), escaped(detail))
+pub fn status_page(title: &str, detail: &str, theme: DesktopTheme) -> String {
+    format!(
+        "<!doctype html><html lang=\"zh-CN\" class=\"{}\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>IA2</title><style>{}</style></head><body><header><strong>IA2</strong><span>工业自动化工作区</span></header><main><h1>{}</h1><p>{}</p></main></body></html>",
+        theme.class(),
+        include_str!("../assets/status.css"),
+        escaped(title),
+        escaped(detail)
+    )
 }
 
 #[derive(Serialize, Deserialize)]
@@ -452,9 +501,50 @@ mod tests {
     }
     #[test]
     fn startup_errors_are_html_escaped() {
-        let html = status_page("<bad>", "<script>alert('x')</script>");
+        let html = status_page("<bad>", "<script>alert('x')</script>", DesktopTheme::Light);
         assert!(!html.contains("<script>"));
         assert!(html.contains("&lt;script&gt;"));
+    }
+    #[test]
+    fn theme_messages_accept_only_owned_pages_and_known_themes() {
+        let origin = Origin::new(3001);
+        for source in [
+            "http://127.0.0.1:3001/",
+            "http://127.0.0.1:3001/hmi.html?project=test",
+        ] {
+            for (name, theme) in [("light", DesktopTheme::Light), ("dark", DesktopTheme::Dark)] {
+                let body = format!(r#"{{"type":"ia2-theme","theme":"{name}"}}"#);
+                assert_eq!(page_theme(&origin, source, &body), Some(theme));
+            }
+        }
+        let body = r#"{"type":"ia2-theme","theme":"dark"}"#;
+        for source in [
+            "https://example.com/",
+            "http://127.0.0.1:3301/",
+            "http://localhost:3001/",
+            "https://127.0.0.1:3001/",
+            "http://user@127.0.0.1:3001/",
+            "about:blank",
+            "null",
+        ] {
+            assert_eq!(page_theme(&origin, source, body), None, "{source}");
+        }
+    }
+    #[test]
+    fn theme_messages_cannot_supply_colors_or_native_commands() {
+        let origin = Origin::new(3001);
+        for body in [
+            r#"{"type":"ia2-theme","theme":"system"}"#,
+            r##"{"type":"ia2-theme","theme":"#fff"}"##,
+            r##"{"type":"ia2-theme","theme":"dark","color":"#fff"}"##,
+            r#"{"type":"shutdown","theme":"dark"}"#,
+            r#"{"theme":"dark"}"#,
+            r#"{"type":"ia2-theme","theme":true}"#,
+            "{",
+        ] {
+            assert_eq!(page_theme(&origin, origin.url(), body), None, "{body}");
+        }
+        assert_eq!(page_theme(&origin, origin.url(), &" ".repeat(129)), None);
     }
     #[test]
     fn shutdown_request_does_not_follow_redirects() {

@@ -15,7 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget};
-use tao::window::{Icon, Window, WindowBuilder};
+use tao::window::{Icon, Theme, Window, WindowBuilder, WindowId};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{TrayIconBuilder, TrayIconEvent};
 use windows_sys::Win32::Foundation::{
@@ -32,7 +32,10 @@ use windows_sys::Win32::UI::Shell::{SetCurrentProcessExplicitAppUserModelID, She
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     MessageBoxW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, SW_SHOWNORMAL,
 };
-use wry::{NewWindowResponse, PermissionResponse, WebContext, WebView, WebViewBuilder};
+use wry::{
+    NewWindowResponse, PermissionResponse, WebContext, WebView, WebViewBuilder,
+    WebViewBuilderExtWindows, WebViewExtWindows,
+};
 
 const RGBA: &[u8] = include_bytes!("../assets/ia2.rgba");
 
@@ -357,6 +360,7 @@ enum DesktopEvent {
     Activate,
     OpenWindow(String),
     External(String),
+    Theme(WindowId, DesktopTheme),
     BackendReady(Result<Backend, String>),
     Exit(Option<String>),
     ShutdownCommand,
@@ -367,6 +371,27 @@ struct View {
     // WebView must be released before its parent native window.
     webview: WebView,
     window: Window,
+    theme: DesktopTheme,
+}
+
+impl View {
+    fn set_theme(&mut self, theme: DesktopTheme) -> Result<(), wry::Error> {
+        self.theme = theme;
+        let (native, browser) = match theme {
+            DesktopTheme::Light => (Theme::Light, wry::Theme::Light),
+            DesktopTheme::Dark => (Theme::Dark, wry::Theme::Dark),
+        };
+        self.window.set_theme(Some(native));
+        self.window.set_background_color(Some(theme.background()));
+        self.webview.set_background_color(theme.background())?;
+        self.webview.set_theme(browser)
+    }
+
+    fn status(&self, title: &str, detail: &str) {
+        let _ = self
+            .webview
+            .load_html(&status_page(title, detail, self.theme));
+    }
 }
 
 fn make_view(
@@ -378,6 +403,8 @@ fn make_view(
 ) -> Result<View, String> {
     let window = WindowBuilder::new()
         .with_title("IA2")
+        .with_theme(Some(Theme::Light))
+        .with_background_color(DesktopTheme::Light.background())
         .with_inner_size(tao::dpi::LogicalSize::new(1360., 900.))
         .with_min_inner_size(tao::dpi::LogicalSize::new(960., 600.))
         .with_window_icon(Some(
@@ -389,9 +416,21 @@ fn make_view(
     let navigation_origin = origin.clone();
     let navigation_proxy = proxy.clone();
     let popup_origin = origin.clone();
+    let theme_origin = origin.clone();
+    let theme_proxy = proxy.clone();
+    let window_id = window.id();
     let builder = WebViewBuilder::new_with_web_context(context)
         .with_focused(false)
-        .with_background_color((20, 24, 28, 255))
+        .with_background_color(DesktopTheme::Light.background())
+        .with_theme(wry::Theme::Light)
+        .with_initialization_script(include_str!("../assets/theme.js"))
+        .with_ipc_handler(move |request| {
+            if let Some(theme) =
+                page_theme(&theme_origin, &request.uri().to_string(), request.body())
+            {
+                let _ = theme_proxy.send_event(DesktopEvent::Theme(window_id, theme));
+            }
+        })
         .with_devtools(cfg!(debug_assertions))
         .with_clipboard(true)
         .with_permission_handler(|_| PermissionResponse::Deny)
@@ -418,6 +457,7 @@ fn make_view(
         builder.with_html(status_page(
             "正在启动",
             "正在准备本机控制器和工作区。\n关闭窗口后，后台将继续运行；可从系统托盘重新打开 IA2。",
+            DesktopTheme::Light,
         ))
     };
     let webview = builder
@@ -425,7 +465,11 @@ fn make_view(
         .map_err(|e| format!("WebView2 窗口初始化失败：{e}"))?;
     window.set_visible(true);
     window.set_focus();
-    Ok(View { webview, window })
+    Ok(View {
+        webview,
+        window,
+        theme: DesktopTheme::Light,
+    })
 }
 
 fn show(view: &View) {
@@ -559,13 +603,20 @@ fn launch(executable: PathBuf, data: PathBuf, port: u16) -> Result<(), String> {
                 }
             }
             Event::UserEvent(DesktopEvent::External(url)) => external(&url),
+            Event::UserEvent(DesktopEvent::Theme(window_id, theme)) => {
+                if let Some(view) = views.get_mut(&window_id) {
+                    if let Err(error) = view.set_theme(theme) {
+                        append_log(&data.join("logs/desktop.log"), &format!("Cannot update desktop theme: {error}"));
+                    }
+                }
+            }
             Event::UserEvent(DesktopEvent::BackendReady(result)) => {
                 startup_pending = false;
                 match result {
                     Ok(mut ready) => {
                         if let Some(view) = views.get(&primary_id) {
                             if let Some(error) = ready.startup_error.take() {
-                                let _ = view.webview.load_html(&status_page("后台未能启动", &error));
+                                view.status("后台未能启动", &error);
                                 show(view);
                                 message(&error, true);
                             } else if let Err(error) = view.webview.load_url(ready.origin.url()) { message(&format!("无法打开工作区：{error}"), true); }
@@ -573,7 +624,7 @@ fn launch(executable: PathBuf, data: PathBuf, port: u16) -> Result<(), String> {
                         backend = Some(ready);
                     }
                     Err(error) => {
-                        if let Some(view) = views.get(&primary_id) { let _ = view.webview.load_html(&status_page("后台未能启动", &error)); show(view); }
+                        if let Some(view) = views.get(&primary_id) { view.status("后台未能启动", &error); show(view); }
                         message(&error, true);
                     }
                 }
@@ -633,7 +684,7 @@ fn launch(executable: PathBuf, data: PathBuf, port: u16) -> Result<(), String> {
                             *control = ControlFlow::Exit;
                         } else {
                             let error = format!("后台已退出（{status}）。请检查设备状态。\n日志：{}\n请从托盘退出 IA2 后重新打开。", active.log.display());
-                            for view in views.values() { let _ = view.webview.load_html(&status_page("后台连接已中断", &error)); }
+                            for view in views.values() { view.status("后台连接已中断", &error); }
                             if let Some(view) = views.get(&primary_id) { show(view); }
                             message(&error, true);
                         }

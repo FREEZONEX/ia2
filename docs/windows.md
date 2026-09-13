@@ -122,6 +122,11 @@ shown rather than treated as a successful launch. The existing
 `IA2.ps1 -Port <port>` entry also starts the native app;
 `IA2.ps1 -Terminal` opens only the CLI environment.
 
+The standard Windows title bar, resize border, Snap and per-monitor DPI
+remain native. The title bar and WebView background follow the workbench's
+light/dark choice; the default is light regardless of the OS theme.
+Startup and connection-error pages render locally without network assets.
+
 **Closing the window hides IA2 to the notification-area tray; the server
 and a running program continue.** Use the tray's Open command to return.
 The tray's Exit command requests shutdown of the server owned by this
@@ -245,7 +250,10 @@ HMI load and live data in the native window. Check tray hide/reopen,
 refusal to exit while a program runs, then confirmed process shutdown
 after the program stops. Launch again through the desktop/Start menu
 shortcut and check data persistence and frontend errors. Source tests do
-not replace installed-artifact checks. Report
+not replace installed-artifact checks. Check light/dark theme changes,
+including light IA2 on a dark Windows desktop, maximization/restore/Snap,
+and supported monitor scaling: there should be no exposed dark strip or
+unpainted client area. Report
 physical serial/network integration and Linux edge deployment with their
 own evidence.
 
