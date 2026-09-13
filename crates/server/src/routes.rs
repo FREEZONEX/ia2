@@ -491,20 +491,30 @@ pub async fn close_project(
     State(state): State<AppState>,
     project: ProjectName,
 ) -> Result<Json<RunResponse>, ApiError> {
+    crate::desktop::complete_transition(close_project_inner(state, project)).await?
+}
+
+async fn close_project_inner(
+    state: AppState,
+    project: ProjectName,
+) -> Result<Json<RunResponse>, ApiError> {
+    let _transition = state.desktop.begin_run().await?;
     // Resolve which project to close — either the named one in the
     // header or the active fallback. Errors out (NoProject) if no
     // project is open. After resolving, stop the runtime if it
     // belongs to that project.
     let target = resolve_project_name(&state, &project)?;
-    {
+    let stopped = {
         let mut prog = state.program.lock();
-        if let Some(rp) = prog.as_ref() {
-            if rp.project_name == target {
-                if let Some(rp) = prog.take() {
-                    rp.handle.stop();
-                }
-            }
+        if prog.as_ref().is_some_and(|rp| rp.project_name == target) {
+            prog.take()
+        } else {
+            None
         }
+    };
+    let stopped_target = stopped.is_some();
+    if let Some(rp) = stopped {
+        rp.handle.shutdown().await;
     }
     // Tear down any ssh tunnels attached to this project's edges.
     state.attachments.detach_all_for_project(&target);
@@ -516,13 +526,7 @@ pub async fn close_project(
     // Wipe runtime caches if the program we stopped belonged to this
     // project — otherwise leave them so the other window can still
     // see its own values.
-    let running_for_target = state
-        .program
-        .lock()
-        .as_ref()
-        .map(|rp| rp.project_name.clone())
-        == Some(target.clone());
-    if running_for_target {
+    if stopped_target {
         *state.last_snapshot.lock() = None;
         *state.last_error.lock() = None;
         *state.running_info.lock() = None;
@@ -2189,6 +2193,18 @@ pub async fn run(
     headers: axum::http::HeaderMap,
     body: Option<Json<RunRequest>>,
 ) -> Result<Json<RunResponse>, ApiError> {
+    crate::desktop::complete_transition(run_inner(state, project, headers, body)).await?
+}
+
+async fn run_inner(
+    state: AppState,
+    project: ProjectName,
+    headers: axum::http::HeaderMap,
+    body: Option<Json<RunRequest>>,
+) -> Result<Json<RunResponse>, ApiError> {
+    // Keep compilation, old-run teardown and new-run registration atomic
+    // with respect to desktop exit (and another concurrent Run).
+    let _transition = state.desktop.begin_run().await?;
     let req = body.map(|Json(b)| b).unwrap_or_default();
     // Starting a program IS driving the plant — an unattributed run
     // flashes the takeover overlay like any other mutating route.
@@ -2310,11 +2326,9 @@ pub async fn run(
         .await
         .map_err(|e| ApiError::Internal(format!("compile task failed: {e}")))??;
 
-    {
-        let mut guard = state.program.lock();
-        if let Some(old) = guard.take() {
-            old.handle.stop();
-        }
+    let old = state.program.lock().take();
+    if let Some(old) = old {
+        old.handle.shutdown().await;
     }
 
     // Rebuild the alarm engine from this project's alarms.toml — the
@@ -2379,19 +2393,7 @@ pub async fn run(
         // and emit Error + Stopped so /api/runtime/status and SSE watchers
         // see the fault instead of a forever-stale "running".
         if let Some(msg) = fault_handle.fault() {
-            *fault_state.last_error.lock() = Some(msg.clone());
-            {
-                let mut guard = fault_state.program.lock();
-                if guard
-                    .as_ref()
-                    .is_some_and(|rp| rp.handle.same_run(&fault_handle))
-                {
-                    guard.take();
-                    *fault_state.running_info.lock() = None;
-                }
-            }
-            let _ = fault_state.event_tx.send(AppEvent::Error(msg));
-            let _ = fault_state.event_tx.send(AppEvent::Stopped);
+            finish_faulted_run(&fault_state, &fault_handle, msg).await;
         }
     });
 
@@ -2433,10 +2435,35 @@ pub async fn run(
     Ok(Json(RunResponse { ok: true }))
 }
 
+pub(crate) async fn finish_faulted_run(
+    state: &AppState,
+    handle: &ironplc_bridge::ProgramHandle,
+    message: String,
+) {
+    let _transition = state.desktop.transition.lock().await;
+    handle.shutdown().await;
+    let mut current = state.program.lock();
+    if current
+        .as_ref()
+        .is_some_and(|rp| rp.handle.same_run(handle))
+    {
+        current.take();
+        *state.last_error.lock() = Some(message.clone());
+        *state.running_info.lock() = None;
+        let _ = state.event_tx.send(AppEvent::Error(message));
+        let _ = state.event_tx.send(AppEvent::Stopped);
+    }
+}
+
 pub async fn stop(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
-) -> Json<RunResponse> {
+) -> Result<Json<RunResponse>, ApiError> {
+    crate::desktop::complete_transition(stop_inner(state, headers)).await
+}
+
+async fn stop_inner(state: AppState, headers: axum::http::HeaderMap) -> Json<RunResponse> {
+    let _transition = state.desktop.transition.lock().await;
     // Global stop — only one program can be running at a time
     // (hardware constraint), so a single `/api/stop` always targets
     // it regardless of which window the request came from.
@@ -2444,8 +2471,9 @@ pub async fn stop(
         crate::runtime_routes::origin_of(&headers).as_deref(),
         "stop".into(),
     );
-    if let Some(rp) = state.program.lock().take() {
-        rp.handle.stop();
+    let stopped = state.program.lock().take();
+    if let Some(rp) = stopped {
+        rp.handle.shutdown().await;
     }
     *state.running_info.lock() = None;
     let _ = state.event_tx.send(AppEvent::Stopped);
@@ -2626,7 +2654,12 @@ fn lsp_launcher_path() -> PathBuf {
 
 async fn handle_lsp_ws(mut socket: WebSocket) {
     let cmd = lsp_launcher_path();
-    let mut child = match Command::new(&cmd)
+    let mut command = Command::new(&cmd);
+    // The desktop backend has no console. Its stdio-only language server
+    // must not allocate a new visible console when an editor is opened.
+    #[cfg(windows)]
+    command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    let mut child = match command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

@@ -99,7 +99,7 @@ try {
     $result.package_sha256 = $hash
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     [IO.Compression.ZipFile]::ExtractToDirectory($PackagePath, $extracted)
-    $required = @('windows-package.json', 'scripts\install-skill.ps1', '.claude\skills\industrial-automation-skill\SKILL.md',
+    $required = @('windows-package.json', 'scripts\install-skill.ps1', 'bin\IA2.exe', 'bin\cs.exe', 'bin\ia2-server.exe', 'bin\ia2-runtime.exe', 'bin\lsp-launcher.exe', '.claude\skills\industrial-automation-skill\SKILL.md',
         '.claude\skills\industrial-automation-skill\references\02-cli-reference.md', 'web\index.html', 'web\hmi.html')
     foreach ($path in $required) {
         if (-not (Test-Path -LiteralPath (Join-Path $extracted $path))) { throw "ZIP omitted required artifact: $path" }
@@ -135,6 +135,18 @@ try {
         Invoke-Native $cs @('--version')
         Invoke-Native $serverPath @('--help')
         Invoke-Native (Join-Path $install 'bin\ia2-runtime.exe') @('--help')
+        # Wait explicitly for a GUI executable; & is not a reliable exit-code
+        # check in PowerShell. This mode starts no desktop window or server.
+        $checkOutput = Join-Path $ArtifactsDirectory 'desktop-runtime.stdout.json'
+        $checkError = Join-Path $ArtifactsDirectory 'desktop-runtime.stderr.log'
+        $desktopCheck = Start-Process -FilePath (Join-Path $install 'bin\IA2.exe') -ArgumentList '--check-runtime' -WorkingDirectory $working -PassThru -Wait `
+            -RedirectStandardOutput $checkOutput -RedirectStandardError $checkError
+        try {
+            if ($desktopCheck.ExitCode -ne 0) { throw "Installed desktop prerequisite check failed (exit $($desktopCheck.ExitCode)); inspect desktop-runtime.stderr.log." }
+            $runtimeCheck = Get-Content -LiteralPath $checkOutput -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($runtimeCheck.ok -ne $true -or [string]::IsNullOrWhiteSpace($runtimeCheck.webview2_version)) { throw 'Installed desktop did not confirm its WebView2 Runtime.' }
+            $result.desktop_runtime = $runtimeCheck
+        } finally { $desktopCheck.Dispose() }
         $listener = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0)
         $listener.Start()
         $port = $listener.LocalEndpoint.Port

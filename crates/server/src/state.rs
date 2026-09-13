@@ -183,6 +183,7 @@ pub struct AgentSession {
 #[derive(Clone)]
 pub struct AppState {
     pub start_time: Instant,
+    pub desktop: Arc<crate::desktop::DesktopLifecycle>,
     /// All currently-open projects, plus which one is the implicit
     /// target for requests that don't supply `X-IA2-Project`.
     pub projects: Arc<Mutex<ProjectRegistry>>,
@@ -278,6 +279,7 @@ impl AppState {
         let (event_tx, _) = broadcast::channel(256);
         Self {
             start_time: Instant::now(),
+            desktop: Arc::new(crate::desktop::DesktopLifecycle::new(None)),
             projects: Arc::new(Mutex::new(ProjectRegistry::default())),
             program: Arc::new(Mutex::new(None)),
             event_tx,

@@ -1,4 +1,5 @@
 mod catalog;
+mod desktop;
 mod edges;
 mod error;
 mod events;
@@ -32,10 +33,8 @@ use crate::state::AppState;
 /// slave entirely (useful when port 5502 is taken by something else).
 const DEFAULT_DEMO_MODBUS_ADDR: &str = "127.0.0.1:5502";
 
-/// Default bind for the HTTP server. `127.0.0.1:0` means "pick any free
-/// port" — which is what the desktop shell uses so we never collide with
-/// whatever else the user has running. The legacy `:3001` default lives
-/// in dev scripts that the Vite proxy points at.
+/// Shared default for the desktop, CLI and Vite proxy. An explicit
+/// `127.0.0.1:0` is available for isolated tests.
 const DEFAULT_BIND: &str = "127.0.0.1:3001";
 
 /// CLI flags for the long-lived HTTP backend. Deliberately tiny — every
@@ -138,12 +137,13 @@ async fn main() -> anyhow::Result<()> {
              --library-dir or IA2_LIBRARY_DIR (`cs library import` will 404)"
         ),
     }
-    let state = AppState::new(
+    let mut state = AppState::new(
         demo_slave.clone(),
         demo_addr.clone(),
         library_dir,
         cli.static_dir.clone(),
     );
+    state.desktop = std::sync::Arc::new(desktop::DesktopLifecycle::from_environment()?);
     try_open_last_project(&state);
 
     if !demo_addr.is_empty() {
@@ -166,6 +166,7 @@ async fn main() -> anyhow::Result<()> {
     let mut app = Router::new()
         .route("/health", get(routes::health))
         .route("/api/health", get(routes::api_health))
+        .route("/api/desktop/shutdown", post(desktop::shutdown))
         // Project lifecycle
         .route(
             "/api/projects",
@@ -429,6 +430,7 @@ async fn main() -> anyhow::Result<()> {
     // tokio task and only ever reads agent.lock() — sharing the
     // same Arc<Mutex<...>> with the request handlers is correct.
     let state_for_watchdog = state.clone();
+    let desktop = state.desktop.clone();
 
     let app = app
         .layer(CorsLayer::permissive())
@@ -439,16 +441,32 @@ async fn main() -> anyhow::Result<()> {
         .bind
         .parse()
         .map_err(|e| anyhow::anyhow!("--bind {:?} is not a SocketAddr: {e}", cli.bind))?;
+    if desktop.enabled() && !bind_addr.ip().is_loopback() {
+        anyhow::bail!("desktop backend must bind to a loopback address");
+    }
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     let local = listener.local_addr()?;
     tracing::info!(addr = %local, "server listening");
+    desktop.announce_ready(local)?;
     // Agent-activity watchdog: every 500 ms, check whether the last
     // CLI heartbeat aged out past the TTL; if so, flip `active=false`
     // and emit an AgentActivity event so the IDE drops its takeover
     // overlay. Cheap (one mutex peek + maybe one broadcast send).
     tokio::spawn(agent_watchdog(state_for_watchdog));
 
-    axum::serve(listener, app).await?;
+    // Long-lived SSE/WebSocket connections must not keep an idle desktop
+    // backend alive forever. Shutdown has already excluded every running
+    // or starting PLC before this bounded connection drain begins.
+    let drain = desktop.clone();
+    let serving = axum::serve(listener, app)
+        .with_graceful_shutdown(async move { drain.wait_for_shutdown().await });
+    tokio::select! {
+        result = serving => result?,
+        () = async {
+            desktop.wait_for_shutdown().await;
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        } => {},
+    }
     Ok(())
 }
 

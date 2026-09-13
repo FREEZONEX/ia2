@@ -40,7 +40,7 @@ grep -Fq 'default_prompt: "Use $industrial-automation-skill' "$SKILL_SRC/agents/
 [ -f "$SKILL_SRC/checklists/offline-readiness.md" ] || fail "offline readiness checklist is missing"
 pass "skill metadata and offline handoff are present"
 
-for windows_file in scripts/install-skill.ps1 scripts/build-windows.ps1 scripts/check-windows.ps1 scripts/package-windows.ps1 docs/windows.md; do
+for windows_file in scripts/install-skill.ps1 scripts/build-windows.ps1 scripts/check-windows.ps1 scripts/package-windows.ps1 docs/windows.md crates/desktop/Cargo.toml; do
   [ -s "$REPO_ROOT/$windows_file" ] || fail "Windows onboarding file missing: $windows_file"
 done
 grep -Fq 'scripts/check-windows.ps1' "$REPO_ROOT/AGENTS.md" \
@@ -50,6 +50,10 @@ grep -Fq 'scripts/install-skill.ps1' "$REPO_ROOT/README.md" \
 grep -Fq 'Windows' "$SKILL_SRC/checklists/first-contact.md" \
   || fail "first contact must explain Windows discovery"
 pass "Windows installer, packaging, quality gate and onboarding are present (native checks run on Windows)"
+grep -Fq 'IA2.exe' "$SKILL_SRC/SKILL.md" \
+  || fail "Windows skill must document the native desktop entry"
+grep -Fq '/api/desktop/shutdown' "$REPO_ROOT/docs/api.md" \
+  || fail "Desktop lifecycle endpoint must be documented"
 
 bash -n "$REPO_ROOT/scripts/install-skill.sh"
 tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/ia2-agent-adaptation.XXXXXX")"

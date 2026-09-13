@@ -1,0 +1,30 @@
+[package]
+name = "ia2-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "IA2"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+url = "2"
+
+[target.'cfg(windows)'.dependencies]
+# Keep the checked-in proc-macro-crate 2.0.0 lock resolution: tao's
+# unused Unix GTK metadata otherwise constrains the workspace TOML parser.
+tao = "0.37.0"
+wry = { version = "0.57.0", default-features = false, features = ["os-webview"] }
+tray-icon = { version = "0.25.0", default-features = false }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_System_Threading", "Win32_System_Console", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell"] }
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1.31"
+
+[dev-dependencies]
+tempfile = "3"

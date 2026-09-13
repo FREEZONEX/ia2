@@ -1,6 +1,6 @@
 #requires -Version 5.1
 <#
-Windows per-user installer for IA2 and industrial-automation-skill.
+Windows per-user installer for native IA2.exe and industrial-automation-skill.
 Run from a source checkout, or from an extracted package-windows.ps1 ZIP.
 No elevation, symlinks, PATH/profile edits, or Windows service are required.
 For macOS/Linux use install-skill.sh; agent discovery is checked by
@@ -100,9 +100,9 @@ if (-not $SkillOnly) {
         }
     }
     # Moving a running Windows executable fails; report before changing skills.
-    foreach ($process in @(Get-Process ia2-server,cs,ia2-runtime,lsp-launcher -ErrorAction SilentlyContinue)) {
+    foreach ($process in @(Get-Process IA2,ia2-server,cs,ia2-runtime,lsp-launcher -ErrorAction SilentlyContinue)) {
         if ($process.Path -and $process.Path.StartsWith([IO.Path]::GetFullPath($InstallRoot).TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {
-            throw "Close installed IA2 processes before upgrading (PID $($process.Id)): $($process.Path)"
+            throw "Close installed IA2 processes before upgrading (PID $($process.Id)): $($process.Path). Closing the desktop window only hides it; use the IA2 tray Exit command after stopping any running program yourself."
         }
     }
     if (-not $SkipBuild -and -not $IsPackage) {
@@ -117,7 +117,7 @@ if (-not $SkillOnly) {
     }
     $BinarySource = if ($IsPackage) { Join-Path $SourceRoot 'bin' } else { Join-Path $SourceRoot 'target\x86_64-pc-windows-msvc\release' }
     $WebSource = if ($IsPackage) { Join-Path $SourceRoot 'web' } else { Join-Path $SourceRoot 'apps\web\dist' }
-    $BinaryNames = [ordered]@{ 'cs.exe' = 'cs.exe'; 'server.exe' = 'ia2-server.exe'; 'lsp-launcher.exe' = 'lsp-launcher.exe'; 'ia2-runtime.exe' = 'ia2-runtime.exe' }
+    $BinaryNames = [ordered]@{ 'IA2.exe' = 'IA2.exe'; 'cs.exe' = 'cs.exe'; 'server.exe' = 'ia2-server.exe'; 'lsp-launcher.exe' = 'lsp-launcher.exe'; 'ia2-runtime.exe' = 'ia2-runtime.exe' }
     foreach ($name in $BinaryNames.Keys) {
         $inputName = if ($IsPackage) { $BinaryNames[$name] } else { $name }
         if (-not (Test-Path -LiteralPath (Join-Path $BinarySource $inputName))) { throw "Required binary missing: $inputName in $BinarySource" }
@@ -164,22 +164,37 @@ if ($Terminal) {
     Write-Host ('Start the IDE in another window with: & "' + (Join-Path $PSScriptRoot 'IA2.ps1') + '"')
     return
 }
-Write-Host "IA2 IDE: http://127.0.0.1:$Port"
-Write-Host 'Keep this window open. Ctrl+C stops this server; closing only the browser does not stop it.'
-Write-Host 'Open the URL after the server prints its listening address. Startup errors remain visible below.'
-$server = Join-Path $PSScriptRoot 'bin\ia2-server.exe'
-Get-Command -Name $server -ErrorAction Stop | Out-Null
-try {
-    $ErrorActionPreference = 'Continue'
-    & $server --bind "127.0.0.1:$Port" --static-dir (Join-Path $PSScriptRoot 'web') --library-dir $env:IA2_LIBRARY_DIR
-    $nativeExit = $LASTEXITCODE
-} finally { $ErrorActionPreference = 'Stop' }
-if ($nativeExit -ne 0) { throw "IA2 server exited with code $nativeExit" }
+$desktop = Join-Path $PSScriptRoot 'bin\IA2.exe'
+Get-Command -Name $desktop -ErrorAction Stop | Out-Null
+Start-Process -FilePath $desktop -ArgumentList @('--port', $Port) -WorkingDirectory $env:USERPROFILE
 '@
         Set-Content -LiteralPath (Join-Path $appStage 'IA2.ps1') -Value $launcher -Encoding UTF8
         Invoke-Native (Join-Path $appStage 'bin\cs.exe') @('--version')
         Invoke-Native (Join-Path $appStage 'bin\ia2-server.exe') @('--help')
         Invoke-Native (Join-Path $appStage 'bin\ia2-runtime.exe') @('--help')
+        # IA2.exe is a GUI-subsystem executable. PowerShell's & operator may
+        # return before it exits, so explicitly wait and inspect its exit code.
+        # The check opens no window/server and must pass before replacing the app.
+        $checkOutput = [IO.Path]::GetTempFileName()
+        $checkError = [IO.Path]::GetTempFileName()
+        $check = $null
+        try {
+            $check = Start-Process -FilePath (Join-Path $appStage 'bin\IA2.exe') -ArgumentList '--check-runtime' -PassThru -Wait `
+                -RedirectStandardOutput $checkOutput -RedirectStandardError $checkError
+            $outputText = Get-Content -LiteralPath $checkOutput -Raw -Encoding UTF8
+            $errorText = Get-Content -LiteralPath $checkError -Raw -Encoding UTF8
+            if ($check.ExitCode -ne 0) {
+                throw "IA2 desktop prerequisite check failed (exit $($check.ExitCode)): $errorText $outputText Install Microsoft Edge WebView2 Evergreen Runtime from https://developer.microsoft.com/microsoft-edge/webview2/ and retry."
+            }
+            $runtimeCheck = $outputText | ConvertFrom-Json
+            if ($runtimeCheck.ok -ne $true -or [string]::IsNullOrWhiteSpace($runtimeCheck.webview2_version)) {
+                throw 'IA2 desktop prerequisite check did not confirm a WebView2 Runtime.'
+            }
+            Write-Host "WebView2 Runtime: $($runtimeCheck.webview2_version)"
+        } finally {
+            if ($null -ne $check) { $check.Dispose() }
+            Remove-Item -LiteralPath $checkOutput, $checkError -Force
+        }
         Install-Tree $appStage $InstallRoot
     }
     for ($i = 0; $i -lt $SkillTargets.Count; $i++) { Install-Tree $skillStages[$i] $SkillTargets[$i] }
@@ -187,14 +202,20 @@ if ($nativeExit -ne 0) { throw "IA2 server exited with code $nativeExit" }
         $menu = Join-Path ([Environment]::GetFolderPath('Programs')) 'IA2'
         New-Item -ItemType Directory -Force -Path $menu | Out-Null
         $shell = New-Object -ComObject WScript.Shell
-        foreach ($name in @('IA2 IDE', 'IA2 Terminal')) {
-            $link = $shell.CreateShortcut((Join-Path $menu "$name.lnk"))
-            $link.TargetPath = Join-Path $PSHOME 'powershell.exe'
-            $link.Arguments = '-NoProfile -NoExit -ExecutionPolicy Bypass -File "' + (Join-Path ([IO.Path]::GetFullPath($InstallRoot)) 'IA2.ps1') + '"'
-            if ($name -eq 'IA2 Terminal') { $link.Arguments += ' -Terminal' }
+        $desktopDirectory = [Environment]::GetFolderPath('DesktopDirectory')
+        foreach ($path in @((Join-Path $menu 'IA2 IDE.lnk'), (Join-Path $desktopDirectory 'IA2 IDE.lnk'))) {
+            $link = $shell.CreateShortcut($path)
+            $link.TargetPath = Join-Path $InstallRoot 'bin\IA2.exe'
+            $link.Arguments = ''
+            $link.IconLocation = (Join-Path $InstallRoot 'bin\IA2.exe') + ',0'
             $link.WorkingDirectory = $env:USERPROFILE
             $link.Save()
         }
+        $link = $shell.CreateShortcut((Join-Path $menu 'IA2 Terminal.lnk'))
+        $link.TargetPath = Join-Path $PSHOME 'powershell.exe'
+        $link.Arguments = '-NoProfile -NoExit -ExecutionPolicy Bypass -File "' + (Join-Path $InstallRoot 'IA2.ps1') + '" -Terminal'
+        $link.WorkingDirectory = $env:USERPROFILE
+        $link.Save()
     }
 } finally {
     foreach ($stage in $stagedDirectories) { if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force } }
@@ -203,5 +224,5 @@ Write-Host 'Installed industrial-automation-skill in both user discovery directo
 if (-not $SkillOnly) {
     Write-Host "Installed IA2 in $InstallRoot. Projects and preferences were preserved; PATH was not changed."
     Write-Host ('Start: & "' + (Join-Path $InstallRoot 'IA2.ps1') + '"')
-    Write-Host 'Or open IA2 IDE / IA2 Terminal from the Start menu (unless -NoShortcuts was used).'
+    Write-Host 'Or open IA2 IDE from the desktop/Start menu, or IA2 Terminal from the Start menu (unless -NoShortcuts was used).'
 }

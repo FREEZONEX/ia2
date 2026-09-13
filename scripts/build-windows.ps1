@@ -24,7 +24,7 @@ try {
         # Native stderr must remain log output when this script is captured
         # with *> in PowerShell 5.1; Cargo's exit code determines success.
         $ErrorActionPreference = 'Continue'
-        & cargo build --locked --release --target x86_64-pc-windows-msvc --target-dir (Join-Path $SourceRoot 'target') -p server -p ia2-cli -p ia2-runtime -p lsp-launcher
+        & cargo build --locked --release --target x86_64-pc-windows-msvc --target-dir (Join-Path $SourceRoot 'target') -p ia2-desktop -p server -p ia2-cli -p ia2-runtime -p lsp-launcher
         $nativeExit = $LASTEXITCODE
     } finally { $ErrorActionPreference = $savedPreference }
     if ($nativeExit -ne 0) { throw "Windows release build failed with exit code $nativeExit" }

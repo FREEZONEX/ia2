@@ -40,8 +40,12 @@ On native Windows, install from a checkout or extracted package with
 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-skill.ps1`.
 Open **IA2 Terminal** for process-local PATH, or invoke
 `& "$env:LOCALAPPDATA\IA2\bin\cs.exe"` in PowerShell. Open **IA2 IDE** or
-run `& "$env:LOCALAPPDATA\IA2\IA2.ps1"` in a separate visible console;
-Ctrl+C stops that server. Do not use Bash `&` background syntax in
+`%LOCALAPPDATA%\IA2\bin\IA2.exe` for the native desktop window. Closing
+the window hides it to the tray and leaves control running. Tray Exit
+refuses while a PLC program is running; explicitly stop the program
+before exiting. The desktop owns a hidden server on `127.0.0.1:3001`
+by default; it refuses an occupied port instead of adopting another
+server. Do not use Bash `&` background syntax in
 PowerShell 5.1. Wrap workflows with
 `cs agent run --label "Build line" -- powershell.exe -NoProfile -File .\workflow.ps1`
 and check `$LASTEXITCODE` after each native command. Use UTF-8 files with

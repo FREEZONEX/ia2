@@ -35,7 +35,8 @@ directories.
   `runtime` = headless edge binary, `cli` = the `cs` binary,
   `ironplc-bridge` = compiler/VM wrapper + shared `monitor` layer
   (debug ops, historian, alarm engine), `project` = on-disk schema,
-  `iomap-*` = field-protocol adapters, `esi`/`iocore` = support).
+  `iomap-*` = field-protocol adapters, `esi`/`iocore` = support,
+  `desktop` = Windows `IA2.exe` window/tray + owned server lifecycle).
   `vendor/ironplc` is a git submodule — never edit it directly; the
   patch registry is `docs/adr/0001-ironplc-ia2-boundary.md`.
 - Web IDE in `apps/web` (React 19 + Vite + Tailwind 4; single SPA plus
@@ -91,7 +92,7 @@ pnpm --filter @cs/web build && pnpm --filter @cs/web test
 On native Windows, use `scripts/check-windows.ps1` (PowerShell 5.1):
 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\check-windows.ps1`.
 It checks adaptation, formatting, Clippy (workspace warnings denied),
-workspace tests, four release binaries, and web build/tests. It builds
+workspace tests, five release binaries, and web build/tests. It builds
 `server.exe` before CLI simulation tests; a missing server is a failure,
 not a skipped test. `scripts/build-windows.ps1` builds explicit x64 MSVC
 release artifacts with a static CRT, without changing global Cargo config.
@@ -124,6 +125,11 @@ your local copies stay current; there is nothing to commit.
   RTU uses COM ports and rejects Linux
   `rs485` direction-control settings. A Windows `.exe` is never a Linux
   deployment payload: use a matching Linux ELF or the provisioned runtime.
+- Windows `IA2.exe` hosts the local UI in WebView2. Closing hides to the
+  tray; it never stops a PLC. Exit uses the owned server's token-gated
+  `/api/desktop/shutdown`, which atomically refuses running/starting PLCs.
+  Keep the desktop profile/logs outside the replaceable installation tree.
+  Monaco and its worker are bundled locally; do not restore CDN loading.
 - Snapshot `bits` is the raw VM slot (REAL = IEEE-754 bits); decode
   with `ironplc_bridge::monitor::typed_value` — never re-parse display
   strings.

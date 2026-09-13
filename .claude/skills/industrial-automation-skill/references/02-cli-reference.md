@@ -10,6 +10,11 @@ Bash heredocs. Session wrapper:
 `cs agent run --label "Build line" -- powershell.exe -NoProfile -File .\workflow.ps1`.
 Windows server startup, packages and hardware limits are documented in
 repository `docs/windows.md`; do not deploy a Windows runtime to Linux.
+The native `IA2.exe` window uses the same HTTP API at port 3001 by default.
+Closing it hides to the tray and keeps PLC control running. Exit requires
+an explicitly stopped PLC. `/api/desktop/shutdown` is a desktop ownership
+endpoint, enabled only on its child backend with a private token; agents
+must not use it to stop control or shut down an unrelated server.
 Real Windows fieldbus configuration uses the same `devices/<name>`
 resource: EtherCAT `nic` is `\Device\NPF_{GUID}` (Npcap required at
 connect), and CANopen `interface` is

@@ -27,9 +27,10 @@ ls ./target/release/cs            # ...or it's the build output, if you're in a 
 
 On Windows, verify `& $cs api GET /health --server http://127.0.0.1:3001`.
 If unavailable, open **IA2 IDE** or run
-`& "$env:LOCALAPPDATA\IA2\IA2.ps1"` in a separate visible console; wait
-for the actual listening address and repeat the health check. Ctrl+C in
-that console stops it; closing a browser tab does not. Do not start a
+`Start-Process "$env:LOCALAPPDATA\IA2\bin\IA2.exe"`; wait for the desktop
+window and repeat the health check. Closing the window hides it to the
+tray and keeps the backend running. Tray Exit refuses while a PLC is
+running; stop it explicitly first. Do not start a
 duplicate instance merely because `cs` was not on the current PATH.
 
 `cs` defaults to `http://127.0.0.1:3001` — the conventional port for a dev server (`cargo run -p server`) or an installed `ia2-server`. Resolve it:

@@ -44,7 +44,7 @@ Already have a clone and only want local agent discovery, with no build or netwo
 
 For repository work in Codex, open the **IA2 Git root** as the workspace, or launch with `codex --cd /path/to/ia2`. Codex discovers `AGENTS.md` and repository skills by walking from its current directory up to the Git root; launching from a parent folder that merely contains the nested `ia2` checkout will not load IA2's repository contract.
 
-**Native Windows 11 x64:** use `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-skill.ps1` from the clone. It installs `cs.exe`, `ia2-server.exe`, `lsp-launcher.exe`, `ia2-runtime.exe`, the built web IDE, the FB library and both user skill copies. No administrator privileges, symlinks or persistent PATH edits are needed. Open **IA2 IDE** or **IA2 Terminal** from the Start menu; the IDE runs in a visible console and stops with Ctrl+C. Add `-SkillOnly` for agent discovery alone. Prebuilt ZIPs use the same installer without a Rust/Node toolchain. See [Windows setup, native checks and packaging](docs/windows.md).
+**Native Windows 11 x64:** use `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-skill.ps1` from the clone or extracted ZIP. It installs the native `IA2.exe` app, `cs.exe`, `ia2-server.exe`, `lsp-launcher.exe`, `ia2-runtime.exe`, the built web IDE, FB library and both user skill copies. Open **IA2 IDE** from the desktop or Start menu; **IA2 Terminal** remains available for CLI work. Closing the window hides it to the tray; exiting refuses while a program runs. The installer checks WebView2 Runtime and explains how to install it if missing. No administrator privileges, symlinks or persistent PATH edits are needed for IA2; prebuilt ZIPs need no Rust/Node toolchain. Add `-SkillOnly` for agent discovery alone. See [Windows setup, native checks and packaging](docs/windows.md).
 
 The Windows entry point is [`scripts/install-skill.ps1`](scripts/install-skill.ps1).
 
@@ -61,7 +61,8 @@ On Windows, engineering, simulation and TCP protocols run natively. The `codex/w
 
 | Component | Tech | Purpose |
 |---|---|---|
-| **`apps/web/`** | React 19 + Vite + TanStack Router + Tailwind 4 | The IDE itself, in the browser. ST / LD / FBD / SFC editors, runtime Monitor, project tree, IO mapping. Single SPA — `vite dev` in development, or served by the server itself via `--static-dir`. |
+| **`apps/web/`** | React 19 + Vite + TanStack Router + Tailwind 4 | The IDE used by the browser and native Windows app. ST / LD / FBD / SFC editors, runtime Monitor, project tree, IO mapping. Single SPA — `vite dev` in development, or served by the server itself via `--static-dir`. |
+| **`crates/desktop/`** | Rust + WebView2 | Native Windows `IA2.exe` window, tray and lifecycle of its local server. |
 | **`crates/server/`** | Rust + axum + tower | HTTP backend (port 3001). REST + SSE. Owns the project, dispatches to ironplc-bridge, schedules tasks. |
 | **`crates/cli/`** | Rust + clap + ureq | The `cs` binary — agent-first command-line. Static analysis, project CRUD, runtime debug. See `cs --help`. |
 | **`crates/ironplc-bridge/`** | Rust | Wraps [ironplc](https://github.com/ironplc/ironplc) compiler + VM. Adds LD / FBD / SFC → ST transpilers + diagnostics enrichment. |
@@ -118,7 +119,7 @@ status/snapshot`) don't trigger the overlay — querying state isn't
 
 ### Run the IDE
 
-On installed Windows, run `& "$env:LOCALAPPDATA\IA2\IA2.ps1"` in PowerShell. For source development, use the commands below in separate terminals; omit the Unix-only `. "$HOME/.cargo/env"` line and run `pnpm install --frozen-lockfile` once. Native acceptance is `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\check-windows.ps1`.
+On installed Windows, double-click **IA2 IDE** on the desktop or in the Start menu. `IA2.ps1` remains a PowerShell entry to the same native app. For source development, use the commands below in separate terminals; omit the Unix-only `. "$HOME/.cargo/env"` line and run `pnpm install --frozen-lockfile` once. Native acceptance is `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\check-windows.ps1`.
 
 ```bash
 # one-time

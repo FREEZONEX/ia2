@@ -42,7 +42,7 @@ try {
         Invoke-Native pnpm @('--filter', '@cs/web', 'build')
     }
     New-Item -ItemType Directory -Force -Path (Join-Path $stage 'bin'), (Join-Path $stage 'scripts'), (Join-Path $stage '.claude\skills') | Out-Null
-    $names = [ordered]@{ 'cs.exe' = 'cs.exe'; 'server.exe' = 'ia2-server.exe'; 'lsp-launcher.exe' = 'lsp-launcher.exe'; 'ia2-runtime.exe' = 'ia2-runtime.exe' }
+    $names = [ordered]@{ 'IA2.exe' = 'IA2.exe'; 'cs.exe' = 'cs.exe'; 'server.exe' = 'ia2-server.exe'; 'lsp-launcher.exe' = 'lsp-launcher.exe'; 'ia2-runtime.exe' = 'ia2-runtime.exe' }
     foreach ($name in $names.Keys) {
         $source = Join-Path $SourceRoot "target\x86_64-pc-windows-msvc\release\$name"
         # Read the PE machine field: packages named x64 must contain x64 binaries.
@@ -125,7 +125,10 @@ IA2 Windows x64
 Open Windows PowerShell in this extracted folder and run:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-skill.ps1
 No Rust, Node, pnpm, administrator rights, or source checkout are required.
-Open IA2 IDE or IA2 Terminal from the Start menu. Read WINDOWS.md for scope and operation.
+Open IA2 IDE from the desktop or Start menu. IA2 Terminal remains available for CLI work.
+The native app requires Microsoft Edge WebView2 Runtime. If the installer reports it missing,
+install Evergreen Runtime from https://developer.microsoft.com/microsoft-edge/webview2/ and retry.
+Read WINDOWS.md for scope and operation. The app, server and web assets must stay together.
 '@
     Set-Content -LiteralPath (Join-Path $stage 'INSTALL.txt') -Value $instructions -Encoding UTF8
     # Compress-Archive skips hidden directories, including the bundled .claude skill.
