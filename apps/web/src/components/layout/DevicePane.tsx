@@ -1,5 +1,8 @@
 import { useEffect, useState } from "react"
 
+import { EmptyState } from "@/components/ui/empty-state"
+import { PaneHeader } from "@/components/ui/pane-header"
+
 import { fetchPouVariables } from "@/lib/api"
 import { useRuntime } from "@/state/runtime"
 import type { VariableInfo } from "@/types/generated/VariableInfo"
@@ -44,11 +47,9 @@ export function DevicePane() {
 
   if (!currentDevice) {
     return (
-      <main className="flex h-full min-h-0 min-w-0 flex-col">
-        <Header title="Device" />
-        <div className="grid flex-1 place-items-center text-sm text-muted-foreground">
-          Select a device from the project tree.
-        </div>
+      <main className="ia2-pane">
+        <PaneHeader title="Devices" description="Connections, channels and variable bindings" />
+        <EmptyState title="Select a device" description="Choose a device in the project tree to configure its connection and channels." />
       </main>
     )
   }
@@ -65,7 +66,7 @@ export function DevicePane() {
   }
 
   return (
-    <main className="flex h-full min-h-0 min-w-0 flex-col">
+    <main className="ia2-pane">
       {currentDevice.protocol === "modbus" ? (
         <ModbusDeviceEditor
           device={currentDevice}
@@ -92,20 +93,5 @@ export function DevicePane() {
         />
       )}
     </main>
-  )
-}
-
-function Header({ title, badge }: { title: string; badge?: string }) {
-  return (
-    <div className="flex h-9 items-center gap-2 border-b border-border pl-3 pr-2 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-      <span className="truncate normal-case tracking-normal text-foreground">
-        {title}
-      </span>
-      {badge && (
-        <span className="rounded bg-muted px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wider">
-          {badge}
-        </span>
-      )}
-    </div>
   )
 }

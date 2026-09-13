@@ -1,96 +1,89 @@
 import { useSyncExternalStore } from "react"
 
-/**
- * Theme controller.
- *
- * The previous version followed `prefers-color-scheme` so a user on a
- * dark-mode macOS would land in the IDE's dark theme by default. The
- * design language explicitly prescribes **white / light gray / near-black
- * as the canonical visual direction** (DESIGN.md §2), so we default to
- * light regardless of the OS, and let the user override via the toggle
- * in the workbench header.
- *
- * Choice is persisted under `ia2.theme` so the next reload
- * stays in the user's mode of choice. SSR-safe (no window touch during
- * `useState` initial value). One-time migration: if the legacy
- * `controlsoftware.theme` key exists, copy it across so users don't
- * lose their dark-mode preference across the rename.
- */
-
+/** The workbench defaults to light, with one persisted preference shared by
+ * same-origin IDE/HMI windows. The native host observes the applied .dark class. */
 const STORAGE_KEY = "ia2.theme"
 const LEGACY_STORAGE_KEY = "controlsoftware.theme"
 type Theme = "light" | "dark"
+const listeners = new Set<() => void>()
 
-/** Read once at module load so the very first paint matches the user's
- * persisted choice (no light → dark flash on dark-mode users). Runs
- * synchronously in the bundle's top-level. */
-if (typeof window !== "undefined") {
-  try {
-    let persisted = window.localStorage.getItem(STORAGE_KEY) as Theme | null
-    if (persisted === null) {
-      const legacy = window.localStorage.getItem(LEGACY_STORAGE_KEY) as Theme | null
-      if (legacy === "dark" || legacy === "light") {
-        window.localStorage.setItem(STORAGE_KEY, legacy)
-        window.localStorage.removeItem(LEGACY_STORAGE_KEY)
-        persisted = legacy
-      }
+function applyTheme(theme: Theme) {
+  if (typeof document === "undefined") return
+  document.documentElement.classList.toggle("dark", theme === "dark")
+  document.documentElement.style.colorScheme = theme
+  for (const [name, content] of [
+    ["theme-color", theme === "dark" ? "#151a19" : "#ffffff"],
+    ["color-scheme", theme],
+  ]) {
+    let meta = document.head.querySelector<HTMLMetaElement>(`meta[name="${name}"]`)
+    if (!meta) {
+      meta = document.createElement("meta")
+      meta.name = name
+      document.head.append(meta)
     }
-    if (persisted === "dark") {
-      document.documentElement.classList.add("dark")
-    } else {
-      document.documentElement.classList.remove("dark")
-    }
-  } catch {
-    /* localStorage unavailable in some sandboxes — fall through to light. */
+    meta.content = content
   }
+  listeners.forEach((listener) => listener())
 }
 
-// ---- Subscribers ----------------------------------------------------------
-// We deliberately don't use Context: the toggle is a single switch shared
-// by every component that needs to know the theme (Workbench, STEditor).
-// A tiny pub-sub via `useSyncExternalStore` is enough and avoids prop
-// drilling.
-const listeners = new Set<() => void>()
-function subscribe(cb: () => void) {
-  listeners.add(cb)
-  return () => listeners.delete(cb)
+function storedTheme(): Theme {
+  try {
+    const stored = window.localStorage.getItem(STORAGE_KEY)
+    if (stored !== null) return stored === "dark" ? "dark" : "light"
+    const legacy = window.localStorage.getItem(LEGACY_STORAGE_KEY)
+    if (legacy === "light" || legacy === "dark") {
+      try {
+        window.localStorage.setItem(STORAGE_KEY, legacy)
+        window.localStorage.removeItem(LEGACY_STORAGE_KEY)
+      } catch { /* Keep the readable preference even if migration cannot write. */ }
+      return legacy
+    }
+  } catch { /* Storage is optional; the light theme still renders. */ }
+  return "light"
+}
+
+function storageChanged(event: StorageEvent) {
+  if (event.key !== STORAGE_KEY && event.key !== null) return
+  try {
+    if (event.storageArea !== window.localStorage) return
+  } catch { return }
+  // Removal/clear restores the default. Ignore malformed values, and never
+  // write back on a storage event: other windows already share that storage.
+  if (event.newValue === null) applyTheme("light")
+  else if (event.newValue === "light" || event.newValue === "dark") applyTheme(event.newValue)
+}
+
+// Apply before first render, including browser chrome and native form controls.
+if (typeof window !== "undefined") {
+  applyTheme(storedTheme())
+  window.addEventListener("storage", storageChanged)
+  import.meta.hot?.dispose(() => window.removeEventListener("storage", storageChanged))
+}
+
+function subscribe(listener: () => void) {
+  listeners.add(listener)
+  return () => listeners.delete(listener)
 }
 function snapshot(): Theme {
   if (typeof document === "undefined") return "light"
   return document.documentElement.classList.contains("dark") ? "dark" : "light"
 }
 
-/** Apply a theme + persist + notify subscribers. Centralised so we can
- *  tweak persistence later (e.g. swap to cookies for SSR) in one place. */
 export function setTheme(theme: Theme) {
   if (typeof document === "undefined") return
-  document.documentElement.classList.toggle("dark", theme === "dark")
-  try {
-    window.localStorage.setItem(STORAGE_KEY, theme)
-  } catch {
-    /* persistence is best-effort */
-  }
-  listeners.forEach((cb) => cb())
+  applyTheme(theme)
+  try { window.localStorage.setItem(STORAGE_KEY, theme) } catch { /* Optional preference. */ }
 }
 
-/** Returns the currently applied theme and re-renders the caller when it
- *  changes. Pure read — to mutate, call `setTheme`. */
 export function useDarkMode(): Theme {
   return useSyncExternalStore(subscribe, snapshot, () => "light")
 }
 
-/** Bind a setter + current value for callers that want both in one go
- *  (e.g. the toggle button). */
 export function useThemeToggle(): {
   theme: Theme
-  setTheme: (t: Theme) => void
+  setTheme: (theme: Theme) => void
   toggle: () => void
 } {
   const theme = useDarkMode()
-  return {
-    theme,
-    setTheme,
-    toggle: () => setTheme(theme === "dark" ? "light" : "dark"),
-  }
+  return { theme, setTheme, toggle: () => setTheme(theme === "dark" ? "light" : "dark") }
 }
-

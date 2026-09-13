@@ -47,10 +47,14 @@ export function severityTone(sev: AlarmSeverity, standing: boolean): AlarmTone {
   }
 }
 
-/** Wall-clock micros → HH:MM:SS (24-hour). 0 = never raised → em-dash. */
-export function fmtAlarmClock(us: bigint): string {
-  if (us === 0n) return "—"
-  const d = new Date(Number(us) / 1000)
+/** HTTP JSON carries microseconds as numbers; generated types use bigint.
+ * Missing, zero and invalid stamps must never look like a raised alarm. */
+export function fmtAlarmClock(us: bigint | number | null | undefined): string {
+  if (typeof us !== "bigint" && typeof us !== "number") return "—"
+  const micros = Number(us)
+  if (!Number.isFinite(micros) || micros <= 0) return "—"
+  const d = new Date(micros / 1000)
+  if (!Number.isFinite(d.getTime())) return "—"
   return d.toLocaleTimeString([], { hour12: false })
 }
 

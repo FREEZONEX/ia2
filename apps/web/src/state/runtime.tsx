@@ -67,6 +67,8 @@ import {
 } from "@/lib/api"
 import { LspClient, pouDocumentUri } from "@/lib/lsp-client"
 
+import { useDiscardChanges } from "@/lib/use-discard-changes"
+
 export type View = "app" | "device" | "iomap" | "edge" | "tasks" | "hmi"
 
 /** Select the project before the next API request reads its routing header.
@@ -207,6 +209,7 @@ type AppState = {
   source: string
   setSource: (s: string) => void
   isDirty: boolean
+  confirmDiscard: () => Promise<boolean>
   diagnostics: CheckDiagnostic[]
   /** Bumps on every project-tree refresh. Editors put it in their
    *  diagnostics-effect deps so importing/removing a library re-checks
@@ -238,7 +241,7 @@ type AppState = {
 
   // Project actions
   createProject: (name: string) => Promise<boolean>
-  openProject: (path: string) => Promise<void>
+  openProject: (path: string) => Promise<boolean>
   closeProject: () => Promise<void>
   refreshProjects: () => Promise<void>
   refreshProject: () => Promise<void>
@@ -298,6 +301,8 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
   const [view, setView] = useState<View | null>(null)
   const [currentPou, setCurrentPou] = useState<Pou | null>(null)
   const [source, setSource] = useState("")
+  const { confirmDiscard, discardDialog } = useDiscardChanges(!!currentPou && source !== currentPou.source)
+  const pouSelectionRef = useRef(0)
   const [diagnostics, setDiagnostics] = useState<CheckDiagnostic[]>([])
   const [projectEpoch, setProjectEpoch] = useState(0)
   const [currentDevice, setCurrentDevice] = useState<Device | null>(null)
@@ -338,22 +343,30 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     sourceRef.current = source
   }, [source])
 
-  const clearProjectState = useCallback(() => {
-    displayedProjectRef.current = null
+  const clearEditorState = useCallback(() => {
+    ++pouSelectionRef.current
     currentPouRef.current = null
     sourceRef.current = ""
-    setProject(null)
     setCurrentPou(null)
     setCurrentDevice(null)
     setCurrentEdge(null)
     setCurrentHmi(null)
     setView(null)
     setSource("")
+    setDiagnostics([])
+    setIomap({ mappings: [] })
+    setTasks({ tasks: [], programs: [] })
+  }, [])
+
+  const clearProjectState = useCallback(() => {
+    clearEditorState()
+    displayedProjectRef.current = null
+    setProject(null)
     setAttached(null)
     setIsRunning(false)
     setRunning(null)
     liveFeedStore.setSnapshot(null)
-  }, [])
+  }, [clearEditorState])
 
   // Register the project's own FUNCTION_BLOCKs (e.g. the imported
   // process-control library) so the graphical FBD / LD editors offer
@@ -781,36 +794,41 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
   // ---------------- Project actions ----------------
 
   const createProject = useCallback(async (name: string): Promise<boolean> => {
+    if (!await confirmDiscard()) return false
     setError(null)
     try {
       const info = await apiCreateProject(name)
       selectWindowProject(info.name)
+      ++pouSelectionRef.current
       const tree = await fetchProject()
+      clearEditorState()
       setProject(tree)
-      setCurrentPou(null)
-      setSource("")
       return true
     } catch (e) {
       setError(String(e))
       return false
     }
-  }, [])
+  }, [confirmDiscard, clearEditorState])
 
-  const openProject = useCallback(async (path: string) => {
+  const openProject = useCallback(async (path: string): Promise<boolean> => {
+    if (!await confirmDiscard()) return false
     setError(null)
     try {
       const info = await apiOpenProject(path)
       selectWindowProject(info.name)
+      ++pouSelectionRef.current
       const tree = await fetchProject()
+      clearEditorState()
       setProject(tree)
-      setCurrentPou(null)
-      setSource("")
+      return true
     } catch (e) {
       setError(String(e))
+      return false
     }
-  }, [])
+  }, [confirmDiscard, clearEditorState])
 
   const closeProject = useCallback(async () => {
+    if (!await confirmDiscard()) return
     setError(null)
     try {
       await apiCloseProject()
@@ -819,21 +837,25 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     } catch (e) {
       setError(String(e))
     }
-  }, [clearProjectState])
+  }, [clearProjectState, confirmDiscard])
 
   // ---------------- POU / Device actions ----------------
 
   const selectPou = useCallback(async (path: string) => {
+    if (currentPouRef.current?.path === path) { setView("app"); return }
+    if (!await confirmDiscard()) return
+    const selection = ++pouSelectionRef.current
     setError(null)
     try {
       const pou = await fetchPou(path)
+      if (selection !== pouSelectionRef.current) return
       setCurrentPou(pou)
       setSource(pou.source)
       setView("app")
     } catch (e) {
-      setError(String(e))
+      if (selection === pouSelectionRef.current) setError(String(e))
     }
-  }, [])
+  }, [confirmDiscard])
 
   // Mirror selectPou into the ref so the SSE Mutation handler (which
   // lives outside React's render scope) can call the latest version.
@@ -960,19 +982,22 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       type_: PouType,
       language: PouLanguage = "st",
     ): Promise<boolean> => {
+      if (!await confirmDiscard()) return false
+      ++pouSelectionRef.current
       setError(null)
       try {
         const pou = await apiCreatePou(path, type_, language)
         await refreshProject()
         setCurrentPou(pou)
         setSource(pou.source)
+        setView("app")
         return true
       } catch (e) {
         setError(String(e))
         return false
       }
     },
-    [refreshProject],
+    [refreshProject, confirmDiscard],
   )
 
   const deletePou = useCallback(
@@ -1204,6 +1229,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       source,
       setSource,
       isDirty,
+      confirmDiscard,
       diagnostics,
       projectEpoch,
       currentDevice,
@@ -1256,6 +1282,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       source,
       setSource,
       isDirty,
+      confirmDiscard,
       diagnostics,
       projectEpoch,
       currentDevice,
@@ -1301,7 +1328,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     ],
   )
 
-  return <Ctx.Provider value={value}>{children}</Ctx.Provider>
+  return <Ctx.Provider value={value}>{children}{discardDialog}</Ctx.Provider>
 }
 
 export function useRuntime() {

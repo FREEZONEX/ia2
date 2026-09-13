@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useState } from "react"
 
 import { Button } from "@/components/ui/button"
+import { ErrorBox } from "@/components/ui/error-box"
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -77,7 +79,7 @@ export function ImportLibraryDialog(props: Props) {
     })
 
   const submit = async (files: string[]) => {
-    if (!lib) return
+    if (!lib || submitting) return
     setSubmitting(true)
     setError(null)
     try {
@@ -96,25 +98,22 @@ export function ImportLibraryDialog(props: Props) {
       <DialogContent className="max-w-lg">
         <DialogHeader>
           <DialogTitle>Import library blocks</DialogTitle>
+          <DialogDescription>Choose reusable function blocks. Importing an existing block updates its local copy.</DialogDescription>
         </DialogHeader>
 
         {error && (
-          <div className="rounded border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-400">
-            {error}
-          </div>
+          <div role="alert"><ErrorBox>{error}</ErrorBox></div>
         )}
 
         {libs === null && !error && (
-          <div className="py-6 text-center text-sm text-muted-foreground">
+          <div className="py-6 text-center text-[13px] text-muted-foreground">
             Loading registry…
           </div>
         )}
 
         {libs !== null && libs.length === 0 && (
-          <div className="py-6 text-center text-sm text-muted-foreground">
-            No libraries in the server registry. Start the server with
-            <span className="px-1 font-mono">--library-dir</span>
-            pointing at a library folder.
+          <div className="py-6 text-center text-[13px] text-muted-foreground">
+            No libraries are available. Install a function block library before importing blocks.
           </div>
         )}
 
@@ -147,12 +146,12 @@ export function ImportLibraryDialog(props: Props) {
                 {lib.name}@{lib.version}
               </span>
               {lib.imported_version && (
-                <span className="ml-2 rounded bg-muted/60 px-1.5 py-0.5 font-mono text-[10px]">
+                <span className="ml-2 rounded bg-muted/60 px-1.5 py-0.5 font-mono text-xs">
                   imported @{lib.imported_version}
                 </span>
               )}
               {updateAvailable && (
-                <span className="ml-2 rounded bg-warn/15 px-1.5 py-0.5 font-mono text-[10px] text-warn">
+                <span className="ml-2 rounded bg-warn/15 px-1.5 py-0.5 font-mono text-xs text-warn">
                   update available
                 </span>
               )}
@@ -160,27 +159,27 @@ export function ImportLibraryDialog(props: Props) {
                 <div className="mt-1">{lib.description}</div>
               )}
             </div>
-            <div className="max-h-72 space-y-0.5 overflow-y-auto rounded border border-border p-1">
+            <div className="max-h-72 divide-y divide-border overflow-y-auto border-y border-border">
               {lib.blocks.map((b) => {
                 const stem = b.file.replace(/\.st$/, "")
                 const isImported = importedStems.has(stem)
                 return (
                   <label
                     key={b.file}
-                    className="flex cursor-pointer items-start gap-2 rounded px-2 py-1 text-xs hover:bg-accent/40"
+                    className="flex cursor-pointer items-start gap-3 px-2 py-3 text-[13px] hover:bg-accent/40"
                   >
                     <input
                       type="checkbox"
-                      className="mt-0.5"
+                      className="mt-0.5 size-4 shrink-0 accent-primary"
                       checked={selected.has(b.file)}
                       onChange={() => toggle(b.file)}
                     />
-                    <span className="flex-1">
+                    <span className="min-w-0 flex-1 break-words">
                       <span className="font-mono text-foreground">
                         {b.name}
                       </span>
                       {isImported && (
-                        <span className="ml-2 rounded bg-muted/60 px-1 py-0.5 font-mono text-[9px] uppercase text-muted-foreground">
+                        <span className="ml-2 rounded bg-muted/60 px-1 py-0.5 font-mono text-xs text-muted-foreground">
                           imported
                         </span>
                       )}
@@ -213,7 +212,7 @@ export function ImportLibraryDialog(props: Props) {
             disabled={!lib || selected.size === 0 || submitting}
             onClick={() => void submit([...selected])}
           >
-            Import {selected.size > 0 ? selected.size : ""} selected
+            {submitting ? "Importing…" : `Import ${selected.size > 0 ? selected.size + " " : ""}selected`}
           </Button>
         </DialogFooter>
       </DialogContent>

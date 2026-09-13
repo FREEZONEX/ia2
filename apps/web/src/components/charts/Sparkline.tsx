@@ -20,7 +20,7 @@ export function Sparkline({
 }: Props) {
   if (values.length < 2) {
     return (
-      <svg viewBox={`0 0 ${width} ${height}`} className="block">
+      <svg viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" className="block h-full w-full" aria-hidden="true">
         <line
           x1={0}
           y1={height / 2}

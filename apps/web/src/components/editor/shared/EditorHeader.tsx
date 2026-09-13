@@ -27,17 +27,17 @@ export function EditorHeader({
   children?: React.ReactNode
 }) {
   return (
-    <div className="border-b border-border bg-muted/30 px-3 py-1.5 text-[11px] uppercase tracking-wider text-muted-foreground">
-      <span className="font-mono normal-case tracking-normal text-foreground">
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 bg-background px-4 py-2 text-[13px] text-muted-foreground">
+      <span className="font-mono text-foreground">
         {name}
       </span>
-      <span className="ml-2 rounded border border-border bg-muted/50 px-1.5 py-0.5 font-mono text-[9px] text-muted-foreground">
-        {language}
+      <span>
+        {language.toUpperCase()}
       </span>
-      <span className="ml-2 rounded border border-border bg-muted/50 px-1.5 py-0.5 font-mono text-[9px] text-muted-foreground">
-        {pouType === "function_block" ? "fb" : "prg"}
+      <span>
+        {pouType === "function_block" ? "Function block" : "Program"}
       </span>
-      <span className="ml-3">{summary}</span>
+      <span>{summary}</span>
       {children}
     </div>
   )

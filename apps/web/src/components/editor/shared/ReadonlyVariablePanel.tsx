@@ -26,12 +26,12 @@ export function ReadonlyVariablePanel({
     { label: "VAR", section: "internal" },
   ]
   return (
-    <div className="grid grid-cols-3 gap-3 border-b border-border bg-muted/10 px-4 py-2 text-[11px]">
+    <div className="grid grid-cols-3 gap-3 border-b border-border bg-muted/10 px-4 py-2 text-[13px]">
       {groups.map((g) => {
         const vs = variables.filter((v) => v.section === g.section)
         return (
           <div key={g.section}>
-            <div className="mb-1 font-mono text-[9px] uppercase tracking-wider text-muted-foreground">
+            <div className="mb-1 font-mono text-xs text-muted-foreground">
               {g.label}
             </div>
             <ul className="space-y-0.5">

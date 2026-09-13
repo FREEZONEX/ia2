@@ -2,139 +2,106 @@
 @import "tw-animate-css";
 
 /* Self-hosted, per the design's type spec: IBM Plex Sans for UI chrome,
- * JetBrains Mono everywhere code, identifiers, addresses and live values
+ * IBM Plex Mono for code, identifiers, addresses and live values
  * appear. Bundled rather than CDN-linked so the IDE renders identically
  * on offline / air-gapped plant networks. Only the weights the UI
- * actually uses are pulled in; the variable mono covers 400/500/700
- * from a single file. */
+ * actually uses are pulled in; both families stay local for offline editing. */
 @import "@fontsource/ibm-plex-sans/400.css";
 @import "@fontsource/ibm-plex-sans/500.css";
 @import "@fontsource/ibm-plex-sans/600.css";
-@import "@fontsource-variable/jetbrains-mono/wght.css";
+@import "@fontsource/ibm-plex-mono/400.css";
+@import "@fontsource/ibm-plex-mono/500.css";
 
 @custom-variant dark (&:is(.dark *));
 
+/* Tier0 product semantics, aligned with the upstream theme library.
+ * Selection and agent activity use lime; process health has separate colors. */
 :root {
-  /* Tightened to 4px from 10px to match the workspace-tool feel of the
-     rest of the IDE. Cascades through Tailwind's rounded-sm/md/lg/xl. */
+  color-scheme: light;
   --radius: 0.25rem;
-  /* ---- Acid-green tune (Figma: IA2 / ZLbt1F2kBzeTsuVF4GpKRy) --------
-   *
-   * Two ideas carry the whole theme:
-   *
-   *  1. WARM neutrals, never pure gray. Every surface sits on a hex
-   *     where R = G > B by a point or two (#FAFAF8, #F2F2F0 / dark
-   *     #1C1C1B, #1A1A19). The warmth is sub-perceptible — you can't
-   *     name it, but pure-gray UI next to it suddenly looks blue.
-   *
-   *  2. ACID GREEN (#B2ED1D) is the *agent's* colour, not a general
-   *     accent. It appears exactly where the machine is in control:
-   *     the window frame and the takeover status bar. Running/success
-   *     states keep a conventional green (--highlight) so "agent
-   *     presence" and "process running" never blur together.
-   */
-  --background: #fafaf8; /* editor / content surface */
-  --foreground: #21201c;
-  --card: #ffffff;
-  --card-foreground: #21201c;
-  --popover: #ffffff;
-  --popover-foreground: #21201c;
-  /* Save-style primary: near-black chip with warm white text. */
-  --primary: #21201c;
-  --primary-foreground: #fafaf8;
-  --secondary: #f2f2f0; /* titlebar / sidebar / chrome surface */
-  --secondary-foreground: #21201c;
-  --muted: #f2f2f0;
-  --muted-foreground: #6f6d66;
-  --accent: #e8e7e3; /* hover / selected rows (warm, not blue) */
-  --accent-foreground: #21201c;
-  --destructive: oklch(0.577 0.245 27.325);
-  /* Conventional green — Running dot, RUNNING pill, TRUE values, the
-     Stop/Run affordances, connected/healthy/bound states. The muted
-     forest green from the Figma frames (#2e8049), deliberately NOT the
-     acid green: process-running and agent-in-control must never blur. */
-  --highlight: #2e8049;
-  --highlight-foreground: #fafaf8;
-  /* THE acid green — agent-in-control surfaces only (window frame,
-     takeover bar, agent chips). Black text on top. */
-  --agent: #b2ed1d;
-  --agent-foreground: #191c08;
-  /* Ochre warn — MODIFIED/dirty/forced/attention. The Figma's MODIFIED
-     badge colour (#a8710f); used at low alpha for chip fills. */
-  --warn: #a8710f;
-  /* The design's single blue — the Monitor trend sparkline. Muted steel,
-     not a saturated cyan, so it reads as data, not a link. */
-  --trend: #3a6fb0;
-  --border: #e4e3df;
-  --input: #e4e3df;
-  --ring: #8a8983;
-  --chart-1: oklch(0.646 0.222 41.116);
-  --chart-2: oklch(0.6 0.118 184.704);
-  --chart-3: oklch(0.398 0.07 227.392);
-  --chart-4: oklch(0.828 0.189 84.429);
-  --chart-5: oklch(0.769 0.188 70.08);
-  --sidebar: #f2f2f0;
-  --sidebar-foreground: #21201c;
-  --sidebar-primary: #21201c;
-  --sidebar-primary-foreground: #fafaf8;
-  --sidebar-accent: #e8e7e3;
-  --sidebar-accent-foreground: #21201c;
-  --sidebar-border: #e4e3df;
-  --sidebar-ring: #8a8983;
+  --tier0-bg-color: #ffffff;
+  --tier0-bg-secondary: #f3f3f3;
+  --tier0-bg-tertiary: #f9f9f9;
+  --tier0-text-color: #050b14;
+  --tier0-text-secondary: #585c62;
+  --tier0-border: #ebebeb;
+  --tier0-primary: #050b14;
+  --tier0-highlight: #b2ed1d;
+  --tier0-highlight-bg-primary: #cef368;
+  --tier0-highlight-bg-tertiary: #f7fde8;
+  --tier0-highlight-text-deep: #48640c;
+  --background: var(--tier0-bg-color);
+  --foreground: var(--tier0-text-color);
+  --card: var(--tier0-bg-color);
+  --card-foreground: var(--foreground);
+  --popover: var(--tier0-bg-color);
+  --popover-foreground: var(--foreground);
+  --primary: var(--tier0-primary);
+  --primary-foreground: #ffffff;
+  --secondary: var(--tier0-bg-tertiary);
+  --secondary-foreground: var(--foreground);
+  --muted: var(--tier0-bg-secondary);
+  --muted-foreground: var(--tier0-text-secondary);
+  --accent: #f3f3f3;
+  --accent-foreground: var(--foreground);
+  --selection: var(--tier0-highlight-bg-tertiary);
+  --selection-foreground: var(--tier0-highlight-text-deep);
+  --button-highlight: var(--tier0-highlight-bg-primary);
+  --destructive: #b91c1c;
+  --highlight: #2f7657;
+  --highlight-foreground: #ffffff;
+  --agent: var(--tier0-highlight);
+  --agent-foreground: #050b14;
+  --warn: #884a00;
+  --trend: #2563ab;
+  --border: var(--tier0-border);
+  --input: #cdced0;
+  --ring: #628210;
+  --scrollbar: #cdced0;
+  --scrollbar-hover: #878787;
+  --chart-1: #2563ab;
+  --chart-2: #2f7657;
+  --chart-3: #884a00;
+  --chart-4: #67458a;
+  --chart-5: #b94d4d;
+  --sidebar: var(--tier0-bg-tertiary);
+  --sidebar-foreground: var(--foreground);
+  --sidebar-primary: var(--primary);
+  --sidebar-primary-foreground: var(--primary-foreground);
+  --sidebar-accent: var(--selection);
+  --sidebar-accent-foreground: var(--selection-foreground);
+  --sidebar-border: var(--border);
+  --sidebar-ring: var(--ring);
 }
 
 .dark {
-  /* Dark half of the acid-green tune. Same two ideas as light:
-   * warm near-blacks (#1C1C1B editor, #1A1A19 chrome — R = G > B,
-   * never a blue-gray), and the SAME acid green (#B2ED1D) for agent
-   * surfaces — the accent does not shift between themes, which is
-   * what makes the takeover state read identically day or night.
-   * Primary stays inverted (warm-white chip, near-black text) so the
-   * Save button is the one high-contrast object in the toolbar in
-   * both themes. */
-  --background: #1c1c1b; /* editor / content surface */
-  --foreground: #eceae4;
-  --card: #232322;
-  --card-foreground: #eceae4;
-  --popover: #232322;
-  --popover-foreground: #eceae4;
-  --primary: #ecebe8; /* Save chip: warm white on dark */
-  --primary-foreground: #21201c;
-  --secondary: #1a1a19; /* titlebar / sidebar / chrome surface */
-  --secondary-foreground: #eceae4;
-  --muted: #262625;
-  --muted-foreground: #a3a199;
-  --accent: #333331; /* hover / selected rows (warm) */
-  --accent-foreground: #eceae4;
-  --destructive: oklch(0.704 0.191 22.216);
-  /* Same forest green lifted for legibility on the near-black editor —
-     same hue as light, more luminance. */
-  --highlight: #3aba67;
-  --highlight-foreground: #10160c;
-  /* Acid green is theme-invariant — the agent looks the same day or
-     night. Only its text flips to the near-black ink. */
-  --agent: #b2ed1d;
-  --agent-foreground: #191c08;
-  /* Ochre lifted for dark legibility (same hue as light's #a8710f). */
-  --warn: #e0a63a;
-  /* Steel blue lifted for the near-black editor. */
-  --trend: #6ea3e0;
-  --border: #33332f;
-  --input: #3a3a36;
-  --ring: #c9c7c0;
-  --chart-1: oklch(0.488 0.243 264.376);
-  --chart-2: oklch(0.696 0.17 162.48);
-  --chart-3: oklch(0.769 0.188 70.08);
-  --chart-4: oklch(0.627 0.265 303.9);
-  --chart-5: oklch(0.645 0.246 16.439);
-  --sidebar: #1a1a19;
-  --sidebar-foreground: #eceae4;
-  --sidebar-primary: #ecebe8;
-  --sidebar-primary-foreground: #21201c;
-  --sidebar-accent: #333331;
-  --sidebar-accent-foreground: #eceae4;
-  --sidebar-border: #33332f;
-  --sidebar-ring: #c9c7c0;
+  color-scheme: dark;
+  --tier0-bg-color: #151a19;
+  --tier0-bg-secondary: #242a29;
+  --tier0-bg-tertiary: #1c211f;
+  --tier0-text-color: #f9f9f9;
+  --tier0-text-secondary: #b5bab7;
+  --tier0-border: #343c38;
+  --tier0-primary: #f3f3f3;
+  --tier0-highlight-bg-tertiary: #29361b;
+  --tier0-highlight-text-deep: #cef368;
+  --primary-foreground: #050b14;
+  --popover: #202623;
+  --accent: #2a312d;
+  --destructive: #ffaaa7;
+  --highlight: #8ee4ba;
+  --highlight-foreground: #10271d;
+  --warn: #ffd16a;
+  --trend: #8ab8ef;
+  --input: #58615b;
+  --ring: #b2ed1d;
+  --scrollbar: #4a534c;
+  --scrollbar-hover: #748177;
+  --chart-1: #8ab8ef;
+  --chart-2: #8ee4ba;
+  --chart-3: #ffd16a;
+  --chart-4: #cbb1e1;
+  --chart-5: #ffaaa7;
 }
 
 @theme inline {
@@ -143,10 +110,9 @@
      live values, badges) — that split is what makes the IDE read as a
      tool rather than a website. System fallbacks keep the layout stable
      if the woff2 hasn't landed yet. */
-  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system,
-    "Segoe UI", sans-serif;
-  --font-mono: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace,
-    "SF Mono", Menlo, Consolas, monospace;
+  --font-sans: "IBM Plex Sans", "IBM Plex Sans SC", "Microsoft YaHei UI",
+    "PingFang SC", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   /* Keep the radius ladder shallow so cards / buttons / inputs / popovers
      all share a near-identical curvature — per the design language we
      don't want the radius itself becoming a visual element. */
@@ -169,6 +135,9 @@
   --color-accent: var(--accent);
   --color-accent-foreground: var(--accent-foreground);
   --color-destructive: var(--destructive);
+  --color-selection: var(--selection);
+  --color-selection-foreground: var(--selection-foreground);
+  --color-button-highlight: var(--button-highlight);
   --color-highlight: var(--highlight);
   --color-highlight-foreground: var(--highlight-foreground);
   --color-agent: var(--agent);
@@ -193,8 +162,10 @@
   --color-sidebar-ring: var(--sidebar-ring);
 }
 
+@layer base {
 * {
   box-sizing: border-box;
+  border-color: var(--border);
 }
 
 html,
@@ -205,53 +176,29 @@ body,
   height: 100%;
 }
 
+html, body, #root {
+  background: var(--background);
+  color: var(--foreground);
+}
+
 body {
   margin: 0;
-  @apply text-foreground font-sans;
-  /* The design's UI type is optically small (11–13px). Without these two
-     the sans reads noticeably chunkier than the Figma frames at the same
-     px size. */
+  @apply font-sans;
+  font-size: 13px;
+  line-height: 1.5;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  /*
-   * Background: transparent on body, set explicitly on the workspace
-   * content area inside Workbench. The Mac shell turns off the
-   * WebView's `drawsBackground` and renders an NSVisualEffectView
-   * underlay — wherever the page leaves a gap (the 28px titlebar
-   * safe area), the OS-level blur shows through behind the traffic
-   * lights. Everywhere else, the workspace sets its own opaque
-   * `bg-background` so text contrast stays predictable regardless
-   * of the user's desktop wallpaper.
-   *
-   * Browsers (and the Linux / Windows shells we'll add later) render
-   * over their own opaque viewport, so this is invisible except on
-   * macOS — no special-casing needed.
-   *
-   * Native-feel pass (cf. native-feel-cross-platform-desktop / 03
-   * § C.1, C.2, C.4): the things that quietly tell a user "this is
-   * a webpage."
-   *
-   *  - cursor: default     — native rows/buttons don't change cursor
-   *                          on hover. Opt back in only for true
-   *                          drag handles or text edit areas.
-   *  - user-select: none   — system-style labels are not selectable;
-   *                          Monaco / source views / output panes
-   *                          re-enable with `.cs-selectable`.
-   *  - overscroll: contain — kills the rubber-band on inner scrollers
-   *                          that leaks the document-scroll feel.
-   *  - tap highlight off   — no iOS-style blue flash on touch.
-   *  - smooth-scroll off   — `scroll-behavior: auto` is the native
-   *                          default; web frameworks sometimes flip
-   *                          it to 'smooth' which feels laggy.
-   */
-  background: transparent;
-  cursor: default;
-  user-select: none;
-  -webkit-user-select: none;
-  overscroll-behavior: contain;
-  -webkit-tap-highlight-color: transparent;
-  scroll-behavior: auto;
+  overscroll-behavior: none;
 }
+
+button, [role="button"] { cursor: pointer; }
+button:disabled, [aria-disabled="true"] { cursor: default; }
+input, textarea { font: inherit; }
+* { scrollbar-width: thin; scrollbar-color: var(--scrollbar) transparent; }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: var(--scrollbar); border: 2px solid var(--background); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-hover); }
+::-webkit-scrollbar-corner { background: var(--background); }
 
 /* Keyboard focus must be visible on EVERY control, not just the ui/
  * base components that carry their own ring classes. This is the
@@ -318,63 +265,7 @@ body {
   mix-blend-mode: normal;
 }
 
-/* ---- Agent takeover chrome ------------------------------------------
- *
- * Per the acid-green design: when an agent is in control the whole
- * window is FRAMED in solid acid green (#B2ED1D) and a 26px status bar
- * docks to the bottom edge, inside the frame — the frame and the bar
- * read as one continuous piece of chrome that "clamps" the app.
- *
- *   .ia2-takeover-frame — solid 3px inset ring. Not a glow, not a
- *     gradient: the design's frame is flat and constant. A very slow,
- *     shallow breath (100% → 82% opacity) keeps it reading as "live"
- *     without becoming a spinner; reduced-motion drops even that.
- *
- *   The status bar itself is a React component (AgentStatusBar) laid
- *   out in normal flow at the bottom of the shell, so the app content
- *   shrinks by 26px rather than being overlapped — matching how the
- *   Figma frames reserve the strip.
- */
-@keyframes ia2-takeover-frame-breath {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.82; }
-}
-
-.ia2-takeover-frame {
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  z-index: 700;
-  box-shadow: inset 0 0 0 3px var(--agent);
-  animation: ia2-takeover-frame-breath 3.2s ease-in-out infinite;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .ia2-takeover-frame {
-    animation: none;
-  }
-}
-
-/* Blinking terminal-style cursor block at the tail of the agent bar's
- * activity text — the design's "the machine is typing" tell. */
-@keyframes ia2-agent-caret-blink {
-  0%, 49% { opacity: 1; }
-  50%, 100% { opacity: 0; }
-}
-.ia2-agent-caret {
-  display: inline-block;
-  width: 7px;
-  height: 14px;
-  margin-left: 4px;
-  background: var(--agent-foreground);
-  animation: ia2-agent-caret-blink 1.1s steps(1) infinite;
-}
-@media (prefers-reduced-motion: reduce) {
-  .ia2-agent-caret {
-    animation: none;
-  }
-}
-
+/* Agent activity is shown in the status bar; no flashing outer frame. */
 @layer base {
   /* Default per-element ring outline used by Tailwind's `outline-ring`.
    * The previous 50% opacity was invisible in dark mode (a 50%-of-mid-
@@ -389,104 +280,11 @@ body {
 
 /* ---- HMI canvas ---------------------------------------------------- */
 
-/* Spawn animation for elements an agent just placed (SSE `touched` ids).
- * Deliberately subtle: a short fade/rise plus one acid-green outline
- * pulse — the acid green marks MACHINE authorship, same vocabulary as
- * the takeover chrome, and decays fast so the screen stays ISA-calm. */
-/* Three beats, Pencil-style: (1) a dashed acid frame sketches the
- * element's place, (2) the element itself springs in from 62% scale,
- * (3) an acid glow blooms and decays. Batches stagger through
- * `--spawn-delay` so a multi-element op reads as a wave of drawing,
- * not a simultaneous pop. The frame/glow live on a separate overlay
- * element (not ::before) so they're visible while the element itself
- * is still at opacity 0. */
-@keyframes hmi-spawn-pop {
-  0% {
-    opacity: 0;
-    transform: scale(0.62);
-  }
-  70% {
-    opacity: 1;
-    transform: scale(1.035);
-  }
-  100% {
-    opacity: 1;
-    transform: scale(1);
-  }
-}
-.hmi-spawn {
-  animation: hmi-spawn-pop 420ms cubic-bezier(0.34, 1.4, 0.64, 1) both;
-  animation-delay: calc(var(--spawn-delay, 0ms) + 130ms);
-}
-@keyframes hmi-spawn-frame {
-  0% {
-    opacity: 0;
-    transform: scale(0.9);
-  }
-  18% {
-    opacity: 1;
-    transform: scale(1);
-  }
-  62% {
-    opacity: 1;
-  }
-  100% {
-    opacity: 0;
-    transform: scale(1.02);
-  }
-}
-@keyframes hmi-spawn-glow {
-  0% {
-    box-shadow:
-      0 0 0 1.5px color-mix(in srgb, var(--agent) 95%, transparent),
-      0 0 0px 0px color-mix(in srgb, var(--agent) 55%, transparent);
-    opacity: 1;
-  }
-  45% {
-    box-shadow:
-      0 0 0 1.5px color-mix(in srgb, var(--agent) 90%, transparent),
-      0 0 22px 4px color-mix(in srgb, var(--agent) 45%, transparent);
-    opacity: 1;
-  }
-  100% {
-    box-shadow:
-      0 0 0 1.5px transparent,
-      0 0 26px 6px transparent;
-    opacity: 0;
-  }
-}
-.hmi-spawn-overlay {
-  position: absolute;
-  pointer-events: none;
-  border-radius: 6px;
-}
-.hmi-spawn-overlay::before {
-  content: "";
-  position: absolute;
-  inset: -7px;
-  border: 1.5px dashed var(--agent);
-  border-radius: 8px;
-  animation: hmi-spawn-frame 620ms ease-out both;
-  animation-delay: var(--spawn-delay, 0ms);
-  opacity: 0;
-}
-.hmi-spawn-overlay::after {
-  content: "";
-  position: absolute;
-  inset: -3px;
-  border-radius: 7px;
-  animation: hmi-spawn-glow 780ms ease-out both;
-  animation-delay: calc(var(--spawn-delay, 0ms) + 200ms);
-  opacity: 0;
-}
-@media (prefers-reduced-motion: reduce) {
-  .hmi-spawn {
-    animation: none;
-  }
-  .hmi-spawn-overlay {
-    display: none;
-  }
-}
+/* Newly authored elements settle in without bouncing or glowing. */
+@keyframes hmi-spawn-fade { from { opacity: 0.35; } to { opacity: 1; } }
+.hmi-spawn { animation: hmi-spawn-fade 180ms ease-out both; }
+.hmi-spawn-overlay { display: none; }
+@media (prefers-reduced-motion: reduce) { .hmi-spawn { animation: none; } }
 
 /* Live process motion — running equipment spins, flowing lines travel,
    levels ease between samples. State is legible from stillness vs
@@ -553,63 +351,20 @@ body {
   }
 }
 
-/* POU "generated" reveal — same machine-authorship vocabulary as the
- * HMI spawn. Two layers: an acid scan line sweeps down the editor area
- * (all four language editors), and the ST editor staggers its visible
- * lines in behind the sweep so the code reads as being written. */
-@keyframes pou-sweep-line {
-  0% {
-    top: 0;
-    opacity: 0;
-  }
-  8% {
-    opacity: 1;
-  }
-  85% {
-    opacity: 1;
-  }
-  100% {
-    top: calc(100% - 2px);
-    opacity: 0;
-  }
+/* Editor mutations keep code stable under the cursor. */
+.pou-sweep::after { display: none; }
+
 }
-.pou-sweep::after {
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: 0;
-  height: 2px;
-  z-index: 40;
-  pointer-events: none;
-  background: linear-gradient(
-    90deg,
-    transparent,
-    var(--agent) 18%,
-    var(--agent) 82%,
-    transparent
-  );
-  box-shadow: 0 0 14px 1px color-mix(in srgb, var(--agent) 55%, transparent);
-  animation: pou-sweep-line 700ms cubic-bezier(0.4, 0, 0.2, 1) both;
-}
-@keyframes pou-line-in {
-  0% {
-    opacity: 0;
-    transform: translateX(-8px);
-  }
-  100% {
-    opacity: 1;
-    transform: translateX(0);
-  }
-}
-.pou-lines-spawn .view-line {
-  animation: pou-line-in 240ms cubic-bezier(0.22, 1, 0.36, 1) both;
-}
-@media (prefers-reduced-motion: reduce) {
-  .pou-sweep::after {
-    display: none;
-  }
-  .pou-lines-spawn .view-line {
-    animation: none;
-  }
+
+@layer components {
+.ia2-pane { display: flex; height: 100%; min-height: 0; min-width: 0; flex-direction: column; background: var(--background); }
+.ia2-pane-header { display: flex; flex-shrink: 0; flex-wrap: wrap; align-items: center; gap: 12px; min-height: 52px; padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--background); }
+.ia2-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 16px; }
+.ia2-section-label { font-size: 12px; font-weight: 500; color: var(--muted-foreground); }
+.ia2-field-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); gap: 16px; }
+.ia2-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.ia2-table th { font-size: 12px; font-weight: 500; color: var(--muted-foreground); text-align: left; background: var(--secondary); }
+.ia2-table th, .ia2-table td { height: 36px; padding: 8px 12px; border-bottom: 1px solid var(--border); }
+.ia2-table tbody tr:hover { background: var(--secondary); }
+
 }

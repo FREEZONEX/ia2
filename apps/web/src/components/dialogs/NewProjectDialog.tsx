@@ -15,18 +15,25 @@ import { Label } from "@/components/ui/label"
 import { useRuntime } from "@/state/runtime"
 
 type Props = {
-  trigger: React.ReactNode
+  trigger?: React.ReactNode
+  open?: boolean
+  onOpenChange?: (open: boolean) => void
 }
 
-export function NewProjectDialog({ trigger }: Props) {
+export function NewProjectDialog({ trigger, open: controlledOpen, onOpenChange }: Props) {
   const { createProject } = useRuntime()
-  const [open, setOpen] = useState(false)
+  const [internalOpen, setInternalOpen] = useState(false)
+  const open = controlledOpen ?? internalOpen
+  const setOpen = (next: boolean) => {
+    if (controlledOpen === undefined) setInternalOpen(next)
+    onOpenChange?.(next)
+  }
   const [name, setName] = useState("")
   const [submitting, setSubmitting] = useState(false)
   const trimmed = name.trim()
 
   const submit = async () => {
-    if (!trimmed) return
+    if (!trimmed || submitting) return
     setSubmitting(true)
     const ok = await createProject(trimmed)
     setSubmitting(false)
@@ -38,14 +45,13 @@ export function NewProjectDialog({ trigger }: Props) {
   }
 
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger asChild>{trigger}</DialogTrigger>
+    <Dialog open={open} onOpenChange={(next) => { if (!submitting) setOpen(next) }}>
+      {trigger && <DialogTrigger asChild>{trigger}</DialogTrigger>}
       <DialogContent>
         <DialogHeader>
           <DialogTitle>New project</DialogTitle>
           <DialogDescription>
-            Creates a new project under{" "}
-            <code className="font-mono">~/Documents/IA2/</code>.
+            Creates a project in the default IA2 projects folder.
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-2">
@@ -62,11 +68,11 @@ export function NewProjectDialog({ trigger }: Props) {
           />
         </div>
         <DialogFooter>
-          <Button variant="ghost" onClick={() => setOpen(false)}>
+          <Button variant="ghost" disabled={submitting} onClick={() => setOpen(false)}>
             Cancel
           </Button>
           <Button onClick={submit} disabled={!trimmed || submitting}>
-            Create
+            {submitting ? "Creating…" : "Create"}
           </Button>
         </DialogFooter>
       </DialogContent>

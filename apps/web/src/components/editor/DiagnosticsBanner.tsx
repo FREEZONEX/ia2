@@ -85,18 +85,18 @@ function Row({
           disabled={!onJump}
           className="flex flex-1 items-start gap-2 text-left hover:text-foreground disabled:cursor-default"
         >
-          <span className="font-mono text-[10px] text-destructive">
+          <span className="font-mono text-xs text-destructive">
             {d.code}
           </span>
           <span className="flex-1 text-foreground">{d.message}</span>
           {/* The first context entry as a short tail hint — almost
               always one structured fragment like `variable=foo`. */}
           {d.context.length > 0 && (
-            <span className="font-mono text-[10px] text-muted-foreground">
+            <span className="font-mono text-xs text-muted-foreground">
               [{d.context[0]}]
             </span>
           )}
-          <span className="font-mono text-[10px] text-muted-foreground">
+          <span className="font-mono text-xs text-muted-foreground">
             {formatLocation(d)}
           </span>
         </button>
@@ -105,7 +105,7 @@ function Row({
             type="button"
             onClick={() => setExpanded((e) => !e)}
             className={cn(
-              "rounded px-1 font-mono text-[11px] text-muted-foreground hover:bg-accent/40 hover:text-foreground",
+              "rounded px-1 font-mono text-[13px] text-muted-foreground hover:bg-accent/40 hover:text-foreground",
               expanded && "bg-accent/30 text-foreground",
             )}
             title={
@@ -127,7 +127,7 @@ function Row({
 
 function Detail({ d }: { d: CheckDiagnostic }) {
   return (
-    <div className="border-t border-destructive/15 bg-destructive/[0.04] px-3 py-2 text-[11px]">
+    <div className="border-t border-destructive/15 bg-destructive/[0.04] px-3 py-2 text-[13px]">
       {/* Context entries: short structured fragments like
           `variable=ghost`. ironplc emits these via Diagnostic.described
           (one fragment per call to `with_context*`). */}
@@ -150,7 +150,7 @@ function Detail({ d }: { d: CheckDiagnostic }) {
             <li key={i} className="text-foreground">
               <span className="mr-1 text-muted-foreground">→</span>
               {r.message}{" "}
-              <span className="font-mono text-[10px] text-muted-foreground">
+              <span className="font-mono text-xs text-muted-foreground">
                 @ {r.start_line}:{r.start_column}
               </span>
             </li>
@@ -165,7 +165,7 @@ function Detail({ d }: { d: CheckDiagnostic }) {
           <summary className="cursor-pointer text-muted-foreground hover:text-foreground">
             Explanation ({d.code})
           </summary>
-          <pre className="mt-1 max-h-72 overflow-auto whitespace-pre-wrap rounded border border-border bg-muted/30 p-2 font-mono text-[10.5px] text-foreground/90">
+          <pre className="mt-1 max-h-72 overflow-auto whitespace-pre-wrap rounded border border-border bg-muted/30 p-2 font-mono text-xs text-foreground/90">
             {d.explanation}
           </pre>
         </details>

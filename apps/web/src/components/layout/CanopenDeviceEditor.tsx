@@ -1,4 +1,4 @@
-import { Plus, Trash2 } from "lucide-react"
+import { Plus, Trash2 } from "@/components/ui/icons"
 
 import { Button } from "@/components/ui/button"
 import { EnumSelect } from "@/components/ui/enum-select"
@@ -80,15 +80,15 @@ export function CanopenDeviceEditor({ device, onSave, link }: DeviceEditorProps)
     <>
       <DeviceSaveBar
         name={device.name}
-        protocol="canopen"
+        protocol="CANopen"
         dirty={dirty}
-        onSave={() => void onSave(draft)}
+        onSave={() => onSave(draft)}
       />
 
-      <div className="flex-1 space-y-6 overflow-auto p-5">
+      <div className="min-h-0 flex-1 space-y-6 overflow-auto p-4">
         <section>
           <SectionHeader title="Bus" />
-          <div className="grid grid-cols-2 gap-3 max-w-2xl">
+          <div className="ia2-field-grid">
             <Field label="CAN interface">
               <Input
                 value={draft.interface}
@@ -170,152 +170,154 @@ export function CanopenDeviceEditor({ device, onSave, link }: DeviceEditorProps)
             </EmptyBox>
           ) : (
             <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead className="text-[10px] uppercase tracking-wider text-muted-foreground">
-                <tr className="border-b border-border">
-                  <th className="px-2 py-1.5 text-left">Name</th>
-                  <th className="px-2 py-1.5 text-left">Index</th>
-                  <th className="px-2 py-1.5 text-left">Sub</th>
-                  <th className="px-2 py-1.5 text-left">Type</th>
-                  <th className="px-2 py-1.5 text-left">Access</th>
-                  <th
-                    className="px-2 py-1.5 text-left"
-                    title="SDO = request/response at the poll interval. TPDO/RPDO = process data on the predefined COB-IDs; slot 1–4 and the byte offset inside the ≤8-byte frame."
-                  >
-                    Transport
-                  </th>
-                  <th
-                    className="px-2 py-1.5 text-left"
-                    title="Optional value written on runtime shutdown/trip. Empty = leave the object untouched."
-                  >
-                    Failsafe
-                  </th>
-                  <th className="px-2 py-1.5 text-left">Linked to</th>
-                  <th className="px-2 py-1.5"></th>
-                </tr>
-              </thead>
-              <tbody>
-                {draft.channels.map((ch, i) => (
-                  <tr
-                    key={i}
-                    className="border-b border-border align-top last:border-0"
-                  >
-                    <td className="px-2 py-1.5">
-                      <Input
-                        value={ch.name}
-                        onChange={(e) => setChannel(i, { name: e.target.value })}
-                        className="h-8 w-32"
-                      />
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <HexCell
-                        value={ch.index}
-                        onChange={(n) => setChannel(i, { index: n })}
-                      />
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <NumberCell
-                        min={0}
-                        max={255}
-                        value={ch.sub_index}
-                        onChange={(n) => setChannel(i, { sub_index: n })}
-                        className="w-16"
-                      />
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <EnumSelect<CanopenDataType>
-                        value={ch.data_type}
-                        onValueChange={(v) => setChannel(i, { data_type: v })}
-                        options={CANOPEN_DATA_TYPES}
-                        className="h-8 w-28"
-                      />
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <EnumSelect<CanopenAccess>
-                        value={ch.access ?? "read"}
-                        onValueChange={(v) => setChannel(i, { access: v })}
-                        options={[
-                          { value: "read", label: "read" },
-                          { value: "write", label: "write" },
-                        ]}
-                        className="h-8 w-24"
-                      />
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <div className="flex items-center gap-1.5">
-                        <EnumSelect<TransportKind>
-                          value={ch.transport.kind}
-                          onValueChange={(v) => setTransportKind(i, v)}
+            <div className="min-w-0 overflow-x-auto">
+              <table className="ia2-table w-full min-w-[800px]">
+                <thead className="text-xs text-muted-foreground">
+                  <tr className="border-b border-border">
+                    <th className="px-2 py-1.5 text-left">Name</th>
+                    <th className="px-2 py-1.5 text-left">Index</th>
+                    <th className="px-2 py-1.5 text-left">Sub</th>
+                    <th className="px-2 py-1.5 text-left">Type</th>
+                    <th className="px-2 py-1.5 text-left">Access</th>
+                    <th
+                      className="px-2 py-1.5 text-left"
+                      title="SDO = request/response at the poll interval. TPDO/RPDO = process data on the predefined COB-IDs; slot 1–4 and the byte offset inside the ≤8-byte frame."
+                    >
+                      Transport
+                    </th>
+                    <th
+                      className="px-2 py-1.5 text-left"
+                      title="Optional value written on runtime shutdown/trip. Empty = leave the object untouched."
+                    >
+                      Failsafe
+                    </th>
+                    <th className="px-2 py-1.5 text-left">Linked to</th>
+                    <th className="px-2 py-1.5"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {draft.channels.map((ch, i) => (
+                    <tr
+                      key={i}
+                      className="border-b border-border align-top last:border-0"
+                    >
+                      <td className="px-2 py-1.5">
+                        <Input
+                          value={ch.name}
+                          onChange={(e) => setChannel(i, { name: e.target.value })}
+                          className="h-8 w-32"
+                        />
+                      </td>
+                      <td className="px-2 py-1.5">
+                        <HexCell
+                          value={ch.index}
+                          onChange={(n) => setChannel(i, { index: n })}
+                        />
+                      </td>
+                      <td className="px-2 py-1.5">
+                        <NumberCell
+                          min={0}
+                          max={255}
+                          value={ch.sub_index}
+                          onChange={(n) => setChannel(i, { sub_index: n })}
+                          className="w-16"
+                        />
+                      </td>
+                      <td className="px-2 py-1.5">
+                        <EnumSelect<CanopenDataType>
+                          value={ch.data_type}
+                          onValueChange={(v) => setChannel(i, { data_type: v })}
+                          options={CANOPEN_DATA_TYPES}
+                          className="h-8 w-28"
+                        />
+                      </td>
+                      <td className="px-2 py-1.5">
+                        <EnumSelect<CanopenAccess>
+                          value={ch.access ?? "read"}
+                          onValueChange={(v) => setChannel(i, { access: v })}
                           options={[
-                            { value: "sdo", label: "SDO" },
-                            { value: "tpdo", label: "TPDO" },
-                            { value: "rpdo", label: "RPDO" },
+                            { value: "read", label: "read" },
+                            { value: "write", label: "write" },
                           ]}
                           className="h-8 w-24"
                         />
-                        {ch.transport.kind !== "sdo" && (
-                          <>
-                            <NumberCell
-                              min={1}
-                              max={4}
-                              value={ch.transport.slot}
-                              onChange={(n) =>
-                                setChannel(i, {
-                                  transport: { ...ch.transport, slot: n } as CanopenChannel["transport"],
-                                })
-                              }
-                              className="w-14"
-                              title="PDO slot 1–4"
-                            />
-                            <NumberCell
-                              min={0}
-                              max={7}
-                              value={ch.transport.byte_offset}
-                              onChange={(n) =>
-                                setChannel(i, {
-                                  transport: {
-                                    ...ch.transport,
-                                    byte_offset: n,
-                                  } as CanopenChannel["transport"],
-                                })
-                              }
-                              className="w-14"
-                              title="Byte offset in the PDO frame"
-                            />
-                          </>
-                        )}
-                      </div>
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <Input
-                        value={ch.failsafe ?? ""}
-                        onChange={(e) => {
-                          const t = e.target.value.trim()
-                          setChannel(i, {
-                            failsafe: t === "" ? null : Number(t),
-                          })
-                        }}
-                        className="h-8 w-20"
-                        placeholder="—"
-                      />
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <LinkedToCell channelName={ch.name} link={link} />
-                    </td>
-                    <td className="px-2 py-1.5 text-right">
-                      <button
-                        type="button"
-                        onClick={() => removeChannel(i)}
-                        className="rounded p-1 text-muted-foreground hover:bg-accent/40 hover:text-destructive"
-                        title="Remove"
-                      >
-                        <Trash2 className="size-3.5" />
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+                      </td>
+                      <td className="px-2 py-1.5">
+                        <div className="flex items-center gap-1.5">
+                          <EnumSelect<TransportKind>
+                            value={ch.transport.kind}
+                            onValueChange={(v) => setTransportKind(i, v)}
+                            options={[
+                              { value: "sdo", label: "SDO" },
+                              { value: "tpdo", label: "TPDO" },
+                              { value: "rpdo", label: "RPDO" },
+                            ]}
+                            className="h-8 w-24"
+                          />
+                          {ch.transport.kind !== "sdo" && (
+                            <>
+                              <NumberCell
+                                min={1}
+                                max={4}
+                                value={ch.transport.slot}
+                                onChange={(n) =>
+                                  setChannel(i, {
+                                    transport: { ...ch.transport, slot: n } as CanopenChannel["transport"],
+                                  })
+                                }
+                                className="w-14"
+                                title="PDO slot 1–4"
+                              />
+                              <NumberCell
+                                min={0}
+                                max={7}
+                                value={ch.transport.byte_offset}
+                                onChange={(n) =>
+                                  setChannel(i, {
+                                    transport: {
+                                      ...ch.transport,
+                                      byte_offset: n,
+                                    } as CanopenChannel["transport"],
+                                  })
+                                }
+                                className="w-14"
+                                title="Byte offset in the PDO frame"
+                              />
+                            </>
+                          )}
+                        </div>
+                      </td>
+                      <td className="px-2 py-1.5">
+                        <Input
+                          value={ch.failsafe ?? ""}
+                          onChange={(e) => {
+                            const t = e.target.value.trim()
+                            setChannel(i, {
+                              failsafe: t === "" ? null : Number(t),
+                            })
+                          }}
+                          className="h-8 w-20"
+                          placeholder="—"
+                        />
+                      </td>
+                      <td className="px-2 py-1.5">
+                        <LinkedToCell channelName={ch.name} link={link} />
+                      </td>
+                      <td className="px-2 py-1.5 text-right">
+                        <button
+                          type="button"
+                          onClick={() => removeChannel(i)}
+                          className="inline-flex size-7 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-accent/40 hover:text-destructive"
+                          title="Remove"
+                        >
+                          <Trash2 className="size-3.5" />
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
             </div>
           )}
         </section>

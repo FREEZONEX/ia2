@@ -1,42 +1,25 @@
-import { X } from "lucide-react"
+import { X } from "@/components/ui/icons"
 import { useEffect, useState } from "react"
-import { Group, Panel, Separator, type Layout } from "react-resizable-panels"
-
+import { Group, Panel, Separator, usePanelRef, type Layout } from "react-resizable-panels"
 import { ProjectEmptyState } from "@/components/dialogs/ProjectEmptyState"
 import { RuntimeProvider, useRuntime } from "@/state/runtime"
 import { AgentStatusBar } from "./AgentStatusBar"
 import { DevicePane } from "./DevicePane"
-import { IconRail } from "./IconRail"
 import { EdgePane } from "./EdgePane"
 import { HmiPane } from "./HmiPane"
 import { IoMapPane } from "./IoMapPane"
 import { MonitorPane } from "./MonitorPane"
 import { ProgramPane } from "./ProgramPane"
 import { ProjectPane } from "./ProjectPane"
+import { QuickOpen } from "./QuickOpen"
+import { SystemIndication } from "./SystemIndication"
 import { TasksPane } from "./TasksPane"
 import { WindowTitleBar } from "./WindowTitleBar"
 
-// The .dark class is applied at module load by lib/dark-mode.ts (reads
-// localStorage). Components that care about the current theme subscribe
-// via useDarkMode(); the toggle lives in the header.
-
 export function Workbench() {
-  return (
-    <RuntimeProvider>
-      <Shell />
-      <GlobalErrorToast />
-    </RuntimeProvider>
-  )
+  return <RuntimeProvider><Shell /><GlobalErrorToast /></RuntimeProvider>
 }
 
-/**
- * Single app-wide surface for failed actions. Every runtime action funnels
- * its failure into the context `error` field; without this, a failure in any
- * pane or dialog that doesn't render `error` itself (Device / IoMap / Tasks /
- * all create dialogs) would vanish silently. Lives inside RuntimeProvider so
- * it works in the loading and empty-project states too. Auto-dismisses, and
- * is manually dismissable.
- */
 function GlobalErrorToast() {
   const { error, clearError } = useRuntime()
   useEffect(() => {
@@ -51,7 +34,7 @@ function GlobalErrorToast() {
       // z-[100] keeps the toast above modal dialog overlays (Radix uses
       // z-50) — a create dialog stays open on failure, so its error must
       // float over the dimming overlay, not behind it.
-      className="fixed bottom-4 right-4 z-[100] flex max-w-md items-start gap-2 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive shadow-lg"
+      className="fixed bottom-4 right-4 z-[100] flex max-w-md items-start gap-2 rounded-md border border-destructive/30 bg-popover px-4 py-3 text-[13px] text-destructive shadow-lg"
     >
       <span className="min-w-0 flex-1 whitespace-pre-wrap break-words">
         {error}
@@ -68,200 +51,71 @@ function GlobalErrorToast() {
   )
 }
 
-/** Read a saved {panelId: size} layout from localStorage; tolerant of
- * corrupted entries (returns `undefined` instead of throwing). */
-function loadLayout(key: string): Layout | undefined {
-  try {
-    const raw = window.localStorage.getItem(key)
-    if (!raw) return undefined
-    const parsed = JSON.parse(raw)
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return parsed as Layout
-    }
-  } catch {
-    /* ignore */
-  }
-  return undefined
-}
 
-function saveLayout(key: string, layout: Layout) {
-  try {
-    window.localStorage.setItem(key, JSON.stringify(layout))
-  } catch {
-    /* localStorage may be unavailable (private mode, etc.) — fine */
-  }
-}
-
-/** useState-backed Layout that mirrors itself to localStorage. */
-function usePersistedLayout(
-  key: string,
-  fallback: Layout,
-): [Layout, (next: Layout) => void] {
-  const [layout, setLayout] = useState<Layout>(
-    () => loadLayout(key) ?? fallback,
-  )
-  useEffect(() => {
-    saveLayout(key, layout)
-  }, [key, layout])
+function usePersistedLayout(key: string, fallback: Layout): [Layout, (layout: Layout) => void] {
+  const [layout, setLayout] = useState<Layout>(() => {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(key) ?? "null")
+      const keys = Object.keys(fallback)
+      if (parsed && typeof parsed === "object" && Object.keys(parsed).length === keys.length && keys.every((id) => typeof parsed[id] === "number" && Number.isFinite(parsed[id]) && parsed[id] >= 0 && parsed[id] <= 100) && Math.abs(keys.reduce((sum, id) => sum + parsed[id], 0) - 100) < 0.1) return parsed
+    } catch { /* An invalid saved layout must not hide the workspace. */ }
+    return fallback
+  })
+  useEffect(() => { try { localStorage.setItem(key, JSON.stringify(layout)) } catch { /* optional preference */ } }, [key, layout])
   return [layout, setLayout]
 }
 
-// Stable IDs — used as React keys and as layout dict keys.
-const PANEL_PROJECT = "project"
-const PANEL_CENTER = "center"
-const PANEL_EDITOR = "editor"
-const PANEL_MONITOR = "monitor"
-
 function Shell() {
   const { project, projectLoading, view } = useRuntime()
-
-  // Storage keys bumped to v3 with the removal of the right-hand
-  // Agents pane — without the bump, anyone with a saved v2 layout
-  // would have a leftover `agents` slot in the dict that no panel
-  // claims, leaving the center stuck at its old narrow width.
-  const [hLayout, setHLayout] = usePersistedLayout("cs.shell.h.v3", {
-    [PANEL_PROJECT]: 18,
-    [PANEL_CENTER]: 82,
-  })
-  const [vLayout, setVLayout] = usePersistedLayout("cs.shell.v.v2", {
-    [PANEL_EDITOR]: 68,
-    [PANEL_MONITOR]: 32,
-  })
-
-  if (projectLoading) {
-    return (
-      <div className="flex h-screen flex-col text-foreground">
-        <div className="grid flex-1 place-items-center bg-background text-sm text-muted-foreground">
-          Loading…
-        </div>
-      </div>
-    )
-  }
-
-  if (!project) {
-    return <ProjectEmptyState />
-  }
-
-  const center =
-    view === "device" ? (
-      <DevicePane />
-    ) : view === "edge" ? (
-      <EdgePane />
-    ) : view === "hmi" ? (
-      <HmiPane />
-    ) : view === "iomap" ? (
-      <IoMapPane />
-    ) : view === "tasks" ? (
-      <TasksPane />
-    ) : (
-      <ProgramPane />
-    )
-
-  // Note: Monitor used to auto-hide when no run had happened yet, but
-  // adding/removing the Panel mid-session made the lib redistribute the
-  // vertical space to an equal split instead of restoring defaultLayout.
-  // It's also more honest to always show Monitor (with its "click Run
-  // to start" placeholder) so the user knows where live data appears.
-  // For users who want it gone, the bottom gutter drags down to
-  // `collapsedSize` (3% — a tiny stub).
-
+  const [hLayout, setHLayout] = usePersistedLayout("ia2.shell.h.v4", { project: 21, center: 79 })
+  const [vLayout, setVLayout] = usePersistedLayout("ia2.shell.v.v4", { editor: 65, monitor: 35 })
+  const projectPanel = usePanelRef()
+  const monitorPanel = usePanelRef()
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  const [monitorCollapsed, setMonitorCollapsed] = useState(false)
+  const [quickOpen, setQuickOpen] = useState(false)
+  const toggleSidebar = () => { const p = projectPanel.current; if (p?.isCollapsed()) p.expand(); else p?.collapse() }
+  const toggleMonitor = () => { const p = monitorPanel.current; if (p?.isCollapsed()) p.expand(); else p?.collapse() }
+  useEffect(() => {
+    const key = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && ["p", "k"].includes(e.key.toLowerCase())) { e.preventDefault(); setQuickOpen(true) }
+    }
+    window.addEventListener("keydown", key)
+    return () => window.removeEventListener("keydown", key)
+  }, [])
+  useEffect(() => {
+    if (!project) return
+    const query = matchMedia("(max-width: 800px)")
+    const fit = () => { if (query.matches) projectPanel.current?.collapse() }
+    const frame = requestAnimationFrame(fit)
+    query.addEventListener("change", fit)
+    return () => { cancelAnimationFrame(frame); query.removeEventListener("change", fit) }
+  }, [project?.name, projectPanel])
+  if (projectLoading) return <div className="flex h-dvh flex-col bg-background"><WindowTitleBar /><div role="status" className="px-6 py-8 text-sm text-muted-foreground">Loading workspace…</div></div>
+  if (!project) return <ProjectEmptyState />
+  const center = view === "device" ? <DevicePane /> : view === "edge" ? <EdgePane /> : view === "hmi" ? <HmiPane /> : view === "iomap" ? <IoMapPane /> : view === "tasks" ? <TasksPane /> : <ProgramPane />
   return (
-    <div className="flex h-screen w-screen flex-col overflow-hidden text-foreground">
-      {/* Slim titlebar: carries the centred project picker (the
-       * document-name-in-titlebar convention). */}
-      <WindowTitleBar />
-      {/* Rail + resizable panes share one horizontal row. The rail is a
-       * fixed 52px outside the resizable Group so dragging the sidebar
-       * gutter never touches it — it's chrome, not a pane. */}
-      <div className="flex h-full min-h-0 w-full bg-background">
-        <IconRail />
-        <Group
-          orientation="horizontal"
-          defaultLayout={hLayout}
-          onLayoutChange={setHLayout}
-          className="h-full min-h-0 flex-1"
-        >
-          <Panel
-            id={PANEL_PROJECT}
-            minSize="10%"
-            maxSize="40%"
-            collapsible
-            collapsedSize="0%"
-          >
-            <ProjectPane />
-          </Panel>
-          <Gutter orientation="vertical" />
-          <Panel id={PANEL_CENTER} minSize="30%">
-            <Group
-              orientation="vertical"
-              defaultLayout={vLayout}
-              onLayoutChange={setVLayout}
-              className="h-full w-full"
-            >
-              <Panel id={PANEL_EDITOR} minSize="20%">
-                {center}
-              </Panel>
-              <Gutter orientation="horizontal" />
-              <Panel
-                id={PANEL_MONITOR}
-                minSize="5%"
-                collapsible
-                collapsedSize="3%"
-              >
-                <MonitorPane />
-              </Panel>
-            </Group>
-          </Panel>
-        </Group>
-      </div>
-      {/* Acid-green agent bar. In normal flow (not an overlay) so the
-       * workspace above shrinks by its 26px instead of being covered —
-       * an agent editing the bottom line of a file must still be able
-       * to see it. Renders nothing when no agent is active. */}
+    <div data-testid="workbench" className="flex h-dvh w-full min-w-0 flex-col overflow-hidden bg-background text-foreground">
+      <WindowTitleBar onSearch={() => setQuickOpen(true)} onToggleSidebar={toggleSidebar} sidebarCollapsed={sidebarCollapsed} onToggleMonitor={toggleMonitor} monitorCollapsed={monitorCollapsed} />
+      <Group orientation="horizontal" defaultLayout={hLayout} onLayoutChange={setHLayout} className="min-h-0 min-w-0 flex-1">
+        <Panel id="project" panelRef={projectPanel} minSize="208px" maxSize="340px" collapsible collapsedSize="0px" onResize={(size) => setSidebarCollapsed(size.inPixels < 40)}><div className="h-full" inert={sidebarCollapsed} aria-hidden={sidebarCollapsed}><ProjectPane /></div></Panel>
+        <Gutter orientation="vertical" />
+        <Panel id="center" minSize="360px">
+          <Group orientation="vertical" defaultLayout={vLayout} onLayoutChange={setVLayout} className="h-full min-h-0 min-w-0">
+            <Panel id="editor" minSize="160px">{center}</Panel>
+            <Gutter orientation="horizontal" />
+            <Panel id="monitor" panelRef={monitorPanel} minSize="210px" maxSize="65%" collapsible collapsedSize="40px" onResize={(size) => setMonitorCollapsed(size.inPixels < 60)}><MonitorPane collapsed={monitorCollapsed} onToggleCollapse={toggleMonitor} /></Panel>
+          </Group>
+        </Panel>
+      </Group>
+      <SystemIndication />
       <AgentStatusBar />
+      <QuickOpen open={quickOpen} onClose={() => setQuickOpen(false)} />
     </div>
   )
 }
 
-/**
- * Drag handle between two panels.
- *
- * Visually: a 4-px-wide (or tall) hit-area centered on a 1-px border line.
- * The hit area is transparent at rest and turns into a 2-px accent strip
- * when hovered or being dragged. This gives a generous grab target without
- * a fat permanent gutter eating screen real estate.
- */
 function Gutter({ orientation }: { orientation: "vertical" | "horizontal" }) {
-  // `orientation === "vertical"` means the SEPARATOR LINE is vertical, i.e.
-  // it sits between two horizontally-arranged panels (left/right).
   const vertical = orientation === "vertical"
-  const classes = [
-    "group relative shrink-0",
-    vertical
-      ? "w-1 cursor-col-resize"
-      : "h-1 cursor-row-resize",
-  ].join(" ")
-  return (
-    <Separator className={classes}>
-      {/* Always-visible 1px hairline */}
-      <span
-        aria-hidden
-        className={
-          vertical
-            ? "pointer-events-none absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-border"
-            : "pointer-events-none absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-border"
-        }
-      />
-      {/* Hover / drag highlight on top */}
-      <span
-        aria-hidden
-        className={
-          (vertical
-            ? "pointer-events-none absolute inset-y-0 left-1/2 w-[2px] -translate-x-1/2 "
-            : "pointer-events-none absolute inset-x-0 top-1/2 h-[2px] -translate-y-1/2 ") +
-          "bg-accent opacity-0 transition-opacity group-hover:opacity-100 group-data-[separator-state=drag]:opacity-100"
-        }
-      />
-    </Separator>
-  )
+  return <Separator aria-label={vertical ? "Resize project explorer" : "Resize monitor"} className={`group relative shrink-0 bg-border/70 transition-colors hover:bg-ring focus-visible:bg-ring ${vertical ? "w-px cursor-col-resize" : "h-px cursor-row-resize"}`}><span aria-hidden className={`absolute z-10 ${vertical ? "-left-1 top-0 h-full w-2" : "-top-1 left-0 h-2 w-full"}`} /></Separator>
 }

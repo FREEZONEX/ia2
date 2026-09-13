@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react"
-import { Files, Moon, Search, Settings, Sun } from "lucide-react"
+import { Files, Moon, Search, Settings, Sun } from "@/components/ui/icons"
 
 import {
   DropdownMenu,

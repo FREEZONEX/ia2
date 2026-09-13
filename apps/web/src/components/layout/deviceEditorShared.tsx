@@ -1,9 +1,11 @@
-import { Link2, Save, X } from "lucide-react"
+import { Link2, Save, X } from "@/components/ui/icons"
 import { useEffect, useMemo, useState } from "react"
 
 import { Button } from "@/components/ui/button"
 import { EnumSelect } from "@/components/ui/enum-select"
 import { Input } from "@/components/ui/input"
+import { PaneHeader } from "@/components/ui/pane-header"
+import { ErrorBox } from "@/components/ui/error-box"
 import type { Device } from "@/types/generated/Device"
 import type { Direction } from "@/types/generated/Direction"
 import type { IoMap } from "@/types/generated/IoMap"
@@ -64,30 +66,41 @@ export function DeviceSaveBar({
   name: string
   protocol: string
   dirty: boolean
-  onSave: () => void
+  onSave: () => Promise<void>
 }) {
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const save = async () => {
+    if (saving || !dirty) return
+    setSaving(true)
+    setError(null)
+    try {
+      await onSave()
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setSaving(false)
+    }
+  }
   return (
-    <div className="flex h-9 items-center justify-between border-b border-border pl-3 pr-2 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-      <span className="flex items-center gap-2 truncate normal-case tracking-normal text-foreground">
-        <span className="truncate font-mono">{name}</span>
-        <span className="rounded border border-border bg-muted/50 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wider text-muted-foreground">
-          {protocol}
-        </span>
-        {dirty && (
-          <span className="rounded bg-warn/15 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wider text-warn">
-            modified
-          </span>
-        )}
-      </span>
-      <Button size="sm" variant="outline" onClick={onSave} disabled={!dirty}>
-        <Save className="mr-1.5 size-3" />
-        Save
-      </Button>
-    </div>
+    <>
+      <PaneHeader
+        title={<span title={name}>{name}</span>}
+        description={protocol}
+        meta={dirty ? <span className="text-warn">Unsaved changes</span> : undefined}
+        actions={
+          <Button size="sm" onClick={() => void save()} disabled={!dirty || saving} aria-busy={saving}>
+            <Save className="size-4" />
+            {saving ? "Saving…" : "Save changes"}
+          </Button>
+        }
+      />
+      {error && <ErrorBox className="m-4 mb-0">{error}</ErrorBox>}
+    </>
   )
 }
 
-/** Uppercase section title, optionally with a right-aligned action (an
+/** Section title, optionally with a right-aligned action (an
  * "Add …" button). */
 export function SectionHeader({
   title,
@@ -99,25 +112,25 @@ export function SectionHeader({
   if (action) {
     return (
       <div className="mb-3 flex items-center justify-between">
-        <div className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+        <h2 className="text-[13px] font-medium text-foreground">
           {title}
-        </div>
+        </h2>
         {action}
       </div>
     )
   }
   return (
-    <div className="mb-3 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+    <h2 className="mb-3 text-[13px] font-medium text-foreground">
       {title}
-    </div>
+    </h2>
   )
 }
 
-/** Dashed-border placeholder shown when a channel/slave/tag table is
+/** Quiet placeholder shown when a channel/slave/tag table is
  * empty. */
 export function EmptyBox({ children }: { children: React.ReactNode }) {
   return (
-    <div className="rounded-md border border-dashed border-border p-4 text-center text-xs text-muted-foreground">
+    <div className="bg-muted/40 px-4 py-6 text-[13px] leading-6 text-muted-foreground">
       {children}
     </div>
   )
@@ -166,7 +179,7 @@ export function LinkedToCell({
   const remove = async (target: Mapping) => {
     const next: IoMap = {
       mappings: link.iomap.mappings.filter(
-        (m) => mappingKey(m) !== mappingKey(target) || m.channel !== channelName,
+        (m) => m.device !== link.deviceName || mappingKey(m) !== mappingKey(target) || m.channel !== channelName,
       ),
     }
     await link.saveIomap(next)
@@ -203,7 +216,7 @@ export function LinkedToCell({
   // Channels with empty names can't be bound (iomap targets by name string).
   if (!channelName) {
     return (
-      <span className="text-[11px] italic text-muted-foreground">
+      <span className="text-xs italic text-muted-foreground">
         (name this channel first)
       </span>
     )
@@ -214,13 +227,13 @@ export function LinkedToCell({
       {bindings.map((m) => (
         <span
           key={mappingKey(m)}
-          className="inline-flex items-center gap-1 rounded-md border border-border bg-muted/40 px-1.5 py-0.5 text-[11px] font-mono"
+          className="inline-flex min-h-7 max-w-full items-center gap-1 rounded-md bg-muted/40 px-2 py-1 text-xs font-mono"
           title={`${m.application}.${m.variable} (${m.direction === "input" ? "bus → var" : "var → bus"})`}
         >
           <span
             className={
               m.direction === "input"
-                ? "text-sky-700 dark:text-sky-400"
+                ? "text-muted-foreground"
                 : "text-highlight"
             }
           >
@@ -232,7 +245,7 @@ export function LinkedToCell({
           <button
             type="button"
             onClick={() => void remove(m)}
-            className="rounded text-muted-foreground hover:text-destructive"
+            className="inline-flex size-6 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-accent/40 hover:text-destructive"
             title="Unlink"
           >
             <X className="size-3" />
@@ -240,13 +253,13 @@ export function LinkedToCell({
         </span>
       ))}
       {adding ? (
-        <div className="flex flex-wrap items-center gap-1 rounded-md border border-dashed border-border bg-background/60 p-1">
+        <div className="flex flex-wrap items-center gap-2 bg-muted/40 p-2">
           <EnumSelect
             value={draft.application}
             onValueChange={(v) => setDraft({ ...draft, application: v })}
             options={link.apps.map((a) => ({ value: a, label: a }))}
             placeholder="app"
-            className="h-7 w-32 text-[11px]"
+            className="h-7 w-32 text-xs"
           />
           <Input
             list={varListId}
@@ -257,7 +270,7 @@ export function LinkedToCell({
               if (e.key === "Escape") setAdding(false)
             }}
             placeholder="variable"
-            className="h-7 w-32 text-[11px]"
+            className="h-7 w-32 text-xs"
             autoFocus
           />
           <datalist id={varListId}>
@@ -274,21 +287,21 @@ export function LinkedToCell({
               { value: "output", label: "→ output" },
               { value: "input", label: "← input" },
             ]}
-            className="h-7 w-24 text-[11px]"
+            className="h-7 w-24 text-xs"
           />
           <Button
             size="sm"
             variant="outline"
             onClick={() => void commit()}
             disabled={!draft.variable.trim() || !draft.application}
-            className="h-7 px-2 text-[11px]"
+            className="h-7 px-2 text-xs"
           >
             Link
           </Button>
           <button
             type="button"
             onClick={() => setAdding(false)}
-            className="rounded p-1 text-muted-foreground hover:text-foreground"
+            className="inline-flex size-7 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-accent/40 hover:text-foreground"
             title="Cancel"
           >
             <X className="size-3" />
@@ -304,11 +317,11 @@ export function LinkedToCell({
               setDraft((d) => ({ ...d, application: link.apps[0] ?? "" }))
             }
           }}
-          className="inline-flex items-center gap-1 rounded-md border border-dashed border-border px-1.5 py-0.5 text-[11px] text-muted-foreground hover:bg-accent/40 hover:text-foreground"
+          className="inline-flex min-h-8 items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-accent/40 hover:text-foreground"
           title="Link this channel to a POU variable"
         >
           <Link2 className="size-3" />
-          link
+          Link variable
         </button>
       )}
     </div>

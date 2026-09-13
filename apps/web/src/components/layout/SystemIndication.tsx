@@ -1,52 +1,26 @@
-import { Moon, Sun } from "lucide-react"
-
-import { useThemeToggle } from "@/lib/dark-mode"
+import { useState } from "react"
+import { Square } from "@/components/ui/icons"
+import { Button } from "@/components/ui/button"
 import { useRuntime } from "@/state/runtime"
 import { useConnected } from "@/state/live-feed"
 import { cn } from "@/lib/utils"
 
+/** Connection and stop remain visible when the editor or Monitor is hidden. */
 export function SystemIndication() {
-  const { isRunning } = useRuntime()
+  const { isRunning, running, attached, isDirty, currentPou, selectPou, stop } = useRuntime()
   const connected = useConnected()
-  const { theme, toggle } = useThemeToggle()
-
-  const { label, dot, text } = connected
-    ? isRunning
-      ? {
-          label: "Running",
-          // The one and only "actively running" green — uses the FX
-          // Green token rather than a hardcoded emerald so the brand
-          // accent stays in one place.
-          dot: "bg-highlight",
-          text: "text-foreground",
-        }
-      : { label: "Idle", dot: "bg-muted-foreground/50", text: "text-muted-foreground" }
-    : {
-        label: "Server unreachable",
-        dot: "bg-destructive/60",
-        text: "text-muted-foreground",
-      }
-
+  const [stopping, setStopping] = useState(false)
+  const label = !connected ? "Server unreachable" : isRunning ? "Controller active" : "Controller stopped"
+  const program = running?.kind === "isolated" ? running.program : running?.kind === "scheduled" ? "Task schedule" : running?.kind === "remote" ? running.edge : null
   return (
-    <div className="flex items-end justify-between gap-2 border-t border-border px-3 py-2">
-      <div className="min-w-0 flex-1">
-        <div className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-          System indication
-        </div>
-        <div className="mt-1 flex items-center gap-2 text-xs">
-          <span className={cn("size-2 rounded-full", dot)} />
-          <span className={cn("truncate", text)}>{label}</span>
-        </div>
-      </div>
-      <button
-        type="button"
-        onClick={toggle}
-        title={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
-        aria-label="Toggle colour theme"
-        className="flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-accent/40 hover:text-foreground"
-      >
-        {theme === "dark" ? <Sun className="size-3.5" /> : <Moon className="size-3.5" />}
-      </button>
-    </div>
+    <footer aria-label="Controller status" className="flex h-9 min-h-9 shrink-0 items-center gap-3 border-t border-border bg-secondary px-4 text-xs">
+      <span className={cn("size-1.5 shrink-0 rounded-full", !connected ? "bg-destructive" : isRunning ? "bg-highlight" : "bg-muted-foreground")} />
+      <span className={cn("shrink-0", !connected && "text-destructive")}>{label}</span>
+      {program && <span className="min-w-0 truncate font-mono text-muted-foreground">{program}</span>}
+      <span className="hidden text-muted-foreground sm:inline">{attached ? "Remote runtime" : "Local runtime"}</span>
+      <div className="flex-1" />
+      {isDirty && currentPou && <button type="button" onClick={() => void selectPou(currentPou.path)} className="min-w-0 truncate text-warn hover:underline" title={`Unsaved changes in ${currentPou.path}`}>Unsaved changes</button>}
+      {isRunning && <Button variant="ghost" size="xs" aria-label="Stop controller" disabled={stopping} onClick={() => { setStopping(true); void stop().finally(() => setStopping(false)) }} className="text-destructive hover:bg-destructive/10 hover:text-destructive"><Square className="size-3.5" />{stopping ? "Stopping…" : "Stop"}</Button>}
+    </footer>
   )
 }

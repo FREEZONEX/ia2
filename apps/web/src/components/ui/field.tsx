@@ -18,12 +18,16 @@ export function Field({
   className?: string
   children: React.ReactNode
 }) {
+  const generated = React.useId()
+  const child = React.isValidElement<{ id?: string; "aria-labelledby"?: string }>(children)
+    ? children : null
+  const id = child?.props.id ?? generated
   return (
-    <div className={cn("space-y-1.5", className)}>
-      <Label className="text-[11px] uppercase tracking-wider text-muted-foreground">
+    <div className={cn("min-w-0 space-y-1.5", className)}>
+      <Label id={`${id}-label`} htmlFor={id} className="text-xs font-medium text-muted-foreground">
         {label}
       </Label>
-      {children}
+      {child ? React.cloneElement(child, { id, "aria-labelledby": child.props["aria-labelledby"] ?? `${id}-label` }) : children}
     </div>
   )
 }

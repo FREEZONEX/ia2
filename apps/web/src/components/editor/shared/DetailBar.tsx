@@ -1,26 +1,10 @@
-/**
- * Canonical detail-bar primitives shared by the LD and SFC editors.
- *
- * Both editors had defined `DetailLabel` / `Separator` / `ActionBtn`
- * under the same names but with drifted rendering. This is the single
- * reconciled set; the look follows the SFC/FBD family, which was the
- * majority:
- *
- *   - `DetailLabel` is the rounded muted pill (SFC's, and FBD's inline
- *     `block bN` label). LD's was a bare uppercase label.
- *   - `Separator` is the vertical hairline (SFC's and FBD's). LD's was
- *     a `·` dot.
- *   - `ActionBtn` is the bordered h-7 button (SFC's, matching FBD's
- *     inline detail buttons). LD's was a compact uppercase text button.
- *     It gains a `destructive` variant — styled like SFC's `DangerBtn`
- *     and FBD's inline delete — so LD's delete action keeps its look.
- */
+/** Shared inspector labels and actions for graphical editors. */
 
-import { cn } from "@/lib/utils"
+import { Button } from "@/components/ui/button"
 
 export function DetailLabel({ children }: { children: React.ReactNode }) {
   return (
-    <span className="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] uppercase text-muted-foreground">
+    <span className="font-mono text-[13px] text-muted-foreground">
       {children}
     </span>
   )
@@ -44,19 +28,16 @@ export function ActionBtn({
   children: React.ReactNode
 }) {
   return (
-    <button
+    <Button
       type="button"
+      size="sm"
+      variant="ghost"
       onClick={onClick}
       disabled={disabled}
       title={title}
-      className={cn(
-        "flex h-7 items-center gap-1 rounded border px-2 text-[11px] disabled:cursor-not-allowed disabled:opacity-50",
-        destructive
-          ? "border-destructive/40 bg-destructive/5 text-destructive hover:bg-destructive/15"
-          : "border-input hover:bg-accent/30",
-      )}
+      className={destructive ? "text-destructive hover:bg-destructive/10 hover:text-destructive" : undefined}
     >
       {children}
-    </button>
+    </Button>
   )
 }

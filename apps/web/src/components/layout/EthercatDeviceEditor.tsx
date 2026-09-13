@@ -1,4 +1,4 @@
-import { Info, Plus, Trash2 } from "lucide-react"
+import { Info, Plus, Trash2 } from "@/components/ui/icons"
 
 import { Button } from "@/components/ui/button"
 import { EnumSelect } from "@/components/ui/enum-select"
@@ -133,15 +133,15 @@ export function EthercatDeviceEditor({
     <>
       <DeviceSaveBar
         name={device.name}
-        protocol="ethercat"
+        protocol="EtherCAT"
         dirty={dirty}
-        onSave={() => void onSave(draft)}
+        onSave={() => onSave(draft)}
       />
 
-      <div className="flex-1 space-y-6 overflow-auto p-5">
+      <div className="min-h-0 flex-1 space-y-6 overflow-auto p-4">
         <section>
           <SectionHeader title="MainDevice" />
-          <div className="grid grid-cols-2 gap-3 max-w-xl">
+          <div className="ia2-field-grid">
             <Field label="Network interface">
               <Input
                 value={draft.nic}
@@ -168,7 +168,7 @@ export function EthercatDeviceEditor({
                 className="h-9 w-full"
               />
             </Field>
-            <div className="col-span-2 flex items-start gap-2 text-[11px] text-muted-foreground">
+            <div className="col-span-2 flex items-start gap-2 text-xs text-muted-foreground">
               <Info className="mt-0.5 size-3 shrink-0" />
               <span>
                 <span className="font-mono">SYNC0</span> enables the
@@ -218,7 +218,7 @@ export function EthercatDeviceEditor({
               </Field>
             )}
             {draft.bringup?.mode === "esi_modular" && (
-              <div className="col-span-2 flex items-start gap-2 text-[11px] text-muted-foreground">
+              <div className="col-span-2 flex items-start gap-2 text-xs text-muted-foreground">
                 <Info className="mt-0.5 size-3 shrink-0" />
                 <span>
                   <span className="font-mono">ESI modular</span> builds the
@@ -250,70 +250,72 @@ export function EthercatDeviceEditor({
               SubDevice on the ring.
             </EmptyBox>
           ) : (
-            <table className="w-full max-w-3xl text-sm">
-              <thead className="text-[10px] uppercase tracking-wider text-muted-foreground">
-                <tr className="border-b border-border">
-                  <th className="px-2 py-1.5 text-left">Index</th>
-                  <th className="px-2 py-1.5 text-left">Name</th>
-                  <th className="px-2 py-1.5 text-left">Vendor ID</th>
-                  <th className="px-2 py-1.5 text-left">Product code</th>
-                  <th className="px-2 py-1.5"></th>
-                </tr>
-              </thead>
-              <tbody>
-                {draft.slaves.map((s, i) => (
-                  <tr key={i} className="border-b border-border last:border-0">
-                    <td className="px-2 py-1.5">
-                      <NumberCell
-                        min={0}
-                        value={s.index}
-                        onChange={(n) => setSlave(i, { index: n })}
-                        className="h-8 w-20"
-                      />
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <Input
-                        value={s.name}
-                        onChange={(e) => setSlave(i, { name: e.target.value })}
-                        className="h-8 w-40"
-                      />
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <Input
-                        value={toHex(s.vendor_id, 8)}
-                        onChange={(e) =>
-                          setSlave(i, { vendor_id: parseHexOrDec(e.target.value) })
-                        }
-                        className="h-8 w-32 font-mono"
-                        placeholder="0x00000000"
-                      />
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <Input
-                        value={toHex(s.product_id, 8)}
-                        onChange={(e) =>
-                          setSlave(i, {
-                            product_id: parseHexOrDec(e.target.value),
-                          })
-                        }
-                        className="h-8 w-32 font-mono"
-                        placeholder="0x00000000"
-                      />
-                    </td>
-                    <td className="px-2 py-1.5 text-right">
-                      <button
-                        type="button"
-                        onClick={() => removeSlave(i)}
-                        className="rounded p-1 text-muted-foreground hover:bg-accent/40 hover:text-destructive"
-                        title="Remove"
-                      >
-                        <Trash2 className="size-3.5" />
-                      </button>
-                    </td>
+            <div className="min-w-0 overflow-x-auto">
+              <table className="ia2-table w-full min-w-[800px]">
+                <thead className="text-xs text-muted-foreground">
+                  <tr className="border-b border-border">
+                    <th className="px-2 py-1.5 text-left">Index</th>
+                    <th className="px-2 py-1.5 text-left">Name</th>
+                    <th className="px-2 py-1.5 text-left">Vendor ID</th>
+                    <th className="px-2 py-1.5 text-left">Product code</th>
+                    <th className="px-2 py-1.5"></th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {draft.slaves.map((s, i) => (
+                    <tr key={i} className="border-b border-border last:border-0">
+                      <td className="px-2 py-1.5">
+                        <NumberCell
+                          min={0}
+                          value={s.index}
+                          onChange={(n) => setSlave(i, { index: n })}
+                          className="h-8 w-20"
+                        />
+                      </td>
+                      <td className="px-2 py-1.5">
+                        <Input
+                          value={s.name}
+                          onChange={(e) => setSlave(i, { name: e.target.value })}
+                          className="h-8 w-40"
+                        />
+                      </td>
+                      <td className="px-2 py-1.5">
+                        <Input
+                          value={toHex(s.vendor_id, 8)}
+                          onChange={(e) =>
+                            setSlave(i, { vendor_id: parseHexOrDec(e.target.value) })
+                          }
+                          className="h-8 w-32 font-mono"
+                          placeholder="0x00000000"
+                        />
+                      </td>
+                      <td className="px-2 py-1.5">
+                        <Input
+                          value={toHex(s.product_id, 8)}
+                          onChange={(e) =>
+                            setSlave(i, {
+                              product_id: parseHexOrDec(e.target.value),
+                            })
+                          }
+                          className="h-8 w-32 font-mono"
+                          placeholder="0x00000000"
+                        />
+                      </td>
+                      <td className="px-2 py-1.5 text-right">
+                        <button
+                          type="button"
+                          onClick={() => removeSlave(i)}
+                          className="inline-flex size-7 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-accent/40 hover:text-destructive"
+                          title="Remove"
+                        >
+                          <Trash2 className="size-3.5" />
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           )}
         </section>
 
@@ -344,148 +346,150 @@ export function EthercatDeviceEditor({
                 : "No channels. Each channel maps a single PDO entry (object dictionary index + sub-index) on one slave."}
             </EmptyBox>
           ) : (
-            <table className="w-full text-sm">
-              <thead className="text-[10px] uppercase tracking-wider text-muted-foreground">
-                <tr className="border-b border-border">
-                  <th className="px-2 py-1.5 text-left">Name</th>
-                  <th className="px-2 py-1.5 text-left">Slave</th>
-                  <th className="px-2 py-1.5 text-left">Direction</th>
-                  <th className="px-2 py-1.5 text-left">PDO index</th>
-                  <th className="px-2 py-1.5 text-left">Sub</th>
-                  <th className="px-2 py-1.5 text-left">Type</th>
-                  <th className="px-2 py-1.5 text-left">Bits</th>
-                  <th
-                    className="px-2 py-1.5 text-left"
-                    title="Byte offset within the SubDevice's PDI region for this direction. Required when running against real hardware; ignored in sim mode."
-                  >
-                    Byte&nbsp;off
-                  </th>
-                  <th
-                    className="px-2 py-1.5 text-left"
-                    title="Bit offset within the byte at Byte off. Only meaningful for sub-byte (1-bit) channels like digital I/O. 0 = LSB."
-                  >
-                    Bit&nbsp;off
-                  </th>
-                  <th className="px-2 py-1.5 text-left">Linked to</th>
-                  <th className="px-2 py-1.5"></th>
-                </tr>
-              </thead>
-              <tbody>
-                {draft.channels.map((ch, i) => (
-                  <tr
-                    key={i}
-                    className="border-b border-border align-top last:border-0"
-                  >
-                    <td className="px-2 py-1.5">
-                      <Input
-                        value={ch.name}
-                        onChange={(e) => setChannel(i, { name: e.target.value })}
-                        className="h-8 w-40"
-                      />
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <EnumSelect
-                        value={String(ch.slave_index)}
-                        onValueChange={(v) =>
-                          setChannel(i, { slave_index: Number(v) })
-                        }
-                        options={draft.slaves.map((s) => ({
-                          value: String(s.index),
-                          label: `[${s.index}] ${s.name}`,
-                        }))}
-                        className="h-8 w-40"
-                      />
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <EnumSelect<EthercatChannel["direction"]>
-                        value={ch.direction}
-                        onValueChange={(v) => setChannel(i, { direction: v })}
-                        options={[
-                          { value: "tx_pdo", label: "TxPDO (in)" },
-                          { value: "rx_pdo", label: "RxPDO (out)" },
-                        ]}
-                        className="h-8 w-36"
-                      />
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <Input
-                        value={toHex(ch.pdo_index, 4)}
-                        onChange={(e) =>
-                          setChannel(i, {
-                            pdo_index: parseHexOrDec(e.target.value),
-                          })
-                        }
-                        className="h-8 w-24 font-mono"
-                        placeholder="0x6000"
-                      />
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <NumberCell
-                        min={0}
-                        max={255}
-                        value={ch.sub_index}
-                        onChange={(n) => setChannel(i, { sub_index: n })}
-                        className="h-8 w-16"
-                      />
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <EnumSelect<EthercatDataType>
-                        value={ch.data_type}
-                        onValueChange={(v) =>
-                          setChannel(i, {
-                            data_type: v,
-                            // Snap bit length to the type's natural width.
-                            bit_length: defaultBitsFor(v),
-                          })
-                        }
-                        options={PDO_DATA_TYPES}
-                        className="h-8 w-36"
-                      />
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <NumberCell
-                        min={1}
-                        max={64}
-                        value={ch.bit_length}
-                        onChange={(n) => setChannel(i, { bit_length: n })}
-                        className="h-8 w-16"
-                      />
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <NumberCell
-                        min={0}
-                        max={65535}
-                        value={ch.pdi_byte_offset}
-                        onChange={(n) => setChannel(i, { pdi_byte_offset: n })}
-                        className="h-8 w-16"
-                      />
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <NumberCell
-                        min={0}
-                        max={7}
-                        value={ch.pdi_bit_offset}
-                        onChange={(n) => setChannel(i, { pdi_bit_offset: n })}
-                        className="h-8 w-14"
-                      />
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <LinkedToCell channelName={ch.name} link={link} />
-                    </td>
-                    <td className="px-2 py-1.5 text-right">
-                      <button
-                        type="button"
-                        onClick={() => removeChannel(i)}
-                        className="rounded p-1 text-muted-foreground hover:bg-accent/40 hover:text-destructive"
-                        title="Remove"
-                      >
-                        <Trash2 className="size-3.5" />
-                      </button>
-                    </td>
+            <div className="min-w-0 overflow-x-auto">
+              <table className="ia2-table w-full min-w-[800px]">
+                <thead className="text-xs text-muted-foreground">
+                  <tr className="border-b border-border">
+                    <th className="px-2 py-1.5 text-left">Name</th>
+                    <th className="px-2 py-1.5 text-left">Slave</th>
+                    <th className="px-2 py-1.5 text-left">Direction</th>
+                    <th className="px-2 py-1.5 text-left">PDO index</th>
+                    <th className="px-2 py-1.5 text-left">Sub</th>
+                    <th className="px-2 py-1.5 text-left">Type</th>
+                    <th className="px-2 py-1.5 text-left">Bits</th>
+                    <th
+                      className="px-2 py-1.5 text-left"
+                      title="Byte offset within the SubDevice's PDI region for this direction. Required when running against real hardware; ignored in sim mode."
+                    >
+                      Byte&nbsp;off
+                    </th>
+                    <th
+                      className="px-2 py-1.5 text-left"
+                      title="Bit offset within the byte at Byte off. Only meaningful for sub-byte (1-bit) channels like digital I/O. 0 = LSB."
+                    >
+                      Bit&nbsp;off
+                    </th>
+                    <th className="px-2 py-1.5 text-left">Linked to</th>
+                    <th className="px-2 py-1.5"></th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {draft.channels.map((ch, i) => (
+                    <tr
+                      key={i}
+                      className="border-b border-border align-top last:border-0"
+                    >
+                      <td className="px-2 py-1.5">
+                        <Input
+                          value={ch.name}
+                          onChange={(e) => setChannel(i, { name: e.target.value })}
+                          className="h-8 w-40"
+                        />
+                      </td>
+                      <td className="px-2 py-1.5">
+                        <EnumSelect
+                          value={String(ch.slave_index)}
+                          onValueChange={(v) =>
+                            setChannel(i, { slave_index: Number(v) })
+                          }
+                          options={draft.slaves.map((s) => ({
+                            value: String(s.index),
+                            label: `[${s.index}] ${s.name}`,
+                          }))}
+                          className="h-8 w-40"
+                        />
+                      </td>
+                      <td className="px-2 py-1.5">
+                        <EnumSelect<EthercatChannel["direction"]>
+                          value={ch.direction}
+                          onValueChange={(v) => setChannel(i, { direction: v })}
+                          options={[
+                            { value: "tx_pdo", label: "TxPDO (in)" },
+                            { value: "rx_pdo", label: "RxPDO (out)" },
+                          ]}
+                          className="h-8 w-36"
+                        />
+                      </td>
+                      <td className="px-2 py-1.5">
+                        <Input
+                          value={toHex(ch.pdo_index, 4)}
+                          onChange={(e) =>
+                            setChannel(i, {
+                              pdo_index: parseHexOrDec(e.target.value),
+                            })
+                          }
+                          className="h-8 w-24 font-mono"
+                          placeholder="0x6000"
+                        />
+                      </td>
+                      <td className="px-2 py-1.5">
+                        <NumberCell
+                          min={0}
+                          max={255}
+                          value={ch.sub_index}
+                          onChange={(n) => setChannel(i, { sub_index: n })}
+                          className="h-8 w-16"
+                        />
+                      </td>
+                      <td className="px-2 py-1.5">
+                        <EnumSelect<EthercatDataType>
+                          value={ch.data_type}
+                          onValueChange={(v) =>
+                            setChannel(i, {
+                              data_type: v,
+                              // Snap bit length to the type's natural width.
+                              bit_length: defaultBitsFor(v),
+                            })
+                          }
+                          options={PDO_DATA_TYPES}
+                          className="h-8 w-36"
+                        />
+                      </td>
+                      <td className="px-2 py-1.5">
+                        <NumberCell
+                          min={1}
+                          max={64}
+                          value={ch.bit_length}
+                          onChange={(n) => setChannel(i, { bit_length: n })}
+                          className="h-8 w-16"
+                        />
+                      </td>
+                      <td className="px-2 py-1.5">
+                        <NumberCell
+                          min={0}
+                          max={65535}
+                          value={ch.pdi_byte_offset}
+                          onChange={(n) => setChannel(i, { pdi_byte_offset: n })}
+                          className="h-8 w-16"
+                        />
+                      </td>
+                      <td className="px-2 py-1.5">
+                        <NumberCell
+                          min={0}
+                          max={7}
+                          value={ch.pdi_bit_offset}
+                          onChange={(n) => setChannel(i, { pdi_bit_offset: n })}
+                          className="h-8 w-14"
+                        />
+                      </td>
+                      <td className="px-2 py-1.5">
+                        <LinkedToCell channelName={ch.name} link={link} />
+                      </td>
+                      <td className="px-2 py-1.5 text-right">
+                        <button
+                          type="button"
+                          onClick={() => removeChannel(i)}
+                          className="inline-flex size-7 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-accent/40 hover:text-destructive"
+                          title="Remove"
+                        >
+                          <Trash2 className="size-3.5" />
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           )}
         </section>
       </div>

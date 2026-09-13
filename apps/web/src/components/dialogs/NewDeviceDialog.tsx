@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button"
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -58,7 +59,7 @@ export function NewDeviceDialog(props: Props) {
   const fullPath = parent ? `${parent}/${trimmed}` : trimmed
 
   const submit = async () => {
-    if (!trimmed) return
+    if (!trimmed || submitting) return
     setSubmitting(true)
     const ok = await createDevice(fullPath, protocol)
     setSubmitting(false)
@@ -67,18 +68,19 @@ export function NewDeviceDialog(props: Props) {
   }
 
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
+    <Dialog open={open} onOpenChange={(next) => { if (!submitting) setOpen(next) }}>
       {props.trigger ? <DialogTrigger asChild>{props.trigger}</DialogTrigger> : null}
       <DialogContent>
         <DialogHeader>
           <DialogTitle>
             New device{" "}
             {parent && (
-              <span className="font-mono text-xs text-muted-foreground">
+              <span className="break-all font-mono text-xs text-muted-foreground">
                 under {parent}
               </span>
             )}
           </DialogTitle>
+          <DialogDescription>Choose a protocol, then configure its connection and channels.</DialogDescription>
         </DialogHeader>
         <div className="space-y-3">
           <div className="space-y-2">
@@ -94,18 +96,18 @@ export function NewDeviceDialog(props: Props) {
               autoFocus
             />
             {trimmed && parent && (
-              <div className="font-mono text-[11px] text-muted-foreground">
+              <div className="break-all font-mono text-xs text-muted-foreground">
                 devices/{fullPath}.toml
               </div>
             )}
           </div>
           <div className="space-y-2">
-            <Label>Protocol</Label>
+            <Label htmlFor="device-protocol">Protocol</Label>
             <Select
               value={protocol}
               onValueChange={(v) => setProtocol(v as Protocol)}
             >
-              <SelectTrigger>
+              <SelectTrigger id="device-protocol">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -118,11 +120,11 @@ export function NewDeviceDialog(props: Props) {
           </div>
         </div>
         <DialogFooter>
-          <Button variant="ghost" onClick={() => setOpen(false)}>
+          <Button variant="ghost" disabled={submitting} onClick={() => setOpen(false)}>
             Cancel
           </Button>
           <Button onClick={submit} disabled={!trimmed || submitting}>
-            Create
+            {submitting ? "Creating…" : "Create"}
           </Button>
         </DialogFooter>
       </DialogContent>

@@ -1,4 +1,4 @@
-import { ArrowLeftRight, ArrowRight, Link2Off } from "lucide-react"
+import { ArrowLeftRight, ArrowRight, Link2Off } from "@/components/ui/icons"
 import { useEffect, useState } from "react"
 
 import { fetchPouVariables } from "@/lib/api"
@@ -19,6 +19,7 @@ export function VariablesPanel() {
   const { currentPou, iomap, project, selectDevice } = useRuntime()
   const [vars, setVars] = useState<VariableInfo[]>([])
   const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
 
   // Refetch whenever the POU changes — variable lists are cheap to recompute
   // and source-typed (so an edit-in-progress changes the list).
@@ -29,12 +30,13 @@ export function VariablesPanel() {
     }
     let cancelled = false
     setLoading(true)
+    setError(null)
     fetchPouVariables(currentPou.path)
       .then((vs) => {
         if (!cancelled) setVars(vs)
       })
-      .catch(() => {
-        if (!cancelled) setVars([])
+      .catch((e) => {
+        if (!cancelled) { setVars([]); setError(String(e)) }
       })
       .finally(() => {
         if (!cancelled) setLoading(false)
@@ -60,10 +62,10 @@ export function VariablesPanel() {
   const knownDevices = new Set(project?.devices.map((d) => d.name) ?? [])
 
   return (
-    <aside className="flex h-full min-h-0 w-full flex-col border-l border-border bg-background/40">
-      <div className="flex h-9 items-center border-b border-border px-3 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+    <aside className="flex h-full min-h-0 w-full flex-col border-l border-border bg-background">
+      <div className="flex min-h-11 shrink-0 items-center border-b border-border px-3 text-[13px] font-medium text-foreground">
         Variables
-        <span className="ml-2 font-mono text-[10px] tracking-normal opacity-60">
+        <span className="ml-2 font-mono text-xs opacity-60">
           {vars.length}
         </span>
       </div>
@@ -72,6 +74,8 @@ export function VariablesPanel() {
           <Empty>Select a POU.</Empty>
         ) : loading && vars.length === 0 ? (
           <Empty>Loading…</Empty>
+        ) : error ? (
+          <div role="alert" className="break-words px-3 py-4 text-xs leading-5 text-destructive">Could not load variables. {error}</div>
         ) : vars.length === 0 ? (
           <Empty>No variables declared.</Empty>
         ) : (
@@ -81,18 +85,18 @@ export function VariablesPanel() {
               return (
                 <li key={v.name} className="px-3 py-2">
                   <div className="flex items-baseline justify-between gap-2">
-                    <span className="truncate font-mono text-[13px] text-foreground">
+                    <span title={v.name} className="truncate font-mono text-[13px] text-foreground">
                       {v.name}
                     </span>
-                    <span className="shrink-0 font-mono text-[10px] uppercase text-muted-foreground">
+                    <span className="shrink-0 font-mono text-xs text-muted-foreground">
                       {v.direction}
                     </span>
                   </div>
-                  <div className="font-mono text-[10px] text-muted-foreground">
+                  <div className="font-mono text-xs text-muted-foreground">
                     {v.type_name}
                   </div>
                   {bindings.length === 0 ? (
-                    <div className="mt-1 inline-flex items-center gap-1 text-[10px] text-muted-foreground/60">
+                    <div className="mt-1 inline-flex items-center gap-1 text-xs text-muted-foreground">
                       <Link2Off className="size-3" />
                       unbound
                     </div>
@@ -112,14 +116,14 @@ export function VariablesPanel() {
                                   : `Jump to ${m.device}`
                               }
                               className={
-                                "inline-flex max-w-full items-center gap-1 rounded-md border border-border bg-muted/40 px-1.5 py-0.5 text-left font-mono text-[11px] " +
+                                "inline-flex min-h-7 max-w-full items-center gap-1 rounded-md bg-muted/40 px-2 py-1 text-left font-mono text-xs " +
                                 (unknown
                                   ? "cursor-not-allowed opacity-50"
                                   : "hover:bg-accent/40")
                               }
                             >
                               {m.direction === "input" ? (
-                                <ArrowLeftRight className="size-3 shrink-0 text-sky-700 dark:text-sky-400" />
+                                <ArrowLeftRight className="size-3 shrink-0 text-muted-foreground" />
                               ) : (
                                 <ArrowRight className="size-3 shrink-0 text-highlight" />
                               )}
@@ -144,7 +148,7 @@ export function VariablesPanel() {
 
 function Empty({ children }: { children: React.ReactNode }) {
   return (
-    <div className="grid h-full place-items-center px-4 text-center text-[11px] italic text-muted-foreground">
+    <div className="px-3 py-5 text-xs leading-5 text-muted-foreground">
       {children}
     </div>
   )

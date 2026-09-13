@@ -1,3 +1,7 @@
 packages:
   - 'apps/*'
   - 'packages/*'
+# Carbon ships compiled icons. Its postinstall only sends telemetry.
+allowBuilds:
+  '@carbon/icon-helpers': false
+  '@carbon/icons-react': false

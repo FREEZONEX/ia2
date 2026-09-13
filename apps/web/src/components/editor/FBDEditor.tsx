@@ -25,7 +25,7 @@
  *    integration stays identical to LD.
  */
 
-import { Plus, Trash2, X } from "lucide-react"
+import { Plus, Trash2, X } from "@/components/ui/icons"
 import { useEffect, useMemo, useRef, useState } from "react"
 
 import { DiagnosticsBanner } from "@/components/editor/DiagnosticsBanner"
@@ -301,7 +301,7 @@ function Toolbar({
 }) {
   if (readOnly) return null
   return (
-    <div className="flex items-center gap-2 border-b border-border bg-muted/10 px-3 py-1 text-xs">
+    <div className="flex flex-wrap items-center gap-2 border-b border-border bg-background px-4 pb-2 text-[13px]">
       <Select
         value=""
         onValueChange={(v) => {
@@ -309,7 +309,7 @@ function Toolbar({
         }}
       >
         <SelectTrigger
-          className="h-7 gap-1 px-2 text-xs"
+          className="h-8 gap-2 px-3 text-[13px]"
           title="Insert a new function block"
           aria-label="Insert a new function block"
         >
@@ -332,7 +332,7 @@ function Toolbar({
           ))}
         </SelectContent>
       </Select>
-      <span className="text-[10px] text-muted-foreground">
+      <span className="text-xs text-muted-foreground">
         drag a block's header to reposition · click a block to edit
       </span>
     </div>
@@ -720,7 +720,7 @@ function FbdCanvas({
               y={y1 + 3}
               className="fill-foreground"
               fontSize="11"
-              fontFamily="ui-monospace, monospace"
+              fontFamily='"IBM Plex Mono", ui-monospace, monospace'
             >
               → {o.variable}
             </text>
@@ -774,7 +774,7 @@ function BlockGlyph({
         textAnchor="middle"
         className="fill-foreground pointer-events-none"
         fontSize="10"
-        fontFamily="ui-monospace, monospace"
+        fontFamily='"IBM Plex Mono", ui-monospace, monospace'
       >
         {block.instance}
       </text>
@@ -814,7 +814,7 @@ function BlockGlyph({
         textAnchor="middle"
         className="fill-foreground pointer-events-none"
         fontSize="13"
-        fontFamily="ui-monospace, monospace"
+        fontFamily='"IBM Plex Mono", ui-monospace, monospace'
         fontWeight={700}
       >
         {block.fb_type}
@@ -831,7 +831,7 @@ function BlockGlyph({
               y={y + 3}
               className="fill-muted-foreground pointer-events-none"
               fontSize="10"
-              fontFamily="ui-monospace, monospace"
+              fontFamily='"IBM Plex Mono", ui-monospace, monospace'
               fontStyle="italic"
             >
               no inputs
@@ -876,7 +876,7 @@ function BlockGlyph({
               y={y + 3}
               className="fill-foreground pointer-events-none"
               fontSize="10"
-              fontFamily="ui-monospace, monospace"
+              fontFamily='"IBM Plex Mono", ui-monospace, monospace'
               fontWeight={600}
             >
               {input.pin}
@@ -888,7 +888,7 @@ function BlockGlyph({
                 y={y + 3}
                 className="fill-muted-foreground pointer-events-none"
                 fontSize="9"
-                fontFamily="ui-monospace, monospace"
+                fontFamily='"IBM Plex Mono", ui-monospace, monospace'
               >
                 {valueText}
               </text>
@@ -919,7 +919,7 @@ function BlockGlyph({
               textAnchor="end"
               className="fill-foreground pointer-events-none"
               fontSize="10"
-              fontFamily="ui-monospace, monospace"
+              fontFamily='"IBM Plex Mono", ui-monospace, monospace'
               fontWeight={600}
             >
               {pin}
@@ -982,7 +982,7 @@ function BlockDetail({
 
   return (
     <div className="flex flex-wrap items-center gap-2 border-t border-highlight/30 bg-highlight/5 px-3 py-1.5 text-xs">
-      <span className="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] uppercase text-muted-foreground">
+      <span className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs text-muted-foreground">
         block {block.id}
       </span>
       <Select
@@ -1011,7 +1011,7 @@ function BlockDetail({
       />
       {outputs.length > 0 && (
         <span
-          className="font-mono text-[10px] text-muted-foreground"
+          className="font-mono text-xs text-muted-foreground"
           title={def ? def.description : undefined}
         >
           out: {outputs.join(" / ")}
@@ -1023,7 +1023,7 @@ function BlockDetail({
         return (
           <span key={pin.pin} className="inline-flex items-center gap-1">
             <span
-              className="font-mono text-[10px] text-muted-foreground"
+              className="font-mono text-xs text-muted-foreground"
               title={`${pin.doc} (${pin.type})`}
             >
               {pin.pin}:
@@ -1049,7 +1049,7 @@ function BlockDetail({
           type="button"
           onClick={onDelete}
           title="Delete this block"
-          className="flex items-center gap-1 rounded border border-destructive/40 bg-destructive/5 px-1.5 py-1 text-[11px] text-destructive hover:bg-destructive/15"
+          className="flex items-center gap-1 rounded border border-destructive/40 bg-destructive/5 px-1.5 py-1 text-[13px] text-destructive hover:bg-destructive/15"
         >
           <Trash2 className="size-3" />
           delete
@@ -1278,7 +1278,7 @@ function OutputsBar({
   )
   return (
     <div className="flex flex-wrap items-center gap-2 border-t border-border bg-muted/10 px-3 py-1.5 text-xs">
-      <span className="font-mono text-[10px] uppercase text-muted-foreground">
+      <span className="font-mono text-xs text-muted-foreground">
         outputs
       </span>
       {prog.outputs.map((o) => {
@@ -1376,7 +1376,7 @@ function AddOutputBinding({
       <button
         type="button"
         onClick={() => onAdd(variable, blockId, pin)}
-        className="flex items-center gap-1 rounded border border-highlight/40 bg-highlight/10 px-1.5 py-0.5 text-[11px] text-foreground hover:bg-highlight/20"
+        className="flex items-center gap-1 rounded border border-highlight/40 bg-highlight/10 px-1.5 py-0.5 text-[13px] text-foreground hover:bg-highlight/20"
       >
         <Plus className="size-3" />
         add

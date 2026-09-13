@@ -1,4 +1,4 @@
-import { useRef, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 
 /** One plotted sample. `t` (seconds, snapshot time base) places the
  *  point on the time axis; without it the series falls back to uniform
@@ -16,6 +16,8 @@ export type TrendSeries = {
 type Props = {
   series: TrendSeries[]
   height?: number
+  /** Fill an authored HMI node without allowing legend/axes to escape. */
+  fit?: boolean
   /** X-axis span in seconds; the newest sample anywhere pins the right
    *  edge, `windowS` earlier pins the left. Only affects timed series. */
   windowS?: number
@@ -24,9 +26,9 @@ type Props = {
 // viewBox width; SVG stretches to the plot rectangle (preserveAspectRatio
 // = none). Gutters are real px around it so axis text stays crisp.
 const W = 1000
-const PAD_L = 40 // Y-axis label gutter
-const PAD_TOP = 6
-const PAD_BOTTOM = 15 // X-axis label strip
+const PAD_L = 52 // Y-axis label gutter
+const PAD_TOP = 8
+const PAD_BOTTOM = 22 // X-axis label strip
 const Y_INSET = 2
 
 /**
@@ -41,23 +43,38 @@ const Y_INSET = 2
  * share the plot); "shared" puts everything on one labelled scale for
  * direct comparison.
  */
-export function TrendChart({ series, height = 110, windowS }: Props) {
+export function TrendChart({ series, height = 130, fit = false, windowS }: Props) {
   const [shared, setShared] = useState(false)
   const [hoverFrac, setHoverFrac] = useState<number | null>(null)
   const plotRef = useRef<HTMLDivElement | null>(null)
+  const containerRef = useRef<HTMLDivElement | null>(null)
+  const legendRef = useRef<HTMLDivElement | null>(null)
+  const [fittedHeight, setFittedHeight] = useState(height)
+  useEffect(() => {
+    if (!fit || !containerRef.current || !legendRef.current) return
+    const container = containerRef.current
+    const legend = legendRef.current
+    const measure = () => setFittedHeight(Math.max(1, container.clientHeight - legend.offsetHeight))
+    measure()
+    const observer = new ResizeObserver(measure)
+    observer.observe(container)
+    observer.observe(legend)
+    return () => observer.disconnect()
+  }, [fit, series.length])
+  const chartHeight = fit ? fittedHeight : height
 
   if (series.length === 0) {
     return (
       <div
-        className="flex items-center justify-center text-[11px] text-muted-foreground"
-        style={{ height }}
+        className="flex min-h-0 items-center justify-center overflow-hidden text-xs text-muted-foreground"
+        style={{ height: fit ? "100%" : height }}
       >
         No variables to trend.
       </div>
     )
   }
 
-  const plotH = Math.max(10, height - PAD_TOP - PAD_BOTTOM)
+  const plotH = Math.max(10, chartHeight - PAD_TOP - PAD_BOTTOM)
 
   // ---- X domain (shared time axis across all series) ----------------
   let anyTimed = false
@@ -139,9 +156,9 @@ export function TrendChart({ series, height = 110, windowS }: Props) {
   const yTicks = labeledRange ? axisTicks(labeledRange) : []
 
   return (
-    <div className="select-none">
+    <div ref={containerRef} className={fit ? "h-full min-h-0 min-w-0 select-none overflow-hidden" : "min-w-0 select-none"}>
       {/* Legend + hover readout + scale toggle */}
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 px-1 text-[10px]">
+      <div ref={legendRef} className="flex flex-wrap items-center gap-x-4 gap-y-1 px-1 pb-2 text-xs">
         {series.map((s, i) => {
           const idx = hoverFrac != null ? nearestIndex(s, hoverFrac) : s.points.length - 1
           const val = idx >= 0 ? s.points[idx]?.v : undefined
@@ -178,7 +195,7 @@ export function TrendChart({ series, height = 110, windowS }: Props) {
                 ? "Shared Y scale — click for per-series auto-scaling"
                 : "Per-series Y scale — click to share one scale"
             }
-            className="rounded border border-border bg-card px-1 font-mono text-[9px] uppercase tracking-wider text-muted-foreground hover:text-foreground"
+            className="rounded border border-border bg-card px-1 font-mono text-xs text-muted-foreground hover:text-foreground"
           >
             {shared ? "shared" : "per-series"}
           </button>
@@ -186,12 +203,12 @@ export function TrendChart({ series, height = 110, windowS }: Props) {
       </div>
 
       {/* Chart area: Y gutter + plot; X labels live in the bottom strip. */}
-      <div className="flex" style={{ height }}>
+      <div className="flex" style={{ height: chartHeight }}>
         <div className="relative shrink-0" style={{ width: PAD_L }}>
           {yTicks.map((tick) => (
             <span
               key={tick}
-              className="absolute right-1 -translate-y-1/2 font-mono text-[9px] tabular-nums text-muted-foreground/70"
+              className="absolute right-1 -translate-y-1/2 font-mono text-xs tabular-nums text-muted-foreground/70"
               style={{ top: PAD_TOP + toY(labeledRange!, tick) }}
             >
               {fmtVal(tick)}
@@ -199,7 +216,7 @@ export function TrendChart({ series, height = 110, windowS }: Props) {
           ))}
           {!labeledRange && (
             <span
-              className="absolute right-1 font-mono text-[9px] uppercase tracking-wider text-muted-foreground/40"
+              className="absolute right-1 font-mono text-xs text-muted-foreground/40"
               style={{ top: PAD_TOP }}
             >
               auto
@@ -280,7 +297,7 @@ export function TrendChart({ series, height = 110, windowS }: Props) {
           {/* X-axis relative-time ticks. */}
           {timed && (
             <div
-              className="absolute inset-x-0 flex justify-between font-mono text-[9px] tabular-nums text-muted-foreground/60"
+              className="absolute inset-x-0 flex justify-between font-mono text-xs tabular-nums text-muted-foreground/60"
               style={{ bottom: 0, height: PAD_BOTTOM }}
             >
               {[0, 0.5, 1].map((f) => (

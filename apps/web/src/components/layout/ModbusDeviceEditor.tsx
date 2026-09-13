@@ -1,4 +1,4 @@
-import { Info, Plus, Trash2 } from "lucide-react"
+import { Info, Plus, Trash2 } from "@/components/ui/icons"
 import { useEffect, useState } from "react"
 
 import { Button } from "@/components/ui/button"
@@ -63,19 +63,19 @@ export function ModbusDeviceEditor({ device, onSave, link }: DeviceEditorProps) 
     <>
       <DeviceSaveBar
         name={device.name}
-        protocol="modbus"
+        protocol="Modbus"
         dirty={dirty}
-        onSave={() => void onSave(draft)}
+        onSave={() => onSave(draft)}
       />
 
-      <div className="flex-1 space-y-6 overflow-auto p-5">
+      <div className="min-h-0 flex-1 space-y-6 overflow-auto p-4">
         <section>
           <SectionHeader title="Connection" />
           <ModbusTransportEditor
             transport={draft.transport}
             onTransport={(t) => update({ transport: t })}
           />
-          <div className="mt-3 grid grid-cols-2 gap-3 max-w-xl">
+          <div className="mt-3 ia2-field-grid">
             <Field label="Slave ID">
               <NumberCell
                 value={draft.slave_id}
@@ -107,133 +107,135 @@ export function ModbusDeviceEditor({ device, onSave, link }: DeviceEditorProps) 
               to define one.
             </EmptyBox>
           ) : (
-            <table className="w-full text-sm">
-              <thead className="text-[10px] uppercase tracking-wider text-muted-foreground">
-                <tr className="border-b border-border">
-                  <th className="px-2 py-1.5 text-left">Name</th>
-                  <th className="px-2 py-1.5 text-left">Kind</th>
-                  <th className="px-2 py-1.5 text-left">Address</th>
-                  <th
-                    className="px-2 py-1.5 text-left"
-                    title="Register interpretation. 32-bit types (u32/i32/f32) span TWO consecutive registers — the norm for instrument floats and totalizers. Ignored for coils/discretes."
-                  >
-                    Type
-                  </th>
-                  <th
-                    className="px-2 py-1.5 text-left"
-                    title="Word order for 32-bit types: hi_lo = ABCD (Modbus default), lo_hi = CDAB (common on Chinese instruments)."
-                  >
-                    Words
-                  </th>
-                  <th className="px-2 py-1.5 text-left">Access</th>
-                  <th className="px-2 py-1.5 text-left">Linked to</th>
-                  <th className="px-2 py-1.5"></th>
-                </tr>
-              </thead>
-              <tbody>
-                {draft.channels.map((ch, i) => (
-                  <tr
-                    key={i}
-                    className="border-b border-border align-top last:border-0"
-                  >
-                    <td className="px-2 py-1.5">
-                      <Input
-                        value={ch.name}
-                        onChange={(e) => setChannel(i, { name: e.target.value })}
-                        className="h-8 w-40"
-                      />
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <EnumSelect<ModbusChannelKind>
-                        value={ch.kind}
-                        onValueChange={(v) => setChannel(i, { kind: v })}
-                        options={[
-                          { value: "coil", label: "Coil" },
-                          { value: "discrete_input", label: "Discrete Input" },
-                          { value: "holding_register", label: "Holding Register" },
-                          { value: "input_register", label: "Input Register" },
-                        ]}
-                        className="h-8 w-44"
-                      />
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <NumberCell
-                        value={ch.address}
-                        onChange={(n) => setChannel(i, { address: n })}
-                        className="h-8 w-24"
-                      />
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <EnumSelect<ModbusDataType>
-                        value={ch.data_type ?? "u16"}
-                        onValueChange={(v) => setChannel(i, { data_type: v })}
-                        disabled={
-                          ch.kind === "coil" || ch.kind === "discrete_input"
-                        }
-                        options={[
-                          { value: "u16", label: "u16" },
-                          { value: "i16", label: "i16" },
-                          { value: "u32", label: "u32 (2reg)" },
-                          { value: "i32", label: "i32 (2reg)" },
-                          { value: "f32", label: "f32 (2reg)" },
-                        ]}
-                        className="h-8 w-24"
-                      />
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <EnumSelect<ModbusWordOrder>
-                        value={ch.word_order ?? "hi_lo"}
-                        onValueChange={(v) => setChannel(i, { word_order: v })}
-                        disabled={
-                          ch.kind === "coil" ||
-                          ch.kind === "discrete_input" ||
-                          ch.data_type === "u16" ||
-                          ch.data_type === "i16" ||
-                          ch.data_type == null
-                        }
-                        options={[
-                          { value: "hi_lo", label: "hi-lo (ABCD)" },
-                          { value: "lo_hi", label: "lo-hi (CDAB)" },
-                        ]}
-                        className="h-8 w-24"
-                      />
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <EnumSelect<ModbusAccess>
-                        value={
-                          ch.kind === "discrete_input" || ch.kind === "input_register"
-                            ? "read"
-                            : ch.access ?? "write"
-                        }
-                        onValueChange={(v) => setChannel(i, { access: v })}
-                        disabled={
-                          ch.kind === "discrete_input" ||
-                          ch.kind === "input_register"
-                        }
-                        options={[
-                          { value: "write", label: "write" },
-                          { value: "read", label: "read-only" },
-                        ]}
-                        className="h-8 w-24"
-                      />
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <LinkedToCell channelName={ch.name} link={link} />
-                    </td>
-                    <td className="px-2 py-1.5 text-right">
-                      <button
-                        type="button"
-                        onClick={() => removeChannel(i)}
-                        className="rounded p-1 text-muted-foreground hover:bg-accent/40 hover:text-destructive"
-                        title="Remove"
-                      >
-                        <Trash2 className="size-3.5" />
-                      </button>
-                    </td>
+            <div className="min-w-0 overflow-x-auto">
+              <table className="ia2-table w-full min-w-[800px]">
+                <thead className="text-xs text-muted-foreground">
+                  <tr className="border-b border-border">
+                    <th className="px-2 py-1.5 text-left">Name</th>
+                    <th className="px-2 py-1.5 text-left">Kind</th>
+                    <th className="px-2 py-1.5 text-left">Address</th>
+                    <th
+                      className="px-2 py-1.5 text-left"
+                      title="Register interpretation. 32-bit types (u32/i32/f32) span TWO consecutive registers — the norm for instrument floats and totalizers. Ignored for coils/discretes."
+                    >
+                      Type
+                    </th>
+                    <th
+                      className="px-2 py-1.5 text-left"
+                      title="Word order for 32-bit types: hi_lo = ABCD (Modbus default), lo_hi = CDAB (common on Chinese instruments)."
+                    >
+                      Words
+                    </th>
+                    <th className="px-2 py-1.5 text-left">Access</th>
+                    <th className="px-2 py-1.5 text-left">Linked to</th>
+                    <th className="px-2 py-1.5"></th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {draft.channels.map((ch, i) => (
+                    <tr
+                      key={i}
+                      className="border-b border-border align-top last:border-0"
+                    >
+                      <td className="px-2 py-1.5">
+                        <Input
+                          value={ch.name}
+                          onChange={(e) => setChannel(i, { name: e.target.value })}
+                          className="h-8 w-40"
+                        />
+                      </td>
+                      <td className="px-2 py-1.5">
+                        <EnumSelect<ModbusChannelKind>
+                          value={ch.kind}
+                          onValueChange={(v) => setChannel(i, { kind: v })}
+                          options={[
+                            { value: "coil", label: "Coil" },
+                            { value: "discrete_input", label: "Discrete Input" },
+                            { value: "holding_register", label: "Holding Register" },
+                            { value: "input_register", label: "Input Register" },
+                          ]}
+                          className="h-8 w-44"
+                        />
+                      </td>
+                      <td className="px-2 py-1.5">
+                        <NumberCell
+                          value={ch.address}
+                          onChange={(n) => setChannel(i, { address: n })}
+                          className="h-8 w-24"
+                        />
+                      </td>
+                      <td className="px-2 py-1.5">
+                        <EnumSelect<ModbusDataType>
+                          value={ch.data_type ?? "u16"}
+                          onValueChange={(v) => setChannel(i, { data_type: v })}
+                          disabled={
+                            ch.kind === "coil" || ch.kind === "discrete_input"
+                          }
+                          options={[
+                            { value: "u16", label: "u16" },
+                            { value: "i16", label: "i16" },
+                            { value: "u32", label: "u32 (2reg)" },
+                            { value: "i32", label: "i32 (2reg)" },
+                            { value: "f32", label: "f32 (2reg)" },
+                          ]}
+                          className="h-8 w-24"
+                        />
+                      </td>
+                      <td className="px-2 py-1.5">
+                        <EnumSelect<ModbusWordOrder>
+                          value={ch.word_order ?? "hi_lo"}
+                          onValueChange={(v) => setChannel(i, { word_order: v })}
+                          disabled={
+                            ch.kind === "coil" ||
+                            ch.kind === "discrete_input" ||
+                            ch.data_type === "u16" ||
+                            ch.data_type === "i16" ||
+                            ch.data_type == null
+                          }
+                          options={[
+                            { value: "hi_lo", label: "hi-lo (ABCD)" },
+                            { value: "lo_hi", label: "lo-hi (CDAB)" },
+                          ]}
+                          className="h-8 w-24"
+                        />
+                      </td>
+                      <td className="px-2 py-1.5">
+                        <EnumSelect<ModbusAccess>
+                          value={
+                            ch.kind === "discrete_input" || ch.kind === "input_register"
+                              ? "read"
+                              : ch.access ?? "write"
+                          }
+                          onValueChange={(v) => setChannel(i, { access: v })}
+                          disabled={
+                            ch.kind === "discrete_input" ||
+                            ch.kind === "input_register"
+                          }
+                          options={[
+                            { value: "write", label: "write" },
+                            { value: "read", label: "read-only" },
+                          ]}
+                          className="h-8 w-24"
+                        />
+                      </td>
+                      <td className="px-2 py-1.5">
+                        <LinkedToCell channelName={ch.name} link={link} />
+                      </td>
+                      <td className="px-2 py-1.5 text-right">
+                        <button
+                          type="button"
+                          onClick={() => removeChannel(i)}
+                          className="inline-flex size-7 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-accent/40 hover:text-destructive"
+                          title="Remove"
+                        >
+                          <Trash2 className="size-3.5" />
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           )}
         </section>
       </div>
@@ -308,12 +310,13 @@ function ModbusTransportEditor({
   return (
     <>
       <div className="mb-3 flex items-center gap-2">
-        <span className="text-[11px] uppercase tracking-wider text-muted-foreground">
+        <span className="text-xs text-muted-foreground">
           Transport
         </span>
         <div className="inline-flex overflow-hidden rounded-md border border-border text-xs">
           <button
             type="button"
+            aria-pressed={transport.kind === "tcp"}
             onClick={() => onTransport({ kind: "tcp", ...tcpDraft })}
             className={
               "px-3 py-1 transition-colors " +
@@ -326,6 +329,7 @@ function ModbusTransportEditor({
           </button>
           <button
             type="button"
+            aria-pressed={transport.kind === "rtu"}
             onClick={() => onTransport({ kind: "rtu", ...rtuDraft })}
             className={
               "border-l border-border px-3 py-1 transition-colors " +
@@ -340,7 +344,7 @@ function ModbusTransportEditor({
       </div>
 
       {transport.kind === "tcp" ? (
-        <div className="grid grid-cols-2 gap-3 max-w-xl">
+        <div className="ia2-field-grid">
           <Field label="Host">
             <Input
               value={transport.host}
@@ -363,7 +367,7 @@ function ModbusTransportEditor({
           </Field>
         </div>
       ) : (
-        <div className="grid grid-cols-2 gap-3 max-w-xl">
+        <div className="ia2-field-grid">
           <Field label="Serial device">
             <Input
               value={transport.serial_device}
@@ -515,7 +519,7 @@ function ModbusTransportEditor({
               </Field>
             </>
           )}
-          <div className="col-span-2 mt-1 flex items-start gap-2 text-[11px] text-muted-foreground">
+          <div className="col-span-2 mt-1 flex items-start gap-2 text-xs text-muted-foreground">
             <Info className="mt-0.5 size-3 shrink-0" />
             <span>
               Device path: macOS{" "}
