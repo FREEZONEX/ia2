@@ -70,7 +70,12 @@ HMI, including same-origin windows. Dark mode changes surfaces, text, controls,
 charts, scrollbars and editor colors while preserving state meanings.
 
 Where the Windows desktop host is present, its background and title bar follow
-the applied web theme. Startup and error pages have self-contained styles so
+the applied web theme, with a fixed caption color matching the page surface.
+The native caption owns the application icon and name; the web content beneath
+it uses a 40 px project toolbar with 8 px gaps and does not repeat that branding.
+The browser interface retains its own IA2 branding and 48 px navigation bar.
+The native system caption remains separate and keeps standard window controls.
+Startup and error pages have self-contained styles so
 they remain readable when the backend is unavailable. Closing a native window
 keeps its controller running in the background; application exit retains the
 running-controller protection.

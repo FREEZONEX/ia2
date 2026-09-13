@@ -357,6 +357,12 @@ input, textarea { font: inherit; }
 }
 
 @layer components {
+.ia2-workspace-header { height: 48px; min-height: 48px; gap: 12px; }
+.ia2-workspace-header [data-app-brand] { display: flex; }
+/* The native caption already carries IA2's icon and name. */
+:root[data-ia2-desktop] .ia2-workspace-header { height: 40px; min-height: 40px; gap: 8px; }
+:root[data-ia2-desktop] [data-app-brand],
+:root[data-ia2-desktop] [data-app-brand-separator] { display: none; }
 .ia2-pane { display: flex; height: 100%; min-height: 0; min-width: 0; flex-direction: column; background: var(--background); }
 .ia2-pane-header { display: flex; flex-shrink: 0; flex-wrap: wrap; align-items: center; gap: 12px; min-height: 52px; padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--background); }
 .ia2-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 16px; }
