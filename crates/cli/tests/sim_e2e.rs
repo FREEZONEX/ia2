@@ -2,9 +2,9 @@
 //! bundled `examples/sim_smoke` project, and the cs binary as a
 //! subprocess — the exact loop an agent runs to prove generated logic.
 //!
-//! Skips (with a loud note) when `target/debug/server` hasn't been
-//! built yet: `cargo build -p server` first, or run the workspace
-//! quality gate which builds everything.
+//! Requires the server binary beside `cs`: run `cargo build -p server`
+//! first, using the same target/profile as this test. A missing server
+//! fails the test instead of silently leaving the scenario unverified.
 
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -19,9 +19,20 @@ fn repo_root() -> PathBuf {
         .unwrap()
 }
 
-fn server_binary() -> Option<PathBuf> {
-    let p = repo_root().join("target/debug/server");
-    p.exists().then_some(p)
+fn server_binary() -> PathBuf {
+    // assert_cmd resolves custom CARGO_TARGET_DIR, target triples, and
+    // release profiles. The server is a sibling, including `.exe` on Windows.
+    let cs = assert_cmd::cargo::cargo_bin("cs");
+    let p = cs
+        .parent()
+        .expect("cs binary directory")
+        .join(format!("server{}", std::env::consts::EXE_SUFFIX));
+    assert!(
+        p.is_file(),
+        "sim_e2e requires {}: run cargo build -p server with the same target/profile first",
+        p.display()
+    );
+    p
 }
 
 struct ServerGuard(Child);
@@ -41,10 +52,7 @@ fn cs(server: &str) -> Command {
 
 #[test]
 fn sim_run_proves_and_refutes_against_a_real_server() {
-    let Some(server_bin) = server_binary() else {
-        eprintln!("SKIP sim_e2e: target/debug/server not built (cargo build -p server)");
-        return;
-    };
+    let server_bin = server_binary();
 
     // Free port: bind-then-drop; the server grabs it a moment later.
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
