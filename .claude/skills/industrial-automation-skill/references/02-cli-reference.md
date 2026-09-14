@@ -98,6 +98,12 @@ cs project check [dir]               # strongest offline gate: full project comp
 cs project info  [dir]               # offline orientation (POUs/devices/edges)
 ```
 
+`project check` is the compile gate, not I/O-map validation. Open the project
+on a local server, then use `cs api POST /api/project/validate` for compile
+diagnostics **and** static device/channel/access checks, without starting
+devices. This recognizes configured gear routes, including parameter Input
+echoes, and rejects Output bindings to gear feedback (see 06).
+
 ### Run / debug (online)
 
 ```

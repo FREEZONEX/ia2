@@ -63,14 +63,19 @@ fn warning(mapping_index: usize, message: String) -> IomapIssue {
 /// Validate every mapping in `iomap` against `devices`. Returns all
 /// findings, sorted by `mapping_index` (errors and warnings interleaved
 /// in row order; an empty Vec means the map is clean).
+/// This is a mapping validator, not a full connect-time device preflight:
+/// unreferenced devices have no mapping row and are not checked here.
 ///
 /// Checks, per mapping:
-/// 1. the named device exists;
+/// 1. the named device exists, and — for EtherCAT — its gear channel
+///    names are unambiguous (an ambiguous device is unroutable, so the
+///    row reports that instead of its own channel finding);
 /// 2. the named channel exists on that device (per-protocol metadata);
 /// 3. the mapping direction is possible for the channel:
 ///    - Modbus: every channel kind is readable (`Input` always fine);
 ///      `Output` needs a writable kind (`Coil` / `HoldingRegister`);
-///    - EtherCAT: `Input` needs a TxPDO channel, `Output` an RxPDO one;
+///    - EtherCAT: PDO directions must match; gear parameters also support
+///      Input echoes, whereas gear feedback is read-only;
 ///    - OPC UA: `Output` needs `access = write`. `Input` is fine on both
 ///      accesses — the adapter mirrors *all* channels each poll cycle
 ///      (write tags are documented "also readable for verification").
@@ -90,6 +95,9 @@ fn warning(mapping_index: usize, message: String) -> IomapIssue {
 ///    channel).
 pub fn validate_iomap(iomap: &IoMap, devices: &[Device]) -> Vec<IomapIssue> {
     let mut issues = Vec::new();
+    // Validate device-wide gear names once, while retaining a diagnostic
+    // on each affected mapping row (the public issue contract is row-based).
+    let mut gear_names: HashMap<&str, Result<(), String>> = HashMap::new();
 
     for (index, mapping) in iomap.mappings.iter().enumerate() {
         // Metadata sanity is device-independent — check it even when the
@@ -108,6 +116,29 @@ pub fn validate_iomap(iomap: &IoMap, devices: &[Device]) -> Vec<IomapIssue> {
             ));
             continue;
         };
+        // Ambiguous gear names make the whole device unroutable, so every
+        // row that names it fails — gear rows and plain PDO rows alike — and
+        // the row's own channel check is short-circuited until it is fixed.
+        // Connect-time validation rejects the same configs; surfacing them
+        // here just moves the failure ahead of the first scan.
+        if let ProtocolConfig::Ethercat(cfg) = &device.config {
+            let validity = gear_names.entry(device.name.as_str()).or_insert_with(|| {
+                let pdo_names = cfg.channels.iter().map(|c| c.name.as_str()).collect();
+                crate::validate_gear_channel_names(&cfg.gear, &pdo_names)
+            });
+            if let Err(message) = &*validity {
+                issues.push(error(
+                    index,
+                    format!(
+                        "mapping '{app}.{var}': device '{dev}': {message}",
+                        app = mapping.application,
+                        var = mapping.variable,
+                        dev = device.name
+                    ),
+                ));
+                continue;
+            }
+        }
         check_channel(index, mapping, device, &mut issues);
     }
 
@@ -245,6 +276,35 @@ fn check_channel(index: usize, mapping: &Mapping, device: &Device, issues: &mut 
             }
         }
         ProtocolConfig::Ethercat(cfg) => {
+            // Gear routes are virtual mailbox channels, not PDO bytes, and
+            // the adapters resolve them first too. Looking here before the
+            // PDO list is only unambiguous because `validate_iomap` has
+            // already rejected gear/PDO name collisions on this device —
+            // keep that precheck ahead of this call.
+            let gear_channel = cfg
+                .gear
+                .iter()
+                .flat_map(|g| g.routed_channels())
+                .find(|(name, _)| *name == mapping.channel);
+            if let Some((_, channel)) = gear_channel {
+                if channel.is_bool() {
+                    warn_range_on_bool_channel(index, mapping, issues);
+                }
+                if mapping.direction == Direction::Output && channel.parameter().is_none() {
+                    issues.push(error(
+                        index,
+                        format!(
+                            "mapping '{app}.{var}': channel '{ch}' on EtherCAT device '{dev}' is \
+                             read-only gear feedback; Output mappings need a writable parameter",
+                            app = mapping.application,
+                            var = mapping.variable,
+                            ch = mapping.channel,
+                            dev = device.name,
+                        ),
+                    ));
+                }
+                return;
+            }
             let Some(ch) = cfg.channels.iter().find(|c| c.name == mapping.channel) else {
                 unknown_channel(issues);
                 return;
