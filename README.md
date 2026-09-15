@@ -9,9 +9,8 @@ A simple, agent-first IDE + runtime for IEC 61131-3 PLC programming.
 
 https://github.com/user-attachments/assets/59e9a583-5064-4f33-918a-2a66c53274ae
 
-**49-second English showreel** — control-logic and HMI generation, software validation, and Linux Edge deployment. The deployment sequence and field-connectivity diagram are illustrative. [Video credits](docs/assets/showreel-credits.md).
+[Video credits](docs/assets/showreel-credits.md).
 
-The hardware claims come with receipts: [`docs/bench/`](docs/bench/) holds the measured evidence — raw CSVs, a re-derivation script, and honest evidence grades.
 
 ## Install it for your coding agent
 
@@ -49,62 +48,6 @@ For repository work in Codex, open the **IA2 Git root** as the workspace, or lau
 
 Now just ask your agent to build a PLC program — it will author ST / LD / FBD / SFC, compile, wire Modbus / EtherCAT / OPC UA / CANopen I/O, run and debug the scan loop, and deploy to edge boxes, all through `cs`. Start with `cs --help` and the skill under `.claude/skills/industrial-automation-skill/`.
 
-## What's in the box
-
-| Component | Tech | Purpose |
-|---|---|---|
-| **`apps/web/`** | React 19 + Vite + TanStack Router + Tailwind 4 | The IDE itself, in the browser. ST / LD / FBD / SFC editors, runtime Monitor, project tree, IO mapping. Single SPA — `vite dev` in development, or served by the server itself via `--static-dir`. |
-| **`crates/server/`** | Rust + axum + tower | HTTP backend (port 3001). REST + SSE. Owns the project, dispatches to ironplc-bridge, schedules tasks. |
-| **`crates/cli/`** | Rust + clap + ureq | The `cs` binary — agent-first command-line. Static analysis, project CRUD, runtime debug. See `cs --help`. |
-| **`crates/ironplc-bridge/`** | Rust | Wraps [ironplc](https://github.com/ironplc/ironplc) compiler + VM. Adds LD / FBD / SFC → ST transpilers + diagnostics enrichment. |
-| **`crates/runtime/`** | Rust | Headless edge runtime (`ia2-runtime` binary). Same scan loop as the IDE-side bridge, plus a small HTTP monitor (health / status / logs / discover) the server reaches over SSH — no LSP, no CORS, no REST project API. Designed for Linux edge boxes. |
-| **`crates/project/`** | Rust | On-disk project schema (POU files, devices, edges, iomap, tasks). |
-| **`crates/iomap-modbus/` `iomap-ethercat/` `iomap-opcua/`** | Rust | I/O adapters: Modbus TCP **and RTU/serial** (tokio-modbus + tokio-serial), EtherCAT (ethercrab), **OPC UA client** (async-opcua) for supervising an existing DCS. Edge runtime publishes **northbound MQTT** (rumqttc) to supOS/Tier0. |
-| **`vendor/ironplc/`** | git submodule | The compiler + VM. |
-
-## Two interfaces, one source of truth
-
-The HTTP API is the canonical contract. The web IDE, the CLI,
-agents, and (future) MCP all talk to it. Everything is JSON; everything
-is curlable.
-
-```
-                       HTTP + SSE (port 3001)
-                              │
-       ┌──────────────────────┼──────────────────────┐
-       ▼                      ▼                      ▼
-  apps/web (React)      crates/cli (`cs`)       agents (Claude
-   in the browser                                 Code / Codex /
-                        in terminal / CI          MCP wrappers)
-```
-
-When an agent runs `cs set pous/…`, the server emits a `Mutation`
-event over SSE; the IDE's project tree updates in real time and the
-editor auto-jumps to the new POU. Same in reverse: when a human saves
-a POU in the IDE, an agent's `cs runtime status` sees the new symbol
-table immediately.
-
-## Agent takeover overlay
-
-When an agent is driving, the IDE shows a pulsing green border plus a
-top-centre banner so the human knows not to fight it for state. Two
-modes:
-
-- **Session mode (preferred).** `cs agent run --label "rebuilding tank
-  controller" -- <cmd>` opens an explicit takeover session: the banner
-  stays on with that label for the whole workflow, then drops when the
-  command exits (success, failure, or Ctrl-C — a background heartbeat
-  thread keeps it alive in between, and the server's 30 s watchdog
-  recovers if the agent crashes). The banner's button reads **End
-  session** — clicking it force-returns control to the human.
-- **Transient mode (back-compat).** A single mutating `cs` subcommand
-  pings `POST /api/agent/heartbeat`; the overlay flashes on with the
-  command name and ages out after 3 s of silence. Fine for one-offs;
-  multi-step work should use session mode so the banner doesn't strobe.
-
-Read-only commands (`cs check`, `cs ls`, `cs get …`, `cs runtime
-status/snapshot`) don't trigger the overlay — querying state isn't
-"operating."
 
 ## Quickstart
 
@@ -168,14 +111,6 @@ cs deploy field_pi                      # tar → ssh → versioned swap → sys
 cs agent run --label "build my_line" -- bash -c 'cs project create my_line; cs set pous/...; cs run'
 ```
 
-Exit codes follow Unix and are enforced uniformly: `0` clean / `1` your
-content has problems (diagnostics, failed probe/deploy/sim) / `2` bad
-request — including HTTP 4xx, with the server's reason printed verbatim
-on stderr / `≥3` infrastructure. `--json`, `--server` and `--project`
-are global flags. `--project NAME` supports Unicode names and literal
-percent signs; the CLI encodes the HTTP project-selection headers.
-If the inner command cannot start, `cs agent run` requests session closure
-before reporting the spawn error with exit code 3.
 Every command's `--help` explains when to call it and
 what to call next — written for agent readers.
 
@@ -258,16 +193,6 @@ the same playbook. Skim `SKILL.md` to see what an agent is told. Run
 `AGENTS.md`, skill metadata, repository discovery, and the skill-only
 installer; the check never contacts a server, network, or hardware.
 
-## Design principles
-
-Read `MEMORY/principles.md` first if you're contributing. The headline:
-
-1. **Simplicity is the headline feature.** Defaults work without
-   configuration. One concept per screen. No "advanced settings."
-2. **Agent-friendly is co-equal with human-friendly.** Anything
-   the GUI does, the CLI + HTTP API also do.
-3. **Text-first storage.** ST as `.st`, graphical languages as JSON.
-   `grep`, `git diff`, `cat` all work.
 
 ## License
 
