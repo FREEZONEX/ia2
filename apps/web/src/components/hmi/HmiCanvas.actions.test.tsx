@@ -209,6 +209,35 @@ describe("HMI write revalidation", () => {
     expect(host.write).toHaveBeenCalledTimes(1)
   })
 
+  // A 5 s-cycle project: nothing newer than the last scan exists, so the
+  // window follows that cadence rather than refusing 3 s out of every 5.
+  const learnSlowCadence = () => {
+    for (const scan of [2, 3, 4, 5]) {
+      clock += 5000
+      act(() => update(scan))
+    }
+  }
+
+  it("allows a write between scans on a slow-cycle project", async () => {
+    render(canvas())
+    await screen.findByRole("button", { name: "Quick set" })
+    learnSlowCadence()
+    clock += 4000
+    fireEvent.click(screen.getByRole("button", { name: "Quick set" }))
+    await waitFor(() => expect(host.write).toHaveBeenCalledTimes(1))
+  })
+
+  it("names the widened budget when a slow project does go stale", async () => {
+    render(canvas())
+    await screen.findByRole("button", { name: "Quick set" })
+    learnSlowCadence()
+    clock += 10_100
+    fireEvent.click(screen.getByRole("button", { name: "Quick set" }))
+    await flush()
+    expect(host.write).not.toHaveBeenCalled()
+    expect(screen.getByRole("alert").textContent).toContain("within 10s")
+  })
+
   it("keeps navigation usable without a live runtime", async () => {
     render(canvas())
     await screen.findByRole("button", { name: "Next screen" })

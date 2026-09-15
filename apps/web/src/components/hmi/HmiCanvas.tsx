@@ -66,6 +66,15 @@ export type CanvasMode = "operate" | "arrange"
 /** Per-element delay inside one spawn batch (the "wave"). */
 const SPAWN_STAGGER_MS = 80
 
+/** Refusal text for stale live data, naming the budget actually in force.
+ *  That budget widens to cover a slow-cycle project's own scan cadence, so
+ *  stating a bare "2 seconds" would be a lie on exactly the projects where
+ *  the number matters. */
+const staleFeedReason = (): string =>
+  `No advancing live data within ${
+    Math.round(liveFeedStore.getActionBudgetMs() / 100) / 10
+  }s — action not sent`
+
 type PendingConfirm = {
   nodeId: string
   action: HmiAction
@@ -341,7 +350,7 @@ export function HmiCanvas({
       throw new Error("Live connection or run changed — request the action again")
     }
     const fresh = liveFeedStore.getFreshSnapshot()
-    if (!fresh) throw new Error("Fresh live data unavailable — action not sent")
+    if (!fresh) throw new Error(staleFeedReason())
     const node = findNode(request.document.root, request.nodeId)
     if (!node || !canHostAction(node.type)) throw new Error("Control unavailable — action not sent")
     const enabled = node.bind["enable"]
@@ -402,7 +411,7 @@ export function HmiCanvas({
       }
       const fresh = liveFeedStore.getFreshSnapshot()
       if (!fresh) {
-        setActionError("Fresh live data unavailable — action not sent")
+        setActionError(staleFeedReason())
         return
       }
       const res = resolveActionWrite(fresh, action, value)

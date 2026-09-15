@@ -334,10 +334,22 @@ function it cannot deliver.
 The canvas checks both direct actions and confirmed actions against the current
 live-feed store at dispatch time. A connected SSE socket alone is insufficient:
 a snapshot must have arrived after connection and its scan count and timestamp
-must have advanced within the last 2 seconds. Repeated frozen snapshots do not
-renew this budget. Disconnects, cleared snapshots, observed counter resets and
+must have advanced within the freshness budget. Repeated frozen snapshots do not
+renew that budget. Disconnects, cleared snapshots, observed counter resets and
 repointing the stream at another runtime (Debug attach/detach) invalidate
 outstanding confirmations; reconnecting does not resend anything.
+
+The budget is 2 seconds or twice the runtime's own observed scan cadence,
+whichever is larger, capped at 30 seconds. A fixed 2 seconds would ask the wrong
+question: `scan_count` advances once per PLC scan, `interval_ms` has no upper
+bound, and on a 5 s-cycle project a 4 s-old value *is* the current picture —
+there is nothing newer to have, so a fixed window would refuse every write for
+3 seconds out of every 5. The cadence is the *lower median* of the last five
+observed gaps, so one dropped frame cannot widen the window, and it is forgotten
+on every generation bump — one runtime's slowness never widens the window for
+the next. The cap is there because the window follows the very thing it
+measures: a degrading scan must not keep buying itself more tolerance. A refusal
+names the budget in force, so a widened window is visible rather than silent.
 
 Before writing, the canvas reads the host's current runtime status (2-second
 request deadline) and requires a running, unpaused, fault-free runtime with no
@@ -358,7 +370,9 @@ reloads invalidate old controls and discard late responses from an older screen.
 These are operator UI checks, not atomic PLC interlocks or a safety function.
 A condition can change after the last client check; authoritative motion limits,
 lease/watchdog handling and process interlocks still belong in the runtime/PLC.
-The 2-second freshness/deadline budgets are UI policy, not measured stop times.
+The freshness budget and the 2-second status-request deadline are UI policy, not
+measured stop times; the freshness budget tracks the runtime's scan cadence and
+says nothing about how fast anything stops.
 They apply to every variable action (including a configured Stop): no-confirm
 means no dialog, not bypassing live-state checks. An unavailable HMI write cannot
 be relied on to stop machinery.
