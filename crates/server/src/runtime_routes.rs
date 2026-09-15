@@ -252,6 +252,15 @@ pub struct WriteVariableRequest {
 pub struct WriteVariableResponse {
     pub name: String,
     pub value: i32,
+    /// Set when the value landed in the VM but the device carrying this
+    /// variable has a dead transport, so it is NOT reaching the field.
+    /// The write is still applied — a Stop that arrives late when the link
+    /// returns beats one that was never commanded — but a caller that
+    /// reports a bare success here would be telling the operator the plant
+    /// obeyed. `null` on an internal variable with no Output mapping, and
+    /// on a healthy link, which is transport health only: it does not
+    /// prove the value took effect.
+    pub undelivered_device: Option<String>,
 }
 
 /// Poke a variable while the program is running. Applied between scan
@@ -275,9 +284,13 @@ pub async fn write_runtime_variable(
     state.maybe_attribute_external(origin_of(&headers).as_deref(), format!("write {name}"));
     // The momentary-pulse reset guarantee lives in the shared monitor
     // core — one implementation for IDE server and edge runtime.
-    let value =
+    let outcome =
         ironplc_bridge::monitor::write_with_pulse(&handle, &name, req.value, req.pulse_ms).await?;
-    Ok(Json(WriteVariableResponse { name, value }))
+    Ok(Json(WriteVariableResponse {
+        name,
+        value: outcome.value,
+        undelivered_device: outcome.undelivered_device,
+    }))
 }
 
 // ============================================================

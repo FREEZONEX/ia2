@@ -43,7 +43,7 @@ beforeEach(() => {
   update()
   host = {
     fetchDoc: vi.fn().mockResolvedValue(structuredClone(base)),
-    write: vi.fn().mockResolvedValue(undefined), nav: vi.fn(),
+    write: vi.fn().mockResolvedValue(null), nav: vi.fn(),
     runtimeState: vi.fn().mockResolvedValue({ running: true, alarm: null }),
     history: vi.fn().mockResolvedValue({ series: [] }),
     alarms: vi.fn().mockResolvedValue([]), ackAlarm: vi.fn(),
@@ -109,7 +109,6 @@ describe("HMI write revalidation", () => {
   it.each([
     { running: true, alarm: "Watchdog tripped — outputs are locked" },
     { running: true, alarm: null, mode: "paused" as const },
-    { running: true, alarm: null, unhealthyDevices: ["bus"] },
     { running: false, alarm: null },
   ])("rejects a fresh unhealthy runtime status: %j", async state => {
     vi.mocked(host.runtimeState).mockResolvedValue(state)
@@ -236,6 +235,30 @@ describe("HMI write revalidation", () => {
     await flush()
     expect(host.write).not.toHaveBeenCalled()
     expect(screen.getByRole("alert").textContent).toContain("within 10s")
+  })
+
+  it("does not take a control away because an unrelated device is down", async () => {
+    // Device health belongs to ONE device and the panel cannot tell which
+    // one carries this variable — the edge panel has no iomap at all. The
+    // runtime scopes that; blanket-refusing here cost every control, Stop
+    // included, over some unrelated island.
+    vi.mocked(host.runtimeState).mockResolvedValue({
+      running: true, alarm: null, unhealthyDevices: ["some_other_island"],
+    })
+    render(canvas())
+    await screen.findByRole("button", { name: "Quick set" })
+    fireEvent.click(screen.getByRole("button", { name: "Quick set" }))
+    await waitFor(() => expect(host.write).toHaveBeenCalledTimes(1))
+  })
+
+  it("reports an applied-but-undelivered write instead of a bare success", async () => {
+    vi.mocked(host.write).mockResolvedValue('device "bus_a" link is down')
+    render(canvas())
+    await screen.findByRole("button", { name: "Quick set" })
+    fireEvent.click(screen.getByRole("button", { name: "Quick set" }))
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("bus_a"))
+    // Reported, never retried — the value is already in the program.
+    expect(host.write).toHaveBeenCalledTimes(1)
   })
 
   it("keeps navigation usable without a live runtime", async () => {

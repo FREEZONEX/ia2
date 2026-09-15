@@ -111,8 +111,11 @@ is dropped on reconnect, restart or a stream repoint. Both no-confirm and
 confirmed variable actions read fresh runtime status with a 2-second deadline,
 then recheck connection/run generation, screen identity, Operate mode, current
 `bind.enable` and the target variable's type before dispatch. A watchdog lock,
-fault, pause, stopped runtime, unhealthy device, stale data or missing enable
-binding value refuses the action with a visible reason. Reconnect does not send
+fault, pause, stopped runtime, stale data or missing enable binding value
+refuses the action with a visible reason. An unhealthy device does NOT: that is
+scoped per variable by the runtime, which applies the write and returns
+`undelivered_device` when that variable's own device link is down, so one dead
+island never costs the operator the rest of the screen. Reconnect does not send
 an old confirmation or queue a retry. Navigation remains usable offline.
 
 The confirmed value stays exactly as displayed; pulse reset remains runtime-side.

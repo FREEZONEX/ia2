@@ -21,7 +21,7 @@ use ts_rs::TS;
 pub use alarms::{AlarmEngine, AlarmJournalEntry, AlarmState};
 pub use history::{Historian, HistoryPoint, HistoryResponse, HistorySeries};
 
-use crate::runtime::{ProgramHandle, RuntimeMode, RuntimeWriteError};
+use crate::runtime::{ProgramHandle, RuntimeMode, RuntimeWriteError, WriteOutcome};
 
 /// One pinned (forced) variable in the runtime's debug state.
 #[derive(Debug, Clone, Serialize, TS)]
@@ -111,7 +111,7 @@ pub async fn write_with_pulse(
     name: &str,
     value: i32,
     pulse_ms: Option<u32>,
-) -> Result<i32, RuntimeWriteError> {
+) -> Result<WriteOutcome, RuntimeWriteError> {
     let v = handle.write_variable(name, value).await?;
     if let Some(ms) = pulse_ms {
         let h = handle.clone();

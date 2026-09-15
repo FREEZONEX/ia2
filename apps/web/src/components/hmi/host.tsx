@@ -39,13 +39,19 @@ export type HmiHost = {
   /** Write one variable. `typeName` comes from the live snapshot so the
    *  host can bit-pack REALs correctly. `pulseMs` asks the RUNTIME to
    *  write 0 back after that many ms — the pulse reset must survive the
-   *  page, so it is never a client timer. */
+   *  page, so it is never a client timer.
+   *
+   *  Resolves to `null` on a clean write, or to a caveat string when the
+   *  runtime applied the value but its device's transport is down. That is
+   *  a report, never a retry: the value is in the program and will flush if
+   *  the link returns, and the operator is told rather than shown a bare
+   *  success. */
   write(
     name: string,
     value: number,
     typeName: string,
     pulseMs?: number,
-  ): Promise<void>
+  ): Promise<string | null>
   /** Navigate to another screen (a `nav` action). */
   nav(target: string): void
   /** Polled by the alarm bar (~2 s cadence). */

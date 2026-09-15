@@ -352,8 +352,16 @@ measures: a degrading scan must not keep buying itself more tolerance. A refusal
 names the budget in force, so a widened window is visible rather than silent.
 
 Before writing, the canvas reads the host's current runtime status (2-second
-request deadline) and requires a running, unpaused, fault-free runtime with no
-unhealthy devices. The standalone panel maps `watchdog_tripped` to an output-lock
+request deadline) and requires a running, unpaused, fault-free runtime. Device
+health is deliberately NOT part of that gate: it belongs to one device, not to
+the runtime, and the canvas cannot tell which device carries the variable — the
+standalone panel has no iomap at all. Refusing on any unhealthy device took away
+every control on the screen, a configured Stop included, because an unrelated
+island dropped, and no coupling declaration exists anywhere in the schema that
+could honestly narrow that. The runtime scopes it instead: it knows the Output
+mapping, applies the write, and returns `undelivered_device` when that
+variable's own device cannot carry the value out. The canvas reports that
+caveat — applied, not delivered — and never retries. The standalone panel maps `watchdog_tripped` to an output-lock
 fault just as the IDE does, even when scan counts continue advancing. After the
 status await the canvas rechecks connection generation, snapshot freshness,
 Operate mode, screen/document identity, current `bind.enable` and variable type.

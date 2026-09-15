@@ -30,7 +30,7 @@ use axum::{
 use futures_util::stream::Stream;
 use ironplc_bridge::{
     DeviceHealth, DeviceReport, DeviceSpec, ProgramHandle, RuntimeMode, RuntimeWriteError,
-    VarSnapshot,
+    VarSnapshot, WriteOutcome,
 };
 use project::{ProjectStore, ProtocolConfig, StoreError};
 use serde::Serialize;
@@ -1138,6 +1138,30 @@ pub(crate) fn audit_outcome(
     }
 }
 
+/// Writes carry delivery state on top of the applied value. An undelivered
+/// write IS an applied write — the ring records what the VM took — so the
+/// distinction rides in the outcome text, where the trail shows the value
+/// never reached that device. Forces use [`audit_outcome`] directly; they
+/// pin a VM value and make no claim about the field.
+pub(crate) fn write_audit_outcome(
+    requested: i32,
+    result: &Result<WriteOutcome, RuntimeWriteError>,
+) -> (Option<i32>, String) {
+    match result {
+        Ok(o) => {
+            let (applied, base) = audit_outcome(requested, &Ok::<i32, RuntimeWriteError>(o.value));
+            match &o.undelivered_device {
+                Some(device) => (
+                    applied,
+                    format!("{base}; not delivered to device '{device}' (link down)"),
+                ),
+                None => (applied, base),
+            }
+        }
+        Err(e) => (None, e.to_string()),
+    }
+}
+
 /// Origin of a mutating request for the audit ring: the `X-IA2-Origin`
 /// header (`gui`, `cs`, …) or `anonymous` when absent. The header value
 /// is only ever stored/printed, never interpolated into a command.
@@ -1174,7 +1198,7 @@ async fn rt_write(
     // core — one implementation for IDE server and edge runtime.
     let origin = origin_of(&headers).to_string();
     let result = monitor::write_with_pulse(&state.handle, &req.name, req.value, req.pulse_ms).await;
-    let (applied, outcome) = audit_outcome(req.value, &result);
+    let (applied, outcome) = write_audit_outcome(req.value, &result);
     record_audit(
         &state.audit,
         &origin,
@@ -1184,10 +1208,15 @@ async fn rt_write(
         applied,
         &outcome,
     );
-    let v = result.map_err(write_err)?;
-    Ok(Json(
-        serde_json::json!({ "ok": true, "name": req.name, "value": v }),
-    ))
+    let outcome = result.map_err(write_err)?;
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "name": req.name,
+        "value": outcome.value,
+        // Same contract as the IDE server's WriteVariableResponse: the write
+        // was applied, and this names the device it cannot currently reach.
+        "undelivered_device": outcome.undelivered_device,
+    })))
 }
 
 async fn rt_force(

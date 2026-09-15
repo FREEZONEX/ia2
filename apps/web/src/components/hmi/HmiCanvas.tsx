@@ -380,15 +380,25 @@ export function HmiCanvas({
           timer = setTimeout(() => reject(new Error("Runtime status timed out — action not sent")), 2000)
         }),
       ])
-      const health = derivePanelHealth(state, 0)
+      // Device health is deliberately NOT part of this gate. It is not a
+      // property of the runtime, it is a property of ONE device, and the
+      // panel cannot tell which device carries this variable — the edge
+      // panel has no iomap at all. Blanket-refusing on any unhealthy device
+      // took away every control, Stop included, because some unrelated
+      // island dropped. The runtime scopes it to the mapping and reports
+      // the caveat below; everything else here is genuinely runtime-wide.
+      const health = derivePanelHealth({ ...state, unhealthyDevices: [] }, 0)
       if (health.kind !== "running") throw new Error(`${health.text} — action not sent`)
       checkWrite(request)
-      await request.host.write(
+      const undelivered = await request.host.write(
         request.write.variable,
         request.write.value,
         request.write.typeName,
         request.action.kind === "pulse" ? request.action.ms : undefined,
       )
+      // A write that landed in the program but not on the bus is not a
+      // failure and not a success — say exactly that, and never retry.
+      if (undelivered && mounted.current) setActionError(undelivered)
     } catch (e) {
       if (mounted.current) setActionError(String(e))
     } finally {

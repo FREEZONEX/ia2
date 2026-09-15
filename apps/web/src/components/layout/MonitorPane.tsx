@@ -108,7 +108,11 @@ export function MonitorPane({ collapsed, onToggleCollapse }: { collapsed: boolea
 
   // A click is pending until the request succeeds and status is read back.
   // A failed command never changes the displayed scan mode or force state.
-  const command = useCallback(async (label: string, action: () => Promise<void>) => {
+  // `action` may resolve to a notice: the runtime applied the write but the
+  // device carrying that variable has a dead link, so it is not reaching the
+  // field. Neither a failure nor a clean success — it rides the same channel
+  // as "accepted; status unconfirmed" rather than being dropped.
+  const command = useCallback(async (label: string, action: () => Promise<string | null | void>) => {
     if (commandRef.current) return false
     commandRef.current = true
     revisionRef.current++
@@ -116,9 +120,10 @@ export function MonitorPane({ collapsed, onToggleCollapse }: { collapsed: boolea
     setCommandError(null)
     let accepted = false
     try {
-      await action()
+      const notice = await action()
       accepted = true
       await refreshStatus()
+      if (notice) setCommandError(`${label} accepted; ${notice}`)
       return true
     } catch (error) {
       setCommandError(accepted

@@ -22,7 +22,7 @@ beforeEach(() => {
   vi.stubGlobal("ResizeObserver", class { constructor(private callback: () => void) {} observe() { this.callback() } disconnect() {} })
   vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(624)
   vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(324)
-  host = { fetchDoc: vi.fn().mockResolvedValue(doc), saveDoc: vi.fn().mockResolvedValue(undefined), write: vi.fn().mockResolvedValue(undefined), nav: vi.fn(),
+  host = { fetchDoc: vi.fn().mockResolvedValue(doc), saveDoc: vi.fn().mockResolvedValue(undefined), write: vi.fn().mockResolvedValue(null), nav: vi.fn(),
     runtimeState: vi.fn().mockResolvedValue({ running: true, alarm: null }), history: vi.fn().mockResolvedValue({ series: [] }), alarms: vi.fn().mockResolvedValue([]), ackAlarm: vi.fn() }
 })
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals() })

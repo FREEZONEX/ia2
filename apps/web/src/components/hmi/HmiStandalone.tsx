@@ -33,7 +33,7 @@ import {
 import { panelFetch } from "@/components/hmi/panel-fetch"
 import { useThemeToggle } from "@/lib/dark-mode"
 import { cn } from "@/lib/utils"
-import { encodeForWrite } from "@/lib/write-encoding"
+import { encodeForWrite, undeliveredNotice } from "@/lib/write-encoding"
 import { liveFeedStore, useConnected } from "@/state/live-feed"
 import type { AlarmState } from "@/types/generated/AlarmState"
 import type { HistoryResponse } from "@/types/generated/HistoryResponse"
@@ -161,6 +161,15 @@ export function HmiStandalone() {
         if (!res.ok) {
           throw new Error(`${res.status}: ${await res.text()}`)
         }
+        // Applied, but the runtime says this variable's own device cannot
+        // carry it out right now. Same contract as the IDE host: report the
+        // caveat, never retry.
+        const applied = (await res.json().catch(() => null)) as {
+          undelivered_device?: string | null
+        } | null
+        return applied?.undelivered_device
+          ? undeliveredNotice(applied.undelivered_device)
+          : null
       },
       nav: (target) => navigate(target),
       // mode + device_health ride along so the alarmbar can tell

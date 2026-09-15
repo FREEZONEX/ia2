@@ -14,3 +14,15 @@ export function encodeForWrite(value: number, typeName: string): number {
   // BOOL, integer family, BYTE/WORD/DWORD all pass through as integers.
   return Math.trunc(value)
 }
+
+/** One wording for both hosts when the runtime applied a write but the
+ *  device carrying that variable has a dead transport.
+ *
+ *  Deliberately not "failed": the value DID land in the program and will
+ *  flush if the link returns. What the operator must not conclude is that
+ *  the plant acted on it. Lives here, beside the encoder, because the IDE
+ *  server path and the edge panel path both already come through this
+ *  module and must say the same thing. */
+export function undeliveredNotice(device: string): string {
+  return `Set in the program, but NOT reaching the field — device "${device}" link is down; do not read this as the plant having obeyed`
+}

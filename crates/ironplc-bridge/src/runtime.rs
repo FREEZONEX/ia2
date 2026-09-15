@@ -119,6 +119,29 @@ pub struct DeviceSpec {
     pub config: ProtocolConfig,
 }
 
+/// An applied write, plus whether it can currently reach the field.
+///
+/// `value` always landed in the VM. A refusal would be the wrong answer
+/// here: the variable may be a Stop, and a Stop that reaches the plant
+/// late when the link comes back beats one that was never commanded.
+/// What must not happen is reporting a bare success — the operator would
+/// read "sent" as "stopped".
+///
+/// `undelivered_device` names the device whose transport is down, when the
+/// variable has an Output mapping onto one. `None` means either the value
+/// is reaching the field or the variable is internal to the program (no
+/// Output mapping — nothing to deliver).
+///
+/// This is transport health only. A healthy link does NOT prove the value
+/// took effect: a slave can sit in SAFEOP, mask its own outputs, or hold
+/// the failsafe zeros after a watchdog trip. The HMI's Stop is not a
+/// safety function under any of these outcomes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteOutcome {
+    pub value: i32,
+    pub undelivered_device: Option<String>,
+}
+
 /// Reasons a variable write can't be honoured.
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeWriteError {
@@ -153,7 +176,7 @@ enum RuntimeCommand {
         name: String,
         value: i32,
         governed: bool,
-        ack: tokio::sync::oneshot::Sender<Result<i32, RuntimeWriteError>>,
+        ack: tokio::sync::oneshot::Sender<Result<WriteOutcome, RuntimeWriteError>>,
     },
     /// Pin a variable's value: every scan begins by writing `value`
     /// into the VM after the input phase but before `run_round`, so the
@@ -316,7 +339,11 @@ impl ProgramHandle {
     /// first unit (tasks.toml declaration order) that declares it;
     /// `instance.variable` targets that PROGRAM instance explicitly
     /// (instance match is case-insensitive).
-    pub async fn write_variable(&self, name: &str, value: i32) -> Result<i32, RuntimeWriteError> {
+    pub async fn write_variable(
+        &self,
+        name: &str,
+        value: i32,
+    ) -> Result<WriteOutcome, RuntimeWriteError> {
         self.send_write(name, value, true).await
     }
 
@@ -332,7 +359,7 @@ impl ProgramHandle {
         &self,
         name: &str,
         value: i32,
-    ) -> Result<i32, RuntimeWriteError> {
+    ) -> Result<WriteOutcome, RuntimeWriteError> {
         self.send_write(name, value, false).await
     }
 
@@ -341,7 +368,7 @@ impl ProgramHandle {
         name: &str,
         value: i32,
         governed: bool,
-    ) -> Result<i32, RuntimeWriteError> {
+    ) -> Result<WriteOutcome, RuntimeWriteError> {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
             .send(RuntimeCommand::WriteVariable {
@@ -1825,7 +1852,21 @@ async fn run_loop_async(
                             };
                             match allowed {
                                 Ok(v) => match runnings[u].write_variable(VarIndex::new(idx), v) {
-                                    Ok(()) => Ok(v),
+                                    // The value is in the VM either way. Report
+                                    // — do not refuse — when its own device
+                                    // cannot carry it out: scoped to THIS
+                                    // variable's device, so an unrelated island
+                                    // going down never costs the operator a
+                                    // control it could still have used.
+                                    Ok(()) => Ok(WriteOutcome {
+                                        value: v,
+                                        undelivered_device: unit_outputs[u]
+                                            .iter()
+                                            .find(|rm| rm.var_index == idx)
+                                            .and_then(|rm| devices.get(rm.device_index))
+                                            .filter(|dev| !dev.is_healthy())
+                                            .map(|dev| dev.name().to_string()),
+                                    }),
                                     Err(trap) => Err(RuntimeWriteError::Vm(format!("{trap:?}"))),
                                 },
                                 Err(e) => Err(e),
@@ -2760,6 +2801,102 @@ mod tests {
             .expect("shutdown");
     }
 
+    /// A write must be judged against the device that carries THAT
+    /// variable, not against the health of the device list as a whole.
+    ///
+    /// An operator's Stop is a variable write. Refusing it because some
+    /// unrelated island dropped costs a control that would still have
+    /// worked, and there is no coupling declaration anywhere in the schema
+    /// that could honestly widen the blocked set — a device does not report
+    /// what it is coupled to. So the scope is the mapping, and the answer is
+    /// a report, not a refusal: the value lands in the VM and flushes if the
+    /// link returns, which beats a Stop that was never commanded.
+    #[tokio::test]
+    async fn a_write_names_only_its_own_down_device() {
+        let container = crate::compile(
+            "PROGRAM main\n\
+                VAR tick : INT := 1; stop_cmd : INT; internal : INT; END_VAR\n\
+                tick := tick + 1;\n\
+            END_PROGRAM",
+        )
+        .expect("program compiles");
+
+        let (mapped, mapped_healthy) = MockDevice::named("bus_mapped");
+        let (unrelated, unrelated_healthy) = MockDevice::named("bus_unrelated");
+        let handle = spawn_units_inner(
+            vec![single_unit(container, 5)],
+            DeviceSource::Prebuilt(vec![Box::new(mapped), Box::new(unrelated)]),
+            vec![project::Mapping {
+                application: "main".into(),
+                variable: "stop_cmd".into(),
+                direction: project::Direction::Output,
+                device: "bus_mapped".into(),
+                channel: "coil".into(),
+                unit: None,
+                min: None,
+                max: None,
+                description: None,
+            }],
+            None,
+            WriteGovernance::default(),
+        );
+
+        let health_of = |name: &str| {
+            handle
+                .device_health()
+                .into_iter()
+                .find(|d| d.name == name)
+                .map(|d| d.healthy)
+        };
+        let settle = |name: &'static str, want: bool| async move {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while health_of(name) != Some(want) && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert_eq!(health_of(name), Some(want), "{name} health must settle");
+        };
+
+        settle("bus_mapped", true).await;
+        let delivered = handle.write_variable("stop_cmd", 1).await.unwrap();
+        assert_eq!(
+            delivered.undelivered_device, None,
+            "healthy link warns nobody"
+        );
+
+        mapped_healthy.store(false, Ordering::Relaxed);
+        settle("bus_mapped", false).await;
+        let undelivered = handle.write_variable("stop_cmd", 1).await.unwrap();
+        assert_eq!(
+            undelivered.value, 1,
+            "an undelivered write is still applied"
+        );
+        assert_eq!(
+            undelivered.undelivered_device.as_deref(),
+            Some("bus_mapped"),
+            "the operator must not read this as a plant that obeyed"
+        );
+
+        // The point of the whole change: someone else's dead bus is not a
+        // reason to take this control away.
+        mapped_healthy.store(true, Ordering::Relaxed);
+        settle("bus_mapped", true).await;
+        unrelated_healthy.store(false, Ordering::Relaxed);
+        settle("bus_unrelated", false).await;
+        let unaffected = handle.write_variable("stop_cmd", 1).await.unwrap();
+        assert_eq!(
+            unaffected.undelivered_device, None,
+            "an unrelated island going down must not cost this control"
+        );
+
+        // No Output mapping means nothing to deliver — not a silent warning.
+        let internal = handle.write_variable("internal", 7).await.unwrap();
+        assert_eq!(internal.undelivered_device, None);
+
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
     /// F64 device channel → LREAL var → F64 device channel, verifying
     /// the 64-bit lane end to end. The probe value carries more
     /// precision than an f32 can hold, so any accidental trip through
@@ -3472,13 +3609,17 @@ mod tests {
         );
         let bits = |f: f32| f.to_bits() as i32;
         // Inside the range: written as asked.
-        let v = handle.write_variable("sp", bits(42.5)).await.unwrap();
+        let v = handle.write_variable("sp", bits(42.5)).await.unwrap().value;
         assert_eq!(v, bits(42.5));
         // Above max: clamped to 100, and the ack says so.
-        let v = handle.write_variable("sp", bits(150.0)).await.unwrap();
+        let v = handle
+            .write_variable("sp", bits(150.0))
+            .await
+            .unwrap()
+            .value;
         assert_eq!(v, bits(100.0));
         // Below min: clamped to 0.
-        let v = handle.write_variable("sp", bits(-3.0)).await.unwrap();
+        let v = handle.write_variable("sp", bits(-3.0)).await.unwrap().value;
         assert_eq!(v, bits(0.0));
         tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
             .await
@@ -3502,7 +3643,7 @@ mod tests {
                 }],
             ),
         );
-        let v = handle.write_variable("x", 99).await.unwrap();
+        let v = handle.write_variable("x", 99).await.unwrap().value;
         assert_eq!(v, 10);
         tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
             .await
@@ -3540,7 +3681,7 @@ mod tests {
             ),
         );
         // Baseline: a plain write of 77 IS clamped to the rule's max.
-        assert_eq!(handle.write_variable("x", 77).await.unwrap(), 10);
+        assert_eq!(handle.write_variable("x", 77).await.unwrap().value, 10);
         // Unlisted variable: write denied, force allowed.
         handle
             .write_variable("y", 5)
@@ -3628,7 +3769,7 @@ mod tests {
         );
         // Not Disconnected above, and this ack proves the drain still
         // runs: the denials left the scan loop alive.
-        assert_eq!(handle.write_variable("c", 9).await.unwrap(), 9);
+        assert_eq!(handle.write_variable("c", 9).await.unwrap().value, 9);
         assert!(handle.fault().is_none(), "no fault may be recorded");
         tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
             .await
@@ -3673,7 +3814,7 @@ mod tests {
         // and the VM value is that write, not NaN.
         let bits = |f: f32| f.to_bits() as i32;
         assert_eq!(
-            handle.write_variable("sp", bits(42.5)).await.unwrap(),
+            handle.write_variable("sp", bits(42.5)).await.unwrap().value,
             bits(42.5)
         );
         let mut rx = handle.subscribe();
@@ -3709,11 +3850,11 @@ mod tests {
             ),
         );
         // Above: floor(10.6) = 10, never 11.
-        assert_eq!(handle.write_variable("x", 99).await.unwrap(), 10);
+        assert_eq!(handle.write_variable("x", 99).await.unwrap().value, 10);
         // Below: ceil(0.4) = 1, never 0.
-        assert_eq!(handle.write_variable("x", -5).await.unwrap(), 1);
+        assert_eq!(handle.write_variable("x", -5).await.unwrap().value, 1);
         // Inside: untouched.
-        assert_eq!(handle.write_variable("x", 5).await.unwrap(), 5);
+        assert_eq!(handle.write_variable("x", 5).await.unwrap().value, 5);
         tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
             .await
             .expect("shutdown");
@@ -3762,7 +3903,7 @@ mod tests {
             "unexpected error: {err:?}"
         );
         // Loop alive after the denial.
-        assert_eq!(handle.write_variable("y", 7).await.unwrap(), 7);
+        assert_eq!(handle.write_variable("y", 7).await.unwrap().value, 7);
         tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
             .await
             .expect("shutdown");
@@ -3803,14 +3944,22 @@ mod tests {
             ),
         );
         let bits = |f: f32| f.to_bits() as i32;
-        let v = handle.write_variable("hi_sp", bits(0.5)).await.unwrap();
+        let v = handle
+            .write_variable("hi_sp", bits(0.5))
+            .await
+            .unwrap()
+            .value;
         let f = f32::from_bits(v as u32);
         assert!(
             (f as f64) <= 0.1,
             "applied value {f} escapes the declared max 0.1"
         );
         assert!((f as f64) > 0.09, "clamp target should stay near the bound");
-        let v = handle.write_variable("lo_sp", bits(0.0)).await.unwrap();
+        let v = handle
+            .write_variable("lo_sp", bits(0.0))
+            .await
+            .unwrap()
+            .value;
         let f = f32::from_bits(v as u32);
         assert!(
             (f as f64) >= 0.1,
@@ -3867,7 +4016,11 @@ mod tests {
             err.to_string().contains("no representable REAL value"),
             "unexpected denial reason: {err}"
         );
-        let v = handle.write_variable("near_sp", bits(-5.0)).await.unwrap();
+        let v = handle
+            .write_variable("near_sp", bits(-5.0))
+            .await
+            .unwrap()
+            .value;
         assert_eq!(
             f32::from_bits(v as u32),
             -5.0,
@@ -3908,10 +4061,10 @@ mod tests {
         );
         // In range: passes through numerically unchanged (the f32-bits
         // decode would have read 50 as 7e-44 and "clamped" it).
-        assert_eq!(handle.write_variable("sp", 50).await.unwrap(), 50);
+        assert_eq!(handle.write_variable("sp", 50).await.unwrap().value, 50);
         // Out of range: clamped in the numeric domain the writer used.
-        assert_eq!(handle.write_variable("sp", 150).await.unwrap(), 100);
-        assert_eq!(handle.write_variable("sp", -5).await.unwrap(), 0);
+        assert_eq!(handle.write_variable("sp", 150).await.unwrap().value, 100);
+        assert_eq!(handle.write_variable("sp", -5).await.unwrap().value, 0);
         tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
             .await
             .expect("shutdown");
@@ -3949,7 +4102,10 @@ mod tests {
         let v = crate::monitor::write_with_pulse(&handle, "x", 50, Some(30))
             .await
             .expect("initial pulse write");
-        assert_eq!(v, 50);
+        assert_eq!(v.value, 50);
+        // A virtual-master fixture has no Output mapping for `x`, so there is
+        // nothing to deliver and nothing to warn about.
+        assert_eq!(v.undelivered_device, None);
         // Give the pulse task and a few scans time to land the reset.
         tokio::time::sleep(Duration::from_millis(150)).await;
         let mut rx = handle.subscribe();

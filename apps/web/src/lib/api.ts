@@ -1,4 +1,4 @@
-import { encodeForWrite } from "@/lib/write-encoding"
+import { encodeForWrite, undeliveredNotice } from "@/lib/write-encoding"
 import type { AlarmState } from "@/types/generated/AlarmState"
 import type { AttachInfo } from "@/types/generated/AttachInfo"
 import type { AttachmentStatus } from "@/types/generated/AttachmentStatus"
@@ -26,6 +26,7 @@ import type { RunResponse } from "@/types/generated/RunResponse"
 import type { RuntimeStatus } from "@/types/generated/RuntimeStatus"
 import type { Tasks } from "@/types/generated/Tasks"
 import type { VariableInfo } from "@/types/generated/VariableInfo"
+import type { WriteVariableResponse } from "@/types/generated/WriteVariableResponse"
 
 async function jsonOrThrow<T>(res: Response, label: string): Promise<T> {
   if (!res.ok) {
@@ -537,9 +538,9 @@ export async function writeVariable(
   value: number,
   typeName: string = "",
   pulseMs?: number,
-): Promise<void> {
+): Promise<string | null> {
   const i32 = encodeForWrite(value, typeName)
-  await jsonOrThrow(
+  const res: WriteVariableResponse = await jsonOrThrow(
     await apiFetch(`/api/runtime/variables/${encodeURIComponent(name)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -549,6 +550,9 @@ export async function writeVariable(
     }),
     `POST /api/runtime/variables/${name}`,
   )
+  // Applied, but the runtime says this variable's own device cannot carry
+  // it out right now. Pass the caveat up; never retry.
+  return res.undelivered_device ? undeliveredNotice(res.undelivered_device) : null
 }
 
 // ---------- Runtime debug controls ----------
