@@ -141,3 +141,48 @@ describe("scan-cadence budget", () => {
     expect(liveFeedStore.getActionBudgetMs()).toBe(ACTION_SNAPSHOT_BASE_BUDGET_MS)
   })
 })
+
+describe("runtime-reported scan period", () => {
+  // Option B: the runtime states its own fastest task interval on /status.
+  // Configuration, not measurement — a stalled stream cannot inflate it and a
+  // degrading scan cannot widen it. The observed-gap estimate stays as the
+  // fallback for runtimes that predate the field.
+  it("beats the observed estimate, with no gaps to learn first", () => {
+    liveFeedStore.setSnapshot(tick(1, 1))
+    expect(liveFeedStore.getActionBudgetMs()).toBe(ACTION_SNAPSHOT_BASE_BUDGET_MS)
+    liveFeedStore.setScanPeriodMs(5000)
+    expect(liveFeedStore.getActionBudgetMs()).toBe(10_000)
+    now += 4000
+    expect(liveFeedStore.getFreshSnapshot()).not.toBeNull()
+  })
+
+  it("overrides a stalled stream's inflated estimate", () => {
+    liveFeedStore.setSnapshot(tick(1, 1))
+    now += 9000
+    liveFeedStore.setSnapshot(tick(2, 2))
+    now += 9000
+    liveFeedStore.setSnapshot(tick(3, 3))
+    expect(liveFeedStore.getActionBudgetMs()).toBe(18_000)
+    // The runtime says it scans every 100 ms; the 9 s gaps were the stream.
+    liveFeedStore.setScanPeriodMs(100)
+    expect(liveFeedStore.getActionBudgetMs()).toBe(ACTION_SNAPSHOT_BASE_BUDGET_MS)
+  })
+
+  it.each([null, undefined, 0, NaN])("falls back to the estimate for %s", value => {
+    liveFeedStore.setScanPeriodMs(5000)
+    liveFeedStore.setScanPeriodMs(value)
+    expect(liveFeedStore.getActionBudgetMs()).toBe(ACTION_SNAPSHOT_BASE_BUDGET_MS)
+  })
+
+  it("is still capped", () => {
+    liveFeedStore.setScanPeriodMs(60_000)
+    expect(liveFeedStore.getActionBudgetMs()).toBe(ACTION_SNAPSHOT_MAX_BUDGET_MS)
+  })
+
+  it("is forgotten with the generation — a new target has its own period", () => {
+    liveFeedStore.setScanPeriodMs(5000)
+    liveFeedStore.setConnected(false)
+    liveFeedStore.setConnected(true)
+    expect(liveFeedStore.getActionBudgetMs()).toBe(ACTION_SNAPSHOT_BASE_BUDGET_MS)
+  })
+})

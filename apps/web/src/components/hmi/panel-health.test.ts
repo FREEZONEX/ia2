@@ -119,3 +119,10 @@ describe("edge watchdog status", () => {
     expect(derivePanelHealth(state, COMMS_LOST_POLLS).kind).toBe("unreachable")
   })
 })
+
+describe("edge scan period", () => {
+  it("carries the runtime's own cadence through, and null when absent", () => {
+    expect(edgeRuntimeState({ fault: null, scan_period_ms: 5000 }).scanPeriodMs).toBe(5000)
+    expect(edgeRuntimeState({ fault: null }).scanPeriodMs).toBeNull()
+  })
+})

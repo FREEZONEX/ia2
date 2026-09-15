@@ -29,6 +29,11 @@ export type HmiRuntimeState = {
   /** Devices whose transport is down (their input variables are frozen
    *  at last-known values). Empty/absent = fieldbus healthy. */
   unhealthyDevices?: string[]
+  /** The runtime's fastest task interval in ms — the cadence at which
+   *  `scan_count` can advance. Feeds the live store's freshness budget, so
+   *  a slow-cycle project is judged against its own rate instead of a fixed
+   *  window. Absent on a runtime that predates the field. */
+  scanPeriodMs?: number | null
 }
 
 export type HmiHost = {

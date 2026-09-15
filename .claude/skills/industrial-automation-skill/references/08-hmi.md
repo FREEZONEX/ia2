@@ -103,9 +103,11 @@ the plant's shape, then curate.
 ## Revalidating operator writes
 
 The canvas requires a connected feed with an advancing snapshot inside a
-freshness budget: 2 seconds, or twice the runtime's own observed scan cadence
-when that is slower (capped at 30 s), because `scan_count` advances once per PLC
-scan and `interval_ms` has no upper bound. Duplicate scans do not renew
+freshness budget: 2 seconds, or twice the runtime's scan cadence when that is
+slower (capped at 30 s), because `scan_count` advances once per PLC scan and
+`interval_ms` has no upper bound. The cadence is `scan_period_ms` from
+`/status` where the runtime reports it, and the panel's own observed gaps
+otherwise. Duplicate scans do not renew
 freshness, one dropped frame does not widen the budget, and the learned cadence
 is dropped on reconnect, restart or a stream repoint. Both no-confirm and
 confirmed variable actions read fresh runtime status with a 2-second deadline,

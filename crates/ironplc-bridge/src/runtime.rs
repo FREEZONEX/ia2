@@ -252,6 +252,17 @@ pub struct ProgramHandle {
     /// the active force set without a round-trip through the cmd
     /// queue.
     forces: Arc<std::sync::Mutex<HashMap<String, i32>>>,
+    /// The fastest unit's task interval, in ms, normalised exactly as
+    /// `UnitClock::interval` is. Fixed for the life of a run, so a plain
+    /// value rather than a shared cell.
+    ///
+    /// This is the cadence at which a snapshot's `scan_count` can advance —
+    /// `scan_count` is the max across units, so the fastest task sets it.
+    /// Clients that judge "is this live data current?" need it: `interval_ms`
+    /// has no upper bound, and on a 5 s-cycle project a 4 s-old value is the
+    /// newest one that exists. Without this they have to guess from observed
+    /// gaps, which a stalled stream inflates.
+    scan_period_ms: u32,
     /// Per-device connect reports (connected/failed + EtherCAT topology),
     /// set once after the initial connect pass. Shared so the HTTP layer
     /// can serve /discover without a scan-loop round-trip.
@@ -514,6 +525,12 @@ impl ProgramHandle {
     /// off. Stays `true` until the program is restarted — a caller seeing
     /// this must not read live variable values as plant state, because the
     /// bus is holding zeros while the VM keeps computing.
+    /// The fastest task interval in ms — the cadence at which `scan_count`
+    /// can advance. See the field docs for why a client needs it.
+    pub fn scan_period_ms(&self) -> u32 {
+        self.scan_period_ms
+    }
+
     pub fn watchdog_tripped(&self) -> bool {
         self.watchdog_tripped.load(Ordering::Relaxed)
     }
@@ -652,6 +669,22 @@ fn spawn_units_inner(
     governance: WriteGovernance,
 ) -> ProgramHandle {
     let stop = Arc::new(AtomicBool::new(false));
+    // Normalised exactly as `UnitClock::interval` below, and MIN across
+    // units because `scan_count` is the max across units — the fastest task
+    // is the one that makes the counter move.
+    let scan_period_ms = units
+        .iter()
+        .map(|u| {
+            if u.interval_ms == 0 {
+                DEFAULT_SCAN_INTERVAL_MS
+            } else {
+                u.interval_ms
+            }
+            .max(1)
+            .min(u32::MAX as u64) as u32
+        })
+        .min()
+        .unwrap_or(DEFAULT_SCAN_INTERVAL_MS as u32);
     let (snapshot_tx, _) = broadcast::channel(64);
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     let mode = Arc::new(std::sync::Mutex::new(RuntimeMode::Running));
@@ -862,6 +895,7 @@ fn spawn_units_inner(
         cmd_tx,
         mode,
         forces,
+        scan_period_ms,
         device_reports,
         device_health,
         watchdog_tripped,
@@ -2796,6 +2830,42 @@ mod tests {
         }
         assert!(handle.device_health()[0].healthy, "recovery must surface");
 
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
+    /// `scan_count` is the MAX across units, so the fastest task is what
+    /// makes it move — and that is the number a client needs to size a
+    /// staleness window. Taking the max here (or the first unit's) would
+    /// hand out a window several times too wide on a mixed-cadence project.
+    #[tokio::test]
+    async fn scan_period_reports_the_fastest_unit() {
+        let handle = spawn_units_inner(
+            vec![
+                unit("slow", trivial_container(), 5_000, 1),
+                unit("fast", trivial_container(), 20, 1),
+            ],
+            DeviceSource::Prebuilt(vec![]),
+            Vec::new(),
+            None,
+            WriteGovernance::default(),
+        );
+        assert_eq!(handle.scan_period_ms(), 20);
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+
+        // Normalised exactly as UnitClock is: 0 means "unspecified", which
+        // the scheduler runs at the default rather than as a busy loop.
+        let handle = spawn_units_inner(
+            vec![unit("default", trivial_container(), 0, 1)],
+            DeviceSource::Prebuilt(vec![]),
+            Vec::new(),
+            None,
+            WriteGovernance::default(),
+        );
+        assert_eq!(handle.scan_period_ms(), DEFAULT_SCAN_INTERVAL_MS as u32);
         tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
             .await
             .expect("shutdown");

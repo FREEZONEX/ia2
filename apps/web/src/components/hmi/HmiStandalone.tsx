@@ -105,7 +105,11 @@ export function HmiStandalone() {
         const s = await jget<EdgeStatus>("/status")
         if (cancelled) return
         setProject(s.project ?? "")
-        setEdgeState(edgeRuntimeState(s))
+        const state = edgeRuntimeState(s)
+        setEdgeState(state)
+        // This poll runs for the whole session, screen or no screen, so it is
+        // the panel's reliable source for the write-freshness budget.
+        liveFeedStore.setScanPeriodMs(state.scanPeriodMs)
         setAlarmsStanding(s.alarms_standing ?? 0)
         setFailedPolls(0)
       } catch {

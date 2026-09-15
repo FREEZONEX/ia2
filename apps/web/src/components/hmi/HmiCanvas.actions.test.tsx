@@ -261,6 +261,17 @@ describe("HMI write revalidation", () => {
     expect(host.write).toHaveBeenCalledTimes(1)
   })
 
+  it("honours a runtime-reported slow cadence without learning any gaps", async () => {
+    render(canvas())
+    await screen.findByRole("button", { name: "Quick set" })
+    // What a /status poll would have set. No observed gaps exist yet — that
+    // is the point: the reported period needs no warm-up.
+    act(() => liveFeedStore.setScanPeriodMs(5000))
+    clock += 4000
+    fireEvent.click(screen.getByRole("button", { name: "Quick set" }))
+    await waitFor(() => expect(host.write).toHaveBeenCalledTimes(1))
+  })
+
   it("keeps navigation usable without a live runtime", async () => {
     render(canvas())
     await screen.findByRole("button", { name: "Next screen" })

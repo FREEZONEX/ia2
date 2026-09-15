@@ -339,14 +339,17 @@ renew that budget. Disconnects, cleared snapshots, observed counter resets and
 repointing the stream at another runtime (Debug attach/detach) invalidate
 outstanding confirmations; reconnecting does not resend anything.
 
-The budget is 2 seconds or twice the runtime's own observed scan cadence,
-whichever is larger, capped at 30 seconds. A fixed 2 seconds would ask the wrong
+The budget is 2 seconds or twice the runtime's scan cadence, whichever is
+larger, capped at 30 seconds. The cadence comes from `scan_period_ms` on
+`/status` when the runtime reports it — configuration, so a stalled stream
+cannot inflate it and a degrading scan cannot widen it. Older runtimes send
+nothing, and the panel then falls back to the cadence it observes. A fixed 2 seconds would ask the wrong
 question: `scan_count` advances once per PLC scan, `interval_ms` has no upper
 bound, and on a 5 s-cycle project a 4 s-old value *is* the current picture —
 there is nothing newer to have, so a fixed window would refuse every write for
-3 seconds out of every 5. The cadence is the *lower median* of the last five
-observed gaps, so one dropped frame cannot widen the window, and it is forgotten
-on every generation bump — one runtime's slowness never widens the window for
+3 seconds out of every 5. The fallback cadence is the *lower median* of the last
+five observed gaps, so one dropped frame cannot widen the window, and both the
+reported period and the observed gaps are forgotten on every generation bump — one runtime's slowness never widens the window for
 the next. The cap is there because the window follows the very thing it
 measures: a degrading scan must not keep buying itself more tolerance. A refusal
 names the budget in force, so a widened window is visible rather than silent.

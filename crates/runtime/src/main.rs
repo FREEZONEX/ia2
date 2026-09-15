@@ -724,6 +724,14 @@ struct Status {
     /// computing and `scan_count` keeps climbing after a trip, so a poller
     /// watching only values sees a healthy plant while the bus holds zeros.
     watchdog_tripped: bool,
+    /// Fastest task interval in ms — the cadence at which `scan_count` can
+    /// advance, since it is the max across units. A client judging "is this
+    /// live data current?" needs this: `interval_ms` has no upper bound, and
+    /// on a 5 s-cycle project a 4 s-old value is the newest one that exists,
+    /// so a fixed staleness window would refuse every operator write between
+    /// scans. It says nothing about how long a scan actually takes — the
+    /// overrun watchdog owns that.
+    scan_period_ms: u32,
     uptime_secs: u64,
     scan_count: u64,
     last_snapshot: Option<VarSnapshot>,
@@ -761,6 +769,7 @@ async fn status(State(state): State<AppState>) -> Json<Status> {
         devices: state.devices.clone(),
         device_health: state.handle.device_health(),
         watchdog_tripped: state.handle.watchdog_tripped(),
+        scan_period_ms: state.handle.scan_period_ms(),
         uptime_secs: state.start_time.elapsed().as_secs(),
         scan_count,
         last_snapshot,

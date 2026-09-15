@@ -46,6 +46,7 @@ class LiveFeedStore {
   private connected = false
   private progressedAt: number | null = null
   private scanGaps: number[] = []
+  private reportedScanPeriodMs: number | null = null
   private generation = 0
   private snapshotListeners = new Set<Listener>()
   private connectedListeners = new Set<Listener>()
@@ -66,15 +67,33 @@ class LiveFeedStore {
    *  Surface this wherever a widened window could surprise an operator: a
    *  tolerance that grows silently is a silent downgrade. */
   getActionBudgetMs = (): number => {
-    if (this.scanGaps.length === 0) return ACTION_SNAPSHOT_BASE_BUDGET_MS
+    const cadence = this.reportedScanPeriodMs ?? this.observedCadenceMs()
+    if (cadence == null) return ACTION_SNAPSHOT_BASE_BUDGET_MS
+    return Math.min(
+      ACTION_SNAPSHOT_MAX_BUDGET_MS,
+      Math.max(ACTION_SNAPSHOT_BASE_BUDGET_MS, cadence * ACTION_BUDGET_SCAN_MULTIPLE),
+    )
+  }
+
+  /** Observed gaps are the FALLBACK, used only until the runtime states its
+   *  own period. They are what a stalled stream inflates and what a
+   *  degrading scan quietly widens; the reported number is neither, because
+   *  it is configuration rather than measurement. */
+  private observedCadenceMs(): number | null {
+    if (this.scanGaps.length === 0) return null
     const sorted = [...this.scanGaps].sort((a, b) => a - b)
     // LOWER median: with two samples the smaller one wins, so a single
     // dropped frame or SSE hiccup cannot widen the window by itself.
-    const typical = sorted[Math.floor((sorted.length - 1) / 2)]
-    return Math.min(
-      ACTION_SNAPSHOT_MAX_BUDGET_MS,
-      Math.max(ACTION_SNAPSHOT_BASE_BUDGET_MS, typical * ACTION_BUDGET_SCAN_MULTIPLE),
-    )
+    return sorted[Math.floor((sorted.length - 1) / 2)]
+  }
+
+  /** The runtime's own fastest task interval, from `/status`. Authoritative
+   *  where it is available; older runtimes send nothing and keep the
+   *  observed-cadence fallback. Pass `null` when unknown — never 0, which
+   *  would pin the budget to the floor and reintroduce the bug. */
+  setScanPeriodMs = (ms: number | null | undefined): void => {
+    this.reportedScanPeriodMs =
+      typeof ms === "number" && Number.isFinite(ms) && ms > 0 ? ms : null
   }
 
   /** Read at dispatch time, not from a React render's cached snapshot.
@@ -106,6 +125,9 @@ class LiveFeedStore {
   private resetCadence(): void {
     this.progressedAt = null
     this.scanGaps = []
+    // A different runtime has a different period. Carrying the old one over
+    // would widen the window for a target that never claimed it.
+    this.reportedScanPeriodMs = null
   }
 
   /** One interval between observed scan advances. Units faster than the

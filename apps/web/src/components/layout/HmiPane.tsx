@@ -64,6 +64,7 @@ export function HmiPane() {
           running: s.running,
           alarm: s.watchdog_tripped ? "Watchdog tripped — outputs are locked" : s.last_error ?? null,
           mode: s.mode?.kind,
+          scanPeriodMs: s.scan_period_ms,
           unhealthyDevices: s.device_health
             .filter((d) => !d.healthy)
             .map((d) => d.name),

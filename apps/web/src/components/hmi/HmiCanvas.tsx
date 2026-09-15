@@ -372,9 +372,10 @@ export function HmiCanvas({
     }
     writing.current = true
     let timer: ReturnType<typeof setTimeout> | undefined
+    let status: HmiRuntimeState | undefined
     try {
       checkWrite(request)
-      const state = await Promise.race([
+      status = await Promise.race([
         request.host.runtimeState(),
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => reject(new Error("Runtime status timed out — action not sent")), 2000)
@@ -387,6 +388,7 @@ export function HmiCanvas({
       // took away every control, Stop included, because some unrelated
       // island dropped. The runtime scopes it to the mapping and reports
       // the caveat below; everything else here is genuinely runtime-wide.
+      const state = status
       const health = derivePanelHealth({ ...state, unhealthyDevices: [] }, 0)
       if (health.kind !== "running") throw new Error(`${health.text} — action not sent`)
       checkWrite(request)
@@ -404,6 +406,11 @@ export function HmiCanvas({
     } finally {
       clearTimeout(timer)
       writing.current = false
+      // Learn the cadence from this read — an IDE screen without an alarmbar
+      // has no other poll — but only AFTER the decision. Moving the budget
+      // between the two checkWrite calls would judge one action on two
+      // different windows.
+      if (status) liveFeedStore.setScanPeriodMs(status.scanPeriodMs)
     }
   }, [checkWrite])
 
@@ -994,6 +1001,7 @@ function AlarmBar({ host }: { host: HmiHost }) {
         if (!cancelled) {
           setState(s)
           setFailedPolls(0)
+          liveFeedStore.setScanPeriodMs(s.scanPeriodMs)
         }
       } catch {
         if (!cancelled) setFailedPolls((n) => n + 1)

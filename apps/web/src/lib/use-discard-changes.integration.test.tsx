@@ -37,7 +37,7 @@ beforeEach(() => {
   vi.mocked(api.fetchProjects).mockResolvedValue([])
   vi.mocked(api.fetchRuntimeStatus).mockResolvedValue({
     running: false, project: "Current", program_instances: [], devices: [], device_health: [],
-    watchdog_tripped: false, scan_count: 0n, last_snapshot_us: 0n, last_error: null,
+    watchdog_tripped: false, scan_period_ms: null, scan_count: 0n, last_snapshot_us: 0n, last_error: null,
     running_info: null, mode: null, forces: [],
   })
   vi.mocked(api.checkProgram).mockResolvedValue([])

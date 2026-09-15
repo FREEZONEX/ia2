@@ -139,6 +139,15 @@ pub struct RuntimeStatus {
     /// is actually holding zeros. `running` also stays `true` — the scan loop
     /// deliberately keeps going so operators can still inspect live state.
     pub watchdog_tripped: bool,
+    /// Fastest task interval in ms — the cadence at which `scan_count` can
+    /// advance, since it is the max across units. A client judging "is this
+    /// live data current?" needs this: `interval_ms` has no upper bound, and
+    /// on a 5 s-cycle project a 4 s-old value is the newest one that exists,
+    /// so a fixed staleness window would refuse every operator write between
+    /// scans. It says nothing about how long a scan actually takes — the
+    /// overrun watchdog owns that.
+    /// `None` when nothing is running.
+    pub scan_period_ms: Option<u32>,
     /// Scan count from the most recent snapshot; 0 before the first one.
     pub scan_count: u64,
     /// Timestamp_us of the most recent snapshot, or 0.
@@ -203,7 +212,7 @@ pub async fn runtime_status(
     // Mode + forces come from the live ProgramHandle, when there is
     // one. Clone the handle out of the mutex briefly to avoid holding
     // the sync lock across the calls.
-    let (mode, forces, device_health, watchdog_tripped) = {
+    let (mode, forces, device_health, watchdog_tripped, scan_period_ms) = {
         let guard = state.program.lock();
         match guard.as_ref() {
             Some(rp) => (
@@ -211,8 +220,9 @@ pub async fn runtime_status(
                 ironplc_bridge::monitor::force_entries(&rp.handle),
                 rp.handle.device_health(),
                 rp.handle.watchdog_tripped(),
+                Some(rp.handle.scan_period_ms()),
             ),
-            None => (None, vec![], vec![], false),
+            None => (None, vec![], vec![], false, None),
         }
     };
     Json(RuntimeStatus {
@@ -222,6 +232,7 @@ pub async fn runtime_status(
         devices,
         device_health,
         watchdog_tripped,
+        scan_period_ms,
         scan_count: snap.as_ref().map(|s| s.scan_count).unwrap_or(0),
         last_snapshot_us: snap.as_ref().map(|s| s.timestamp_us).unwrap_or(0),
         last_error,
