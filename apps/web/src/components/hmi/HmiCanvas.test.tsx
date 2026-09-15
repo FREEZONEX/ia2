@@ -3,14 +3,11 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { HmiCanvas, type CanvasMode } from "./HmiCanvas"
 import { HmiHostProvider, type HmiHost } from "./host"
+import { liveFeedStore } from "@/state/live-feed"
 import { fitCanvasScale } from "./canvas-viewport"
 import type { HmiDoc } from "@/types/generated/HmiDoc"
 
 vi.mock("@/state/hmi-live", () => ({ useHmiMutation: () => null }))
-vi.mock("@/state/live-feed", () => ({
-  useConnected: () => true,
-  useLastSnapshot: () => ({ timestamp_us: 1n, scan_count: 1n, vars: [{ name: "level", type_name: "REAL", value: "2.5", bits: 0 }] }),
-}))
 const doc: HmiDoc = {
   title: "Tank", version: 1, level: 2, grid: { w: 1000, h: 800, snap: 8 },
   root: { id: "root", type: "group", layout: "absolute", x: 0, y: 0, w: 1000, h: 800, gap: 0, bind: {}, action: {}, children: [
@@ -19,6 +16,9 @@ const doc: HmiDoc = {
 }
 let host: HmiHost
 beforeEach(() => {
+  liveFeedStore.setSnapshot(null)
+  liveFeedStore.setConnected(true)
+  liveFeedStore.setSnapshot({ timestamp_us: 1n, scan_count: 1n, vars: [{ name: "level", type_name: "REAL", value: "2.5", bits: 0 }] })
   vi.stubGlobal("ResizeObserver", class { constructor(private callback: () => void) {} observe() { this.callback() } disconnect() {} })
   vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(624)
   vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(324)

@@ -329,6 +329,40 @@ label it Stop/Abort, style it as a control, and document the physical
 e-stop as the real safety device; a soft-PLC HMI never claims a safety
 function it cannot deliver.
 
+### Live-state revalidation for variable writes
+
+The canvas checks both direct actions and confirmed actions against the current
+live-feed store at dispatch time. A connected SSE socket alone is insufficient:
+a snapshot must have arrived after connection and its scan count and timestamp
+must have advanced within the last 2 seconds. Repeated frozen snapshots do not
+renew this budget. Disconnects, cleared snapshots, observed counter resets and
+repointing the stream at another runtime (Debug attach/detach) invalidate
+outstanding confirmations; reconnecting does not resend anything.
+
+Before writing, the canvas reads the host's current runtime status (2-second
+request deadline) and requires a running, unpaused, fault-free runtime with no
+unhealthy devices. The standalone panel maps `watchdog_tripped` to an output-lock
+fault just as the IDE does, even when scan counts continue advancing. After the
+status await the canvas rechecks connection generation, snapshot freshness,
+Operate mode, screen/document identity, current `bind.enable` and variable type.
+An unresolved or false enable binding refuses the write. A failed check displays
+a reason, sends no write and does not queue a retry. Navigation remains available
+offline; alarm acknowledgment is a separate path, unchanged by these checks.
+
+Confirmation freezes the displayed target value, including toggle direction,
+clamping and type. New live values do not silently replace that target. Only one
+variable-write check/request runs at a time; rapid clicks are not queued. Pulse
+reset still travels in the original runtime-side `pulse_ms` request. Document
+reloads invalidate old controls and discard late responses from an older screen.
+
+These are operator UI checks, not atomic PLC interlocks or a safety function.
+A condition can change after the last client check; authoritative motion limits,
+lease/watchdog handling and process interlocks still belong in the runtime/PLC.
+The 2-second freshness/deadline budgets are UI policy, not measured stop times.
+They apply to every variable action (including a configured Stop): no-confirm
+means no dialog, not bypassing live-state checks. An unavailable HMI write cannot
+be relied on to stop machinery.
+
 ## Phasing
 
 **P0 — format + runtime view + agent plumbing.** Schema/store/validate in

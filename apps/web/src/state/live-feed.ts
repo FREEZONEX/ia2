@@ -21,9 +21,14 @@ import type { VarSnapshot } from "@/types/generated/VarSnapshot"
 
 type Listener = () => void
 
+/** Operator-write freshness budget, not a PLC or safety timeout. */
+export const ACTION_SNAPSHOT_MAX_AGE_MS = 2000
+
 class LiveFeedStore {
   private snapshot: VarSnapshot | null = null
   private connected = false
+  private progressedAt: number | null = null
+  private generation = 0
   private snapshotListeners = new Set<Listener>()
   private connectedListeners = new Set<Listener>()
 
@@ -32,6 +37,16 @@ class LiveFeedStore {
 
   getSnapshot = (): VarSnapshot | null => this.snapshot
   getConnected = (): boolean => this.connected
+  getGeneration = (): number => this.generation
+
+  /** Read at dispatch time, not from a React render's cached snapshot.
+   *  A socket opening is insufficient; an advancing scan must arrive. */
+  getFreshSnapshot = (): VarSnapshot | null => {
+    const age = this.progressedAt == null ? Infinity : performance.now() - this.progressedAt
+    return this.connected && age >= 0 && age < ACTION_SNAPSHOT_MAX_AGE_MS
+      ? this.snapshot
+      : null
+  }
 
   subscribeSnapshot = (l: Listener): (() => void) => {
     this.snapshotListeners.add(l)
@@ -48,6 +63,25 @@ class LiveFeedStore {
   }
 
   setSnapshot(snap: VarSnapshot | null): void {
+    const previous = this.snapshot
+    if (!snap) {
+      this.progressedAt = null
+      this.generation++
+    } else {
+      const scan = Number(snap.scan_count)
+      const stamp = Number(snap.timestamp_us)
+      const valid = Number.isFinite(scan) && Number.isFinite(stamp) && scan > 0 && stamp > 0
+      const restarted = previous != null &&
+        (scan < Number(previous.scan_count) || stamp < Number(previous.timestamp_us))
+      if (restarted) {
+        this.generation++
+        this.progressedAt = null
+      }
+      const advanced = previous == null || restarted ||
+        (scan > Number(previous.scan_count) && stamp > Number(previous.timestamp_us))
+      if (!valid || !this.connected) this.progressedAt = null
+      else if (advanced) this.progressedAt = performance.now()
+    }
     this.snapshot = snap
     this.snapshotListeners.forEach((l) => l())
   }
@@ -55,6 +89,8 @@ class LiveFeedStore {
   setConnected(up: boolean): void {
     if (this.connected === up) return
     this.connected = up
+    this.progressedAt = null
+    this.generation++
     this.connectedListeners.forEach((l) => l())
   }
 }

@@ -78,6 +78,7 @@ export function derivePanelHealth(
 export type EdgeStatus = {
   project?: string | null
   fault?: string | null
+  watchdog_tripped?: boolean
   mode?: RuntimeMode | null
   device_health?: DeviceHealth[] | null
   /** Standing alarm count from the runtime's alarm engine (0 / absent
@@ -91,8 +92,8 @@ export type EdgeStatus = {
  *  "Stopped". */
 export function edgeRuntimeState(s: EdgeStatus): HmiRuntimeState {
   return {
-    running: s.fault == null && (s.mode == null || s.mode.kind === "running"),
-    alarm: s.fault ?? null,
+    running: !s.watchdog_tripped && s.fault == null && (s.mode == null || s.mode.kind === "running"),
+    alarm: s.watchdog_tripped ? "Watchdog tripped — outputs are locked" : s.fault ?? null,
     mode: s.mode?.kind,
     unhealthyDevices: (s.device_health ?? [])
       .filter((d) => !d.healthy)

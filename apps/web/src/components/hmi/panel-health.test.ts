@@ -106,3 +106,16 @@ describe("edgeRuntimeState", () => {
     expect(edgeRuntimeState({ fault: "trap" }).running).toBe(false)
   })
 })
+
+
+describe("edge watchdog status", () => {
+  it("does not show an advancing but output-locked runtime as running", () => {
+    const status = { fault: null, mode: { kind: "running" as const }, watchdog_tripped: true }
+    const state = edgeRuntimeState(status)
+    expect(state.running).toBe(false)
+    const health = derivePanelHealth(state, 0)
+    expect(health.kind).toBe("fault")
+    expect(health.text).toContain("Watchdog")
+    expect(derivePanelHealth(state, COMMS_LOST_POLLS).kind).toBe("unreachable")
+  })
+})

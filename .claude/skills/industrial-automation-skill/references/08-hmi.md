@@ -100,6 +100,24 @@ variables per device (an equipment section per wired device, qualified
 `instance.variable` bindings) — regenerate after wiring changes to see
 the plant's shape, then curate.
 
+## Revalidating operator writes
+
+The canvas requires a connected feed with an advancing snapshot less than
+2 seconds old. Duplicate scans do not renew freshness. Both no-confirm and
+confirmed variable actions read fresh runtime status with a 2-second deadline,
+then recheck connection/run generation, screen identity, Operate mode, current
+`bind.enable` and the target variable's type before dispatch. A watchdog lock,
+fault, pause, stopped runtime, unhealthy device, stale data or missing enable
+binding value refuses the action with a visible reason. Reconnect does not send
+an old confirmation or queue a retry. Navigation remains usable offline.
+
+The confirmed value stays exactly as displayed; pulse reset remains runtime-side.
+A document reload invalidates old controls/confirmations. These UI checks do not
+replace PLC interlocks or establish safety timing. Even a no-confirm Stop is a
+variable write subject to these availability checks; retain independent stopping
+means. Test browser confirmation races with the component's mocked host/live feed;
+PLC scenarios alone cannot exercise a browser's pending-confirmation state.
+
 ## Maps: values become colors and words, declaratively
 
 A binding spec can carry `map` — an ordered rule list applied after

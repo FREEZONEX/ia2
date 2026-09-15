@@ -50,7 +50,7 @@ import {
 } from "@/lib/alarms"
 import { cn } from "@/lib/utils"
 import { useHmiMutation } from "@/state/hmi-live"
-import { useConnected, useLastSnapshot } from "@/state/live-feed"
+import { liveFeedStore, useConnected, useLastSnapshot } from "@/state/live-feed"
 import { TrendChart, type TrendSeries } from "@/components/charts/TrendChart"
 import type { AlarmState } from "@/types/generated/AlarmState"
 import type { HmiAction } from "@/types/generated/HmiAction"
@@ -71,6 +71,11 @@ type PendingConfirm = {
   action: HmiAction
   /** Resolved at request time — Confirm sends exactly this. */
   write: ResolvedWrite
+  document: HmiDoc
+  path: string
+  host: HmiHost
+  feedGeneration: number
+  documentVersion: number
 }
 
 export function HmiCanvas({
@@ -95,11 +100,13 @@ export function HmiCanvas({
   const loadRevision = useRef(0)
 
   // ---- document load + live reload --------------------------------
+  const documentVersion = useRef(0)
   const load = useCallback(async () => {
     const revision = ++loadRevision.current
     try {
       const d = await host.fetchDoc(path)
       if (revision !== loadRevision.current) return
+      documentVersion.current = revision
       setDoc(d)
       setLoadError(null)
       onDocLoaded?.(d)
@@ -125,6 +132,7 @@ export function HmiCanvas({
   useEffect(() => {
     if (!mutation || mutation.path !== path) return
     if (mutation.deleted) {
+      loadRevision.current++
       setDoc(null)
       setLoadError("screen was deleted")
       return
@@ -311,25 +319,74 @@ export function HmiCanvas({
     setDragPos(null)
   }, [mode, path])
 
-  // The write itself. `write` was resolved at request time, so the
-  // confirm path sends exactly what the dialog showed. A pulse's reset
-  // rides the SAME request (`pulseMs`) — the runtime writes the 0, so a
-  // closed tab or suspended tablet can't leave the coil latched.
-  const performWrite = useCallback(
-    async (action: HmiAction, write: ResolvedWrite) => {
-      try {
-        await host.write(
-          write.variable,
-          write.value,
-          write.typeName,
-          action.kind === "pulse" ? action.ms : undefined,
-        )
-      } catch (e) {
-        setActionError(String(e))
-      }
-    },
-    [host],
-  )
+  // Refs cover changes that happen while a fresh status request is in flight.
+  const actionContext = useRef({ host, path, mode, doc, loadError })
+  actionContext.current = { host, path, mode, doc, loadError }
+  const mounted = useRef(false)
+  const writing = useRef(false)
+  useEffect(() => {
+    mounted.current = true
+    return () => { mounted.current = false }
+  }, [])
+
+  const checkWrite = useCallback((request: PendingConfirm) => {
+    const current = actionContext.current
+    if (!mounted.current || current.mode !== "operate" || current.host !== request.host ||
+        current.path !== request.path || current.doc !== request.document || current.loadError ||
+        request.documentVersion !== documentVersion.current ||
+        request.documentVersion !== loadRevision.current) {
+      throw new Error("Screen changed — request the action again")
+    }
+    if (request.feedGeneration !== liveFeedStore.getGeneration()) {
+      throw new Error("Live connection or run changed — request the action again")
+    }
+    const fresh = liveFeedStore.getFreshSnapshot()
+    if (!fresh) throw new Error("Fresh live data unavailable — action not sent")
+    const node = findNode(request.document.root, request.nodeId)
+    if (!node || !canHostAction(node.type)) throw new Error("Control unavailable — action not sent")
+    const enabled = node.bind["enable"]
+    if (enabled !== undefined && !resolveOn(fresh, enabled)) {
+      throw new Error("Control is no longer enabled — action not sent")
+    }
+    const variable = lookupVar(fresh, request.write.variable)
+    if (!variable || variable.type_name !== request.write.typeName) {
+      throw new Error("Live variable or type changed — request the action again")
+    }
+  }, [])
+
+  // Keep the value/type shown in the card; recheck permission to dispatch it.
+  // Pulse reset remains one runtime-side request, never a browser timer.
+  const performWrite = useCallback(async (request: PendingConfirm) => {
+    if (writing.current) {
+      setActionError("Another action is awaiting a response — action not sent")
+      return
+    }
+    writing.current = true
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      checkWrite(request)
+      const state = await Promise.race([
+        request.host.runtimeState(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("Runtime status timed out — action not sent")), 2000)
+        }),
+      ])
+      const health = derivePanelHealth(state, 0)
+      if (health.kind !== "running") throw new Error(`${health.text} — action not sent`)
+      checkWrite(request)
+      await request.host.write(
+        request.write.variable,
+        request.write.value,
+        request.write.typeName,
+        request.action.kind === "pulse" ? request.action.ms : undefined,
+      )
+    } catch (e) {
+      if (mounted.current) setActionError(String(e))
+    } finally {
+      clearTimeout(timer)
+      writing.current = false
+    }
+  }, [checkWrite])
 
   const requestAction = useCallback(
     (nodeId: string, action: HmiAction, value?: number) => {
@@ -343,22 +400,38 @@ export function HmiCanvas({
         }
         return
       }
-      const res = resolveActionWrite(snapshot, action, value)
+      const fresh = liveFeedStore.getFreshSnapshot()
+      if (!fresh) {
+        setActionError("Fresh live data unavailable — action not sent")
+        return
+      }
+      const res = resolveActionWrite(fresh, action, value)
       if (!res.ok) {
         setActionError(res.reason)
+        return
+      }
+      if (!doc) return
+      const request: PendingConfirm = {
+        nodeId, action, write: res.write, document: doc, path, host,
+        feedGeneration: liveFeedStore.getGeneration(), documentVersion: documentVersion.current,
+      }
+      try {
+        checkWrite(request)
+      } catch (e) {
+        setActionError(String(e))
         return
       }
       const needsConfirm =
         "confirm" in action ? action.confirm : true
       if (needsConfirm) {
-        setPending({ nodeId, action, write: res.write })
+        setPending(request)
       } else {
         // A clamped no-confirm entry still writes — but never silently.
         setActionError(clampNotice(res.write))
-        void performWrite(action, res.write)
+        void performWrite(request)
       }
     },
-    [mode, host, snapshot, performWrite],
+    [mode, host, doc, path, checkWrite, performWrite],
   )
 
   // ---- render ------------------------------------------------------
@@ -448,7 +521,7 @@ export function HmiCanvas({
             if (mode !== "operate") return
             const p = pending
             setPending(null)
-            void performWrite(p.action, p.write)
+            void performWrite(p)
           }}
         />
       )}

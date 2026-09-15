@@ -602,6 +602,17 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     return () => {
       es.close()
       esRef.current = null
+      // `es.close()` fires no `onerror`, so without this the store keeps
+      // `connected: true` across an attach/detach repoint — the next
+      // stream's `onopen` then early-returns and never bumps the
+      // generation. The previous runtime's snapshot would stay "fresh"
+      // for the whole action budget, and a confirmation resolved against
+      // THAT runtime would still pass the canvas's dispatch checks after
+      // the switch. Counter regression cannot cover this: two runtimes
+      // are two time bases, and an edge's uptime may exceed the local
+      // one's.
+      liveFeedStore.setConnected(false)
+      liveFeedStore.setSnapshot(null)
     }
   }, [attached, clearProjectState, refreshProjects])
 
