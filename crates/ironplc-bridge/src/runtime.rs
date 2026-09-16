@@ -3037,6 +3037,87 @@ mod tests {
             .expect("shutdown");
     }
 
+    /// The empirical claim the whole write-freshness design rests on, which
+    /// until now was only inferred from reading this file: on a project whose
+    /// task is slower than the snapshot period, the snapshot stream KEEPS
+    /// FLOWING while `scan_count` sits still between scans.
+    ///
+    /// That shape is why a fixed staleness window was the wrong question. A
+    /// client watching only `scan_count` sees a counter that is frozen most of
+    /// the time and concludes the data is stale, when in fact the newest value
+    /// that exists is exactly the one it is holding. `scan_period_ms` is what
+    /// lets it tell that apart from a genuinely dead feed.
+    ///
+    /// 600 ms rather than a realistic 5 s: the relationship under test is
+    /// "task interval >> snapshot period", and 600 ms exercises it in a
+    /// second and a half instead of half a minute.
+    #[tokio::test]
+    async fn a_slow_task_keeps_streaming_while_its_scan_count_sits_still() {
+        const SLOW_MS: u64 = 600;
+        let handle = spawn_units_inner(
+            vec![single_unit(trivial_container(), SLOW_MS)],
+            DeviceSource::Prebuilt(vec![]),
+            Vec::new(),
+            None,
+            WriteGovernance::default(),
+        );
+        assert_eq!(
+            handle.scan_period_ms(),
+            SLOW_MS as u32,
+            "the reported period is what a client sizes its window from"
+        );
+
+        let mut rx = handle.subscribe();
+        let mut snaps: Vec<VarSnapshot> = Vec::new();
+        let until = Instant::now() + Duration::from_millis(1_500);
+        while Instant::now() < until {
+            let left = until - Instant::now();
+            match tokio::time::timeout(left, rx.recv()).await {
+                Ok(Ok(s)) => snaps.push(s),
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                _ => break,
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+
+        // A liveness floor, not a cadence assertion: ~13 arrive on an idle
+        // machine, and the ratio below is the structural claim. Loose enough
+        // that a loaded host does not turn this into a false red.
+        assert!(
+            snaps.len() >= 5,
+            "stream went quiet: only {} snapshots",
+            snaps.len()
+        );
+        let advances = snaps
+            .windows(2)
+            .filter(|w| w[1].scan_count > w[0].scan_count)
+            .count();
+        let frozen = snaps
+            .windows(2)
+            .filter(|w| w[1].scan_count == w[0].scan_count && w[1].timestamp_us > w[0].timestamp_us)
+            .count();
+
+        // The point: far more frames carry a frozen counter than a fresh scan.
+        assert!(
+            frozen > advances,
+            "a {SLOW_MS} ms task against a {SNAPSHOT_PERIOD:?} snapshot period must \
+             deliver mostly frozen-counter frames; got {frozen} frozen vs {advances} advancing"
+        );
+        assert!(
+            advances >= 1,
+            "the scan must still advance sometimes, or the fixture proves nothing"
+        );
+        // And those frozen frames are LIVE data, not a stalled stream: their
+        // timestamps moved. Anything judging freshness on the counter alone
+        // cannot tell this apart from a dead feed.
+        assert!(
+            frozen >= 1,
+            "expected frozen-counter frames with advancing timestamps"
+        );
+    }
+
     /// `scan_count` is the MAX across units, so the fastest task is what
     /// makes it move — and that is the number a client needs to size a
     /// staleness window. Taking the max here (or the first unit's) would
