@@ -10,7 +10,10 @@
 //! Shape: one background poll task owns the tag mirror — every
 //! `poll_interval_ms` it issues ONE bulk Read service call for all
 //! readable channels (OPC UA reads N nodes per call, so 200 tags is
-//! still one round-trip). `read_channel` returns the mirrored value;
+//! still one round-trip — subject to the server's `MaxNodesPerRead`,
+//! which this adapter does not chunk against; a response that does not
+//! match the request one-for-one is rejected rather than zipped, see
+//! `pair_results`). `read_channel` returns the mirrored value;
 //! `write_channel` performs a direct Write service call so command
 //! errors surface immediately at the scan loop.
 //!
@@ -318,7 +321,36 @@ async fn bulk_read(
         .read(&reads, TimestampsToReturn::Neither, 0.0)
         .await
         .map_err(|e| IoError::Transport(format!("opcua bulk read: {e}")))?;
+    pair_results(channels, results)
+}
 
+/// Pair a Read response with the channels that asked for it, positionally —
+/// which is the only correspondence the service defines.
+///
+/// The count is checked first. A `zip` alone would have accepted a short
+/// response as a *success*: the tags past the cut keep whatever the mirror
+/// held (0 for any tag whose very first read was already short), health stays
+/// green because the call returned `Ok`, and nothing is logged. A PV frozen at
+/// zero that the system insists is healthy is the worst shape a supervisory
+/// read can take, so a response that does not line up with the request is
+/// treated as a failed refresh instead: last-known values are served and the
+/// health tracker flips after `UNHEALTHY_AFTER_FAILURES`.
+///
+/// The realistic cause is a server `MaxNodesPerRead` smaller than the tag
+/// count — this adapter issues one Read for every readable channel — so the
+/// message names it.
+fn pair_results(
+    channels: &[ResolvedChannel],
+    results: Vec<DataValue>,
+) -> Result<Vec<(String, ChannelValue)>, IoError> {
+    if results.len() != channels.len() {
+        return Err(IoError::Transport(format!(
+            "opcua bulk read: asked for {} nodes, got {} results — the response cannot be \
+             matched to the request (server MaxNodesPerRead below the tag count?)",
+            channels.len(),
+            results.len()
+        )));
+    }
     let mut out = Vec::with_capacity(results.len());
     for (ch, dv) in channels.iter().zip(results) {
         let good = dv.status.map(|s| s.is_good()).unwrap_or(true);
@@ -660,5 +692,85 @@ fn ua_type_name(id: &NodeId) -> (Option<&'static str>, Option<OpcuaDataType>) {
         11 => (Some("Double"), Some(OpcuaDataType::F64)),
         12 => (Some("String"), None),
         _ => (None, None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opcua::types::Variant;
+
+    fn ch(name: &str, ty: OpcuaDataType) -> ResolvedChannel {
+        ResolvedChannel {
+            meta: OpcuaChannel {
+                name: name.into(),
+                node_id: format!("ns=2;s={name}"),
+                data_type: ty,
+                access: OpcuaAccess::Read,
+                failsafe: None,
+            },
+            node: NodeId::new(2, name),
+        }
+    }
+
+    #[test]
+    fn a_matching_response_pairs_positionally() {
+        let channels = vec![ch("pv1", OpcuaDataType::F64), ch("pv2", OpcuaDataType::F64)];
+        let results = vec![
+            DataValue::value_only(Variant::Double(1.5)),
+            DataValue::value_only(Variant::Double(2.5)),
+        ];
+        let out = pair_results(&channels, results).expect("counts match");
+        assert_eq!(
+            out,
+            vec![
+                ("pv1".to_string(), ChannelValue::F64(1.5)),
+                ("pv2".to_string(), ChannelValue::F64(2.5)),
+            ]
+        );
+    }
+
+    /// The defect this guards: a short response used to be a *success*. The
+    /// tags past the cut would keep their seeded zero forever while
+    /// `is_healthy()` stayed true — a dead PV the system swears is live.
+    #[test]
+    fn a_short_response_is_a_failed_refresh_not_a_partial_success() {
+        let channels = vec![
+            ch("pv1", OpcuaDataType::F64),
+            ch("pv2", OpcuaDataType::F64),
+            ch("pv3", OpcuaDataType::F64),
+        ];
+        let results = vec![DataValue::value_only(Variant::Double(1.5))];
+        let err = pair_results(&channels, results).expect_err("a short response must not pass");
+        let msg = err.to_string();
+        assert!(msg.contains("asked for 3 nodes, got 1"), "{msg}");
+        assert!(msg.contains("MaxNodesPerRead"), "{msg}");
+    }
+
+    /// A server returning MORE than asked is just as unmatchable — the extra
+    /// entries mean the positional correspondence is not the one we assumed.
+    #[test]
+    fn an_over_long_response_is_rejected_too() {
+        let channels = vec![ch("pv1", OpcuaDataType::F64)];
+        let results = vec![
+            DataValue::value_only(Variant::Double(1.5)),
+            DataValue::value_only(Variant::Double(2.5)),
+        ];
+        assert!(pair_results(&channels, results).is_err());
+    }
+
+    /// A tag that comes back Bad is skipped (keeping its last value) without
+    /// failing the whole refresh — that is per-tag quality, not a mismatch.
+    #[test]
+    fn a_bad_status_tag_is_skipped_while_the_rest_of_the_read_stands() {
+        let channels = vec![ch("pv1", OpcuaDataType::F64), ch("pv2", OpcuaDataType::F64)];
+        let mut bad = DataValue::value_only(Variant::Double(9.0));
+        bad.status = Some(opcua::types::StatusCode::BadNoData);
+        let out = pair_results(
+            &channels,
+            vec![bad, DataValue::value_only(Variant::Double(2.5))],
+        )
+        .expect("counts still match");
+        assert_eq!(out, vec![("pv2".to_string(), ChannelValue::F64(2.5))]);
     }
 }
