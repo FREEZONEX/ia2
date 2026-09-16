@@ -12,7 +12,7 @@
  *     are inert so a mis-tap can't write to the plant while laying out.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react"
 import { Button } from "@/components/ui/button"
 import { EmptyState } from "@/components/ui/empty-state"
 import { fitCanvasScale } from "./canvas-viewport"
@@ -343,10 +343,14 @@ export function HmiCanvas({
   const actionContext = useRef({ host, path, mode, doc, loadError })
   // Published after commit, not during render: a render React throws away
   // (StrictMode's double pass, an interrupted concurrent render) would
-  // otherwise leave this pointing at state that was never on screen. Every
-  // reader is an event handler or a post-await recheck, so they all run after
-  // the commit this publishes.
-  useEffect(() => {
+  // otherwise leave this pointing at state that was never on screen.
+  //
+  // LAYOUT effect, not a passive one. A passive effect runs after paint, so a
+  // control is clickable for a beat while this still holds the previous
+  // render's doc — and `checkWrite` reads it, sees a doc mismatch, and refuses
+  // a perfectly good action as "Screen changed". Caught by the post-await
+  // recheck tests, which stopped being able to open the confirm card at all.
+  useLayoutEffect(() => {
     actionContext.current = { host, path, mode, doc, loadError }
   })
   const mounted = useRef(false)
