@@ -55,8 +55,8 @@ Each entry: the symptom you'll see, the cause, the fix.
 **Fix:** `cs runtime status --json` lists active forces. `cs runtime unforce NAME`. (This is why workflow recipe D always unforces at the end.)
 
 ### RETAIN value didn't persist across restart
-**Cause:** either the variable isn't in a `VAR RETAIN` block, or the program was killed hard (not a clean stop) between the 5 s flush windows.
-**Fix:** confirm the `VAR RETAIN` declaration. Note the flush cadence is 5 s + on clean stop — up to 5 s of change can be lost on an unclean kill. Also: values restore as i32, so LREAL/LINT/LWORD truncate (use DINT-class for retained counters).
+**Cause:** the variable isn't in a `VAR RETAIN` block; or the block is inside a `FUNCTION_BLOCK`, which is not persisted at all; or the program was killed hard (not a clean stop) between the 5 s flush windows.
+**Fix:** confirm the `VAR RETAIN` declaration sits in a `PROGRAM` or `VAR_GLOBAL` block — an FB-internal one is warned about at compile time and ignored (`grep` the runtime log for `VAR RETAIN inside a FUNCTION_BLOCK`). Note the flush cadence is 5 s + on clean stop — up to 5 s of change can be lost on an unclean kill. Values themselves are stored as raw 64-bit slots and do not truncate.
 
 ### The run stopped by itself — snapshots frozen, nothing obvious in the way
 **Cause:** the program faulted. A VM trap (divide by zero, bad array index, …) in any scheduled instance stops the whole plant and zeroes outputs (failsafe), by design.
@@ -118,7 +118,7 @@ An `init_sdo` entry targets a CoE object the drive doesn't have. A failed startu
 - **One running program per server.** Hardware (Modbus/EtherCAT bus) can have one master. Starting a program stops the previous, across all projects.
 - **No `AT %IX0.0` located variables.** Bind via `iomap.toml`, not IEC direct addressing.
 - **Real EtherCAT is Linux-only** (`CAP_NET_RAW`). On macOS use `nic: "_sim"`.
-- **RETAIN restores as i32** — wide types truncate.
+- **RETAIN works in `PROGRAM` / `VAR_GLOBAL` blocks only** — an FB-internal `VAR RETAIN` is ignored (compile-time warning). Values are raw 64-bit slots; nothing truncates.
 - **No per-entry iomap/tasks/device-channel edits.** Whole-document get → edit → set.
 - **WSTRING** is upstream-WIP; don't author WSTRING programs expecting them to run.
 - **No FB instances inside a FUNCTION_BLOCK** (e.g. a TON declared in an FB's `VAR` block) — compile-time error; hoist the instance into the calling PROGRAM. See `05-iec-61131.md` § quirks.

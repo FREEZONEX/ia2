@@ -128,7 +128,8 @@ After deploy, an edge box looks like:
 │   │                                standalone HMI panel (/hmi) from here
 │   ├── 2026-05-12T07-15-00Z/       previous (kept for rollback)
 │   └── _initial/                   install.sh stub
-└── (state for retained variables would go here)
+└── state/                       retain.json + historian segments — sibling of `current`,
+                                 so a symlink swap never touches it
 ```
 
 ## Upgrading pre-HMI edges
