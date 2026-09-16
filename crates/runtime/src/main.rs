@@ -706,6 +706,46 @@ async fn health(State(state): State<AppState>) -> Json<Health> {
 use ironplc_bridge::monitor::{self, ForceEntry, ModeResponse};
 
 #[cfg(test)]
+mod write_response_tests {
+    use super::write_response;
+    use ironplc_bridge::WriteOutcome;
+
+    #[test]
+    fn the_body_carries_the_keys_the_panel_reads_by_name() {
+        let delivered = write_response(
+            "stop_cmd",
+            &WriteOutcome {
+                value: 1,
+                undelivered_device: None,
+            },
+        );
+        assert_eq!(delivered["ok"], true, "cs edge reads this");
+        assert_eq!(delivered["name"], "stop_cmd");
+        assert_eq!(delivered["value"], 1);
+        assert!(
+            delivered["undelivered_device"].is_null(),
+            "a delivered write must say so explicitly, not omit the key"
+        );
+
+        let stranded = write_response(
+            "stop_cmd",
+            &WriteOutcome {
+                value: 1,
+                undelivered_device: Some("bus_a".into()),
+            },
+        );
+        assert_eq!(
+            stranded["value"], 1,
+            "an undelivered write is still applied"
+        );
+        assert_eq!(
+            stranded["undelivered_device"], "bus_a",
+            "this exact key is what the panel reads; renaming it drops the warning silently"
+        );
+    }
+}
+
+#[cfg(test)]
 mod build_stamp_tests {
     /// A provenance stamp that silently degrades to an empty string is worse
     /// than none — `/status` would serve a field that looks answered. Assert
@@ -1245,6 +1285,25 @@ fn write_err(e: RuntimeWriteError) -> (StatusCode, String) {
     }
 }
 
+/// The `/write` success body.
+///
+/// Extracted so its KEYS are covered by a test. They are hand-written strings
+/// here — unlike the IDE server's typed `WriteVariableResponse`, which the
+/// compiler checks — and the operator panel reads them by name, so a typo
+/// would compile, deploy, and silently drop the undelivered warning.
+///
+/// `ok` stays in the body: `cs edge` reads it (crates/cli/src/cmd/edge.rs).
+fn write_response(name: &str, outcome: &WriteOutcome) -> serde_json::Value {
+    serde_json::json!({
+        "ok": true,
+        "name": name,
+        "value": outcome.value,
+        // Same contract as the IDE server's WriteVariableResponse: the write
+        // was applied, and this names the device it cannot currently reach.
+        "undelivered_device": outcome.undelivered_device,
+    })
+}
+
 async fn rt_write(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -1265,14 +1324,7 @@ async fn rt_write(
         &outcome,
     );
     let outcome = result.map_err(write_err)?;
-    Ok(Json(serde_json::json!({
-        "ok": true,
-        "name": req.name,
-        "value": outcome.value,
-        // Same contract as the IDE server's WriteVariableResponse: the write
-        // was applied, and this names the device it cannot currently reach.
-        "undelivered_device": outcome.undelivered_device,
-    })))
+    Ok(Json(write_response(&req.name, &outcome)))
 }
 
 async fn rt_force(

@@ -1674,6 +1674,25 @@ async fn run_loop_async(
             }
         }
     }
+    // Output mappings whose device never connected, resolved once, silently.
+    //
+    // `unit_outputs` only holds mappings bound to a LIVE device, so a write to
+    // a variable on a device that never came up would find nothing there and
+    // report a clean success — the exact silence this crate's undelivered
+    // reporting exists to end, just via a different door than a link that
+    // dropped after connecting. Resolved here because `pending_mappings` is
+    // drained by the reconnect worker, and because doing it per write would
+    // re-log every routing warning on every write.
+    let mut parked_output_device: Vec<HashMap<u16, String>> =
+        (0..n_units).map(|_| HashMap::new()).collect();
+    for m in &pending_mappings {
+        if let Some((unit_index, Direction::Output, rm)) =
+            resolve_mapping(m, usize::MAX, &instances, &var_index_by_name, &debug_maps)
+        {
+            parked_output_device[unit_index].insert(rm.var_index, m.device.clone());
+        }
+    }
+
     for (i, unit) in units.iter().enumerate() {
         tracing::info!(
             instance = %unit.instance,
@@ -1936,9 +1955,23 @@ async fn run_loop_async(
                                         undelivered_device: unit_outputs[u]
                                             .iter()
                                             .find(|rm| rm.var_index == idx)
-                                            .and_then(|rm| devices.get(rm.device_index))
-                                            .filter(|dev| !dev.is_healthy())
-                                            .map(|dev| dev.name().to_string()),
+                                            .map_or_else(
+                                                // Nothing bound: either this
+                                                // variable has no Output
+                                                // mapping at all (nothing to
+                                                // deliver, correctly silent),
+                                                // or its device never
+                                                // connected — which is
+                                                // undelivered without needing
+                                                // to ask anyone's health.
+                                                || parked_output_device[u].get(&idx).cloned(),
+                                                |rm| {
+                                                    devices
+                                                        .get(rm.device_index)
+                                                        .filter(|dev| !dev.is_healthy())
+                                                        .map(|dev| dev.name().to_string())
+                                                },
+                                            ),
                                     }),
                                     Err(trap) => Err(RuntimeWriteError::Vm(format!("{trap:?}"))),
                                 },
@@ -2945,6 +2978,59 @@ mod tests {
             handle.scan_overruns() >= during,
             "the total is history and must not be walked back by recovery"
         );
+
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
+    /// The other door to "this write is not reaching the field": a device that
+    /// never connected at all. Its mappings are parked rather than bound, so
+    /// the live-device lookup finds nothing and — before this — the write came
+    /// back a clean success. Partial bus connectivity is an ordinary
+    /// operational state here (the runtime deliberately starts anyway), so
+    /// this is not an exotic path.
+    #[tokio::test]
+    async fn a_write_to_a_device_that_never_connected_is_undelivered_too() {
+        let container = crate::compile(
+            "PROGRAM main\n\
+                VAR tick : INT := 1; stop_cmd : INT; internal : INT; END_VAR\n\
+                tick := tick + 1;\n\
+            END_PROGRAM",
+        )
+        .expect("program compiles");
+
+        let handle = spawn_units_inner(
+            vec![single_unit(container, 5)],
+            // No devices come up at all.
+            DeviceSource::Prebuilt(vec![]),
+            vec![project::Mapping {
+                application: "main".into(),
+                variable: "stop_cmd".into(),
+                direction: project::Direction::Output,
+                device: "absent_bus".into(),
+                channel: "coil".into(),
+                unit: None,
+                min: None,
+                max: None,
+                description: None,
+            }],
+            None,
+            WriteGovernance::default(),
+        );
+
+        let parked = handle.write_variable("stop_cmd", 1).await.unwrap();
+        assert_eq!(parked.value, 1, "the write still applies to the VM");
+        assert_eq!(
+            parked.undelivered_device.as_deref(),
+            Some("absent_bus"),
+            "a device that never connected cannot carry the value either"
+        );
+
+        // Control: no Output mapping means nothing to deliver, and the parked
+        // table must not start answering for unmapped variables.
+        let internal = handle.write_variable("internal", 7).await.unwrap();
+        assert_eq!(internal.undelivered_device, None);
 
         tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
             .await

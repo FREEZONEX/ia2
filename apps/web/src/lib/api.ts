@@ -1,4 +1,4 @@
-import { encodeForWrite, undeliveredNotice } from "@/lib/write-encoding"
+import { encodeForWrite, undeliveredFrom } from "@/lib/write-encoding"
 import type { AlarmState } from "@/types/generated/AlarmState"
 import type { AttachInfo } from "@/types/generated/AttachInfo"
 import type { AttachmentStatus } from "@/types/generated/AttachmentStatus"
@@ -552,7 +552,7 @@ export async function writeVariable(
   )
   // Applied, but the runtime says this variable's own device cannot carry
   // it out right now. Pass the caveat up; never retry.
-  return res.undelivered_device ? undeliveredNotice(res.undelivered_device) : null
+  return undeliveredFrom(res)
 }
 
 // ---------- Runtime debug controls ----------

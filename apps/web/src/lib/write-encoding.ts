@@ -26,3 +26,19 @@ export function encodeForWrite(value: number, typeName: string): number {
 export function undeliveredNotice(device: string): string {
   return `Set in the program, but NOT reaching the field — device "${device}" link is down; do not read this as the plant having obeyed`
 }
+
+/** Read the undelivered-device caveat out of a write response body.
+ *
+ *  The edge panel talks to the runtime's `/write`, whose body is hand-built
+ *  JSON on the Rust side rather than a generated type — so nothing checks that
+ *  this key still matches what the runtime emits. Named and tested on both
+ *  sides for that reason: a rename there and a silent loss of the warning here
+ *  would otherwise look identical to a healthy write.
+ *
+ *  Tolerant of a body that is missing, malformed, or from an older runtime
+ *  that has no such field: those mean "nothing to report", not "failed". */
+export function undeliveredFrom(body: unknown): string | null {
+  const device = (body as { undelivered_device?: unknown } | null | undefined)
+    ?.undelivered_device
+  return typeof device === "string" && device !== "" ? undeliveredNotice(device) : null
+}
