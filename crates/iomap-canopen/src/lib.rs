@@ -97,6 +97,21 @@ impl CanopenDevice {
                 config.node_id
             )));
         }
+        // The channel table below is keyed by name, so a name declared twice
+        // does not collide — it overwrites, and the earlier channel ceases to
+        // exist while every mapping onto that name silently moves to the
+        // survivor. Refuse: a config that cannot be read unambiguously is not
+        // one to run a plant on. `/api/project/validate` reports the same
+        // thing at author time, but the edge runtime validates nothing — this
+        // is the only check that always runs.
+        let dups =
+            project::duplicate_channel_names(config.channels.iter().map(|c| c.name.as_str()));
+        if !dups.is_empty() {
+            return Err(IoError::Connect(format!(
+                "device '{name}': channel name declared more than once: {}",
+                dups.join(", ")
+            )));
+        }
         let mut channels = HashMap::new();
         for ch in &config.channels {
             if let CanopenTransport::Tpdo { slot, .. } | CanopenTransport::Rpdo { slot, .. } =

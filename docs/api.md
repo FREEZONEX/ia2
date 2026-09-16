@@ -54,6 +54,17 @@ declares. A bare name that is in fact *shared* is NOT caught: the snapshot
 qualifies it and the alarm is dead anyway, but distinguishing that needs
 per-instance variable sets, which static extraction does not carry.
 
+It also lints each **device document against itself** (`device-validate`, all
+errors). Two findings, both of which used to pass silently: a channel name
+declared more than once — every adapter keys its channel table by name, so the
+repeat overwrites and the earlier channel stops existing while mappings onto
+that name move to the survivor, and `iomap-validate` compounds it by resolving
+the same name to the *first* match while the adapter keeps the *last*; and an
+OPC UA or CANopen `failsafe` on a channel whose `access` is not `write`, which
+the failsafe sweep skips, so a configured safe state can never be applied. The
+duplicate-name half is also refused by the adapters themselves at connect,
+because the edge runtime runs no project validation at all.
+
 ## POUs
 
 A POU is one IEC declaration (PROGRAM / FUNCTION_BLOCK / FUNCTION). A

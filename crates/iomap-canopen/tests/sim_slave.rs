@@ -251,3 +251,48 @@ async fn heartbeat_loss_flips_health_and_recovery_restores_it() {
     assert!(dev.is_healthy(), "heartbeat back → healthy again");
     dev.shutdown().await.unwrap();
 }
+
+/// A document that names one channel twice cannot be read unambiguously:
+/// the adapter's table is keyed by name, so the earlier object would simply
+/// cease to exist and every mapping onto that name would silently move to
+/// the survivor — a different index, a different meaning, no error anywhere.
+///
+/// `_sim` connects without hardware, so this exercises the real connect path:
+/// a config that would otherwise have come up healthy is refused instead.
+#[tokio::test]
+async fn a_repeated_channel_name_is_refused_at_connect() {
+    let mut cfg = base_config();
+    cfg.channels = vec![
+        ch(
+            "statusword",
+            0x6041,
+            0,
+            CanopenDataType::U16,
+            CanopenAccess::Read,
+            CanopenTransport::Sdo,
+        ),
+        // Same name, a different object entirely.
+        ch(
+            "statusword",
+            0x6064,
+            0,
+            CanopenDataType::I32,
+            CanopenAccess::Read,
+            CanopenTransport::Sdo,
+        ),
+    ];
+    let msg = match CanopenDevice::connect("drive".into(), &cfg).await {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("a repeated channel name must not connect"),
+    };
+    assert!(msg.contains("declared more than once"), "{msg}");
+    assert!(msg.contains("statusword"), "{msg}");
+
+    // Control: the same two objects under distinct names connect fine, so
+    // the guard is about the NAME collision and nothing else.
+    cfg.channels[1].name = "actual_position".into();
+    let dev = CanopenDevice::connect("drive".into(), &cfg)
+        .await
+        .expect("distinct names connect");
+    drop(dev);
+}

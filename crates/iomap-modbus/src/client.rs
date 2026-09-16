@@ -208,6 +208,21 @@ pub struct ModbusDevice {
 
 impl ModbusDevice {
     pub async fn connect(name: String, config: &ModbusConfig) -> Result<Self, IoError> {
+        // The channel table below is keyed by name, so a name declared twice
+        // does not collide — it overwrites, and the earlier channel ceases to
+        // exist while every mapping onto that name silently moves to the
+        // survivor. Refuse: a config that cannot be read unambiguously is not
+        // one to run a plant on. `/api/project/validate` reports the same
+        // thing at author time, but the edge runtime validates nothing — this
+        // is the only check that always runs.
+        let dups =
+            project::duplicate_channel_names(config.channels.iter().map(|c| c.name.as_str()));
+        if !dups.is_empty() {
+            return Err(IoError::Connect(format!(
+                "device '{name}': channel name declared more than once: {}",
+                dups.join(", ")
+            )));
+        }
         let timeout = request_timeout(config);
         let mut client = establish(&config.transport, config.slave_id, timeout).await?;
 
@@ -1251,6 +1266,39 @@ mod tests {
             },
             cmd_rx,
         )
+    }
+
+    /// A device document that declares one channel name twice cannot be read
+    /// unambiguously, so `connect` refuses it — and refuses it BEFORE opening
+    /// the transport, which is what the unroutable address here proves: a
+    /// config error must not need a working link to be reported.
+    #[tokio::test]
+    async fn duplicate_channel_names_are_refused_before_the_socket_is_opened() {
+        let cfg = ModbusConfig {
+            transport: ModbusTransport::Tcp(ModbusTcpParams {
+                host: "203.0.113.1".into(), // TEST-NET-3: guaranteed unroutable
+                port: 502,
+            }),
+            slave_id: 1,
+            poll_interval_ms: 100,
+            timeout_ms: Some(30_000),
+            reconnect_backoff_ms: None,
+            channels: vec![
+                reg("flow", 10, ModbusDataType::U16, ModbusWordOrder::HiLo),
+                reg("flow", 99, ModbusDataType::U16, ModbusWordOrder::HiLo),
+            ],
+        };
+        let started = std::time::Instant::now();
+        let msg = match ModbusDevice::connect("plc".into(), &cfg).await {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a document with a repeated channel name must not connect"),
+        };
+        assert!(msg.contains("declared more than once"), "{msg}");
+        assert!(msg.contains("flow"), "{msg}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the guard must run before establish(), not after its 30 s timeout"
+        );
     }
 
     #[tokio::test]

@@ -13,6 +13,7 @@
 //! ```
 
 mod alarm_check;
+mod device_check;
 mod errors;
 mod fbd;
 pub mod hmi;
@@ -24,6 +25,7 @@ mod store;
 mod types;
 
 pub use alarm_check::{validate_alarms, AlarmIssue};
+pub use device_check::{duplicate_channel_names, validate_devices, DeviceIssue};
 pub use errors::StoreError;
 pub use fbd::{
     FbdBlock, FbdInputBinding, FbdInputSource, FbdOutputBinding, FbdPosition, FbdProgram,

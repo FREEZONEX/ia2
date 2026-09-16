@@ -2022,6 +2022,16 @@ pub async fn validate_project(
         // validate, not the first scan.
         let iomap = store.read_iomap()?;
         let devices = store.list_devices()?;
+        // Static device lint, BEFORE the iomap lint reasons about those same
+        // documents: a device that declares one channel name twice makes the
+        // two disagree — the linter resolves the name to the first match, the
+        // adapter keeps the last — so report the broken document first.
+        for issue in project::validate_devices(&devices) {
+            out.push(diag(
+                "device-validate",
+                format!("device '{}': {}", issue.device, issue.message),
+            ));
+        }
         for issue in project::validate_iomap(&iomap, &devices) {
             let code = match issue.severity {
                 project::IomapIssueSeverity::Error => "iomap-validate",

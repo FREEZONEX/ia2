@@ -1066,7 +1066,9 @@ pub struct EthercatSdoInit {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct EthercatChannel {
-    /// Unique channel name — what iomap entries reference.
+    /// Unique channel name — what iomap entries reference. Uniqueness is
+    /// enforced by `validate_devices`; a repeat would silently discard the
+    /// earlier PDO entry, since the channel table is keyed by name.
     pub name: String,
     /// Which SubDevice on the bus this PDO entry lives on (matches
     /// `EthercatSlave.index`).
@@ -1253,7 +1255,10 @@ fn default_canopen_heartbeat_timeout_ms() -> u32 {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct CanopenChannel {
-    /// Unique channel name — what iomap entries reference.
+    /// Unique channel name — what iomap entries reference. Uniqueness is
+    /// enforced: `validate_devices` reports a repeat, and the adapter refuses
+    /// to connect (its channel table is keyed by name, so a repeat would
+    /// silently discard the earlier object).
     pub name: String,
     /// Object dictionary index (hex in the UI, e.g. 0x6041 statusword).
     pub index: u16,
