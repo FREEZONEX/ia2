@@ -41,7 +41,7 @@ serves a smaller subset on its own port — see `docs/edge-deploy.md`.
 | `GET` | `/api/fs/browse?path=` | List the sub-directories of `path` (default `~/Documents/IA2`) for the Open-project folder picker — directories only, dotfiles hidden, each flagged `is_project` (has a `project.toml`). Returns `FsListing`. | A browser has no native OS folder dialog |
 | `GET` | `/api/project` | Full project tree (applications, devices, edges, iomap, tasks, folder lists). Returns `ProjectTree` or `null` when no project is open. | |
 | `POST` | `/api/project/migrate-tasks` | One-shot migrate inline-CONFIGURATION blocks in POU files into `tasks.toml`. Idempotent. Returns `MigrationResponse`. | Legacy projects only |
-| `POST` | `/api/project/validate` | Run `compile_project` and return diagnostics without spawning. Returns `Vec<CheckDiagnostic>` (empty = ok). | Pre-flight check before Run/Deploy |
+| `POST` | `/api/project/validate` | Run `compile_project` and return diagnostics without spawning. Returns `Vec<CheckDiagnostic>` (empty = ok). Also lints `alarms.toml`: an alarm whose `variable` names nothing the project declares is an error (`alarms-validate`), because the engine matches snapshot names exactly and skips an unmatched definition quietly — leaving a calm, never-raised entry in `/alarms` that claims coverage it does not have. Both snapshot spellings are accepted (bare, and `instance.variable` for a name more than one PROGRAM instance declares); a bare name that is in fact shared is NOT caught, because static extraction carries no per-POU attribution. | Pre-flight check before Run/Deploy |
 
 ## POUs
 

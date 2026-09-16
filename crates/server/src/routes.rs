@@ -2036,6 +2036,32 @@ pub async fn validate_project(
             }
             out.push(d);
         }
+        // Static alarm lint: does each definition watch a variable that
+        // exists? The engine skips an unmatched one quietly, so without this
+        // a typo'd or renamed variable leaves a calm, never-raised entry in
+        // /alarms that claims coverage it does not have.
+        {
+            let alarms = store.read_alarms()?;
+            let mut sources = Vec::new();
+            for path in store.list_pou_paths()? {
+                sources.push(store.read_pou_source(&path)?);
+            }
+            let declared_names: Vec<String> = sources
+                .iter()
+                .flat_map(|src| ironplc_bridge::extract_variables(src))
+                .map(|v| v.name)
+                .collect();
+            let declared: std::collections::HashSet<&str> =
+                declared_names.iter().map(String::as_str).collect();
+            let instances: Vec<String> =
+                tasks.programs.iter().map(|p| p.instance.clone()).collect();
+            for issue in project::validate_alarms(&alarms.alarms, &declared, &instances) {
+                out.push(diag(
+                    "alarms-validate",
+                    format!("alarm #{}: {}", issue.alarm_index + 1, issue.message),
+                ));
+            }
+        }
         // HMI screens fold into the same diagnostics story (the
         // docs/hmi-design.md contract): structural issues, unknown
         // variables, read-only write targets, dangling nav targets. A

@@ -3128,6 +3128,44 @@ mod tests {
         );
     }
 
+    /// Snapshot variable names come from the compiler's debug map verbatim,
+    /// and the alarm engine matches them with `==`. Anything validating an
+    /// alarm definition statically against ST source therefore depends on the
+    /// two spellings agreeing — including case. Pin it rather than assume it.
+    #[tokio::test]
+    async fn snapshot_names_match_the_declared_spelling() {
+        let src = "PROGRAM main\n\
+                VAR Level_SP : INT := 1; tick : INT := 1; END_VAR\n\
+                tick := tick + 1;\n\
+            END_PROGRAM";
+        let declared: Vec<String> = crate::extract_variables(src)
+            .into_iter()
+            .map(|v| v.name)
+            .collect();
+        let handle = spawn_units_inner(
+            vec![single_unit(crate::compile(src).expect("compiles"), 5)],
+            DeviceSource::Prebuilt(vec![]),
+            Vec::new(),
+            None,
+            WriteGovernance::default(),
+        );
+        let mut rx = handle.subscribe();
+        let snap = last_snapshot_within(&mut rx, Duration::from_millis(500)).await;
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+
+        let in_snapshot: Vec<&str> = snap.vars.iter().map(|v| v.name.as_str()).collect();
+        assert!(
+            in_snapshot.contains(&"Level_SP"),
+            "snapshot should carry the declared spelling; got {in_snapshot:?}"
+        );
+        assert!(
+            declared.contains(&"Level_SP".to_string()),
+            "static extraction should carry the declared spelling; got {declared:?}"
+        );
+    }
+
     /// `scan_count` is the MAX across units, so the fastest task is what
     /// makes it move — and that is the number a client needs to size a
     /// staleness window. Taking the max here (or the first unit's) would

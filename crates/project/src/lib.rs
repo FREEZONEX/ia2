@@ -12,6 +12,7 @@
 //! └── iomap.toml             # variable ↔ channel bindings
 //! ```
 
+mod alarm_check;
 mod errors;
 mod fbd;
 pub mod hmi;
@@ -22,6 +23,7 @@ mod sfc;
 mod store;
 mod types;
 
+pub use alarm_check::{validate_alarms, AlarmIssue};
 pub use errors::StoreError;
 pub use fbd::{
     FbdBlock, FbdInputBinding, FbdInputSource, FbdOutputBinding, FbdPosition, FbdProgram,

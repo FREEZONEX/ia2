@@ -79,6 +79,24 @@ cases (set inputs, watch outputs). For richer dynamics, add a second
 PROGRAM that computes sensor values from actuator state and schedule it
 in tasks.toml alongside the program under test.
 
+## An alarm that can never fire
+
+The engine matches a definition's `variable` against snapshot names with `==`
+and skips an unmatched one **quietly**. So a typo, or an ST rename that
+`alarms.toml` did not follow, leaves an alarm that never evaluates — and
+`GET /alarms` reports it as calm, never-raised and already-acknowledged. A
+green line claiming coverage that is not there.
+
+`POST /api/project/validate` now refuses it: an alarm watching a variable no
+POU declares is an **error** (`alarms-validate`), not a warning. Run validate
+after renaming anything an alarm watches.
+
+Both spellings a snapshot can carry are accepted — bare, and
+`instance.variable` for a name more than one PROGRAM instance declares. What
+it does NOT catch: a bare name that is in fact shared, where the snapshot adds
+the `instance.` prefix and the alarm is dead anyway. Static extraction has no
+per-POU attribution, so that one still needs a run to notice.
+
 ## Alarms — declared in the project, evaluated by the runtime
 
 Definitions are project config (`alarms.toml`), authored like any other
