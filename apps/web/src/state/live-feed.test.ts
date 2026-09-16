@@ -43,6 +43,17 @@ describe("operator-write snapshot freshness", () => {
     liveFeedStore.setSnapshot(tick(3, 2))
     expect(liveFeedStore.getFreshSnapshot()).not.toBeNull()
   })
+  it("does not renew on a paused runtime, whose timestamps keep moving", () => {
+    // Snapshots fan out at a fixed cadence while paused, so `timestamp_us`
+    // advances and `scan_count` does not. Only requiring both to move keeps a
+    // frozen plant from reading as a live one.
+    liveFeedStore.setSnapshot(tick(1, 1))
+    now += ACTION_SNAPSHOT_BASE_BUDGET_MS
+    liveFeedStore.setSnapshot(tick(1, 500))
+    expect(liveFeedStore.getFreshSnapshot()).toBeNull()
+    liveFeedStore.setSnapshot(tick(1, 900))
+    expect(liveFeedStore.getFreshSnapshot()).toBeNull()
+  })
   it("invalidates confirmations on disconnect and waits for post-reconnect data", () => {
     liveFeedStore.setSnapshot(tick(1))
     const generation = liveFeedStore.getGeneration()

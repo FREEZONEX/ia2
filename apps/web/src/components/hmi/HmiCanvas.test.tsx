@@ -16,6 +16,11 @@ const doc: HmiDoc = {
 }
 let host: HmiHost
 beforeEach(() => {
+  // Pin the clock. The write-freshness budget is measured with
+  // `performance.now()`, so on a loaded machine a real-clock gap between this
+  // setup and the confirm click could age the snapshot out and fail a test
+  // that is about typing, not timing.
+  vi.spyOn(performance, "now").mockReturnValue(1_000)
   liveFeedStore.setSnapshot(null)
   liveFeedStore.setConnected(true)
   liveFeedStore.setSnapshot({ timestamp_us: 1n, scan_count: 1n, vars: [{ name: "level", type_name: "REAL", value: "2.5", bits: 0 }] })

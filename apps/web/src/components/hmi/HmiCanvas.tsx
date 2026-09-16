@@ -66,6 +66,11 @@ export type CanvasMode = "operate" | "arrange"
 /** Per-element delay inside one spawn batch (the "wave"). */
 const SPAWN_STAGGER_MS = 80
 
+/** `derivePanelHealth`'s failed-poll count for a one-shot read that just
+ *  returned. The comms-lost verdict belongs to the alarm bar's repeated poll;
+ *  a status we are holding in our hand cannot be unreachable. */
+const STATUS_READ_JUST_SUCCEEDED = 0
+
 /** Does any of this node's actions reach the plant? `nav` does not — it stays
  *  usable when writes are blocked, the same way it stays usable offline. */
 function nodeWrites(node: HmiNode): boolean {
@@ -336,7 +341,14 @@ export function HmiCanvas({
 
   // Refs cover changes that happen while a fresh status request is in flight.
   const actionContext = useRef({ host, path, mode, doc, loadError })
-  actionContext.current = { host, path, mode, doc, loadError }
+  // Published after commit, not during render: a render React throws away
+  // (StrictMode's double pass, an interrupted concurrent render) would
+  // otherwise leave this pointing at state that was never on screen. Every
+  // reader is an event handler or a post-await recheck, so they all run after
+  // the commit this publishes.
+  useEffect(() => {
+    actionContext.current = { host, path, mode, doc, loadError }
+  })
   const mounted = useRef(false)
   const writing = useRef(false)
   useEffect(() => {
@@ -399,7 +411,10 @@ export function HmiCanvas({
       // island dropped. The runtime scopes it to the mapping and reports
       // the caveat below; everything else here is genuinely runtime-wide.
       const state = status
-      const health = derivePanelHealth({ ...state, unhealthyDevices: [] }, 0)
+      const health = derivePanelHealth(
+        { ...state, unhealthyDevices: [] },
+        STATUS_READ_JUST_SUCCEEDED,
+      )
       if (health.kind !== "running") throw new Error(`${health.text} — action not sent`)
       checkWrite(request)
       const undelivered = await request.host.write(

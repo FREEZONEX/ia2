@@ -79,7 +79,7 @@ directories.
 ```bash
 ./scripts/check-agent-adaptation.sh
 cargo fmt --all
-cargo clippy --workspace        # zero warnings expected
+cargo clippy --workspace --all-targets -- -D warnings   # exit code proves it
 cargo build -p server          # real server required by CLI sim e2e
 cargo test  --workspace         # includes the sim e2e + deploy-script tests
 cargo build --release -p server -p ia2-cli -p ia2-runtime -p lsp-launcher
