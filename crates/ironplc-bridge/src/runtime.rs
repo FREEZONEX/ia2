@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -252,6 +252,20 @@ pub struct ProgramHandle {
     /// the active force set without a round-trip through the cmd
     /// queue.
     forces: Arc<std::sync::Mutex<HashMap<String, i32>>>,
+    /// Scan deadlines missed since this program started, summed over units,
+    /// and the longest streak any unit is currently on.
+    ///
+    /// The log says this ONCE per unit and then suppresses itself, so after
+    /// the first line scrolls away nothing answers "is it still overrunning?".
+    /// `watchdog_tripped` only answers the terminal case. These two cover the
+    /// middle: a total that climbs between polls means deadlines are being
+    /// missed right now, and the streak is the distance to
+    /// [`WATCHDOG_OVERRUN_THRESHOLD`].
+    ///
+    /// They describe the ACHIEVED cadence, which `scan_period_ms` — a
+    /// configured number — cannot.
+    scan_overruns: Arc<AtomicU64>,
+    consecutive_scan_overruns: Arc<AtomicU32>,
     /// The fastest unit's task interval, in ms, normalised exactly as
     /// `UnitClock::interval` is. Fixed for the life of a run, so a plain
     /// value rather than a shared cell.
@@ -531,6 +545,18 @@ impl ProgramHandle {
         self.scan_period_ms
     }
 
+    /// Scan deadlines missed since start, summed over units. Climbing between
+    /// two reads means the runtime is missing them now.
+    pub fn scan_overruns(&self) -> u64 {
+        self.scan_overruns.load(Ordering::Relaxed)
+    }
+
+    /// Longest overrun streak any unit is currently on; 0 when every unit made
+    /// its last deadline. Reaching [`WATCHDOG_OVERRUN_THRESHOLD`] trips.
+    pub fn consecutive_scan_overruns(&self) -> u32 {
+        self.consecutive_scan_overruns.load(Ordering::Relaxed)
+    }
+
     pub fn watchdog_tripped(&self) -> bool {
         self.watchdog_tripped.load(Ordering::Relaxed)
     }
@@ -685,6 +711,8 @@ fn spawn_units_inner(
         })
         .min()
         .unwrap_or(DEFAULT_SCAN_INTERVAL_MS as u32);
+    let scan_overruns = Arc::new(AtomicU64::new(0));
+    let consecutive_scan_overruns = Arc::new(AtomicU32::new(0));
     let (snapshot_tx, _) = broadcast::channel(64);
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     let mode = Arc::new(std::sync::Mutex::new(RuntimeMode::Running));
@@ -702,6 +730,8 @@ fn spawn_units_inner(
     let device_reports_clone = device_reports.clone();
     let device_health_clone = device_health.clone();
     let watchdog_tripped_clone = watchdog_tripped.clone();
+    let scan_overruns_clone = scan_overruns.clone();
+    let consecutive_overruns_clone = consecutive_scan_overruns.clone();
     let device_reports_reconnect = device_reports.clone();
 
     let join_handle = std::thread::spawn(move || {
@@ -819,6 +849,8 @@ fn spawn_units_inner(
                 forces_clone,
                 device_health_clone,
                 watchdog_tripped_clone,
+                scan_overruns_clone,
+                consecutive_overruns_clone,
                 &fault_tx,
                 reconnect_rx,
                 state_path,
@@ -895,6 +927,8 @@ fn spawn_units_inner(
         cmd_tx,
         mode,
         forces,
+        scan_overruns,
+        consecutive_scan_overruns,
         scan_period_ms,
         device_reports,
         device_health,
@@ -1528,6 +1562,11 @@ async fn run_loop_async(
     // tell a latched run from a healthy one — see the field docs on
     // `ProgramHandle::watchdog_tripped`.
     watchdog_tripped: Arc<AtomicBool>,
+    // Achieved-cadence counters for /status: deadlines missed since start and
+    // the longest current streak. The overrun log line fires once per unit and
+    // then suppresses itself, so it cannot answer "still overrunning?".
+    scan_overruns: Arc<AtomicU64>,
+    consecutive_scan_overruns: Arc<AtomicU32>,
     // Borrowed: the wrapper keeps ownership so its panic path can also
     // record into the same channel (and so the sender drops — closing
     // the watch — only when the scan thread exits).
@@ -2152,6 +2191,9 @@ async fn run_loop_async(
                 clocks[i].consecutive_overruns = 0;
             } else {
                 clocks[i].consecutive_overruns = clocks[i].consecutive_overruns.saturating_add(1);
+                // Counted every time, unlike the warning below, which fires
+                // once per unit and then goes quiet for the life of the run.
+                scan_overruns.fetch_add(1, Ordering::Relaxed);
                 if !clocks[i].warned_overrun {
                     let overrun = after - clocks[i].next_due;
                     tracing::warn!(
@@ -2167,6 +2209,7 @@ async fn run_loop_async(
                 if !watchdog_tripped.load(Ordering::Relaxed)
                     && clocks[i].consecutive_overruns >= WATCHDOG_OVERRUN_THRESHOLD
                 {
+                    // fallthrough below trips the watchdog
                     tracing::error!(
                         instance = %instances[i],
                         consecutive = clocks[i].consecutive_overruns,
@@ -2186,6 +2229,16 @@ async fn run_loop_async(
                 }
                 clocks[i].next_due = after + clocks[i].interval;
             }
+            // The streak the watchdog actually watches is the longest one on
+            // any unit, so publish that rather than whichever unit ran last.
+            consecutive_scan_overruns.store(
+                clocks
+                    .iter()
+                    .map(|c| c.consecutive_overruns)
+                    .max()
+                    .unwrap_or(0),
+                Ordering::Relaxed,
+            );
         }
         if vm_fault {
             break;
@@ -2829,6 +2882,69 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert!(handle.device_health()[0].healthy, "recovery must surface");
+
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
+    /// Overruns short of the watchdog threshold are invisible today: the log
+    /// warns once per unit and then suppresses itself, and `watchdog_tripped`
+    /// only covers the terminal case. A runtime quietly missing every fourth
+    /// deadline looks identical on /status to one meeting all of them.
+    ///
+    /// These counters are what make "configured 2 ms, achieving something
+    /// else" answerable without grepping a journal that has already rolled.
+    #[tokio::test]
+    async fn scan_overruns_are_counted_and_the_streak_clears() {
+        let handle = spawn_units_inner(
+            vec![single_unit(trivial_container(), 5)],
+            DeviceSource::Prebuilt(vec![]),
+            Vec::new(),
+            None,
+            WriteGovernance::default(),
+        );
+
+        // Negative control. Without it a fixture that overruns on its own
+        // would make the assertions below pass for the wrong reason.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(handle.scan_overruns(), 0, "an idle 5 ms unit must keep up");
+        assert_eq!(handle.consecutive_scan_overruns(), 0);
+
+        // Stay UNDER the trip threshold: this is the middle ground that had
+        // no signal at all, not the latched end state.
+        handle
+            .inject_scan_stall(12, WATCHDOG_OVERRUN_THRESHOLD - 2)
+            .await
+            .expect("inject reaches the loop");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while handle.scan_overruns() == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let during = handle.scan_overruns();
+        assert!(
+            during > 0,
+            "12 ms stalls against a 5 ms interval must count"
+        );
+        assert!(
+            !handle.watchdog_tripped(),
+            "under the threshold must not trip"
+        );
+
+        // The streak clears once scans land on time again; the total does not.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while handle.consecutive_scan_overruns() > 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            handle.consecutive_scan_overruns(),
+            0,
+            "recovery must clear the streak — it is the distance to the trip"
+        );
+        assert!(
+            handle.scan_overruns() >= during,
+            "the total is history and must not be walked back by recovery"
+        );
 
         tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
             .await

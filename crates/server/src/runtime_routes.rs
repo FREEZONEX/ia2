@@ -148,6 +148,20 @@ pub struct RuntimeStatus {
     /// overrun watchdog owns that.
     /// `None` when nothing is running.
     pub scan_period_ms: Option<u32>,
+    /// Scan deadlines missed since the program started, summed over units, and
+    /// the longest streak any unit is currently on.
+    ///
+    /// The overrun log line fires ONCE per unit and then suppresses itself, so
+    /// after it scrolls away nothing else answers "is this runtime still
+    /// missing deadlines?". `watchdog_tripped` only covers the terminal case.
+    /// A total that climbs between two polls means it is missing them now; the
+    /// streak is the distance to the trip threshold.
+    ///
+    /// This is the ACHIEVED cadence. `scan_period_ms` is the configured one and
+    /// says nothing about whether it is being met.
+    /// Both `None` when nothing is running.
+    pub scan_overruns: Option<u64>,
+    pub consecutive_scan_overruns: Option<u32>,
     /// Scan count from the most recent snapshot; 0 before the first one.
     pub scan_count: u64,
     /// Timestamp_us of the most recent snapshot, or 0.
@@ -212,7 +226,15 @@ pub async fn runtime_status(
     // Mode + forces come from the live ProgramHandle, when there is
     // one. Clone the handle out of the mutex briefly to avoid holding
     // the sync lock across the calls.
-    let (mode, forces, device_health, watchdog_tripped, scan_period_ms) = {
+    let (
+        mode,
+        forces,
+        device_health,
+        watchdog_tripped,
+        scan_period_ms,
+        scan_overruns,
+        consecutive_scan_overruns,
+    ) = {
         let guard = state.program.lock();
         match guard.as_ref() {
             Some(rp) => (
@@ -221,8 +243,10 @@ pub async fn runtime_status(
                 rp.handle.device_health(),
                 rp.handle.watchdog_tripped(),
                 Some(rp.handle.scan_period_ms()),
+                Some(rp.handle.scan_overruns()),
+                Some(rp.handle.consecutive_scan_overruns()),
             ),
-            None => (None, vec![], vec![], false, None),
+            None => (None, vec![], vec![], false, None, None, None),
         }
     };
     Json(RuntimeStatus {
@@ -233,6 +257,8 @@ pub async fn runtime_status(
         device_health,
         watchdog_tripped,
         scan_period_ms,
+        scan_overruns,
+        consecutive_scan_overruns,
         scan_count: snap.as_ref().map(|s| s.scan_count).unwrap_or(0),
         last_snapshot_us: snap.as_ref().map(|s| s.timestamp_us).unwrap_or(0),
         last_error,

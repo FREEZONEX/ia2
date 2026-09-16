@@ -705,9 +705,39 @@ async fn health(State(state): State<AppState>) -> Json<Health> {
 
 use ironplc_bridge::monitor::{self, ForceEntry, ModeResponse};
 
+#[cfg(test)]
+mod build_stamp_tests {
+    /// A provenance stamp that silently degrades to an empty string is worse
+    /// than none — `/status` would serve a field that looks answered. Assert
+    /// the shape, including the honest `unknown` fallback.
+    #[test]
+    fn the_build_stamp_is_present_and_shaped() {
+        let commit = env!("IA2_BUILD_COMMIT");
+        let rustc = env!("IA2_BUILD_RUSTC");
+        assert!(!commit.is_empty(), "commit stamp must never be empty");
+        assert!(!rustc.is_empty(), "rustc stamp must never be empty");
+        assert!(
+            rustc == "unknown" || rustc.starts_with("rustc "),
+            "rustc stamp should be a version line or the honest fallback: {rustc}"
+        );
+        eprintln!("build stamp: commit={commit} rustc={rustc}");
+    }
+}
+
 #[derive(Serialize)]
 struct Status {
     version: &'static str,
+    /// What built this binary: the source commit (suffixed `-dirty` when the
+    /// tree had uncommitted changes) and the compiler version, stamped in at
+    /// compile time by `build.rs`.
+    ///
+    /// A deployed runtime is a bare file on a box with nothing beside it
+    /// recording its origin; without this, "which commit is the bench
+    /// running?" has no answer months later. Either may be `unknown` when the
+    /// build could not see a git tree and none was supplied — an absent
+    /// provenance, not a guessed one.
+    build_commit: &'static str,
+    build_rustc: &'static str,
     project: String,
     /// PROGRAM instances scheduled by the project's tasks.toml.
     program_instances: Vec<String>,
@@ -732,6 +762,19 @@ struct Status {
     /// scans. It says nothing about how long a scan actually takes — the
     /// overrun watchdog owns that.
     scan_period_ms: u32,
+    /// Scan deadlines missed since the program started, summed over units, and
+    /// the longest streak any unit is currently on.
+    ///
+    /// The overrun log line fires ONCE per unit and then suppresses itself, so
+    /// after it scrolls away nothing else answers "is this runtime still
+    /// missing deadlines?". `watchdog_tripped` only covers the terminal case.
+    /// A total that climbs between two polls means it is missing them now; the
+    /// streak is the distance to the trip threshold.
+    ///
+    /// This is the ACHIEVED cadence. `scan_period_ms` is the configured one and
+    /// says nothing about whether it is being met.
+    scan_overruns: u64,
+    consecutive_scan_overruns: u32,
     uptime_secs: u64,
     scan_count: u64,
     last_snapshot: Option<VarSnapshot>,
@@ -764,12 +807,16 @@ async fn status(State(state): State<AppState>) -> Json<Status> {
         .count();
     Json(Status {
         version: env!("CARGO_PKG_VERSION"),
+        build_commit: env!("IA2_BUILD_COMMIT"),
+        build_rustc: env!("IA2_BUILD_RUSTC"),
         project: state.project_name.clone(),
         program_instances: state.program_instances.clone(),
         devices: state.devices.clone(),
         device_health: state.handle.device_health(),
         watchdog_tripped: state.handle.watchdog_tripped(),
         scan_period_ms: state.handle.scan_period_ms(),
+        scan_overruns: state.handle.scan_overruns(),
+        consecutive_scan_overruns: state.handle.consecutive_scan_overruns(),
         uptime_secs: state.start_time.elapsed().as_secs(),
         scan_count,
         last_snapshot,
