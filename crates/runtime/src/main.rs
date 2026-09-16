@@ -394,6 +394,22 @@ async fn main() -> Result<()> {
     } else {
         let p = args.state_dir.join("retain.json");
         tracing::info!(state_path = %p.display(), "RETAIN state file");
+        // The documented promise is that retained values survive a deploy,
+        // which holds only while the state dir sits OUTSIDE the versioned
+        // project tree. The `../state` default lands there for an absolute
+        // `--project-dir`; a relative one makes `.parent().parent()` run out
+        // of components and fall back to `<project>/state`, which the next
+        // symlink swap orphans. Say so rather than let a totalizer vanish on
+        // the deploy after next.
+        if p.starts_with(&args.project_dir) {
+            tracing::warn!(
+                state_path = %p.display(),
+                project_dir = %args.project_dir.display(),
+                "RETAIN state lives INSIDE the project directory: a redeploy \
+                 that replaces the project will orphan it. Pass an absolute \
+                 --project-dir, or point --state-dir outside the versioned tree."
+            );
+        }
         Some(p)
     };
 
