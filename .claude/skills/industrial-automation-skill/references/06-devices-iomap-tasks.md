@@ -149,7 +149,11 @@ enable); engage is refused unless `max_travel > 0`; ratio/phase latch at the
 engage edge (mid-run edits inert until re-engage); travel past `±max_travel`
 clamps then trips to a hold that clears only when engage drops; enable loss
 forces a re-arm. The loop **owns `target_position` — leave it unmapped in
-`iomap`** (any PLC write is overwritten each cycle). Sim example and
+`iomap`** (any PLC write is overwritten each cycle). Static validation now
+enforces that: an Output mapping onto an RxPDO covering the engine's four
+target bytes on the follower slave is an error, not a silent discard. Reading
+those bytes is a separate matter — they are controller→device, so an Input
+mapping onto them fails the ordinary direction rule. Sim example and
 bounded-trip scenario: `examples/eg_gear_incycle`. Simulation does not prove
 physical timing, PDO layout, or machine safety; those remain bench gates.
 

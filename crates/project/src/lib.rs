@@ -27,7 +27,7 @@ pub use errors::StoreError;
 pub use fbd::{
     FbdBlock, FbdInputBinding, FbdInputSource, FbdOutputBinding, FbdPosition, FbdProgram,
 };
-pub use gear_channels::{validate_gear_channel_names, GearParam, GearReadback};
+pub use gear_channels::{validate_gear_channel_names, GearParam, GearReadback, GEAR_TARGET_BYTES};
 pub use hmi::{
     apply_hmi_ops, hmi_nav_targets, hmi_variables, hmi_write_variables, validate_hmi, HmiAction,
     HmiBinding, HmiBindingSpec, HmiDoc, HmiGrid, HmiIssue, HmiLayout, HmiMapEntry, HmiNode,

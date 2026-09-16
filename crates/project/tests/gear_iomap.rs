@@ -369,3 +369,121 @@ fn unreferenced_devices_have_no_iomap_row_to_diagnose() {
     // that the map does not reference. Full device preflight is separate.
     assert!(check(device(vec![g]), vec![]).is_empty());
 }
+
+// ---- The engine's own output bytes --------------------------------------
+//
+// The gear engine writes target_position after the output phase, so a PLC
+// Output mapping onto those bytes validates, deploys and is discarded every
+// scan. The README and the skill both say "leave it unmapped"; nothing checked
+// it. Same class of quiet wrongness as the false positive this PR removes,
+// pointing the other way.
+
+/// An RxPDO entry at `byte_offset` on slave 0, sized in bits.
+fn pdo_at(name: &str, byte_offset: u16, bit_length: u8) -> project::EthercatChannel {
+    let mut c = pdo(name, project::EthercatPdoDirection::RxPdo);
+    c.pdi_byte_offset = byte_offset;
+    c.bit_length = bit_length;
+    c
+}
+
+fn with_gear_at(target_pos_offset: u16, channels: Vec<project::EthercatChannel>) -> Device {
+    let mut g = gear();
+    g.target_pos_offset = target_pos_offset;
+    let mut ec = device(vec![g]);
+    ethercat(&mut ec).channels = channels;
+    ec
+}
+
+#[test]
+fn an_output_mapping_onto_the_engine_target_bytes_is_refused() {
+    // target_position: i32 at byte 2 — exactly the eg_gear_incycle layout.
+    let ec = with_gear_at(2, vec![pdo_at("target_position", 2, 32)]);
+    let issues = check(ec, vec![mapping("target_position", Direction::Output)]);
+    assert_eq!(issues.len(), 1, "{issues:?}");
+    assert_eq!(issues[0].severity, IomapIssueSeverity::Error);
+    assert!(
+        issues[0].message.contains("gear engine writes"),
+        "{issues:?}"
+    );
+    assert!(
+        issues[0].message.contains("leave it unmapped"),
+        "{issues:?}"
+    );
+}
+
+#[test]
+fn a_partial_overlap_still_counts() {
+    // The engine owns [2, 6). A 16-bit entry at byte 4 covers [4, 6).
+    let ec = with_gear_at(2, vec![pdo_at("half_in", 4, 16)]);
+    assert_eq!(
+        check(ec, vec![mapping("half_in", Direction::Output)]).len(),
+        1
+    );
+}
+
+#[test]
+fn the_new_check_fires_on_writes_only() {
+    // An Input mapping onto that RxPDO is already refused by the plain
+    // direction rule (controller->device bytes are not readable), and it must
+    // keep reporting THAT — the gear finding is about a write being discarded,
+    // and saying so here would misdescribe the fault.
+    let ec = with_gear_at(2, vec![pdo_at("target_position", 2, 32)]);
+    let issues = check(ec, vec![mapping("target_position", Direction::Input)]);
+    assert_eq!(issues.len(), 1, "{issues:?}");
+    assert!(issues[0].message.contains("RxPDO"), "{issues:?}");
+    assert!(!issues[0].message.contains("gear engine"), "{issues:?}");
+}
+
+#[test]
+fn an_output_clear_of_the_target_window_is_untouched() {
+    // controlword at [0, 2) sits below the engine's [2, 6).
+    let ec = with_gear_at(2, vec![pdo_at("controlword", 0, 16)]);
+    assert!(check(ec, vec![mapping("controlword", Direction::Output)]).is_empty());
+}
+
+#[test]
+fn the_engine_owns_bytes_only_on_its_own_slave() {
+    let mut ec = with_gear_at(2, vec![pdo_at("other_axis_target", 2, 32)]);
+    // Same offset, different slave — a separate SubDevice's PDI region.
+    ethercat(&mut ec).channels[0].slave_index = 1;
+    assert!(check(ec, vec![mapping("other_axis_target", Direction::Output)]).is_empty());
+}
+
+#[test]
+fn input_side_gear_offsets_are_not_output_bytes() {
+    // actual_position / statusword are the bytes the engine READS, in the
+    // input PDI. pdi_byte_offset is per-direction, so a TxPDO at the same
+    // number does not share an address space with the target window.
+    let mut ec = with_gear_at(
+        0,
+        vec![pdo("actual_position", project::EthercatPdoDirection::TxPdo)],
+    );
+    ethercat(&mut ec).channels[0].pdi_byte_offset = 0;
+    assert!(check(
+        ec.clone(),
+        vec![mapping("actual_position", Direction::Input)]
+    )
+    .is_empty());
+    // Output onto a TxPDO is still the plain direction error, not a gear one.
+    let issues = check(ec, vec![mapping("actual_position", Direction::Output)]);
+    assert_eq!(issues.len(), 1, "{issues:?}");
+    assert!(issues[0].message.contains("TxPDO"), "{issues:?}");
+    assert!(!issues[0].message.contains("gear engine"), "{issues:?}");
+}
+
+#[test]
+fn every_name_collision_is_reported_not_just_the_first() {
+    let mut g = gear();
+    g.trip_channel = "ratio_num".into();
+    g.phase_channel = "ratio_den".into();
+    let issues = check(
+        device(vec![g]),
+        vec![mapping("ratio_num", Direction::Output)],
+    );
+    assert_eq!(issues.len(), 1, "{issues:?}");
+    let m = &issues[0].message;
+    assert!(
+        m.contains("'ratio_num'") && m.contains("'ratio_den'"),
+        "{m}"
+    );
+}

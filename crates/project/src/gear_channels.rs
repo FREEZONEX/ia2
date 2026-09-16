@@ -1,15 +1,31 @@
 //! Shared gear channel contract for static I/O validation and adapter routing.
 //!
 //! These channels address the engine's parameter mailbox, not PDO bytes.
+//!
+//! This crate OWNS the contract; `iomap-ethercat` consumes it. Both the linter
+//! and the real/simulated adapters resolve gear routes from here, so a second
+//! copy on the adapter side would be the drift this module exists to prevent.
 use std::collections::HashSet;
 
 use crate::EthercatGear;
+
+/// Output bytes the in-cycle gear engine writes every scan, starting at the
+/// gear's `target_pos_offset` on its follower slave.
+///
+/// Mirrors `iomap_ethercat::gear::write_i32`, which copies exactly four
+/// little-endian bytes of the i32 target into the output PDI after the output
+/// phase has run. A PLC Output mapping onto those bytes is therefore
+/// overwritten every cycle — it validates, deploys, and does nothing.
+pub const GEAR_TARGET_BYTES: u16 = 4;
 
 /// Writable engine parameters. Not every engine operation is exposed by
 /// the device facade; see [`EthercatGear::routed_channels`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GearParam {
     Engage,
+    /// Reserved: in the schema and the engine, but NOT routed by the device
+    /// facade. See [`EthercatGear::routed_channels`] — do not "complete" the
+    /// catalog by adding it.
     RatioApply,
     RatioNum,
     RatioDen,
@@ -23,7 +39,9 @@ pub enum GearParam {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GearReadback {
     Engage,
+    /// Reserved, not routed — see [`GearParam::RatioApply`].
     RatioApply,
+    /// Reserved, not routed — see [`GearParam::RatioApply`].
     RatioAck,
     RatioNum,
     RatioDen,
@@ -85,6 +103,24 @@ impl EthercatGear {
     }
 }
 
+impl EthercatGear {
+    /// Does this gear's engine own `[start, start + len)` of `slave`'s OUTPUT
+    /// PDI? The engine writes its target there after the output phase, so a
+    /// PLC Output mapping onto those bytes never reaches the wire.
+    ///
+    /// Only the target window is owned. `actual_pos_offset` and
+    /// `status_word_offset` are INPUT bytes the engine reads; mapping those as
+    /// Input is exactly right and must not be flagged.
+    pub fn owns_output_bytes(&self, slave: u16, start: u16, len: u16) -> bool {
+        if slave != self.slave_index {
+            return false;
+        }
+        let end = start.saturating_add(len.max(1));
+        let gear_end = self.target_pos_offset.saturating_add(GEAR_TARGET_BYTES);
+        start < gear_end && self.target_pos_offset < end
+    }
+}
+
 /// Reject ambiguous names before either validation or runtime routing can
 /// choose a winner. Keep the existing reservation of ratio-apply/ack names,
 /// even though those two schema fields do not currently create routes.
@@ -93,6 +129,10 @@ pub fn validate_gear_channel_names(
     pdo_names: &HashSet<&str>,
 ) -> Result<(), String> {
     let mut seen = HashSet::new();
+    // Report every collision, not just the first: fixing a config one error per
+    // re-run is the linter experience this crate already rejects elsewhere
+    // (see `validate_reports_all_errors_at_once`).
+    let mut problems = Vec::new();
     for gear in gears {
         let names = gear.routed_channels().map(|(name, _)| name);
         for name in names.into_iter().chain([
@@ -100,16 +140,19 @@ pub fn validate_gear_channel_names(
             gear.ratio_ack_channel.as_str(),
         ]) {
             if pdo_names.contains(name) {
-                return Err(format!(
+                problems.push(format!(
                     "gear channel '{name}' collides with a PDO channel name"
                 ));
-            }
-            if !seen.insert(name) {
-                return Err(format!(
+            } else if !seen.insert(name) {
+                problems.push(format!(
                     "gear channel '{name}' is used by more than one gear axis or parameter"
                 ));
             }
         }
     }
-    Ok(())
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems.join("; "))
+    }
 }

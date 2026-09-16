@@ -75,7 +75,9 @@ fn warning(mapping_index: usize, message: String) -> IomapIssue {
 ///    - Modbus: every channel kind is readable (`Input` always fine);
 ///      `Output` needs a writable kind (`Coil` / `HoldingRegister`);
 ///    - EtherCAT: PDO directions must match; gear parameters also support
-///      Input echoes, whereas gear feedback is read-only;
+///      Input echoes, whereas gear feedback is read-only; and an Output
+///      mapping onto PDO bytes an in-cycle gear engine writes is refused,
+///      because the engine overwrites them every scan;
 ///    - OPC UA: `Output` needs `access = write`. `Input` is fine on both
 ///      accesses — the adapter mirrors *all* channels each poll cycle
 ///      (write tags are documented "also readable for verification").
@@ -311,6 +313,44 @@ fn check_channel(index: usize, mapping: &Mapping, device: &Device, issues: &mut 
             };
             if ch.data_type == EthercatDataType::Bool {
                 warn_range_on_bool_channel(index, mapping, issues);
+            }
+            // The in-cycle gear engine owns its follower's target bytes and
+            // rewrites them after the output phase. A PLC Output mapping there
+            // passes every other check, deploys, and is silently discarded
+            // every scan — the same class of quiet wrongness this validator
+            // exists to end, just pointing the other way from a false positive.
+            // The span mirrors the cyclic task's own
+            // `[pdi_byte_offset .. + ceil(bit_length / 8)]`.
+            // RxPDO only: `pdi_byte_offset` is relative to the SubDevice's
+            // input OR output region, and the engine writes the output one.
+            // Without this a TxPDO at a low offset reads as a collision with
+            // bytes it does not share an address space with.
+            if mapping.direction == Direction::Output && ch.direction == EthercatPdoDirection::RxPdo
+            {
+                let len = ch.bit_length.div_ceil(8) as u16;
+                if let Some(gear) = cfg
+                    .gear
+                    .iter()
+                    .find(|g| g.owns_output_bytes(ch.slave_index, ch.pdi_byte_offset, len))
+                {
+                    issues.push(error(
+                        index,
+                        format!(
+                            "mapping '{app}.{var}': channel '{chan}' on EtherCAT device '{dev}' \
+                             covers output bytes the in-cycle gear engine writes every scan \
+                             (slave {slave}, target_pos_offset {off}, {n} bytes); the engine owns \
+                             target_position — leave it unmapped",
+                            app = mapping.application,
+                            var = mapping.variable,
+                            chan = mapping.channel,
+                            dev = device.name,
+                            slave = gear.slave_index,
+                            off = gear.target_pos_offset,
+                            n = crate::GEAR_TARGET_BYTES,
+                        ),
+                    ));
+                    return;
+                }
             }
             match (mapping.direction, ch.direction) {
                 (Direction::Input, EthercatPdoDirection::RxPdo) => {
