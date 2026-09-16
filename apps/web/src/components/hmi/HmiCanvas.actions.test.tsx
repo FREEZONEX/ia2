@@ -272,6 +272,52 @@ describe("HMI write revalidation", () => {
     await waitFor(() => expect(host.write).toHaveBeenCalledTimes(1))
   })
 
+  // Attached to an edge, the canvas renders the EDGE's stream while the IDE's
+  // `write` still posts to the project server's own runtime. Commanding a
+  // runtime the operator is not looking at is worse than refusing.
+  describe("a host that cannot deliver a write", () => {
+    const BLOCKED = "Attached to a remote edge — read-only"
+
+    it("refuses with the host's reason, not a live-state one", async () => {
+      host.writesBlocked = BLOCKED
+      render(canvas())
+      fireEvent.click(await screen.findByRole("button", { name: "Quick set" }))
+      await flush()
+      expect(host.write).not.toHaveBeenCalled()
+      // Never even asks the wrong runtime how it is doing.
+      expect(host.runtimeState).not.toHaveBeenCalled()
+      expect(screen.getByRole("alert").textContent).toContain(BLOCKED)
+    })
+
+    it("disables the write controls but not navigation", async () => {
+      host.writesBlocked = BLOCKED
+      render(canvas())
+      expect(await screen.findByRole("button", { name: "Quick set" }))
+        .toHaveProperty("disabled", true)
+      expect(screen.getByRole("button", { name: "Set level" }))
+        .toHaveProperty("disabled", true)
+      // `nav` is not a write; it stays usable, as it does offline.
+      const nav = screen.getByRole("button", { name: "Next screen" })
+      expect(nav).toHaveProperty("disabled", false)
+      fireEvent.click(nav)
+      expect(host.nav).toHaveBeenCalledWith("next")
+    })
+
+    it("refuses a confirmation that was opened before the block", async () => {
+      render(canvas())
+      await openConfirm()
+      // Mutated in place: a NEW host object would change the host identity,
+      // which reloads the document and takes the card away on its own. This
+      // is the narrower path — same host, block arrives mid-confirmation.
+      host.writesBlocked = BLOCKED
+      fireEvent.click(screen.getByRole("button", { name: "Confirm" }))
+      await flush()
+      expect(host.write).not.toHaveBeenCalled()
+      expect(host.runtimeState).not.toHaveBeenCalled()
+      expect(screen.getByRole("alert").textContent).toContain(BLOCKED)
+    })
+  })
+
   it("keeps navigation usable without a live runtime", async () => {
     render(canvas())
     await screen.findByRole("button", { name: "Next screen" })

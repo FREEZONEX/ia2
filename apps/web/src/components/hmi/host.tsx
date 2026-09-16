@@ -37,6 +37,19 @@ export type HmiRuntimeState = {
 }
 
 export type HmiHost = {
+  /** Why variable writes are unavailable on this host regardless of live
+   *  state, or null/absent when they are available.
+   *
+   *  The IDE sets it while attached to a remote edge. The canvas is then
+   *  showing the EDGE's snapshot stream, but `write` goes to the project
+   *  server's own runtime — there is no edge write proxy — so a write would
+   *  land on a different runtime than the one the operator is looking at and
+   *  than every check was judged against. The Monitor pane has always refused
+   *  in this state ("Remote values · read only"); the canvas now does too.
+   *
+   *  A plain value, not a getter, so the host object's identity changes when
+   *  it changes — which is what invalidates an outstanding confirmation. */
+  writesBlocked?: string | null
   fetchDoc(path: string): Promise<HmiDoc>
   /** Persist a whole document (Arrange-mode drag). Absent → layout is
    *  read-only, which is the edge panel's case. */

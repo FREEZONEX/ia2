@@ -120,6 +120,11 @@ scoped per variable by the runtime, which applies the write and returns
 island never costs the operator the rest of the screen. Reconnect does not send
 an old confirmation or queue a retry. Navigation remains usable offline.
 
+In the IDE, attaching to a remote edge makes the canvas read-only: the stream is
+the edge's but writes are not proxied and would reach the local server runtime,
+so write controls render disabled and outstanding confirmations stop being
+confirmable. Navigation still works. The standalone panel is never in this state.
+
 The confirmed value stays exactly as displayed; pulse reset remains runtime-side.
 A document reload invalidates old controls/confirmations. These UI checks do not
 replace PLC interlocks or establish safety timing. Even a no-confirm Stop is a

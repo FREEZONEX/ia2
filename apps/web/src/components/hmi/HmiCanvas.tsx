@@ -66,6 +66,12 @@ export type CanvasMode = "operate" | "arrange"
 /** Per-element delay inside one spawn batch (the "wave"). */
 const SPAWN_STAGGER_MS = 80
 
+/** Does any of this node's actions reach the plant? `nav` does not — it stays
+ *  usable when writes are blocked, the same way it stays usable offline. */
+function nodeWrites(node: HmiNode): boolean {
+  return Object.values(node.action).some((a) => a != null && a.kind !== "nav")
+}
+
 /** Refusal text for stale live data, naming the budget actually in force.
  *  That budget widens to cover a slow-cycle project's own scan cadence, so
  *  stating a bare "2 seconds" would be a lie on exactly the projects where
@@ -339,6 +345,10 @@ export function HmiCanvas({
   }, [])
 
   const checkWrite = useCallback((request: PendingConfirm) => {
+    // First: a host that cannot deliver a write at all. Checked ahead of the
+    // live-state gates so the operator gets the real reason rather than a
+    // freshness message about a runtime this write would never reach.
+    if (request.host.writesBlocked) throw new Error(request.host.writesBlocked)
     const current = actionContext.current
     if (!mounted.current || current.mode !== "operate" || current.host !== request.host ||
         current.path !== request.path || current.doc !== request.document || current.loadError ||
@@ -424,6 +434,10 @@ export function HmiCanvas({
         } catch (e) {
           setActionError(String(e))
         }
+        return
+      }
+      if (host.writesBlocked) {
+        setActionError(host.writesBlocked)
         return
       }
       const fresh = liveFeedStore.getFreshSnapshot()
@@ -823,7 +837,9 @@ function renderKind(
       const onBind = node.bind["on"]
       const lit = onBind !== undefined && resolveOn(snapshot, onBind)
       const enBind = node.bind["enable"]
-      const disabled = enBind !== undefined && !resolveOn(snapshot, enBind)
+      const disabled =
+        (enBind !== undefined && !resolveOn(snapshot, enBind)) ||
+        (host.writesBlocked != null && nodeWrites(node))
       return (
         <button
           type="button"
@@ -922,6 +938,7 @@ function InputNode({
   snapshot: ReturnType<typeof useLastSnapshot>
   onAction: (nodeId: string, action: HmiAction, value?: number) => void
 }) {
+  const host = useHmiHost()
   const [text, setText] = useState("")
   const commit = node.action["commit"]
   const b = node.bind["value"]
@@ -929,7 +946,9 @@ function InputNode({
   // current value, which may legitimately be text (STRING var).
   const current = b !== undefined ? displayBinding(snapshot, b) : null
   const enBind = node.bind["enable"]
-  const disabled = enBind !== undefined && !resolveOn(snapshot, enBind)
+  const disabled =
+    (enBind !== undefined && !resolveOn(snapshot, enBind)) ||
+    (host.writesBlocked != null && nodeWrites(node))
   return (
     <div className="flex h-full w-full items-center gap-1.5 overflow-hidden">
       {node.label && (

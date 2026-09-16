@@ -372,6 +372,17 @@ An unresolved or false enable binding refuses the write. A failed check displays
 a reason, sends no write and does not queue a retry. Navigation remains available
 offline; alarm acknowledgment is a separate path, unchanged by these checks.
 
+Before any of that, the canvas asks whether its host can deliver a write at
+all. In the IDE, attaching to a remote edge repoints the snapshot stream at that
+edge while `writeVariable` still posts to the project server's own runtime —
+there is no edge write proxy. Commanding a runtime the operator is not looking
+at, and that every live-state check was judged against a different snapshot
+from, is worse than refusing: the canvas goes read-only for the duration, the
+write controls render disabled, and an outstanding confirmation stops being
+confirmable. MonitorPane has refused in this state from the start ("Remote
+values · read only"). Navigation is not a write and stays usable, exactly as it
+does offline. The standalone panel is never in this state — it *is* the edge.
+
 Confirmation freezes the displayed target value, including toggle direction,
 clamping and type. New live values do not silently replace that target. Only one
 variable-write check/request runs at a time; rapid clicks are not queued. Pulse
