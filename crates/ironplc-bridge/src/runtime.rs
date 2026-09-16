@@ -1432,12 +1432,21 @@ fn enforce_write_governance(
     if governance.write_mode == WriteMode::Open {
         return Ok(value);
     }
+    // Identify the variable before judging it. `resolve_var` found this
+    // index in a map built from the same debug info, so a miss here is
+    // unreachable — but the two fallbacks it used to have disagreed with
+    // each other: an absent name became "" (matching nothing, denying for
+    // the wrong reason) while an absent type became "not REAL" (taking the
+    // integer lane for a REAL, comparing IEEE-754 bits as an integer).
+    // A variable we cannot identify is one we cannot bound. Deny.
+    let Some(info) = debug_maps[unit].get(&var_index) else {
+        return Err(RuntimeWriteError::GovernanceDenied(format!(
+            "{name} (no debug entry for this variable — cannot check it against any rule)"
+        )));
+    };
     // Candidate rule keys: the qualified `instance.variable` form and
     // the bare debug name — matching is case-insensitive, like the IEC.
-    let bare = debug_maps[unit]
-        .get(&var_index)
-        .map(|d| d.name.to_lowercase())
-        .unwrap_or_default();
+    let bare = info.name.to_lowercase();
     let qualified = format!("{}.{}", instances[unit].to_lowercase(), bare);
     let rule = governance.rules.iter().find(|r| {
         let key = r.variable.to_lowercase();
@@ -1469,10 +1478,11 @@ fn enforce_write_governance(
     // `write_variable_raw` and never comes through here. Clamping the
     // value the writer actually sent keeps governed and ungoverned
     // LREAL writes consistent.
-    let is_real = debug_maps[unit]
-        .get(&var_index)
-        .map(|d| d.type_name.to_ascii_uppercase().starts_with("REAL"))
-        .unwrap_or(false);
+    // `starts_with("REAL")` and not `== "REAL"` by intent, and LREAL does
+    // not match it — "LREAL" starts with L. Unsigned types wider than i32
+    // compare as signed here, which the i32 write API already bounds: a
+    // caller cannot express a value that would expose the difference.
+    let is_real = info.type_name.to_ascii_uppercase().starts_with("REAL");
     if is_real {
         let current = f32::from_bits(value as u32);
         if current.is_nan() {
