@@ -86,7 +86,7 @@ prompts — the IDE runs `ssh -o BatchMode=yes`).
    - `tar`s your project directory + (if found) a freshly-built
      `ia2-runtime` from the dev machine
    - Pipes the tar into `ssh edge bash …` which extracts to
-     `$INSTALL_DIR/versions/<UTC-timestamp>/`, atomically swaps the
+     `$INSTALL_DIR/versions/<UTC-timestamp>.<unique-suffix>/`, atomically swaps the
      `current` symlink, and `systemctl restart ia2`s
    - Streams the remote script's output back into the pane
 
@@ -94,8 +94,11 @@ prompts — the IDE runs `ssh -o BatchMode=yes`).
    - a broken tar stream or a local tar failure fails the deploy (no
      silently-truncated uploads);
    - a failed `systemctl restart` fails the deploy (`ok: false` + the
-     log) — files staged but old code still running is a FAILURE, not a
-     success with a footnote;
+     log). The prior `current` link is restored, or removed on a failed first
+     install; staged files remain for inspection. Unique version directories
+     keep same-second deployments from overwriting the rollback payload.
+     Runtime state is unconfirmed: a failed restart may already have stopped
+     the old process. File rollback does not prove that it is running;
    - a missing `VERSION=` line from the remote script fails the deploy
      (script drift = state unknown);
    - a project whose `[governance]` table is invalid (unknown key,

@@ -732,7 +732,8 @@ fn sh_squote(s: &str) -> String {
 /// swap happens before the restart, so without that the box is left armed:
 /// the running process is still the old one — which is what the error says —
 /// but `current` names a version that has never started here, and the next
-/// reboot or watchdog adopts it silently.
+/// reboot or watchdog adopts it silently. A failed restart does not tell us
+/// whether the old process survived; rollback restores files, not runtime state.
 fn remote_deploy_script(
     install_dir: &str,
     project_basename: &str,
@@ -770,13 +771,17 @@ PROJECT={project_basename}
 # Where `current` points before this deploy touches it — the rollback
 # target if the restart fails. Empty on a first install.
 PREV=""
-if [ -e "$INSTALL_DIR/current" ]; then
-  PREV=$(readlink -f "$INSTALL_DIR/current" 2>/dev/null || true)
+if [ -L "$INSTALL_DIR/current" ]; then
+  PREV=$(readlink "$INSTALL_DIR/current")
 fi
 echo "PREV=$PREV"
 TS=$(date -u +%Y-%m-%dT%H-%M-%SZ)
-DEST="$INSTALL_DIR/versions/$TS"
-mkdir -p "$DEST"
+mkdir -p "$INSTALL_DIR/versions"
+DEST=$(mktemp -d "$INSTALL_DIR/versions/$TS.XXXXXX")
+# Match the old version-directory traversal permissions; the service may
+# run as a different account from the SSH deployer.
+chmod 755 "$DEST"
+TS=$(basename "$DEST")
 # Extract everything the dev machine streamed in.
 tar -xf - -C "$DEST"
 # If a project subdir was bundled, lift its contents up so the layout is
@@ -810,22 +815,27 @@ echo "VERSION=$TS"
 if command -v systemctl >/dev/null 2>&1; then
   if systemctl is-enabled --quiet {EDGE_UNIT} 2>/dev/null; then
     RESTART_ERR=""
+    USER_RESTART_ERR=""
     if RESTART_ERR=$(sudo -n systemctl restart {EDGE_UNIT} 2>&1); then
       echo "RESTARTED={EDGE_UNIT}"
-    elif RESTART_ERR=$(systemctl --user restart {EDGE_UNIT} 2>&1); then
+    elif USER_RESTART_ERR=$(systemctl --user restart {EDGE_UNIT} 2>&1); then
       echo "RESTARTED={EDGE_UNIT}"
     else
-      # `current` was already swapped above. Put it back: the process that
-      # is running right now is still the old one, but a `current` left
-      # pointing at a version this box has never successfully started means
+      # Restore the prior link (or its absence). Restart may have stopped the
+      # old process before failing; do not claim any process is still running.
+      # A `current` left pointing at a version that failed to start means
       # the next reboot, watchdog or `systemctl start` silently adopts it.
       # The files stay under versions/ for a human to inspect and re-swap.
       if [ -n "$PREV" ]; then
         ln -sfn "$PREV" "$TMPLINK"
         mv -Tf "$TMPLINK" "$INSTALL_DIR/current"
         echo "ROLLED_BACK=$PREV" >&2
+      else
+        rm -- "$INSTALL_DIR/current"
+        echo "ROLLED_BACK=none (no previous current link)" >&2
       fi
-      echo "ERROR: staged $DEST but FAILED to restart the {EDGE_UNIT} unit; rolled current back — the edge still runs the previous version: $RESTART_ERR" >&2
+      echo "ERROR: staged $DEST but FAILED to restart the {EDGE_UNIT} unit; restored previous current link state; runtime state is unconfirmed" >&2
+      printf 'system restart: %s\nuser restart: %s\n' "$RESTART_ERR" "$USER_RESTART_ERR" >&2
       exit 3
     fi
   else
@@ -1141,10 +1151,13 @@ mod tests {
             "#!/bin/bash\n[ \"$1\" = \"-n\" ] && shift\nexec \"$@\"\n",
         )
         .unwrap();
+        // Force two deployments into the same timestamp: a rollback must
+        // not point at a directory the failed deployment already overwrote.
+        std::fs::write(shim.join("date"), "#!/bin/sh\necho 2026-09-17T00-00-00Z\n").unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            for f in ["systemctl", "sudo"] {
+            for f in ["systemctl", "sudo", "date"] {
                 std::fs::set_permissions(shim.join(f), std::fs::Permissions::from_mode(0o755))
                     .unwrap();
             }
@@ -1175,9 +1188,8 @@ mod tests {
     /// Regression: the symlink swap happens BEFORE the restart, so a deploy
     /// whose restart failed used to leave `current` pointing at a version the
     /// box had never successfully started — while the error told the operator
-    /// "the edge still runs the previous version". True of the running
-    /// process, and false of the next reboot, watchdog or `systemctl start`,
-    /// which would adopt the untested version with nobody watching.
+    /// "the edge still runs the previous version". Neither that process
+    /// claim nor the next restart target was guaranteed.
     #[test]
     fn a_failed_restart_rolls_the_current_symlink_back() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1232,6 +1244,19 @@ mod tests {
             .rev()
             .find_map(|l| l.strip_prefix("VERSION="))
             .expect("VERSION= is still printed before the restart");
+        assert_ne!(
+            install
+                .join("versions")
+                .join(version)
+                .canonicalize()
+                .unwrap(),
+            good
+        );
+        let prior = std::fs::read_to_string(good.join("project/project.toml")).unwrap();
+        assert!(
+            prior.contains("marker = \"v1\""),
+            "rollback payload was overwritten: {prior}"
+        );
         assert!(
             install
                 .join("versions")
@@ -1240,6 +1265,35 @@ mod tests {
                 .is_file(),
             "the rolled-back version stays staged"
         );
+    }
+
+    #[test]
+    fn first_install_restart_failure_removes_unconfirmed_current() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp.path().join("ia2");
+        std::fs::create_dir_all(&install).unwrap();
+        write_systemctl_shims(&install);
+        std::fs::write(install.join(".shim/enabled"), "").unwrap();
+        let stage = stage_project(tmp.path(), "first");
+        let script = remote_deploy_script(
+            install.to_str().unwrap(),
+            "myproj",
+            Some("ia2-runtime"),
+            None,
+        );
+        let out = run_deploy_script(&install, &script, &stage, &["myproj", "ia2-runtime"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(3), "{stderr}");
+        assert!(std::fs::symlink_metadata(install.join("current")).is_err());
+        assert!(
+            !stderr.contains("still runs the previous version"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("runtime state is unconfirmed"), "{stderr}");
+        assert!(std::fs::read_dir(install.join("versions"))
+            .unwrap()
+            .next()
+            .is_some());
     }
 
     #[test]
