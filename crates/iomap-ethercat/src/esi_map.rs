@@ -57,8 +57,18 @@ fn map_channel(_i: usize, c: &EsiChannel) -> EthercatChannel {
 /// ESI uses the IEC/ETG type names (`BOOL`, `UINT`, `INT`, `UDINT`,
 /// `REAL32`, …) plus bit-width aliases (`UINT16`, `BIT`). Anything
 /// unrecognized falls back to the closest unsigned type for the entry's bit
-/// width — never panics, so a novel vendor type name degrades to a sane
-/// raw width rather than failing the whole assembly.
+/// width, so a novel vendor type name degrades to a sane raw width rather
+/// than failing the whole assembly.
+///
+/// The name and the BitLen are taken from the ESI independently and are NOT
+/// cross-checked here, so this can emit a lane wider than the entry (a
+/// 24-bit entry under an unknown name becomes U32, and a vendor naming an
+/// 8-bit entry `UINT` becomes U16 at 8 bits). That is deliberate and safe:
+/// `bits.rs` reads and writes exactly `bit_length` bits and extends into the
+/// lane. It used to be neither — the accessors decoded by the lane's width
+/// and indexed past the entry, so such a channel panicked the scan thread on
+/// its first read. A lane NARROWER than the entry is refused outright, at
+/// connect by `validate_channel_shapes` and again in the accessors.
 fn map_data_type(name: &str, bit_len: u8) -> EthercatDataType {
     use EthercatDataType::*;
     match name.trim().to_ascii_uppercase().as_str() {

@@ -242,6 +242,24 @@ mod tests {
         assert!(msg.contains("spill"), "{msg}");
     }
 
+    /// Sim deliberately accepts channel shapes the real bus refuses — it
+    /// keeps values per name and never runs the bit packers — so legacy
+    /// sim-only configs keep working. Pinned because it is a real asymmetry:
+    /// "it connected in sim" is not evidence that it will connect on the
+    /// bench, which is why the sim path logs a WARN naming the difference.
+    #[tokio::test]
+    async fn sim_accepts_a_channel_shape_the_real_bus_would_refuse() {
+        let mut cfg = sim_config_with_two_outputs_and_one_input();
+        // An 8-bit lane holding a 32-bit entry: real mode fails the connect
+        // (the high three bytes would be dropped every cycle).
+        cfg.channels[1].bit_length = 32;
+        cfg.channels[1].data_type = EthercatDataType::U8;
+        let dev = EthercatDevice::connect("s".into(), &cfg)
+            .await
+            .expect("sim connects regardless of shape");
+        assert!(dev.is_healthy());
+    }
+
     #[tokio::test]
     async fn sim_device_reports_healthy_through_the_facade() {
         let cfg = sim_config_with_two_outputs_and_one_input();

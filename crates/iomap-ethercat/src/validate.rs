@@ -217,6 +217,12 @@ pub(crate) fn validate_channel_shapes(channels: &[EthercatChannel]) -> Result<()
                 off = ch.pdi_bit_offset
             ));
         }
+        // The lane must be able to hold the entry. `bits.rs` owns the rule so
+        // connect and the accessors cannot drift apart; an entry wider than
+        // its declared type would lose its high bits every cycle, silently.
+        if let Err(why) = crate::bits::check_width(ch.data_type, ch.bit_length) {
+            problems.push(format!("channel '{name}': {why}", name = ch.name));
+        }
     }
     if problems.is_empty() {
         Ok(())
@@ -324,7 +330,15 @@ mod tests {
             pdo_index: 0x6000,
             sub_index: 1,
             bit_length,
-            data_type: EthercatDataType::Bool,
+            // Derived from the width rather than hardcoded: these fixtures
+            // used to declare 16-bit entries as Bool, a shape the accessors
+            // cannot serve and `validate_channel_shapes` now rejects.
+            data_type: match bit_length {
+                0 | 1 => EthercatDataType::Bool,
+                2..=8 => EthercatDataType::U8,
+                9..=16 => EthercatDataType::U16,
+                _ => EthercatDataType::U32,
+            },
             pdi_byte_offset: byte_offset,
             pdi_bit_offset: bit_offset,
         }
@@ -628,6 +642,27 @@ mod tests {
             channel("word", 0, EthercatPdoDirection::TxPdo, 2, 0, 16),
         ];
         assert!(validate_channel_shapes(&good).is_ok());
+    }
+
+    /// The lane must be able to hold the entry. `map_data_type` takes the
+    /// type from the ESI name and the length from its BitLen without
+    /// cross-checking them, so a coupler whose vendor names an 8-bit entry
+    /// `UDINT` reaches us as U32-at-8-bits; the reverse — a 32-bit entry on
+    /// an 8-bit lane — would drop three bytes of a real measurement every
+    /// cycle. Fail the connect, with the channel named.
+    #[test]
+    fn a_lane_too_narrow_for_the_entry_fails_the_connect() {
+        let mut ch = channel("torque", 0, EthercatPdoDirection::TxPdo, 0, 0, 32);
+        ch.data_type = EthercatDataType::U8;
+        let err = validate_channel_shapes(&[ch]).unwrap_err();
+        assert!(err.contains("torque"), "{err}");
+        assert!(err.contains("dropped silently"), "{err}");
+
+        // The wide-lane direction is legitimate and must still connect: a
+        // 24-bit vendor entry read as U32 is the ESI fallback's normal output.
+        let mut ok = channel("pos24", 0, EthercatPdoDirection::TxPdo, 0, 0, 24);
+        ok.data_type = EthercatDataType::U32;
+        assert!(validate_channel_shapes(&[ok]).is_ok());
     }
 
     // ---- init_sdo -----------------------------------------------------------

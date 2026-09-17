@@ -5,8 +5,16 @@
 //!  - CI tests of the iomap layer
 //!
 //! Output channels echo what the program writes; input channels start
-//! at zero. Direction and data type are still validated so iomap mistakes
-//! surface early, just like real mode.
+//! at zero. Channel references (unknown slave index, duplicate name) and
+//! PDI ranges are validated exactly as in real mode, so those iomap
+//! mistakes surface early.
+//!
+//! Channel *shapes* are not: sim keeps values per name and never touches the
+//! bit packers, so entries real mode refuses (a lane narrower than the
+//! entry, a non-byte-aligned multi-bit entry, a zero bit_length) still
+//! connect here — deliberately, so legacy sim-only configs keep working.
+//! They are logged as a WARN naming what the real bus will do, because a
+//! sim run is meant to be evidence about the bench.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,6 +44,22 @@ impl SimEthercat {
         // channels may share a name — same references check as the real path.
         validate::validate_channel_refs(&config.channels, &config.slaves)
             .map_err(IoError::Connect)?;
+
+        // Sim stores values per name and never touches the bit packers, so a
+        // channel shape the PDI accessors cannot serve connects here and is
+        // refused on the real bus. That difference is the point of this
+        // warning: proving a project in sim is supposed to be evidence about
+        // the bench, and silently accepting what the bench will reject makes
+        // it evidence about nothing. WARN rather than refuse — legacy
+        // sim-only configs with odd shapes keep working, they just say so.
+        if let Err(why) = validate::validate_channel_shapes(&config.channels) {
+            tracing::warn!(
+                device = %name,
+                %why,
+                "ethercat sim: channel shapes a real bus would REFUSE at connect — \
+                 sim serves them from its per-name value map, real mode cannot"
+            );
+        }
 
         let channels: HashMap<String, EthercatChannel> = config
             .channels

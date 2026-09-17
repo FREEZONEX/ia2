@@ -279,15 +279,21 @@ pub(crate) fn read_json_blob(from: &str) -> Result<serde_json::Value> {
 /// `[A-Za-z0-9_.~-]` — notably `/`, so nested resource names travel as
 /// `%2F` the way the API expects.
 pub(crate) fn url_encode(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | '~') {
-                c.to_string()
-            } else {
-                format!("%{:02X}", c as u32)
+    let mut out = String::with_capacity(s.len());
+    // Percent-encoding is defined over BYTES. Encoding `char`s instead
+    // emitted the code point: `泵` (U+6CF5) became `%6CF5`, which a server
+    // reads as `%6C` + the literal `F51` — so `泵1` arrived as `lF51`, and
+    // `café` as `caf%E9`, which is not valid UTF-8 at all. Silent, and only
+    // for non-ASCII names, which nothing in the project store forbids.
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'.' | b'-' | b'~' => {
+                out.push(b as char)
             }
-        })
-        .collect()
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// Build a no-proxy ureq Agent. ureq 2.x auto-picks up `HTTP_PROXY` /
@@ -302,4 +308,56 @@ pub(crate) fn http_agent() -> &'static ureq::Agent {
             .timeout(std::time::Duration::from_secs(30))
             .build()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::url_encode;
+
+    #[test]
+    fn unreserved_characters_pass_through() {
+        assert_eq!(url_encode("pump1"), "pump1");
+        assert_eq!(url_encode("a_b.c-d~e"), "a_b.c-d~e");
+    }
+
+    /// The defect: percent-encoding is over bytes, not chars. Encoding the
+    /// code point produced `%6CF5` for `泵` — a server decodes `%6C` and
+    /// leaves `F5` literal, so the name it looks up is not the name asked
+    /// for. Nothing in the project store restricts names to ASCII.
+    #[test]
+    fn non_ascii_names_encode_as_utf8_bytes() {
+        assert_eq!(url_encode("泵1"), "%E6%B3%B51");
+        assert_eq!(url_encode("café"), "caf%C3%A9");
+        // Round-trips through a standard decoder back to the original.
+        assert_eq!(
+            String::from_utf8(percent_decode(&url_encode("总览"))).unwrap(),
+            "总览"
+        );
+    }
+
+    #[test]
+    fn reserved_and_space_are_escaped() {
+        assert_eq!(url_encode("a b"), "a%20b");
+        assert_eq!(url_encode("a/b"), "a%2Fb");
+        assert_eq!(url_encode("a?b#c"), "a%3Fb%23c");
+    }
+
+    /// Minimal decoder — deliberately not the encoder's inverse by
+    /// construction, so the round-trip above is a real check.
+    fn percent_decode(s: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        let b = s.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'%' && i + 2 < b.len() {
+                let hex = std::str::from_utf8(&b[i + 1..i + 3]).expect("ascii hex");
+                out.push(u8::from_str_radix(hex, 16).expect("hex pair"));
+                i += 3;
+            } else {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+        out
+    }
 }

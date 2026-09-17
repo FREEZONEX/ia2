@@ -122,6 +122,15 @@ Value encoding for force/write: human notation — `TRUE`/`FALSE`/`1`/`0`
 for BOOL, `50.0` for REAL (the CLI bit-packs by the variable's live
 type). Negative numbers after `--`: `cs runtime force setpoint -- -5`.
 
+The value must FIT that type: `40000` on an `INT` exits 2 naming the
+range, rather than arriving as -25536. `UDINT`/`DWORD` may exceed
+`i32::MAX` and ride the wire as their bit pattern, which is lossless
+precisely because the range is checked first. A non-finite `REAL`
+(`1e40` parses as +inf, `nan` as NaN) is refused for the same reason.
+When the runtime has not exposed the variable's type the CLI guesses
+from the value's shape and says so on stderr — an overflow still fails
+rather than wrapping.
+
 Governed projects (`[governance]` in `project.toml` — see 09): in
 `allowlist` mode a write to an unlisted variable exits 2 with the
 server's 403 reason on stderr, and a rule's `min`/`max` **clamp** the

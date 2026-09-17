@@ -91,8 +91,11 @@ scan thread**. This is implemented (commit fc4addd):
   thread-owned and units share them sequentially — no concurrency.
 - **Snapshots** merge across units; a name colliding between units renders
   as `instance.variable`, while single-unit projects keep bare names.
-- **RETAIN** keys gain the instance prefix when N > 1; bare keys migrate
-  on load.
+- **RETAIN** keys gain the instance prefix when N > 1. Load accepts both
+  spellings for the unit's own instance, so adding *or removing* a PROGRAM
+  carries the values across; a bare key never adopts another instance's
+  value. Only `PROGRAM` and `VAR_GLOBAL` retain vars are persisted — an
+  FB-internal one has no debug-map slot to address.
 - **Constraint**: cross-PROGRAM `VAR_GLOBAL` sharing is not supported
   (separate containers isolate the address spaces); `/api/run` and
   `/api/project/validate` detect it and return a clear error.

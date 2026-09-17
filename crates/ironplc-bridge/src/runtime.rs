@@ -639,7 +639,9 @@ pub struct ProgramUnit {
 ///
 /// RETAIN variables across all units persist into one state file when
 /// `state_path` is set; keys are `instance.variable` when there is more
-/// than one unit, bare names otherwise.
+/// than one unit, bare names otherwise. Restore accepts *either*
+/// spelling (see `lookup_retain_value`), so adding or removing a PROGRAM
+/// from `tasks.toml` doesn't reset the values that survive.
 pub fn spawn_units(
     units: Vec<ProgramUnit>,
     device_specs: Vec<DeviceSpec>,
@@ -1756,13 +1758,7 @@ async fn run_loop_async(
                 Ok(Some(state)) => {
                     let mut restored = 0;
                     for (i, key, idx) in &retain_entries {
-                        // Prefer the canonical key; accept the bare name
-                        // as migration for state files written before
-                        // the project became multi-PROGRAM.
-                        let value = state.vars.get(key).copied().or_else(|| {
-                            key.split_once('.')
-                                .and_then(|(_, bare)| state.vars.get(bare).copied())
-                        });
+                        let value = lookup_retain_value(&state.vars, &units[*i].instance, key);
                         if let Some(value) = value {
                             // Raw 64-bit slot write — lossless for all
                             // IEC types (schema 2; v1 files arrive here
@@ -2403,6 +2399,32 @@ fn value_for_type(raw: u64, type_tag: u8) -> ChannelValue {
         iec_type_tag::LREAL => ChannelValue::F64(f64::from_bits(raw)),
         _ => ChannelValue::I32(raw as i32),
     }
+}
+
+/// Find one retain variable's saved value in a loaded state file,
+/// accepting every key spelling this runtime writes.
+///
+/// The canonical key depends on how many units are scheduled —
+/// `instance.variable` for a multi-PROGRAM project, the bare name for a
+/// single one — so the *same* variable changes spelling on disk when a
+/// program is added to or removed from `tasks.toml`. Trying only the
+/// canonical key and the qualified-to-bare direction covered growing the
+/// schedule but not shrinking it: dropping the second PROGRAM left the
+/// survivor looking up `counter` in a file that had written
+/// `a_inst.counter`, so every retained value silently reset to its
+/// initialiser. Both directions are tried, so a schedule change never
+/// loses state.
+///
+/// Only *this* unit's instance is ever tried, never another's — a bare
+/// key must not adopt a different PROGRAM's saved value.
+fn lookup_retain_value(vars: &HashMap<String, u64>, instance: &str, key: &str) -> Option<u64> {
+    if let Some(v) = vars.get(key) {
+        return Some(*v);
+    }
+    let bare = key.split_once('.').map_or(key, |(_, bare)| bare);
+    vars.get(bare)
+        .or_else(|| vars.get(&format!("{instance}.{bare}")))
+        .copied()
 }
 
 /// Snapshot every RETAIN variable's current VM value (across all units)
@@ -3125,6 +3147,44 @@ mod tests {
         assert!(
             frozen >= 1,
             "expected frozen-counter frames with advancing timestamps"
+        );
+    }
+
+    /// Snapshot variable names come from the compiler's debug map verbatim,
+    /// and the alarm engine matches them with `==`. Anything validating an
+    /// alarm definition statically against ST source therefore depends on the
+    /// two spellings agreeing — including case. Pin it rather than assume it.
+    #[tokio::test]
+    async fn snapshot_names_match_the_declared_spelling() {
+        let src = "PROGRAM main\n\
+                VAR Level_SP : INT := 1; tick : INT := 1; END_VAR\n\
+                tick := tick + 1;\n\
+            END_PROGRAM";
+        let declared: Vec<String> = crate::extract_variables(src)
+            .into_iter()
+            .map(|v| v.name)
+            .collect();
+        let handle = spawn_units_inner(
+            vec![single_unit(crate::compile(src).expect("compiles"), 5)],
+            DeviceSource::Prebuilt(vec![]),
+            Vec::new(),
+            None,
+            WriteGovernance::default(),
+        );
+        let mut rx = handle.subscribe();
+        let snap = last_snapshot_within(&mut rx, Duration::from_millis(500)).await;
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+
+        let in_snapshot: Vec<&str> = snap.vars.iter().map(|v| v.name.as_str()).collect();
+        assert!(
+            in_snapshot.contains(&"Level_SP"),
+            "snapshot should carry the declared spelling; got {in_snapshot:?}"
+        );
+        assert!(
+            declared.contains(&"Level_SP".to_string()),
+            "static extraction should carry the declared spelling; got {declared:?}"
         );
     }
 
@@ -4486,5 +4546,183 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
             .await
             .expect("shutdown");
+    }
+
+    // ---- RETAIN: the wiring between retain.rs and the scan loop ----
+    //
+    // The on-disk format had unit tests and the AST extraction had unit
+    // tests; the part that joins them — resolve a name to a slot, restore
+    // before the first scan, flush on a cadence — had none, and every
+    // scan-loop test above passes `retain_vars: Vec::new()` with no state
+    // path. That gap is why the key-spelling asymmetry below survived.
+
+    /// A PROGRAM with one RETAIN variable that the scan loop never
+    /// modifies, so a restored value stays observable in the snapshot.
+    fn retain_container() -> Container {
+        crate::compile(
+            "PROGRAM main\n\
+                VAR RETAIN counter : DINT := 0; END_VAR\n\
+                VAR ticks : INT := 0; END_VAR\n\
+                ticks := ticks + 1;\n\
+            END_PROGRAM",
+        )
+        .expect("retain program compiles")
+    }
+
+    fn retain_unit(instance: &str) -> ProgramUnit {
+        ProgramUnit {
+            retain_vars: vec!["counter".into()],
+            ..unit(instance, retain_container(), 10, 1)
+        }
+    }
+
+    /// Write a state file by hand so the restore assertion doesn't depend
+    /// on a previous run's timing.
+    fn seed_retain_file(path: &std::path::Path, entries: &[(&str, u64)]) {
+        let vars: HashMap<String, u64> = entries
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect();
+        crate::retain::save(path, &crate::retain::build(vars, 0, 0)).expect("seed state file");
+    }
+
+    async fn restored_counter(handle: &ProgramHandle, name: &str) -> String {
+        let mut rx = handle.subscribe();
+        let snap = last_snapshot_within(&mut rx, Duration::from_millis(300)).await;
+        var_value(&snap, name)
+    }
+
+    #[test]
+    fn a_retain_key_is_found_under_either_spelling() {
+        let vars: HashMap<String, u64> = [("counter".to_string(), 7u64)].into_iter().collect();
+        // Single-unit run reading a file written while two units ran.
+        let qualified: HashMap<String, u64> =
+            [("a_inst.counter".to_string(), 7u64)].into_iter().collect();
+        assert_eq!(
+            lookup_retain_value(&qualified, "a_inst", "counter"),
+            Some(7),
+            "shrinking the schedule must still find the value"
+        );
+        // Multi-unit run reading a file written while one unit ran.
+        assert_eq!(
+            lookup_retain_value(&vars, "a_inst", "a_inst.counter"),
+            Some(7),
+            "growing the schedule must still find the value"
+        );
+        // Exact key wins, and is tried first.
+        let both: HashMap<String, u64> = [
+            ("counter".to_string(), 1u64),
+            ("a_inst.counter".to_string(), 2u64),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            lookup_retain_value(&both, "a_inst", "a_inst.counter"),
+            Some(2)
+        );
+        assert_eq!(lookup_retain_value(&both, "a_inst", "counter"), Some(1));
+    }
+
+    /// The bare spelling must never adopt a *different* PROGRAM's saved
+    /// value — that would be worse than losing it.
+    #[test]
+    fn a_bare_retain_key_does_not_adopt_another_instances_value() {
+        let other: HashMap<String, u64> = [("b_inst.counter".to_string(), 99u64)]
+            .into_iter()
+            .collect();
+        assert_eq!(lookup_retain_value(&other, "a_inst", "counter"), None);
+        assert_eq!(
+            lookup_retain_value(&other, "a_inst", "a_inst.counter"),
+            None
+        );
+    }
+
+    /// Regression: removing a PROGRAM from `tasks.toml` used to reset every
+    /// retained value in the PROGRAM that stayed.
+    ///
+    /// Two units write `a_inst.counter`; the survivor runs alone, so its
+    /// canonical key is the bare `counter`, and the old lookup only ever
+    /// walked qualified -> bare. A totalizer that had been counting for
+    /// months silently restarted at its initialiser, with nothing logged.
+    #[tokio::test]
+    async fn dropping_a_program_keeps_the_survivors_retained_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state").join("retain.json");
+        seed_retain_file(&path, &[("a_inst.counter", 4242), ("b_inst.counter", 7)]);
+
+        let handle = spawn_units_inner(
+            vec![retain_unit("a_inst")],
+            DeviceSource::Prebuilt(Vec::new()),
+            Vec::new(),
+            Some(path.clone()),
+            WriteGovernance::default(),
+        );
+        assert_eq!(
+            restored_counter(&handle, "counter").await,
+            "4242",
+            "the surviving PROGRAM's retained value must come back"
+        );
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
+    /// The other direction, which already worked and must keep working:
+    /// adding a second PROGRAM to a project whose state file still holds
+    /// bare names.
+    #[tokio::test]
+    async fn adding_a_program_keeps_the_existing_retained_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("retain.json");
+        seed_retain_file(&path, &[("counter", 4242)]);
+
+        let handle = spawn_units_inner(
+            vec![retain_unit("a_inst"), retain_unit("b_inst")],
+            DeviceSource::Prebuilt(Vec::new()),
+            Vec::new(),
+            Some(path.clone()),
+            WriteGovernance::default(),
+        );
+        // `counter` is declared by both units, so snapshots qualify it.
+        assert_eq!(restored_counter(&handle, "a_inst.counter").await, "4242");
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
+    /// The flush half: a multi-unit run writes one merged file keyed by
+    /// instance, and the final flush on stop captures it.
+    #[tokio::test]
+    async fn a_multi_unit_run_flushes_one_file_keyed_by_instance() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("retain.json");
+        seed_retain_file(&path, &[("counter", 4242)]);
+
+        let handle = spawn_units_inner(
+            vec![retain_unit("a_inst"), retain_unit("b_inst")],
+            DeviceSource::Prebuilt(Vec::new()),
+            Vec::new(),
+            Some(path.clone()),
+            WriteGovernance::default(),
+        );
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+
+        let state = crate::retain::load(&path)
+            .expect("state file reads")
+            .expect("state file exists");
+        let mut keys: Vec<&String> = state.vars.keys().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["a_inst.counter", "b_inst.counter"],
+            "each instance gets its own key so same-named vars don't collide"
+        );
+        assert_eq!(
+            state.vars["a_inst.counter"], 4242,
+            "the restored value round-trips back out on the final flush"
+        );
     }
 }

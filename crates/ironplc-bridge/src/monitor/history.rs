@@ -120,6 +120,28 @@ impl Historian {
     /// cadence. Non-numeric variables are skipped (BOOL records 0/1).
     pub fn note_snapshot(&self, snap: &VarSnapshot) {
         let mut inner = self.inner.lock().expect("historian lock");
+        // `timestamp_us` is elapsed-since-THIS-run, so it rewinds to zero every
+        // time a program is started. The IDE server shares one historian across
+        // runs — `clear()` only fires on project close — so without this a
+        // forward-only throttle discards every sample of the new run until its
+        // clock passes the old run's last one. A ten-minute run costs ten
+        // minutes of the next run's history: flat trend, no error, nothing in a
+        // log.
+        //
+        // Rings go too, not just the cursor. The axis is per-run, so samples
+        // from two runs are not comparable; keeping them would leave the ring
+        // non-monotonic, and `query` buckets by walking samples in order and
+        // merging into the LAST point — out-of-order input there does not
+        // merge, it emits points that jump backwards in time.
+        if snap.timestamp_us < inner.last_sample_us {
+            tracing::info!(
+                previous_last_us = inner.last_sample_us,
+                now_us = snap.timestamp_us,
+                "snapshot clock rewound — new run; starting a fresh history window"
+            );
+            inner.series.clear();
+            inner.last_sample_us = 0;
+        }
         if snap.timestamp_us < inner.last_sample_us + self.sample_interval_us {
             return;
         }
@@ -316,6 +338,47 @@ mod tests {
                 bits: v.to_bits() as u64,
             }],
         }
+    }
+
+    #[test]
+    fn a_restarted_program_keeps_being_recorded() {
+        // `snap.timestamp_us` is elapsed-since-this-run, so it restarts at 0
+        // every time a program is started. The IDE server shares ONE historian
+        // across runs (clear() only fires on project close), so a throttle
+        // that only ever compares forward silently drops every sample of the
+        // new run until its clock passes the old run's last one — a ten-minute
+        // run costs ten minutes of the next run's history, with a flat trend
+        // and no error anywhere.
+        let h = Historian::new(1_000_000, 100, None);
+        for t in [1_000_000u64, 2_000_000, 600_000_000] {
+            h.note_snapshot(&snap(t, 1.0));
+        }
+        assert_eq!(
+            h.query(&[], 0, u64::MAX, 1000).series[0].points.len(),
+            3,
+            "first run recorded"
+        );
+
+        // Restart: the clock rewinds.
+        h.note_snapshot(&snap(1_000_000, 2.0));
+        h.note_snapshot(&snap(2_000_000, 3.0));
+        let points = h.query(&[], 0, u64::MAX, 1000).series[0].points.clone();
+
+        // A fresh window, and one that actually records — the bug was that it
+        // recorded NOTHING until the new run outlived the old one.
+        assert_eq!(
+            points.len(),
+            2,
+            "the new run's samples must be kept: {points:?}"
+        );
+        assert_eq!(points[0].v, 2.0, "and they must be the NEW run's values");
+        assert_eq!(points[1].v, 3.0);
+        // Per-run axis: keeping run 1's samples alongside would leave the ring
+        // non-monotonic, which `query` cannot bucket.
+        assert!(
+            points.windows(2).all(|w| w[0].t_us < w[1].t_us),
+            "points must stay ordered in time: {points:?}"
+        );
     }
 
     #[test]

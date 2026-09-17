@@ -121,14 +121,23 @@ fn compile_library(library: &Library) -> Result<Container, BridgeError> {
 /// Walk a parsed `Library` and collect every variable whose declaration
 /// is qualified `RETAIN`. Covers:
 ///   - `PROGRAM` `VAR RETAIN` blocks
-///   - `FUNCTION_BLOCK` `VAR RETAIN` blocks (FB instance state)
 ///   - Global `VAR_GLOBAL RETAIN` declarations
 ///
-/// We don't currently descend into nested function-block instances
-/// (their retain qualifier is on the FB's own declaration, which we
-/// already capture). Variable names are lower-cased so the runtime
-/// can match directly against `VarDebugInfo.name` (which ironplc's
-/// debug section also stores lower-cased).
+/// `VAR RETAIN` inside a `FUNCTION_BLOCK` body is deliberately **not**
+/// collected, and this is the one place that decision is enforced. The
+/// container's debug section publishes the FB *instance* (`c1`) and never
+/// its internal slots, so there is no variable index to read or write —
+/// the state simply cannot be persisted from here. Worse, the AST hands
+/// us the bare name (`count`), which the runtime resolves against the
+/// debug map of the enclosing unit: if the PROGRAM happens to declare its
+/// own `count`, that variable — which nobody declared RETAIN — silently
+/// becomes retentive, and is restored over its initialiser on the next
+/// start. Dropping the names removes that hazard; each one is warned
+/// about by name so the gap stays audible instead of silent.
+///
+/// Variable names are lower-cased so the runtime can match directly
+/// against `VarDebugInfo.name` (which ironplc's debug section also
+/// stores lower-cased).
 fn extract_retain_vars(library: &Library) -> Vec<String> {
     let mut out = Vec::new();
     for element in &library.elements {
@@ -146,7 +155,14 @@ fn extract_retain_vars(library: &Library) -> Vec<String> {
                 for v in &fb.variables {
                     if v.qualifier == DeclarationQualifier::Retain {
                         if let Some(id) = v.identifier.symbolic_id() {
-                            out.push(id.lower_case().clone());
+                            tracing::warn!(
+                                function_block = %fb.name,
+                                variable = %id.lower_case(),
+                                "VAR RETAIN inside a FUNCTION_BLOCK is not persisted: the \
+                                 bytecode debug section exposes only the FB instance, not its \
+                                 internal slots. Move the value to the PROGRAM's VAR RETAIN \
+                                 block (or a VAR_GLOBAL RETAIN) if it must survive a restart."
+                            );
                         }
                     }
                 }
@@ -1560,6 +1576,57 @@ mod retain_tests {
         );
         let (_container, meta) = compile_with_metadata(&src).unwrap();
         assert_eq!(meta.retain_vars, vec!["counter", "setpoint"]);
+    }
+
+    /// `VAR RETAIN` inside a FUNCTION_BLOCK must not reach the retain
+    /// list. The AST gives us the bare name, the runtime resolves bare
+    /// names against the enclosing unit's debug map, and that map holds
+    /// the FB *instance* (`c1`) but never its internals — so the name
+    /// either misses entirely or, as here, lands on the PROGRAM's own
+    /// same-named variable and quietly makes it retentive.
+    ///
+    /// `count` below is a plain `VAR` with an initialiser the operator
+    /// expects on every start. Persisting and restoring it would be a
+    /// wrong-start-state bug reported by nobody.
+    #[test]
+    fn a_function_blocks_retain_var_never_captures_the_programs_variable() {
+        let src = wrap(
+            "FUNCTION_BLOCK counterfb\n\
+                VAR RETAIN count : DINT := 0; END_VAR\n\
+                count := count + 1;\n\
+            END_FUNCTION_BLOCK\n\
+            PROGRAM main\n\
+                VAR c1 : counterfb; count : INT := 7; END_VAR\n\
+                c1();\n\
+            END_PROGRAM",
+        );
+        let (_container, meta) = compile_with_metadata(&src).unwrap();
+        assert!(
+            meta.retain_vars.is_empty(),
+            "FB-internal RETAIN is unsupported and must stay out of the list, \
+             not collide with PROGRAM main's own `count`: {:?}",
+            meta.retain_vars
+        );
+    }
+
+    /// The supported declarations still come through, including a global
+    /// declared alongside an unsupported FB retain var.
+    #[test]
+    fn global_and_program_retain_vars_survive_alongside_an_fb_retain_var() {
+        let src = wrap(
+            "VAR_GLOBAL RETAIN g_total : DINT := 0; END_VAR\n\
+            FUNCTION_BLOCK counterfb\n\
+                VAR RETAIN fb_only : DINT := 0; END_VAR\n\
+                fb_only := fb_only + 1;\n\
+            END_FUNCTION_BLOCK\n\
+            PROGRAM main\n\
+                VAR c1 : counterfb; END_VAR\n\
+                VAR RETAIN setpoint : INT := 42; END_VAR\n\
+                c1();\n\
+            END_PROGRAM",
+        );
+        let (_container, meta) = compile_with_metadata(&src).unwrap();
+        assert_eq!(meta.retain_vars, vec!["g_total", "setpoint"]);
     }
 
     #[test]

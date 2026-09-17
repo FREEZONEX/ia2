@@ -638,11 +638,13 @@ impl ProjectStore {
         let text = fs::read_to_string(&path)?;
         let mut edge: Edge = toml::from_str(&text)?;
         edge.name = name.into();
+        validate_edge_target(&edge)?;
         Ok(edge)
     }
 
     pub fn write_edge(&self, edge: &Edge) -> Result<(), StoreError> {
         validate_path(&edge.name)?;
+        validate_edge_target(edge)?;
         let leaf_name = leaf_segment(&edge.name).to_string();
         let path = self.root.join("edges").join(format!("{}.toml", edge.name));
         if let Some(parent) = path.parent() {
@@ -658,6 +660,7 @@ impl ProjectStore {
 
     pub fn create_edge(&self, name: &str, host: &str) -> Result<Edge, StoreError> {
         validate_path(name)?;
+        validate_ssh_target("host", host, false)?;
         let path = self.root.join("edges").join(format!("{name}.toml"));
         if path.exists() {
             return Err(StoreError::AlreadyExists(name.into()));
@@ -1128,6 +1131,60 @@ fn invalid_governance(msg: String) -> StoreError {
 
 /// A single path segment: no separators at all, plus the usual
 /// `validate_path` per-segment rules.
+/// Reject `host` / `ssh_user` values that `ssh` would not treat as a plain
+/// destination.
+///
+/// These are passed to `ssh` as the destination argument (`host` or
+/// `user@host`), never through a shell — so shell metacharacters are inert,
+/// but **argument** injection is not. `ssh` parses any argument starting with
+/// `-` as an option, so a host of `-oProxyCommand=<cmd>` makes the dev
+/// machine run `<cmd>` on the next probe / deploy / attach. Verified against
+/// OpenSSH 10.3: the ProxyCommand ran.
+///
+/// The reachable path is not theoretical: `POST /api/edges` takes `host`
+/// straight from the request body, `PUT` writes a whole `Edge`, and both land
+/// in `edges/<name>.toml` — a file that also travels with a shared or
+/// agent-authored project (ADR-0002's threat model).
+///
+/// Deliberately permissive otherwise: `~/.ssh/config` aliases, bare IPv6
+/// literals and ordinary hostnames all pass. Only a leading `-`, whitespace,
+/// and control characters are refused.
+fn validate_ssh_target(
+    field: &'static str,
+    value: &str,
+    allow_empty: bool,
+) -> Result<(), StoreError> {
+    let bad = |why: &'static str| {
+        Err(StoreError::InvalidEdgeTarget {
+            field,
+            value: value.into(),
+            why,
+        })
+    };
+    if value.is_empty() {
+        return if allow_empty {
+            Ok(())
+        } else {
+            bad("it is empty")
+        };
+    }
+    if value.starts_with('-') {
+        return bad("it starts with '-'");
+    }
+    if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return bad("it contains whitespace or control characters");
+    }
+    Ok(())
+}
+
+/// Both halves of an edge's ssh destination. Applied on read as well as
+/// write: a project whose `edges/*.toml` was authored outside the API must
+/// not load an unusable destination and hand it to `ssh`.
+fn validate_edge_target(edge: &Edge) -> Result<(), StoreError> {
+    validate_ssh_target("host", &edge.host, false)?;
+    validate_ssh_target("ssh_user", &edge.ssh_user, true)
+}
+
 fn validate_single_segment(name: &str) -> Result<(), StoreError> {
     if name.contains('/') {
         return Err(StoreError::InvalidName(name.into()));
@@ -1510,6 +1567,94 @@ fn default_config_for(protocol: Protocol) -> ProtocolConfig {
             start_on_connect: true,
             channels: vec![],
         }),
+    }
+}
+
+#[cfg(test)]
+mod ssh_target_tests {
+    use super::*;
+
+    fn store(dir: &std::path::Path) -> ProjectStore {
+        ProjectStore::create(dir.to_path_buf(), "p").expect("create project")
+    }
+
+    /// The vector: `ssh` parses any destination starting with '-' as an
+    /// option. `-oProxyCommand=<cmd>` runs `<cmd>` on the DEV machine at the
+    /// next probe / deploy / attach. Confirmed against OpenSSH 10.3 before
+    /// this guard existed.
+    #[test]
+    fn an_option_shaped_host_is_refused_by_every_door() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let evil = "-oProxyCommand=touch /tmp/pwned";
+
+        let err = s.create_edge("bench", evil).unwrap_err();
+        assert!(format!("{err}").contains("starts with '-'"), "{err}");
+
+        // The PUT path and the read path are separate doors; both must shut,
+        // because edges/*.toml also travels with a shared project.
+        let mut edge = s.create_edge("ok", "grey0").unwrap();
+        edge.host = evil.into();
+        assert!(s.write_edge(&edge).is_err(), "write_edge must refuse");
+
+        std::fs::write(
+            dir.path().join("edges/handwritten.toml"),
+            format!("host = \"{evil}\"\n"),
+        )
+        .unwrap();
+        let err = s.read_edge("handwritten").unwrap_err();
+        assert!(
+            format!("{err}").contains("ProxyCommand"),
+            "the why is named: {err}"
+        );
+    }
+
+    #[test]
+    fn an_option_shaped_ssh_user_is_refused_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut edge = s.create_edge("bench", "grey0").unwrap();
+        // `user@host` is one argument, so a leading '-' on the user half
+        // makes the whole destination option-shaped.
+        edge.ssh_user = "-oProxyCommand=id".into();
+        let err = s.write_edge(&edge).unwrap_err();
+        assert!(format!("{err}").contains("ssh_user"), "{err}");
+    }
+
+    #[test]
+    fn whitespace_and_control_characters_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        for bad in ["grey0 -oProxyCommand=id", "grey0\nHost evil", "grey0\t"] {
+            assert!(s.create_edge("x", bad).is_err(), "must refuse {bad:?}");
+        }
+    }
+
+    /// Ordinary destinations keep working — this guard must not be the
+    /// reason someone cannot reach their bench.
+    #[test]
+    fn ordinary_hosts_aliases_and_ipv6_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        for (i, good) in [
+            "grey0",
+            "192.168.1.50",
+            "edge-01.plant.local",
+            "2001:db8::1",
+            "bench_rig",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut e = s.create_edge(&format!("e{i}"), good).expect(good);
+            e.ssh_user = "operator".into();
+            s.write_edge(&e).expect(good);
+            assert_eq!(s.read_edge(&format!("e{i}")).expect(good).host, *good);
+        }
+        // An empty ssh_user means "let ssh decide" and stays legal.
+        let mut e = s.create_edge("anon", "grey0").unwrap();
+        e.ssh_user = String::new();
+        s.write_edge(&e).unwrap();
     }
 }
 

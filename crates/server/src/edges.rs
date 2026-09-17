@@ -727,6 +727,13 @@ fn sh_squote(s: &str) -> String {
 /// the `current` symlink atomically (rename(2) of a temp symlink), and
 /// restarts the systemd unit. Old versions are kept; rollback is just a
 /// symlink swap.
+///
+/// A failed restart rolls `current` back to where it pointed before. The
+/// swap happens before the restart, so without that the box is left armed:
+/// the running process is still the old one — which is what the error says —
+/// but `current` names a version that has never started here, and the next
+/// reboot or watchdog adopts it silently. A failed restart does not tell us
+/// whether the old process survived; rollback restores files, not runtime state.
 fn remote_deploy_script(
     install_dir: &str,
     project_basename: &str,
@@ -761,9 +768,20 @@ fn remote_deploy_script(
         r#"set -euo pipefail
 INSTALL_DIR={install_dir}
 PROJECT={project_basename}
+# Where `current` points before this deploy touches it — the rollback
+# target if the restart fails. Empty on a first install.
+PREV=""
+if [ -L "$INSTALL_DIR/current" ]; then
+  PREV=$(readlink "$INSTALL_DIR/current")
+fi
+echo "PREV=$PREV"
 TS=$(date -u +%Y-%m-%dT%H-%M-%SZ)
-DEST="$INSTALL_DIR/versions/$TS"
-mkdir -p "$DEST"
+mkdir -p "$INSTALL_DIR/versions"
+DEST=$(mktemp -d "$INSTALL_DIR/versions/$TS.XXXXXX")
+# Match the old version-directory traversal permissions; the service may
+# run as a different account from the SSH deployer.
+chmod 755 "$DEST"
+TS=$(basename "$DEST")
 # Extract everything the dev machine streamed in.
 tar -xf - -C "$DEST"
 # If a project subdir was bundled, lift its contents up so the layout is
@@ -795,15 +813,33 @@ echo "VERSION=$TS"
 # deploy — reporting success while the old code keeps running would be
 # a lie the operator discovers at the worst possible time.
 if command -v systemctl >/dev/null 2>&1; then
-  if systemctl is-enabled --quiet ia2 2>/dev/null; then
-    if sudo -n systemctl restart ia2 2>/dev/null || systemctl --user restart ia2 2>/dev/null; then
-      echo "RESTARTED=ia2"
+  if systemctl is-enabled --quiet {EDGE_UNIT} 2>/dev/null; then
+    RESTART_ERR=""
+    USER_RESTART_ERR=""
+    if RESTART_ERR=$(sudo -n systemctl restart {EDGE_UNIT} 2>&1); then
+      echo "RESTARTED={EDGE_UNIT}"
+    elif USER_RESTART_ERR=$(systemctl --user restart {EDGE_UNIT} 2>&1); then
+      echo "RESTARTED={EDGE_UNIT}"
     else
-      echo "ERROR: deployed files but FAILED to restart the ia2 unit — the edge still runs the previous version" >&2
+      # Restore the prior link (or its absence). Restart may have stopped the
+      # old process before failing; do not claim any process is still running.
+      # A `current` left pointing at a version that failed to start means
+      # the next reboot, watchdog or `systemctl start` silently adopts it.
+      # The files stay under versions/ for a human to inspect and re-swap.
+      if [ -n "$PREV" ]; then
+        ln -sfn "$PREV" "$TMPLINK"
+        mv -Tf "$TMPLINK" "$INSTALL_DIR/current"
+        echo "ROLLED_BACK=$PREV" >&2
+      else
+        rm -- "$INSTALL_DIR/current"
+        echo "ROLLED_BACK=none (no previous current link)" >&2
+      fi
+      echo "ERROR: staged $DEST but FAILED to restart the {EDGE_UNIT} unit; restored previous current link state; runtime state is unconfirmed" >&2
+      printf 'system restart: %s\nuser restart: %s\n' "$RESTART_ERR" "$USER_RESTART_ERR" >&2
       exit 3
     fi
   else
-    echo "(ia2.service not enabled — install it once via infra/install.sh; the new version is staged but nothing restarted)" >&2
+    echo "({EDGE_UNIT}.service not enabled — install it once via infra/install.sh; the new version is staged but nothing restarted)" >&2
   fi
 fi
 "#,
@@ -832,8 +868,9 @@ pub async fn attach_edge(
     registry: &AttachmentRegistry,
 ) -> io::Result<AttachInfo> {
     // Pick an ephemeral local port by binding briefly then releasing it
-    // back to the OS — ssh will grab it a moment later. Tiny race window;
-    // for an MVP dev tool it's acceptable.
+    // back to the OS — ssh will grab it a moment later. The race window
+    // stays (nothing reserves the port in between), but `forward_options`
+    // makes losing it an error instead of a misroute.
     let probe = TcpListener::bind("127.0.0.1:0").await?;
     let local_port = probe.local_addr()?.port();
     drop(probe);
@@ -841,11 +878,9 @@ pub async fn attach_edge(
     // Kill any previous tunnel for this (project, edge) pair first.
     registry.detach(project_name, &edge.name);
 
-    let forward = format!("{local_port}:127.0.0.1:{}", edge.runtime_port);
     let mut child = ssh_cmd(edge)
         .arg("-N")
-        .arg("-L")
-        .arg(&forward)
+        .args(forward_options(local_port, edge.runtime_port))
         // Drop privileges: no PTY, no stdin/stdout (we're not running a
         // command), kill on drop so the tunnel goes away if the server
         // exits unexpectedly.
@@ -901,6 +936,13 @@ pub async fn attach_edge(
 /// Build the base ssh command with our usual options: explicit port,
 /// optional user, connect timeout, BatchMode (so we never hang on a
 /// password prompt — keys / agent only).
+///
+/// The destination is an argv entry, not a shell word, so metacharacters in
+/// it are inert — but `ssh` parses any argument starting with `-` as an
+/// OPTION, and `-oProxyCommand=…` would run a command on this machine. That
+/// is why `ProjectStore` refuses such a value on read, write and create
+/// (`validate_edge_target`); this function relies on an `Edge` having come
+/// through that door.
 pub fn ssh_cmd(edge: &Edge) -> Command {
     let mut c = Command::new("ssh");
     c.arg("-p")
@@ -920,6 +962,28 @@ pub fn ssh_cmd(edge: &Edge) -> Command {
     c
 }
 
+/// The forwarding half of the attach command line.
+///
+/// `ExitOnForwardFailure=yes` is load-bearing, not hygiene. Without it a
+/// failed LOCAL bind is non-fatal to ssh: it logs "bind: Address already in
+/// use", stays connected and forwards nothing. The readiness probe in
+/// `attach_edge` connects to the port to decide the tunnel is up — and on a
+/// lost port race that connect SUCCEEDS, because the process that won the
+/// port is listening there. The IDE would then proxy the whole runtime
+/// session to an unrelated local listener and call it attached. With the
+/// option, ssh exits, `try_wait` sees it, and the caller gets ssh's own
+/// error.
+fn forward_options(local_port: u16, runtime_port: u16) -> [String; 4] {
+    [
+        "-o".into(),
+        "ExitOnForwardFailure=yes".into(),
+        "-L".into(),
+        // Remote side is the edge's loopback: the runtime never binds a
+        // routable address, so the tunnel is the only way in.
+        format!("{local_port}:127.0.0.1:{runtime_port}"),
+    ]
+}
+
 fn first_line(s: &str) -> &str {
     s.lines()
         .find(|l| !l.trim().is_empty())
@@ -930,6 +994,22 @@ fn first_line(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ExitOnForwardFailure=yes` must stay on the attach command line: it
+    /// is what turns a lost local-port race into an ssh exit instead of a
+    /// live tunnel that forwards nothing while the readiness probe talks to
+    /// whoever won the port.
+    #[test]
+    fn the_attach_forward_exits_on_bind_failure_and_targets_edge_loopback() {
+        let opts = forward_options(45_000, 13_001);
+        assert_eq!(opts[0], "-o");
+        assert_eq!(opts[1], "ExitOnForwardFailure=yes");
+        assert_eq!(opts[2], "-L");
+        assert_eq!(
+            opts[3], "45000:127.0.0.1:13001",
+            "the remote end is the edge's loopback — the runtime binds nothing routable"
+        );
+    }
 
     /// Hermetic end-to-end run of `remote_deploy_script` — the exact
     /// bytes we ssh to edges — under a local bash with a tar stream on
@@ -1045,6 +1125,175 @@ mod tests {
         assert!(vdir.join("runtime").is_file(), "binary renamed to runtime");
         let current = std::fs::read_link(install.join("current")).unwrap();
         assert_eq!(current, vdir, "current symlink points at the new version");
+    }
+
+    /// Write PATH shims that make the script's restart branch reachable and
+    /// controllable: `systemctl is-enabled` succeeds only when the `enabled`
+    /// marker exists, and any `restart` fails. `sudo -n <cmd>` just runs
+    /// `<cmd>`, so the sudo path reaches the same shim.
+    fn write_systemctl_shims(install_dir: &std::path::Path) {
+        let shim = install_dir.join(".shim");
+        std::fs::create_dir_all(&shim).unwrap();
+        std::fs::write(
+            shim.join("systemctl"),
+            "#!/bin/bash\n\
+             for a in \"$@\"; do\n\
+             case \"$a\" in\n\
+             is-enabled) [ -f \"$(dirname \"$0\")/enabled\" ] && exit 0; exit 1 ;;\n\
+             restart) echo \"Job for ia2.service failed\" >&2; exit 1 ;;\n\
+             esac\n\
+             done\n\
+             exit 0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            shim.join("sudo"),
+            "#!/bin/bash\n[ \"$1\" = \"-n\" ] && shift\nexec \"$@\"\n",
+        )
+        .unwrap();
+        // Force two deployments into the same timestamp: a rollback must
+        // not point at a directory the failed deployment already overwrote.
+        std::fs::write(shim.join("date"), "#!/bin/sh\necho 2026-09-17T00-00-00Z\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for f in ["systemctl", "sudo", "date"] {
+                std::fs::set_permissions(shim.join(f), std::fs::Permissions::from_mode(0o755))
+                    .unwrap();
+            }
+        }
+    }
+
+    fn stage_project(tmp: &std::path::Path, marker: &str) -> std::path::PathBuf {
+        let stage = tmp.join(format!("stage-{marker}"));
+        std::fs::create_dir_all(stage.join("myproj")).unwrap();
+        std::fs::write(
+            stage.join("myproj/project.toml"),
+            format!("name = \"myproj\"\nmarker = \"{marker}\"\n"),
+        )
+        .unwrap();
+        std::fs::write(stage.join("ia2-runtime"), "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                stage.join("ia2-runtime"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        stage
+    }
+
+    /// Regression: the symlink swap happens BEFORE the restart, so a deploy
+    /// whose restart failed used to leave `current` pointing at a version the
+    /// box had never successfully started — while the error told the operator
+    /// "the edge still runs the previous version". Neither that process
+    /// claim nor the next restart target was guaranteed.
+    #[test]
+    fn a_failed_restart_rolls_the_current_symlink_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp.path().join("ia2");
+        std::fs::create_dir_all(&install).unwrap();
+        write_systemctl_shims(&install);
+
+        // First deploy: unit not enabled -> staged, nothing restarted, ok.
+        let v1 = stage_project(tmp.path(), "v1");
+        let script = remote_deploy_script(
+            install.to_str().unwrap(),
+            "myproj",
+            Some("ia2-runtime"),
+            None,
+        );
+        let out = run_deploy_script(&install, &script, &v1, &["myproj", "ia2-runtime"]);
+        assert!(out.status.success(), "first deploy must succeed");
+        // `readlink -f` in the script resolves symlinks, and on macOS a
+        // tmpdir's /var is really /private/var — compare canonical paths.
+        let good = std::fs::canonicalize(install.join("current")).unwrap();
+
+        // Second deploy: unit now "enabled", every restart fails.
+        std::fs::write(install.join(".shim/enabled"), "").unwrap();
+        let v2 = stage_project(tmp.path(), "v2");
+        let script = remote_deploy_script(
+            install.to_str().unwrap(),
+            "myproj",
+            Some("ia2-runtime"),
+            None,
+        );
+        let out = run_deploy_script(&install, &script, &v2, &["myproj", "ia2-runtime"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(3),
+            "a failed restart fails the deploy: {stderr}"
+        );
+        assert!(stderr.contains("ROLLED_BACK="), "{stderr}");
+        assert!(
+            stderr.contains("Job for ia2.service failed"),
+            "the restart's own reason must survive, not be swallowed: {stderr}"
+        );
+        assert_eq!(
+            std::fs::canonicalize(install.join("current")).unwrap(),
+            good,
+            "current must point back at the version this box actually started"
+        );
+        // The new files are still on disk for a human to inspect / re-swap.
+        let staged = String::from_utf8_lossy(&out.stdout);
+        let version = staged
+            .lines()
+            .rev()
+            .find_map(|l| l.strip_prefix("VERSION="))
+            .expect("VERSION= is still printed before the restart");
+        assert_ne!(
+            install
+                .join("versions")
+                .join(version)
+                .canonicalize()
+                .unwrap(),
+            good
+        );
+        let prior = std::fs::read_to_string(good.join("project/project.toml")).unwrap();
+        assert!(
+            prior.contains("marker = \"v1\""),
+            "rollback payload was overwritten: {prior}"
+        );
+        assert!(
+            install
+                .join("versions")
+                .join(version)
+                .join("runtime")
+                .is_file(),
+            "the rolled-back version stays staged"
+        );
+    }
+
+    #[test]
+    fn first_install_restart_failure_removes_unconfirmed_current() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp.path().join("ia2");
+        std::fs::create_dir_all(&install).unwrap();
+        write_systemctl_shims(&install);
+        std::fs::write(install.join(".shim/enabled"), "").unwrap();
+        let stage = stage_project(tmp.path(), "first");
+        let script = remote_deploy_script(
+            install.to_str().unwrap(),
+            "myproj",
+            Some("ia2-runtime"),
+            None,
+        );
+        let out = run_deploy_script(&install, &script, &stage, &["myproj", "ia2-runtime"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(3), "{stderr}");
+        assert!(std::fs::symlink_metadata(install.join("current")).is_err());
+        assert!(
+            !stderr.contains("still runs the previous version"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("runtime state is unconfirmed"), "{stderr}");
+        assert!(std::fs::read_dir(install.join("versions"))
+            .unwrap()
+            .next()
+            .is_some());
     }
 
     #[test]

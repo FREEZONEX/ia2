@@ -43,6 +43,29 @@ serves a smaller subset on its own port — see `docs/edge-deploy.md`.
 | `POST` | `/api/project/migrate-tasks` | One-shot migrate inline-CONFIGURATION blocks in POU files into `tasks.toml`. Idempotent. Returns `MigrationResponse`. | Legacy projects only |
 | `POST` | `/api/project/validate` | Compile and statically validate the I/O map without starting devices. Returns `Vec<CheckDiagnostic>` (empty = ok). Recognizes configured EtherCAT gear routes: seven read/write parameters and two read-only feedback channels; unknown names, feedback writes, gear/PDO name collisions on referenced devices, and an Output mapping onto the PDO bytes an in-cycle gear engine writes each scan are errors (collisions previously surfaced only when the device connected; the engine-owned bytes were previously accepted and then silently discarded every cycle). Unreferenced devices still need connect-time validation. | Pre-flight check before Run/Deploy |
 
+`/api/project/validate` also lints `alarms.toml`. An alarm whose `variable`
+names nothing the project declares is an **error** (`alarms-validate`): the
+engine matches snapshot names exactly and skips an unmatched definition
+quietly, so such a definition never evaluates and `GET /alarms` reports it as
+a calm, never-raised, already-acknowledged entry — a green line claiming
+coverage that does not exist. Both spellings a snapshot can carry are accepted
+— bare, and `instance.variable` for a name more than one PROGRAM instance
+declares. A bare name that is in fact *shared* is NOT caught: the snapshot
+qualifies it and the alarm is dead anyway, but distinguishing that needs
+per-instance variable sets, which static extraction does not carry.
+
+It also lints each **device document against itself** (`device-validate`, all
+errors). Two findings, both of which used to pass silently on Modbus, OPC UA
+and CANopen (EtherCAT already refused the first at connect): a channel name
+declared more than once — every adapter keys its channel table by name, so the
+repeat overwrites and the earlier channel stops existing while mappings onto
+that name move to the survivor, and `iomap-validate` compounds it by resolving
+the same name to the *first* match while the adapter keeps the *last*; and an
+OPC UA or CANopen `failsafe` on a channel whose `access` is not `write`, which
+the failsafe sweep skips, so a configured safe state can never be applied. The
+duplicate-name half is also refused by the adapters themselves at connect,
+because the edge runtime runs no project validation at all.
+
 ## POUs
 
 A POU is one IEC declaration (PROGRAM / FUNCTION_BLOCK / FUNCTION). A
