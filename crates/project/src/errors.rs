@@ -23,6 +23,17 @@ pub enum StoreError {
     )]
     InvalidName(String),
 
+    #[error(
+        "edge {field} '{value}' is not usable as an ssh destination: {why}. It is passed to \
+         `ssh` as the destination argument, so a value starting with '-' would be parsed as an \
+         option (e.g. -oProxyCommand=…, which runs a command on THIS machine)."
+    )]
+    InvalidEdgeTarget {
+        field: &'static str,
+        value: String,
+        why: &'static str,
+    },
+
     #[error("folder '{0}' already exists")]
     FolderExists(String),
 

@@ -926,6 +926,13 @@ pub async fn attach_edge(
 /// Build the base ssh command with our usual options: explicit port,
 /// optional user, connect timeout, BatchMode (so we never hang on a
 /// password prompt — keys / agent only).
+///
+/// The destination is an argv entry, not a shell word, so metacharacters in
+/// it are inert — but `ssh` parses any argument starting with `-` as an
+/// OPTION, and `-oProxyCommand=…` would run a command on this machine. That
+/// is why `ProjectStore` refuses such a value on read, write and create
+/// (`validate_edge_target`); this function relies on an `Edge` having come
+/// through that door.
 pub fn ssh_cmd(edge: &Edge) -> Command {
     let mut c = Command::new("ssh");
     c.arg("-p")
