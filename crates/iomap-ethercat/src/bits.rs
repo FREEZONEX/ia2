@@ -130,8 +130,15 @@ pub fn read_value(
     Ok(match data_type {
         EthercatDataType::Bool => unreachable!("handled above"),
         EthercatDataType::U8 | EthercatDataType::U16 => ChannelValue::U16(raw as u16),
-        EthercatDataType::I8 => ChannelValue::U16(sign_extend(raw, bit_length) as i16 as u16),
-        EthercatDataType::I16 => ChannelValue::U16(sign_extend(raw, bit_length) as i16 as u16),
+        // Signed narrow fields ride the I32 lane, sign-extended — the same
+        // rule I32 below already follows, and the one Modbus and CANopen
+        // follow. Parking the two's-complement pattern in `U16` instead
+        // made a -2 reading arrive as 65534 in any variable wider than 16
+        // bits (DINT/LINT/REAL/LREAL); an INT hid it, because the VM
+        // truncates the slot back to 16 bits.
+        EthercatDataType::I8 | EthercatDataType::I16 => {
+            ChannelValue::I32(sign_extend(raw, bit_length))
+        }
         EthercatDataType::U32 => ChannelValue::I32(raw as i32),
         EthercatDataType::I32 => ChannelValue::I32(sign_extend(raw, bit_length)),
         EthercatDataType::Real => {
@@ -329,6 +336,11 @@ mod tests {
         assert_eq!(v, ChannelValue::U16(0x1234));
     }
 
+    /// A negative I16 must come back as a negative *number*, not as the
+    /// bit pattern in the unsigned lane. Reading it back as `U16(0xFF9C)`
+    /// looks fine here and still delivers 65436 to any variable wider
+    /// than 16 bits — see the bridge's
+    /// `signed_channel_reaches_a_wide_variable_intact`.
     #[test]
     fn i16_negative_roundtrip() {
         let mut pdi = [0u8; 2];
@@ -338,16 +350,28 @@ mod tests {
             0,
             16,
             EthercatDataType::I16,
-            ChannelValue::U16(-100i16 as u16),
+            ChannelValue::I32(-100),
         )
         .unwrap();
         // -100 = 0xFF9C in two's-complement i16 (LE: 0x9C, 0xFF)
         assert_eq!(pdi, [0x9C, 0xFF]);
         let v = read_value(&pdi, 0, 0, 16, EthercatDataType::I16).unwrap();
-        match v {
-            ChannelValue::U16(raw) => assert_eq!(raw as i16, -100),
-            _ => panic!("expected U16, got {v:?}"),
-        }
+        assert_eq!(v, ChannelValue::I32(-100), "signed fields use the I32 lane");
+        assert_eq!(v.to_i32(), -100);
+
+        // The old spelling still WRITES the same bytes — which is why the
+        // defect was invisible from the wire's side.
+        let mut alt = [0u8; 2];
+        write_value(
+            &mut alt,
+            0,
+            0,
+            16,
+            EthercatDataType::I16,
+            ChannelValue::U16(-100i16 as u16),
+        )
+        .unwrap();
+        assert_eq!(alt, pdi);
     }
 
     #[test]
@@ -551,9 +575,9 @@ mod tests {
     /// Round-trip at the natural widths must be untouched by all of the above.
     #[test]
     fn full_width_entries_round_trip_exactly_as_before() {
-        // Signed 8/16-bit entries ride the U16 lane as raw bits (the bridge
-        // reinterprets per the bound variable's type), so each case names the
-        // value it writes and the value it must read back.
+        // Unsigned entries ride the U16 lane; signed ones of every width
+        // ride I32, sign-extended. Each case names the value it writes and
+        // the value it must read back.
         for (bits, ty, put, want) in [
             (
                 8u8,
@@ -570,8 +594,14 @@ mod tests {
             (
                 16,
                 EthercatDataType::I16,
-                ChannelValue::U16(-2i16 as u16),
-                ChannelValue::U16(0xfffe),
+                ChannelValue::I32(-2),
+                ChannelValue::I32(-2),
+            ),
+            (
+                8,
+                EthercatDataType::I8,
+                ChannelValue::I32(-2),
+                ChannelValue::I32(-2),
             ),
             (
                 32,

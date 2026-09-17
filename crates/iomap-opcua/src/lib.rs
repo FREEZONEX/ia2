@@ -396,7 +396,11 @@ fn from_variant(v: &Variant, ty: OpcuaDataType) -> Option<ChannelValue> {
     let n = as_f64(v)?;
     Some(match ty {
         OpcuaDataType::Bool => ChannelValue::Bool(n != 0.0),
-        OpcuaDataType::I16 | OpcuaDataType::U16 => ChannelValue::U16(n as i64 as u16),
+        OpcuaDataType::U16 => ChannelValue::U16(n as i64 as u16),
+        // Int16 is signed: carry it on the I32 lane so a negative tag
+        // survives. As `U16` a -40 setpoint arrived as 65496 in any
+        // variable wider than 16 bits.
+        OpcuaDataType::I16 => ChannelValue::I32(n as i64 as i16 as i32),
         OpcuaDataType::I32 | OpcuaDataType::U32 => ChannelValue::I32(n as i64 as i32),
         OpcuaDataType::F32 => ChannelValue::Real(n as f32),
         // Double tags ride the 64-bit lane end to end (→ LREAL vars).
@@ -501,7 +505,8 @@ impl IoDevice for OpcuaDevice {
 fn default_for(ty: OpcuaDataType) -> ChannelValue {
     match ty {
         OpcuaDataType::Bool => ChannelValue::Bool(false),
-        OpcuaDataType::I16 | OpcuaDataType::U16 => ChannelValue::U16(0),
+        OpcuaDataType::U16 => ChannelValue::U16(0),
+        OpcuaDataType::I16 => ChannelValue::I32(0),
         OpcuaDataType::I32 | OpcuaDataType::U32 => ChannelValue::I32(0),
         OpcuaDataType::F32 => ChannelValue::Real(0.0),
         OpcuaDataType::F64 => ChannelValue::F64(0.0),
@@ -699,6 +704,26 @@ fn ua_type_name(id: &NodeId) -> (Option<&'static str>, Option<OpcuaDataType>) {
 mod tests {
     use super::*;
     use opcua::types::Variant;
+
+    /// An Int16 tag reading negative must reach the channel lane as a
+    /// negative number. Decoded into `U16` the bit pattern looks right on
+    /// the wire and then widens without a sign: a -40 setpoint arrives as
+    /// 65496 in any PLC variable wider than 16 bits. Modbus's decoder
+    /// carries the same warning in a comment; this adapter did not follow
+    /// it.
+    #[test]
+    fn negative_int16_tag_stays_negative() {
+        let v = from_variant(&Variant::Int16(-40), OpcuaDataType::I16).expect("decodes");
+        assert_eq!(v, ChannelValue::I32(-40));
+        assert_eq!(v.to_i32(), -40);
+        assert_eq!(v.to_f64(), -40.0, "REAL/LREAL targets too");
+
+        // The unsigned neighbour is unchanged and still unsigned.
+        assert_eq!(
+            from_variant(&Variant::UInt16(65496), OpcuaDataType::U16).expect("decodes"),
+            ChannelValue::U16(65496)
+        );
+    }
 
     fn ch(name: &str, ty: OpcuaDataType) -> ResolvedChannel {
         ResolvedChannel {
