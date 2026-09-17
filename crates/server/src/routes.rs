@@ -2971,7 +2971,7 @@ pub fn save_open_projects(state: &AppState) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&path, serde_json::to_vec_pretty(&payload)?)
+        project::write_atomic(&path, serde_json::to_vec_pretty(&payload)?)
     })() {
         tracing::warn!(?path, %e, "failed to persist open-projects list");
     }

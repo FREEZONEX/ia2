@@ -113,37 +113,20 @@ pub fn load(path: &Path) -> std::io::Result<Option<RetainState>> {
     Ok(Some(state))
 }
 
-/// Write atomically: serialise → write to `<path>.tmp` → fsync →
-/// rename over `path`. A crash between rename steps leaves either
-/// the previous good file or the new good file — never a partial
-/// write. The parent directory is created if missing so callers don't
-/// have to pre-mkdir `state/`.
+/// Write atomically through [`project::write_atomic`] — the same writer
+/// every project file uses: temporary → fsync → rename → directory fsync,
+/// so a crash or power cut leaves either the previous good file or the new
+/// one, never a partial write. The parent directory is created if missing
+/// so callers don't have to pre-mkdir `state/`.
 pub fn save(path: &Path, state: &RetainState) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
         }
     }
-    let mut tmp = path.to_path_buf();
-    let tmp_name = match path.file_name().and_then(|s| s.to_str()) {
-        Some(name) => format!("{name}.tmp"),
-        None => "retain.json.tmp".to_string(),
-    };
-    tmp.set_file_name(tmp_name);
-
     let bytes = serde_json::to_vec_pretty(state)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    {
-        // Scope the file so it's closed before we rename — on some
-        // filesystems renaming over an open handle is fine, on others
-        // (Windows) it's a hard error. Closing first is safe everywhere.
-        use std::io::Write;
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(&bytes)?;
-        f.sync_all()?;
-    }
-    fs::rename(&tmp, path)?;
-    Ok(())
+    project::write_atomic(path, bytes)
 }
 
 /// Builder helper so the runtime doesn't have to know the schema

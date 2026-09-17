@@ -119,7 +119,7 @@ pub fn save_last_opened(project_path: &Path) {
     };
     match toml::to_string(&state) {
         Ok(text) => {
-            if let Err(e) = fs::write(&state_path, text) {
+            if let Err(e) = crate::fsutil::write_atomic(&state_path, text) {
                 tracing::warn!(?state_path, %e, "failed to write state file");
             }
         }
