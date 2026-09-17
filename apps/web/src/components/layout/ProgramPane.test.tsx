@@ -9,13 +9,14 @@ const runtime = vi.hoisted(() => ({
   },
   source: "PROGRAM Main VAR value : BOOL; END_VAR END_PROGRAM",
   isDirty: true,
+  externalChange: null as null | { path: string; source: string },
   isRunning: false,
   diagnostics: [],
   tasks: { tasks: [], programs: [] } as {
     tasks: { name: string; interval_ms: number; priority: number }[]
     programs: { instance: string; program: string; task: string }[]
   },
-  setSource: vi.fn(), saveCurrentPou: vi.fn(), run: vi.fn(), stop: vi.fn(), saveTasks: vi.fn(), clearError: vi.fn(),
+  setSource: vi.fn(), loadExternalChange: vi.fn(), saveCurrentPou: vi.fn(), run: vi.fn(), stop: vi.fn(), saveTasks: vi.fn(), clearError: vi.fn(),
 }))
 vi.mock("@/state/runtime", () => ({ useRuntime: () => runtime, usePouSpawnTick: () => 0 }))
 vi.mock("@/components/editor/STEditor", () => ({ STEditor: () => <div>ST editor</div> }))
@@ -31,12 +32,28 @@ beforeEach(() => {
   vi.clearAllMocks()
   runtime.isRunning = false
   runtime.isDirty = true
+  runtime.externalChange = null
   runtime.currentPou.path = "main"
   runtime.currentPou.declarations = [{ name: "Main", type: "program", language: "st" }]
   runtime.tasks = { tasks: [], programs: [] }
   for (const action of [runtime.saveCurrentPou, runtime.run, runtime.stop, runtime.saveTasks]) action.mockResolvedValue(undefined)
 })
 afterEach(cleanup)
+
+describe("external changes", () => {
+  it("says so while the buffer holds edits to a version that is no longer on disk", () => {
+    runtime.externalChange = { path: "main", source: "PROGRAM Main (* agent *) END_PROGRAM" }
+    render(<ProgramPane />)
+    expect(screen.getByRole("alert").textContent).toMatch(/changed on disk/i)
+    fireEvent.click(screen.getByRole("button", { name: "Load disk version" }))
+    expect(runtime.loadExternalChange).toHaveBeenCalledOnce()
+  })
+
+  it("stays quiet otherwise", () => {
+    render(<ProgramPane />)
+    expect(screen.queryByText(/changed on disk/i)).toBeNull()
+  })
+})
 
 describe("program actions", () => {
   it("keeps save progress visible and blocks overlapping actions until the request finishes", async () => {

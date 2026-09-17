@@ -3,8 +3,9 @@
  * the live canvas, plus the human editing surface — Arrange mode shows the
  * palette strip and an editable inspector (geometry, props, bindings,
  * actions), Operate mode a read-only one. Both agents (via `cs hmi op`)
- * and humans edit through the same /ops endpoint, so either side's
- * changes land live on the other's canvas.
+ * and humans edit through the same /ops endpoint — drags included — so
+ * either side's changes land live on the other's canvas and neither can
+ * overwrite what the other added.
  */
 
 import { useCallback, useEffect, useMemo, useState } from "react"
@@ -21,7 +22,7 @@ import {
   fetchRuntimeAlarms,
   fetchRuntimeHistory,
   fetchRuntimeStatus,
-  saveHmi,
+  hmiOps,
   writeVariable,
 } from "@/lib/api"
 import { PaneHeader } from "@/components/ui/pane-header"
@@ -56,7 +57,7 @@ export function HmiPane() {
         ? "Attached to a remote edge — values are the edge's, writes are not proxied; read-only"
         : null,
       fetchDoc: fetchHmi,
-      saveDoc: saveHmi,
+      moveNode: (path, id, x, y) => hmiOps(path, [{ op: "update_node", id, patch: { x, y } }]),
       write: writeVariable,
       nav: (target) => void selectHmi(target),
       runtimeState: async () => {

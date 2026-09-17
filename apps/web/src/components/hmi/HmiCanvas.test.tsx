@@ -27,11 +27,56 @@ beforeEach(() => {
   vi.stubGlobal("ResizeObserver", class { constructor(private callback: () => void) {} observe() { this.callback() } disconnect() {} })
   vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(624)
   vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(324)
-  host = { fetchDoc: vi.fn().mockResolvedValue(doc), saveDoc: vi.fn().mockResolvedValue(undefined), write: vi.fn().mockResolvedValue(null), nav: vi.fn(),
+  host = { fetchDoc: vi.fn().mockResolvedValue(doc), moveNode: vi.fn().mockResolvedValue(undefined), write: vi.fn().mockResolvedValue(null), nav: vi.fn(),
     runtimeState: vi.fn().mockResolvedValue({ running: true, alarm: null }), history: vi.fn().mockResolvedValue({ series: [] }), alarms: vi.fn().mockResolvedValue([]), ackAlarm: vi.fn() }
 })
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
 const canvas = (mode: CanvasMode) => <HmiHostProvider value={host}><HmiCanvas path="overview" mode={mode} selected={null} onSelect={vi.fn()} /></HmiHostProvider>
+
+describe("Arrange-mode drag", () => {
+  // An agent's `cs hmi op` lands on disk; this canvas has not reloaded yet
+  // (the SSE mutation is still in flight — here it never arrives). Moving an
+  // element must not write back the canvas's in-memory copy of the whole
+  // screen: that copy predates the agent's node and would delete it.
+  it("moves only the dragged node, keeping what another writer added meanwhile", async () => {
+    let server: HmiDoc = structuredClone(doc)
+    server.root.children!.push({ id: "agent_lamp", type: "lamp", x: 300, y: 20, w: 40, h: 40, bind: {}, action: {} } as never)
+    const saveDoc = vi.fn(async (_path: string, next: HmiDoc) => { server = structuredClone(next) })
+    ;(host as HmiHost & { saveDoc?: unknown }).saveDoc = saveDoc
+    host.moveNode = vi.fn(async (_path: string, id: string, x: number, y: number) => {
+      const node = server.root.children!.find((n) => n.id === id)!
+      node.x = x
+      node.y = y
+    })
+
+    render(canvas("arrange"))
+    const node = await screen.findByRole("button", { name: "Set level" })
+    // Drag distance is divided by the fitted scale; let the fit land first.
+    await waitFor(() => expect(screen.getByTestId("hmi-screen").style.transform).toBe("scale(0.375)"))
+    const wrapper = node.closest("[data-hmi-id]")!
+    const viewport = screen.getByTestId("hmi-viewport")
+    fireEvent.pointerDown(wrapper, { clientX: 100, clientY: 100, pointerId: 1 })
+    fireEvent.pointerMove(viewport, { clientX: 130, clientY: 100, pointerId: 1 })
+    fireEvent.pointerUp(viewport, { clientX: 130, clientY: 100, pointerId: 1 })
+
+    await waitFor(() => expect(server.root.children!.find((n) => n.id === "set")!.x).not.toBe(20))
+    expect(server.root.children!.map((n) => n.id)).toEqual(["set", "agent_lamp"])
+    expect(saveDoc).not.toHaveBeenCalled()
+    expect(host.moveNode).toHaveBeenCalledWith("overview", "set", 104, 24) // 30px / 0.375 = 80, snapped to the 8-unit grid
+  })
+
+  it("reloads and reports when the move is refused", async () => {
+    host.moveNode = vi.fn().mockRejectedValue(new Error("node vanished"))
+    render(canvas("arrange"))
+    const node = await screen.findByRole("button", { name: "Set level" })
+    const viewport = screen.getByTestId("hmi-viewport")
+    fireEvent.pointerDown(node.closest("[data-hmi-id]")!, { clientX: 100, clientY: 100, pointerId: 1 })
+    fireEvent.pointerMove(viewport, { clientX: 130, clientY: 100, pointerId: 1 })
+    fireEvent.pointerUp(viewport, { clientX: 130, clientY: 100, pointerId: 1 })
+    expect(await screen.findByText(/layout was not saved: .*node vanished/i)).toBeTruthy()
+    await waitFor(() => expect(host.fetchDoc).toHaveBeenCalledTimes(2))
+  })
+})
 
 describe("HMI viewport and action modes", () => {
   it("fits both axes and keeps explicit actual-size controls", async () => {
