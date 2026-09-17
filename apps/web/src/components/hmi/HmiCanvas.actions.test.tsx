@@ -52,6 +52,25 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
 
 describe("HMI write revalidation", () => {
+  it("does not carry a delayed status cadence into a new connection", async () => {
+    let release!: (s: { running: boolean; alarm: null; scanPeriodMs: number }) => void
+    vi.mocked(host.runtimeState).mockImplementation(() => new Promise(resolve => { release = resolve }))
+    render(canvas())
+    await openConfirm()
+    fireEvent.click(screen.getByRole("button", { name: "Confirm" }))
+    await flush()
+    act(() => {
+      liveFeedStore.setConnected(false)
+      liveFeedStore.setConnected(true)
+      update(2)
+    })
+    await act(async () => release({ running: true, alarm: null, scanPeriodMs: 5000 }))
+    expect(host.write).not.toHaveBeenCalled()
+    expect(liveFeedStore.getActionBudgetMs()).toBe(2000)
+    clock += 2100
+    expect(liveFeedStore.getFreshSnapshot()).toBeNull()
+  })
+
   it("refuses cached data while disconnected, including no-confirm actions", async () => {
     render(canvas())
     await screen.findByRole("button", { name: "Quick set" })

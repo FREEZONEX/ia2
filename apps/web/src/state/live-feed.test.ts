@@ -154,6 +154,21 @@ describe("scan-cadence budget", () => {
 })
 
 describe("runtime-reported scan period", () => {
+  it.each(["disconnect", "cleared", "restart"])("ignores a delayed period after %s", kind => {
+    liveFeedStore.setSnapshot(tick(10, 10))
+    const generation = liveFeedStore.getGeneration()
+    if (kind === "disconnect") {
+      liveFeedStore.setConnected(false)
+      liveFeedStore.setConnected(true)
+    }
+    if (kind === "cleared") liveFeedStore.setSnapshot(null)
+    if (kind === "restart") liveFeedStore.setSnapshot(tick(1, 1))
+    liveFeedStore.setScanPeriodMs(5000, generation)
+    expect(liveFeedStore.getActionBudgetMs()).toBe(ACTION_SNAPSHOT_BASE_BUDGET_MS)
+    liveFeedStore.setScanPeriodMs(5000, liveFeedStore.getGeneration())
+    expect(liveFeedStore.getActionBudgetMs()).toBe(10_000)
+  })
+
   // Option B: the runtime states its own fastest task interval on /status.
   // Configuration, not measurement — a stalled stream cannot inflate it and a
   // degrading scan cannot widen it. The observed-gap estimate stays as the

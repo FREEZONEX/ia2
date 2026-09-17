@@ -101,19 +101,20 @@ export function HmiStandalone() {
   useEffect(() => {
     let cancelled = false
     const tick = async () => {
+      const generation = liveFeedStore.getGeneration()
       try {
         const s = await jget<EdgeStatus>("/status")
-        if (cancelled) return
+        if (cancelled || generation !== liveFeedStore.getGeneration()) return
         setProject(s.project ?? "")
         const state = edgeRuntimeState(s)
         setEdgeState(state)
         // This poll runs for the whole session, screen or no screen, so it is
         // the panel's reliable source for the write-freshness budget.
-        liveFeedStore.setScanPeriodMs(state.scanPeriodMs)
+        liveFeedStore.setScanPeriodMs(state.scanPeriodMs, generation)
         setAlarmsStanding(s.alarms_standing ?? 0)
         setFailedPolls(0)
       } catch {
-        if (!cancelled) setFailedPolls((n) => n + 1)
+        if (!cancelled && generation === liveFeedStore.getGeneration()) setFailedPolls((n) => n + 1)
       }
     }
     void tick()

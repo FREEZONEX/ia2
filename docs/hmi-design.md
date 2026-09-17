@@ -350,7 +350,9 @@ there is nothing newer to have, so a fixed window would refuse every write for
 3 seconds out of every 5. The fallback cadence is the *lower median* of the last
 five observed gaps, so one dropped frame cannot widen the window, and both the
 reported period and the observed gaps are forgotten on every generation bump — one runtime's slowness never widens the window for
-the next. The cap is there because the window follows the very thing it
+the next. Status requests carry their starting generation; late responses from
+an old connection/run are discarded rather than restoring its cadence.
+The cap is there because the window follows the very thing it
 measures: a degrading scan must not keep buying itself more tolerance. A refusal
 names the budget in force, so a widened window is visible rather than silent.
 
