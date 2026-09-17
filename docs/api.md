@@ -55,7 +55,8 @@ qualifies it and the alarm is dead anyway, but distinguishing that needs
 per-instance variable sets, which static extraction does not carry.
 
 It also lints each **device document against itself** (`device-validate`, all
-errors). Two findings, both of which used to pass silently: a channel name
+errors). Two findings, both of which used to pass silently on Modbus, OPC UA
+and CANopen (EtherCAT already refused the first at connect): a channel name
 declared more than once — every adapter keys its channel table by name, so the
 repeat overwrites and the earlier channel stops existing while mappings onto
 that name move to the survivor, and `iomap-validate` compounds it by resolving

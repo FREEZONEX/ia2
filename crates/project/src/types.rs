@@ -1066,9 +1066,10 @@ pub struct EthercatSdoInit {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct EthercatChannel {
-    /// Unique channel name — what iomap entries reference. Uniqueness is
-    /// enforced by `validate_devices`; a repeat would silently discard the
-    /// earlier PDO entry, since the channel table is keyed by name.
+    /// Unique channel name — what iomap entries reference. The EtherCAT
+    /// adapter has always enforced this at connect (`validate_channel_refs`,
+    /// both sim and real); `validate_devices` now also reports it at author
+    /// time, through `/api/project/validate`, instead of at bring-up.
     pub name: String,
     /// Which SubDevice on the bus this PDO entry lives on (matches
     /// `EthercatSlave.index`).
