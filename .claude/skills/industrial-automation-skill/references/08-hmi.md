@@ -109,7 +109,8 @@ slower (capped at 30 s), because `scan_count` advances once per PLC scan and
 `/status` where the runtime reports it, and the panel's own observed gaps
 otherwise. Duplicate scans do not renew
 freshness, one dropped frame does not widen the budget, and the learned cadence
-is dropped on reconnect, restart or a stream repoint. Both no-confirm and
+is dropped on reconnect, restart or a stream repoint. Delayed status responses
+from a previous connection/run cannot restore that old cadence. Both no-confirm and
 confirmed variable actions read fresh runtime status with a 2-second deadline,
 then recheck connection/run generation, screen identity, Operate mode, current
 `bind.enable` and the target variable's type before dispatch. A watchdog lock,

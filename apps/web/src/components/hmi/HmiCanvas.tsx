@@ -439,7 +439,9 @@ export function HmiCanvas({
       // has no other poll — but only AFTER the decision. Moving the budget
       // between the two checkWrite calls would judge one action on two
       // different windows.
-      if (status) liveFeedStore.setScanPeriodMs(status.scanPeriodMs)
+      if (status && mounted.current && actionContext.current.host === request.host) {
+        liveFeedStore.setScanPeriodMs(status.scanPeriodMs, request.feedGeneration)
+      }
     }
   }, [checkWrite])
 
@@ -1034,15 +1036,16 @@ function AlarmBar({ host }: { host: HmiHost }) {
   useEffect(() => {
     let cancelled = false
     const tick = async () => {
+      const generation = liveFeedStore.getGeneration()
       try {
         const s = await host.runtimeState()
-        if (!cancelled) {
+        if (!cancelled && generation === liveFeedStore.getGeneration()) {
           setState(s)
           setFailedPolls(0)
-          liveFeedStore.setScanPeriodMs(s.scanPeriodMs)
+          liveFeedStore.setScanPeriodMs(s.scanPeriodMs, generation)
         }
       } catch {
-        if (!cancelled) setFailedPolls((n) => n + 1)
+        if (!cancelled && generation === liveFeedStore.getGeneration()) setFailedPolls((n) => n + 1)
       }
     }
     void tick()

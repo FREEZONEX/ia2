@@ -91,7 +91,10 @@ class LiveFeedStore {
    *  where it is available; older runtimes send nothing and keep the
    *  observed-cadence fallback. Pass `null` when unknown — never 0, which
    *  would pin the budget to the floor and reintroduce the bug. */
-  setScanPeriodMs = (ms: number | null | undefined): void => {
+  // Async callers capture the generation BEFORE requesting status. A delayed
+  // response from a previous connection/run must not widen the current budget.
+  setScanPeriodMs = (ms: number | null | undefined, generation = this.generation): void => {
+    if (generation !== this.generation) return
     this.reportedScanPeriodMs =
       typeof ms === "number" && Number.isFinite(ms) && ms > 0 ? ms : null
   }
