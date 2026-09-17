@@ -116,7 +116,8 @@ pub(crate) fn cmd_runtime(client: &Client, cmd: RuntimeCmd, json: bool) -> Resul
             let resp = match &edge {
                 Some(e) => {
                     let encoded =
-                        pack_value(&name, edge_var_type(client, e, &name).as_deref(), &value)?;
+                        pack_value(&name, edge_var_type(client, e, &name).as_deref(), &value)
+                            .map_err(crate::http::UsageError::wrap)?;
                     client.post(
                         &format!("/api/edges/{}/runtime/force", url_encode(e)),
                         &serde_json::json!({ "name": name, "value": encoded }),
@@ -153,7 +154,8 @@ pub(crate) fn cmd_runtime(client: &Client, cmd: RuntimeCmd, json: bool) -> Resul
             let resp = match &edge {
                 Some(e) => {
                     let encoded =
-                        pack_value(&name, edge_var_type(client, e, &name).as_deref(), &value)?;
+                        pack_value(&name, edge_var_type(client, e, &name).as_deref(), &value)
+                            .map_err(crate::http::UsageError::wrap)?;
                     client.post(
                         &format!("/api/edges/{}/runtime/write", url_encode(e)),
                         &serde_json::json!({ "name": name, "value": encoded }),
@@ -222,7 +224,12 @@ fn filter_snapshot(snap: &serde_json::Value, vars: &str) -> serde_json::Value {
 /// agents) can use natural notation.
 pub(crate) fn parse_value(client: &Client, name: &str, raw: &str) -> Result<i32> {
     let var_type = snapshot_var_type(client, name).unwrap_or_default();
-    pack_value(name, var_type.as_deref(), raw)
+    // A value that doesn't fit its type is the caller's to fix, so it must
+    // exit 2 like every other usage problem. Left as a bare anyhow error it
+    // fell through main's downcast chain to 3 — "infrastructure failure" —
+    // and a script reading the documented exit codes would retry a typo
+    // forever.
+    pack_value(name, var_type.as_deref(), raw).map_err(crate::http::UsageError::wrap)
 }
 
 /// Resolve an edge variable's type from the edge runtime's `/status`
@@ -241,6 +248,22 @@ fn edge_var_type(client: &Client, edge: &str, name: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Inclusive value range of an IEC integer type. The i32 force/write wire
+/// carries the BITS, so `UDINT`/`DWORD` legitimately exceed `i32::MAX` and
+/// are sent as their two's-complement pattern — lossless precisely because
+/// the caller range-checks first.
+fn int_range(int_type: &str) -> (i64, i64) {
+    match int_type {
+        "SINT" => (i8::MIN as i64, i8::MAX as i64),
+        "USINT" | "BYTE" => (0, u8::MAX as i64),
+        "INT" => (i16::MIN as i64, i16::MAX as i64),
+        "UINT" | "WORD" => (0, u16::MAX as i64),
+        "UDINT" | "DWORD" => (0, u32::MAX as i64),
+        // DINT and anything else routed here by the caller's match.
+        _ => (i32::MIN as i64, i32::MAX as i64),
+    }
 }
 
 /// Bit-pack a human value string into the i32 force/write wire, given the
@@ -265,6 +288,17 @@ fn pack_value(name: &str, var_type: Option<&str>, raw: &str) -> Result<i32> {
             let f: f32 = raw
                 .parse()
                 .with_context(|| format!("value `{raw}` doesn't parse as REAL (32-bit float)"))?;
+            // Rust's f32 parse returns Ok(inf) on overflow and Ok(NaN) for
+            // "nan", so both would ride the wire as a bit pattern and land in
+            // a plant variable. The runtime already refuses NaN where a
+            // governance rule has to clamp it; refuse it here too, before it
+            // is anyone else's problem.
+            if !f.is_finite() {
+                anyhow::bail!(
+                    "value `{raw}` is not a finite REAL (parsed as {f}) — \
+                     a plant variable has no use for it"
+                );
+            }
             Ok(f.to_bits() as i32)
         }
         Some("LREAL") => {
@@ -282,6 +316,20 @@ fn pack_value(name: &str, var_type: Option<&str>, raw: &str) -> Result<i32> {
             let n: i64 = raw.parse().with_context(|| {
                 format!("value `{raw}` doesn't parse as integer for {int_type}")
             })?;
+            // `n as i32` alone truncates twice over: once here, and again
+            // downstream when the runtime stores an i32 into a narrower IEC
+            // slot. 40000 into an INT arrives as -25536 — a wrong setpoint,
+            // delivered silently, by the one verb that exists BECAUSE it is
+            // type-aware. Refuse instead.
+            let (lo, hi) = int_range(int_type);
+            if n < lo || n > hi {
+                anyhow::bail!(
+                    "value `{raw}` is outside {int_type} ({lo}..={hi}) — \
+                     it would reach the variable truncated"
+                );
+            }
+            // Unsigned types wider than i32 ride the wire as raw bits; the
+            // range check above is what makes that lossless.
             Ok(n as i32)
         }
         Some(other) => {
@@ -327,4 +375,102 @@ fn snapshot_var_type(client: &Client, name: &str) -> Result<Option<String>> {
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pack_value;
+
+    fn ok(ty: &str, raw: &str) -> i32 {
+        pack_value("v", Some(ty), raw).unwrap_or_else(|e| panic!("{ty} {raw}: {e:#}"))
+    }
+    fn err(ty: &str, raw: &str) -> String {
+        format!(
+            "{:#}",
+            pack_value("v", Some(ty), raw).expect_err("{ty} {raw} must be refused")
+        )
+    }
+
+    #[test]
+    fn bools_accept_both_spellings_and_numbers() {
+        assert_eq!(ok("BOOL", "TRUE"), 1);
+        assert_eq!(ok("BOOL", "false"), 0);
+        assert_eq!(ok("BOOL", "7"), 1);
+        assert_eq!(ok("BOOL", "0"), 0);
+    }
+
+    #[test]
+    fn integers_inside_their_type_pack_unchanged() {
+        assert_eq!(ok("INT", "-32768"), -32768);
+        assert_eq!(ok("INT", "32767"), 32767);
+        assert_eq!(ok("SINT", "-128"), -128);
+        assert_eq!(ok("USINT", "255"), 255);
+        assert_eq!(ok("DINT", "-2147483648"), i32::MIN);
+    }
+
+    /// The defect: `n as i32` truncated, and the runtime truncated again into
+    /// the narrower IEC slot. 40000 into an INT arrived as -25536 — a wrong
+    /// setpoint, silently, from the verb that exists because it is
+    /// type-aware.
+    #[test]
+    fn an_integer_outside_its_type_is_refused_not_truncated() {
+        let e = err("INT", "40000");
+        assert!(e.contains("outside INT"), "{e}");
+        assert!(e.contains("-32768..=32767"), "{e}");
+        assert!(e.contains("truncated"), "{e}");
+
+        assert!(err("SINT", "200").contains("outside SINT"));
+        assert!(err("USINT", "-1").contains("outside USINT"));
+        assert!(err("UINT", "65536").contains("outside UINT"));
+        // i64-parseable but far outside i32 — used to wrap to 705032704.
+        assert!(err("DINT", "5000000000").contains("outside DINT"));
+    }
+
+    /// `UDINT`/`DWORD` legitimately exceed i32 and ride the wire as bits.
+    /// The range check is what makes that lossless rather than a wrap.
+    #[test]
+    fn wide_unsigned_types_ride_the_wire_as_bits() {
+        assert_eq!(ok("UDINT", "4294967295"), -1, "0xFFFFFFFF as i32");
+        assert_eq!(ok("DWORD", "2147483648"), i32::MIN, "0x80000000 as i32");
+        assert!(err("UDINT", "4294967296").contains("outside UDINT"));
+        assert!(err("UDINT", "-1").contains("outside UDINT"));
+    }
+
+    #[test]
+    fn reals_pack_as_ieee_bits() {
+        assert_eq!(ok("REAL", "1.5"), 1.5f32.to_bits() as i32);
+        assert_eq!(ok("REAL", "-0.25"), (-0.25f32).to_bits() as i32);
+    }
+
+    /// Rust parses "1e40" as +inf and "nan" as NaN, both `Ok`. Neither
+    /// belongs in a plant variable.
+    #[test]
+    fn non_finite_reals_are_refused() {
+        assert!(err("REAL", "1e40").contains("not a finite REAL"));
+        assert!(err("REAL", "nan").contains("not a finite REAL"));
+        assert!(err("REAL", "-inf").contains("not a finite REAL"));
+    }
+
+    #[test]
+    fn lreal_says_why_it_cannot_ride_the_32_bit_wire() {
+        assert!(err("LREAL", "1.5").contains("doesn't fit the 32-bit force wire"));
+    }
+
+    #[test]
+    fn an_unknown_type_is_named_rather_than_guessed() {
+        let e = err("STRING", "hello");
+        assert!(e.contains("STRING"), "{e}");
+    }
+
+    /// With no type info the packer guesses from the value's shape and says
+    /// so on stderr; overflow still fails rather than wrapping.
+    #[test]
+    fn without_type_info_the_guess_still_refuses_an_overflowing_integer() {
+        assert_eq!(pack_value("v", None, "42").unwrap(), 42);
+        assert_eq!(
+            pack_value("v", None, "1.5").unwrap(),
+            1.5f32.to_bits() as i32
+        );
+        assert!(pack_value("v", None, "5000000000").is_err());
+    }
 }

@@ -780,3 +780,37 @@ fn project_flag_encodes_unicode_and_literal_percent_for_http_headers() {
         "{seen:?}"
     );
 }
+
+// ================================================================
+//  Exit-code contract on the write path
+// ================================================================
+
+/// A value the caller can fix must exit 2, not 3. Both invocations below
+/// point at a dead port, so the ONLY difference is whether the value itself
+/// was rejected before any request went out — which is exactly the
+/// distinction the documented codes make (2 = fix your input, ≥3 = fix your
+/// infrastructure). It used to be 3 for both: `pack_value`'s error was a
+/// bare anyhow error and fell through main's downcast chain, so a script
+/// following the contract would retry a typo until it gave up.
+#[test]
+fn a_value_that_cannot_be_packed_exits_two_while_a_dead_server_exits_three() {
+    let dead = "http://127.0.0.1:1";
+    cs().arg("--server")
+        .arg(dead)
+        .arg("runtime")
+        .arg("write")
+        .arg("speed")
+        .arg("5000000000")
+        .assert()
+        .code(2)
+        .stderr(contains("doesn't parse as i32"));
+
+    cs().arg("--server")
+        .arg(dead)
+        .arg("runtime")
+        .arg("write")
+        .arg("speed")
+        .arg("42")
+        .assert()
+        .code(3);
+}
