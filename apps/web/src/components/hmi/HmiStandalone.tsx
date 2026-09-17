@@ -33,7 +33,7 @@ import {
 import { panelFetch } from "@/components/hmi/panel-fetch"
 import { useThemeToggle } from "@/lib/dark-mode"
 import { cn } from "@/lib/utils"
-import { encodeForWrite } from "@/lib/write-encoding"
+import { encodeForWrite, undeliveredFrom } from "@/lib/write-encoding"
 import { liveFeedStore, useConnected } from "@/state/live-feed"
 import type { AlarmState } from "@/types/generated/AlarmState"
 import type { HistoryResponse } from "@/types/generated/HistoryResponse"
@@ -101,15 +101,20 @@ export function HmiStandalone() {
   useEffect(() => {
     let cancelled = false
     const tick = async () => {
+      const generation = liveFeedStore.getGeneration()
       try {
         const s = await jget<EdgeStatus>("/status")
-        if (cancelled) return
+        if (cancelled || generation !== liveFeedStore.getGeneration()) return
         setProject(s.project ?? "")
-        setEdgeState(edgeRuntimeState(s))
+        const state = edgeRuntimeState(s)
+        setEdgeState(state)
+        // This poll runs for the whole session, screen or no screen, so it is
+        // the panel's reliable source for the write-freshness budget.
+        liveFeedStore.setScanPeriodMs(state.scanPeriodMs, generation)
         setAlarmsStanding(s.alarms_standing ?? 0)
         setFailedPolls(0)
       } catch {
-        if (!cancelled) setFailedPolls((n) => n + 1)
+        if (!cancelled && generation === liveFeedStore.getGeneration()) setFailedPolls((n) => n + 1)
       }
     }
     void tick()
@@ -161,6 +166,10 @@ export function HmiStandalone() {
         if (!res.ok) {
           throw new Error(`${res.status}: ${await res.text()}`)
         }
+        // Applied, but the runtime says this variable's own device cannot
+        // carry it out right now. Same contract as the IDE host: report the
+        // caveat, never retry.
+        return undeliveredFrom(await res.json().catch(() => null))
       },
       nav: (target) => navigate(target),
       // mode + device_health ride along so the alarmbar can tell

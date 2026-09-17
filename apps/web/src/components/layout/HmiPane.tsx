@@ -34,7 +34,7 @@ import type { HmiDoc } from "@/types/generated/HmiDoc"
 import type { HmiIssue } from "@/types/generated/HmiIssue"
 
 export function HmiPane() {
-  const { currentHmi, selectHmi } = useRuntime()
+  const { currentHmi, selectHmi, attached } = useRuntime()
   const [mode, setMode] = useState<CanvasMode>("operate")
   const [selected, setSelected] = useState<string | null>(null)
   const [doc, setDoc] = useState<HmiDoc | null>(null)
@@ -48,6 +48,13 @@ export function HmiPane() {
   // edge panel provides its own implementation of this seam.
   const host = useMemo<HmiHost>(
     () => ({
+      // Attached to an edge, the canvas below is rendering the EDGE's snapshot
+      // stream while `writeVariable` still posts to this server's own runtime
+      // — there is no edge write proxy. Refuse rather than command a runtime
+      // the operator is not looking at; MonitorPane has always done the same.
+      writesBlocked: attached
+        ? "Attached to a remote edge — values are the edge's, writes are not proxied; read-only"
+        : null,
       fetchDoc: fetchHmi,
       saveDoc: saveHmi,
       write: writeVariable,
@@ -64,6 +71,7 @@ export function HmiPane() {
           running: s.running,
           alarm: s.watchdog_tripped ? "Watchdog tripped — outputs are locked" : s.last_error ?? null,
           mode: s.mode?.kind,
+          scanPeriodMs: s.scan_period_ms,
           unhealthyDevices: s.device_health
             .filter((d) => !d.healthy)
             .map((d) => d.name),
@@ -73,7 +81,7 @@ export function HmiPane() {
       alarms: fetchRuntimeAlarms,
       ackAlarm: ackRuntimeAlarm,
     }),
-    [selectHmi],
+    [selectHmi, attached],
   )
 
   useEffect(() => {

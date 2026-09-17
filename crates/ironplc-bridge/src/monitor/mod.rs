@@ -21,7 +21,7 @@ use ts_rs::TS;
 pub use alarms::{AlarmEngine, AlarmJournalEntry, AlarmState};
 pub use history::{Historian, HistoryPoint, HistoryResponse, HistorySeries};
 
-use crate::runtime::{ProgramHandle, RuntimeMode, RuntimeWriteError};
+use crate::runtime::{ProgramHandle, RuntimeMode, RuntimeWriteError, WriteOutcome};
 
 /// One pinned (forced) variable in the runtime's debug state.
 #[derive(Debug, Clone, Serialize, TS)]
@@ -111,18 +111,39 @@ pub async fn write_with_pulse(
     name: &str,
     value: i32,
     pulse_ms: Option<u32>,
-) -> Result<i32, RuntimeWriteError> {
+) -> Result<WriteOutcome, RuntimeWriteError> {
     let v = handle.write_variable(name, value).await?;
     if let Some(ms) = pulse_ms {
         let h = handle.clone();
         let n = name.to_string();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(ms as u64)).await;
-            if let Err(e) = h.write_variable_ungoverned(&n, 0).await {
+            match h.write_variable_ungoverned(&n, 0).await {
                 // The program may have stopped in the window — that also
                 // clears the variable, so a failed reset is benign then;
                 // log it so a live-program failure is still visible.
-                tracing::warn!(variable = %n, ?e, "pulse reset write failed");
+                Err(e) => tracing::warn!(variable = %n, ?e, "pulse reset write failed"),
+                // Applied to the VM but NOT reaching the field: the link went
+                // down inside the pulse window. The momentary value is still
+                // on the wire from the first half of this write, and stays
+                // there for the outage — which is exactly the latch `pulse_ms`
+                // exists to prevent, so it cannot pass silently.
+                //
+                // Self-correcting, not permanent: the output phase flushes the
+                // current VM value every scan, so the 0 lands when the link
+                // returns. What is lost without this line is any record that
+                // the plant held the command in between.
+                Ok(o) => {
+                    if let Some(device) = o.undelivered_device {
+                        tracing::warn!(
+                            variable = %n,
+                            %device,
+                            "pulse reset applied to the VM but not delivered — that \
+                             device's link is down, so the field holds the momentary \
+                             value until it returns"
+                        );
+                    }
+                }
             }
         });
     }

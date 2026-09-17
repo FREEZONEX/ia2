@@ -30,7 +30,7 @@ use axum::{
 use futures_util::stream::Stream;
 use ironplc_bridge::{
     DeviceHealth, DeviceReport, DeviceSpec, ProgramHandle, RuntimeMode, RuntimeWriteError,
-    VarSnapshot,
+    VarSnapshot, WriteOutcome,
 };
 use project::{ProjectStore, ProtocolConfig, StoreError};
 use serde::Serialize;
@@ -705,9 +705,79 @@ async fn health(State(state): State<AppState>) -> Json<Health> {
 
 use ironplc_bridge::monitor::{self, ForceEntry, ModeResponse};
 
+#[cfg(test)]
+mod write_response_tests {
+    use super::write_response;
+    use ironplc_bridge::WriteOutcome;
+
+    #[test]
+    fn the_body_carries_the_keys_the_panel_reads_by_name() {
+        let delivered = write_response(
+            "stop_cmd",
+            &WriteOutcome {
+                value: 1,
+                undelivered_device: None,
+            },
+        );
+        assert_eq!(delivered["ok"], true, "cs edge reads this");
+        assert_eq!(delivered["name"], "stop_cmd");
+        assert_eq!(delivered["value"], 1);
+        assert!(
+            delivered["undelivered_device"].is_null(),
+            "a delivered write must say so explicitly, not omit the key"
+        );
+
+        let stranded = write_response(
+            "stop_cmd",
+            &WriteOutcome {
+                value: 1,
+                undelivered_device: Some("bus_a".into()),
+            },
+        );
+        assert_eq!(
+            stranded["value"], 1,
+            "an undelivered write is still applied"
+        );
+        assert_eq!(
+            stranded["undelivered_device"], "bus_a",
+            "this exact key is what the panel reads; renaming it drops the warning silently"
+        );
+    }
+}
+
+#[cfg(test)]
+mod build_stamp_tests {
+    /// A provenance stamp that silently degrades to an empty string is worse
+    /// than none — `/status` would serve a field that looks answered. Assert
+    /// the shape, including the honest `unknown` fallback.
+    #[test]
+    fn the_build_stamp_is_present_and_shaped() {
+        let commit = env!("IA2_BUILD_COMMIT");
+        let rustc = env!("IA2_BUILD_RUSTC");
+        assert!(!commit.is_empty(), "commit stamp must never be empty");
+        assert!(!rustc.is_empty(), "rustc stamp must never be empty");
+        assert!(
+            rustc == "unknown" || rustc.starts_with("rustc "),
+            "rustc stamp should be a version line or the honest fallback: {rustc}"
+        );
+        eprintln!("build stamp: commit={commit} rustc={rustc}");
+    }
+}
+
 #[derive(Serialize)]
 struct Status {
     version: &'static str,
+    /// What built this binary: the source commit (suffixed `-dirty` when the
+    /// tree had uncommitted changes) and the compiler version, stamped in at
+    /// compile time by `build.rs`.
+    ///
+    /// A deployed runtime is a bare file on a box with nothing beside it
+    /// recording its origin; without this, "which commit is the bench
+    /// running?" has no answer months later. Either may be `unknown` when the
+    /// build could not see a git tree and none was supplied — an absent
+    /// provenance, not a guessed one.
+    build_commit: &'static str,
+    build_rustc: &'static str,
     project: String,
     /// PROGRAM instances scheduled by the project's tasks.toml.
     program_instances: Vec<String>,
@@ -724,6 +794,27 @@ struct Status {
     /// computing and `scan_count` keeps climbing after a trip, so a poller
     /// watching only values sees a healthy plant while the bus holds zeros.
     watchdog_tripped: bool,
+    /// Fastest task interval in ms — the cadence at which `scan_count` can
+    /// advance, since it is the max across units. A client judging "is this
+    /// live data current?" needs this: `interval_ms` has no upper bound, and
+    /// on a 5 s-cycle project a 4 s-old value is the newest one that exists,
+    /// so a fixed staleness window would refuse every operator write between
+    /// scans. It says nothing about how long a scan actually takes — the
+    /// overrun watchdog owns that.
+    scan_period_ms: u32,
+    /// Scan deadlines missed since the program started, summed over units, and
+    /// the longest streak any unit is currently on.
+    ///
+    /// The overrun log line fires ONCE per unit and then suppresses itself, so
+    /// after it scrolls away nothing else answers "is this runtime still
+    /// missing deadlines?". `watchdog_tripped` only covers the terminal case.
+    /// A total that climbs between two polls means it is missing them now; the
+    /// streak is the distance to the trip threshold.
+    ///
+    /// This is the ACHIEVED cadence. `scan_period_ms` is the configured one and
+    /// says nothing about whether it is being met.
+    scan_overruns: u64,
+    consecutive_scan_overruns: u32,
     uptime_secs: u64,
     scan_count: u64,
     last_snapshot: Option<VarSnapshot>,
@@ -756,11 +847,16 @@ async fn status(State(state): State<AppState>) -> Json<Status> {
         .count();
     Json(Status {
         version: env!("CARGO_PKG_VERSION"),
+        build_commit: env!("IA2_BUILD_COMMIT"),
+        build_rustc: env!("IA2_BUILD_RUSTC"),
         project: state.project_name.clone(),
         program_instances: state.program_instances.clone(),
         devices: state.devices.clone(),
         device_health: state.handle.device_health(),
         watchdog_tripped: state.handle.watchdog_tripped(),
+        scan_period_ms: state.handle.scan_period_ms(),
+        scan_overruns: state.handle.scan_overruns(),
+        consecutive_scan_overruns: state.handle.consecutive_scan_overruns(),
         uptime_secs: state.start_time.elapsed().as_secs(),
         scan_count,
         last_snapshot,
@@ -1138,6 +1234,30 @@ pub(crate) fn audit_outcome(
     }
 }
 
+/// Writes carry delivery state on top of the applied value. An undelivered
+/// write IS an applied write — the ring records what the VM took — so the
+/// distinction rides in the outcome text, where the trail shows the value
+/// never reached that device. Forces use [`audit_outcome`] directly; they
+/// pin a VM value and make no claim about the field.
+pub(crate) fn write_audit_outcome(
+    requested: i32,
+    result: &Result<WriteOutcome, RuntimeWriteError>,
+) -> (Option<i32>, String) {
+    match result {
+        Ok(o) => {
+            let (applied, base) = audit_outcome(requested, &Ok::<i32, RuntimeWriteError>(o.value));
+            match &o.undelivered_device {
+                Some(device) => (
+                    applied,
+                    format!("{base}; not delivered to device '{device}' (link down)"),
+                ),
+                None => (applied, base),
+            }
+        }
+        Err(e) => (None, e.to_string()),
+    }
+}
+
 /// Origin of a mutating request for the audit ring: the `X-IA2-Origin`
 /// header (`gui`, `cs`, …) or `anonymous` when absent. The header value
 /// is only ever stored/printed, never interpolated into a command.
@@ -1165,6 +1285,25 @@ fn write_err(e: RuntimeWriteError) -> (StatusCode, String) {
     }
 }
 
+/// The `/write` success body.
+///
+/// Extracted so its KEYS are covered by a test. They are hand-written strings
+/// here — unlike the IDE server's typed `WriteVariableResponse`, which the
+/// compiler checks — and the operator panel reads them by name, so a typo
+/// would compile, deploy, and silently drop the undelivered warning.
+///
+/// `ok` stays in the body: `cs edge` reads it (crates/cli/src/cmd/edge.rs).
+fn write_response(name: &str, outcome: &WriteOutcome) -> serde_json::Value {
+    serde_json::json!({
+        "ok": true,
+        "name": name,
+        "value": outcome.value,
+        // Same contract as the IDE server's WriteVariableResponse: the write
+        // was applied, and this names the device it cannot currently reach.
+        "undelivered_device": outcome.undelivered_device,
+    })
+}
+
 async fn rt_write(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -1174,7 +1313,7 @@ async fn rt_write(
     // core — one implementation for IDE server and edge runtime.
     let origin = origin_of(&headers).to_string();
     let result = monitor::write_with_pulse(&state.handle, &req.name, req.value, req.pulse_ms).await;
-    let (applied, outcome) = audit_outcome(req.value, &result);
+    let (applied, outcome) = write_audit_outcome(req.value, &result);
     record_audit(
         &state.audit,
         &origin,
@@ -1184,10 +1323,8 @@ async fn rt_write(
         applied,
         &outcome,
     );
-    let v = result.map_err(write_err)?;
-    Ok(Json(
-        serde_json::json!({ "ok": true, "name": req.name, "value": v }),
-    ))
+    let outcome = result.map_err(write_err)?;
+    Ok(Json(write_response(&req.name, &outcome)))
 }
 
 async fn rt_force(

@@ -29,9 +29,27 @@ export type HmiRuntimeState = {
   /** Devices whose transport is down (their input variables are frozen
    *  at last-known values). Empty/absent = fieldbus healthy. */
   unhealthyDevices?: string[]
+  /** The runtime's fastest task interval in ms — the cadence at which
+   *  `scan_count` can advance. Feeds the live store's freshness budget, so
+   *  a slow-cycle project is judged against its own rate instead of a fixed
+   *  window. Absent on a runtime that predates the field. */
+  scanPeriodMs?: number | null
 }
 
 export type HmiHost = {
+  /** Why variable writes are unavailable on this host regardless of live
+   *  state, or null/absent when they are available.
+   *
+   *  The IDE sets it while attached to a remote edge. The canvas is then
+   *  showing the EDGE's snapshot stream, but `write` goes to the project
+   *  server's own runtime — there is no edge write proxy — so a write would
+   *  land on a different runtime than the one the operator is looking at and
+   *  than every check was judged against. The Monitor pane has always refused
+   *  in this state ("Remote values · read only"); the canvas now does too.
+   *
+   *  A plain value, not a getter, so the host object's identity changes when
+   *  it changes — which is what invalidates an outstanding confirmation. */
+  writesBlocked?: string | null
   fetchDoc(path: string): Promise<HmiDoc>
   /** Persist a whole document (Arrange-mode drag). Absent → layout is
    *  read-only, which is the edge panel's case. */
@@ -39,13 +57,19 @@ export type HmiHost = {
   /** Write one variable. `typeName` comes from the live snapshot so the
    *  host can bit-pack REALs correctly. `pulseMs` asks the RUNTIME to
    *  write 0 back after that many ms — the pulse reset must survive the
-   *  page, so it is never a client timer. */
+   *  page, so it is never a client timer.
+   *
+   *  Resolves to `null` on a clean write, or to a caveat string when the
+   *  runtime applied the value but its device's transport is down. That is
+   *  a report, never a retry: the value is in the program and will flush if
+   *  the link returns, and the operator is told rather than shown a bare
+   *  success. */
   write(
     name: string,
     value: number,
     typeName: string,
     pulseMs?: number,
-  ): Promise<void>
+  ): Promise<string | null>
   /** Navigate to another screen (a `nav` action). */
   nav(target: string): void
   /** Polled by the alarm bar (~2 s cadence). */

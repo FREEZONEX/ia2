@@ -12,7 +12,7 @@
  *     are inert so a mis-tap can't write to the plant while laying out.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react"
 import { Button } from "@/components/ui/button"
 import { EmptyState } from "@/components/ui/empty-state"
 import { fitCanvasScale } from "./canvas-viewport"
@@ -50,7 +50,7 @@ import {
 } from "@/lib/alarms"
 import { cn } from "@/lib/utils"
 import { useHmiMutation } from "@/state/hmi-live"
-import { useConnected, useLastSnapshot } from "@/state/live-feed"
+import { liveFeedStore, useConnected, useLastSnapshot } from "@/state/live-feed"
 import { TrendChart, type TrendSeries } from "@/components/charts/TrendChart"
 import type { AlarmState } from "@/types/generated/AlarmState"
 import type { HmiAction } from "@/types/generated/HmiAction"
@@ -66,11 +66,36 @@ export type CanvasMode = "operate" | "arrange"
 /** Per-element delay inside one spawn batch (the "wave"). */
 const SPAWN_STAGGER_MS = 80
 
+/** `derivePanelHealth`'s failed-poll count for a one-shot read that just
+ *  returned. The comms-lost verdict belongs to the alarm bar's repeated poll;
+ *  a status we are holding in our hand cannot be unreachable. */
+const STATUS_READ_JUST_SUCCEEDED = 0
+
+/** Does any of this node's actions reach the plant? `nav` does not — it stays
+ *  usable when writes are blocked, the same way it stays usable offline. */
+function nodeWrites(node: HmiNode): boolean {
+  return Object.values(node.action).some((a) => a != null && a.kind !== "nav")
+}
+
+/** Refusal text for stale live data, naming the budget actually in force.
+ *  That budget widens to cover a slow-cycle project's own scan cadence, so
+ *  stating a bare "2 seconds" would be a lie on exactly the projects where
+ *  the number matters. */
+const staleFeedReason = (): string =>
+  `No advancing live data within ${
+    Math.round(liveFeedStore.getActionBudgetMs() / 100) / 10
+  }s — action not sent`
+
 type PendingConfirm = {
   nodeId: string
   action: HmiAction
   /** Resolved at request time — Confirm sends exactly this. */
   write: ResolvedWrite
+  document: HmiDoc
+  path: string
+  host: HmiHost
+  feedGeneration: number
+  documentVersion: number
 }
 
 export function HmiCanvas({
@@ -95,11 +120,13 @@ export function HmiCanvas({
   const loadRevision = useRef(0)
 
   // ---- document load + live reload --------------------------------
+  const documentVersion = useRef(0)
   const load = useCallback(async () => {
     const revision = ++loadRevision.current
     try {
       const d = await host.fetchDoc(path)
       if (revision !== loadRevision.current) return
+      documentVersion.current = revision
       setDoc(d)
       setLoadError(null)
       onDocLoaded?.(d)
@@ -125,6 +152,7 @@ export function HmiCanvas({
   useEffect(() => {
     if (!mutation || mutation.path !== path) return
     if (mutation.deleted) {
+      loadRevision.current++
       setDoc(null)
       setLoadError("screen was deleted")
       return
@@ -311,25 +339,111 @@ export function HmiCanvas({
     setDragPos(null)
   }, [mode, path])
 
-  // The write itself. `write` was resolved at request time, so the
-  // confirm path sends exactly what the dialog showed. A pulse's reset
-  // rides the SAME request (`pulseMs`) — the runtime writes the 0, so a
-  // closed tab or suspended tablet can't leave the coil latched.
-  const performWrite = useCallback(
-    async (action: HmiAction, write: ResolvedWrite) => {
-      try {
-        await host.write(
-          write.variable,
-          write.value,
-          write.typeName,
-          action.kind === "pulse" ? action.ms : undefined,
-        )
-      } catch (e) {
-        setActionError(String(e))
+  // Refs cover changes that happen while a fresh status request is in flight.
+  const actionContext = useRef({ host, path, mode, doc, loadError })
+  // Published after commit, not during render: a render React throws away
+  // (StrictMode's double pass, an interrupted concurrent render) would
+  // otherwise leave this pointing at state that was never on screen.
+  //
+  // LAYOUT effect, not a passive one. A passive effect runs after paint, so a
+  // control is clickable for a beat while this still holds the previous
+  // render's doc — and `checkWrite` reads it, sees a doc mismatch, and refuses
+  // a perfectly good action as "Screen changed". Caught by the post-await
+  // recheck tests, which stopped being able to open the confirm card at all.
+  useLayoutEffect(() => {
+    actionContext.current = { host, path, mode, doc, loadError }
+  })
+  const mounted = useRef(false)
+  const writing = useRef(false)
+  useEffect(() => {
+    mounted.current = true
+    return () => { mounted.current = false }
+  }, [])
+
+  const checkWrite = useCallback((request: PendingConfirm) => {
+    // First: a host that cannot deliver a write at all. Checked ahead of the
+    // live-state gates so the operator gets the real reason rather than a
+    // freshness message about a runtime this write would never reach.
+    if (request.host.writesBlocked) throw new Error(request.host.writesBlocked)
+    const current = actionContext.current
+    if (!mounted.current || current.mode !== "operate" || current.host !== request.host ||
+        current.path !== request.path || current.doc !== request.document || current.loadError ||
+        request.documentVersion !== documentVersion.current ||
+        request.documentVersion !== loadRevision.current) {
+      throw new Error("Screen changed — request the action again")
+    }
+    if (request.feedGeneration !== liveFeedStore.getGeneration()) {
+      throw new Error("Live connection or run changed — request the action again")
+    }
+    const fresh = liveFeedStore.getFreshSnapshot()
+    if (!fresh) throw new Error(staleFeedReason())
+    const node = findNode(request.document.root, request.nodeId)
+    if (!node || !canHostAction(node.type)) throw new Error("Control unavailable — action not sent")
+    const enabled = node.bind["enable"]
+    if (enabled !== undefined && !resolveOn(fresh, enabled)) {
+      throw new Error("Control is no longer enabled — action not sent")
+    }
+    const variable = lookupVar(fresh, request.write.variable)
+    if (!variable || variable.type_name !== request.write.typeName) {
+      throw new Error("Live variable or type changed — request the action again")
+    }
+  }, [])
+
+  // Keep the value/type shown in the card; recheck permission to dispatch it.
+  // Pulse reset remains one runtime-side request, never a browser timer.
+  const performWrite = useCallback(async (request: PendingConfirm) => {
+    if (writing.current) {
+      setActionError("Another action is awaiting a response — action not sent")
+      return
+    }
+    writing.current = true
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let status: HmiRuntimeState | undefined
+    try {
+      checkWrite(request)
+      status = await Promise.race([
+        request.host.runtimeState(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("Runtime status timed out — action not sent")), 2000)
+        }),
+      ])
+      // Device health is deliberately NOT part of this gate. It is not a
+      // property of the runtime, it is a property of ONE device, and the
+      // panel cannot tell which device carries this variable — the edge
+      // panel has no iomap at all. Blanket-refusing on any unhealthy device
+      // took away every control, Stop included, because some unrelated
+      // island dropped. The runtime scopes it to the mapping and reports
+      // the caveat below; everything else here is genuinely runtime-wide.
+      const state = status
+      const health = derivePanelHealth(
+        { ...state, unhealthyDevices: [] },
+        STATUS_READ_JUST_SUCCEEDED,
+      )
+      if (health.kind !== "running") throw new Error(`${health.text} — action not sent`)
+      checkWrite(request)
+      const undelivered = await request.host.write(
+        request.write.variable,
+        request.write.value,
+        request.write.typeName,
+        request.action.kind === "pulse" ? request.action.ms : undefined,
+      )
+      // A write that landed in the program but not on the bus is not a
+      // failure and not a success — say exactly that, and never retry.
+      if (undelivered && mounted.current) setActionError(undelivered)
+    } catch (e) {
+      if (mounted.current) setActionError(String(e))
+    } finally {
+      clearTimeout(timer)
+      writing.current = false
+      // Learn the cadence from this read — an IDE screen without an alarmbar
+      // has no other poll — but only AFTER the decision. Moving the budget
+      // between the two checkWrite calls would judge one action on two
+      // different windows.
+      if (status && mounted.current && actionContext.current.host === request.host) {
+        liveFeedStore.setScanPeriodMs(status.scanPeriodMs, request.feedGeneration)
       }
-    },
-    [host],
-  )
+    }
+  }, [checkWrite])
 
   const requestAction = useCallback(
     (nodeId: string, action: HmiAction, value?: number) => {
@@ -343,22 +457,42 @@ export function HmiCanvas({
         }
         return
       }
-      const res = resolveActionWrite(snapshot, action, value)
+      if (host.writesBlocked) {
+        setActionError(host.writesBlocked)
+        return
+      }
+      const fresh = liveFeedStore.getFreshSnapshot()
+      if (!fresh) {
+        setActionError(staleFeedReason())
+        return
+      }
+      const res = resolveActionWrite(fresh, action, value)
       if (!res.ok) {
         setActionError(res.reason)
+        return
+      }
+      if (!doc) return
+      const request: PendingConfirm = {
+        nodeId, action, write: res.write, document: doc, path, host,
+        feedGeneration: liveFeedStore.getGeneration(), documentVersion: documentVersion.current,
+      }
+      try {
+        checkWrite(request)
+      } catch (e) {
+        setActionError(String(e))
         return
       }
       const needsConfirm =
         "confirm" in action ? action.confirm : true
       if (needsConfirm) {
-        setPending({ nodeId, action, write: res.write })
+        setPending(request)
       } else {
         // A clamped no-confirm entry still writes — but never silently.
         setActionError(clampNotice(res.write))
-        void performWrite(action, res.write)
+        void performWrite(request)
       }
     },
-    [mode, host, snapshot, performWrite],
+    [mode, host, doc, path, checkWrite, performWrite],
   )
 
   // ---- render ------------------------------------------------------
@@ -448,7 +582,7 @@ export function HmiCanvas({
             if (mode !== "operate") return
             const p = pending
             setPending(null)
-            void performWrite(p.action, p.write)
+            void performWrite(p)
           }}
         />
       )}
@@ -724,7 +858,9 @@ function renderKind(
       const onBind = node.bind["on"]
       const lit = onBind !== undefined && resolveOn(snapshot, onBind)
       const enBind = node.bind["enable"]
-      const disabled = enBind !== undefined && !resolveOn(snapshot, enBind)
+      const disabled =
+        (enBind !== undefined && !resolveOn(snapshot, enBind)) ||
+        (host.writesBlocked != null && nodeWrites(node))
       return (
         <button
           type="button"
@@ -823,6 +959,7 @@ function InputNode({
   snapshot: ReturnType<typeof useLastSnapshot>
   onAction: (nodeId: string, action: HmiAction, value?: number) => void
 }) {
+  const host = useHmiHost()
   const [text, setText] = useState("")
   const commit = node.action["commit"]
   const b = node.bind["value"]
@@ -830,7 +967,9 @@ function InputNode({
   // current value, which may legitimately be text (STRING var).
   const current = b !== undefined ? displayBinding(snapshot, b) : null
   const enBind = node.bind["enable"]
-  const disabled = enBind !== undefined && !resolveOn(snapshot, enBind)
+  const disabled =
+    (enBind !== undefined && !resolveOn(snapshot, enBind)) ||
+    (host.writesBlocked != null && nodeWrites(node))
   return (
     <div className="flex h-full w-full items-center gap-1.5 overflow-hidden">
       {node.label && (
@@ -897,14 +1036,16 @@ function AlarmBar({ host }: { host: HmiHost }) {
   useEffect(() => {
     let cancelled = false
     const tick = async () => {
+      const generation = liveFeedStore.getGeneration()
       try {
         const s = await host.runtimeState()
-        if (!cancelled) {
+        if (!cancelled && generation === liveFeedStore.getGeneration()) {
           setState(s)
           setFailedPolls(0)
+          liveFeedStore.setScanPeriodMs(s.scanPeriodMs, generation)
         }
       } catch {
-        if (!cancelled) setFailedPolls((n) => n + 1)
+        if (!cancelled && generation === liveFeedStore.getGeneration()) setFailedPolls((n) => n + 1)
       }
     }
     void tick()

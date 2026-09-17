@@ -37,8 +37,14 @@ prompts — the IDE runs `ssh -o BatchMode=yes`).
      --target aarch64-unknown-linux-gnu
    # binary lands at target/aarch64-unknown-linux-gnu/release/ia2-runtime
    ```
-   All deps are pure Rust; cross-compile should succeed without extra
-   system libs.
+   The dependency tree is NOT pure Rust: `ring` (C + assembly) arrives via
+   `rumqttc` → `tokio-rustls` → `rustls` for the MQTT northbound's TLS. So a
+   cross build needs a C toolchain for the target, which is the reason to use
+   `cross` (it supplies one in a container) rather than plain
+   `cargo build --target`. A bare `rustup target add` plus `cargo build
+   --target x86_64-unknown-linux-musl` on macOS fails in `ring`'s build script
+   with `failed to find tool "x86_64-linux-musl-gcc"` — verified 2026-09-16.
+   Check with `cargo tree -p ia2-runtime -i cc` before assuming otherwise.
 
 2. **Bootstrap the edge**. From your dev machine:
    ```sh

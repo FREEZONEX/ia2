@@ -1,3 +1,18 @@
+# `stable` is NOT reproducible: it resolves to whatever the builder had that
+# day. Measured 2026-09-16 — the same source built as 1.95.0 on a dev Mac
+# and 1.98.1 in a container, within the hour. For a workspace whose output
+# runs plants, that matters.
+#
+# Pinning an exact version here was tried and backed out: rustup installs a
+# version-pinned toolchain as a SEPARATE toolchain from `stable`, even when
+# the two are the same release, so every developer and every container pays
+# a fresh multi-hundred-MB download — and the gate is meant to run
+# `--offline`. Pin this only together with a way to pre-seed that toolchain.
+#
+# Until then the traceability half is covered at the artifact instead: the
+# edge runtime stamps its source commit and compiler at build time
+# (crates/runtime/build.rs) and serves them on /status, so a deployed binary
+# answers "what built me?" without anyone having to remember.
 [toolchain]
 channel = "stable"
 components = ["rustfmt", "clippy"]

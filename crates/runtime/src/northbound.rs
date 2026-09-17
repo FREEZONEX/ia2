@@ -195,7 +195,7 @@ async fn handle_write(ctx: &NorthboundCtx, payload: &[u8]) {
     // The broker gets no result topic (northbound is a data path), so
     // the audit entry is the ONLY record of what the platform asked
     // versus what governance applied — record both sides.
-    let (applied, outcome) = crate::audit_outcome(bits, &result);
+    let (applied, outcome) = crate::write_audit_outcome(bits, &result);
     crate::record_audit(
         &ctx.audit,
         "mqtt",

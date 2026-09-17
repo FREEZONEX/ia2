@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -119,6 +119,29 @@ pub struct DeviceSpec {
     pub config: ProtocolConfig,
 }
 
+/// An applied write, plus whether it can currently reach the field.
+///
+/// `value` always landed in the VM. A refusal would be the wrong answer
+/// here: the variable may be a Stop, and a Stop that reaches the plant
+/// late when the link comes back beats one that was never commanded.
+/// What must not happen is reporting a bare success — the operator would
+/// read "sent" as "stopped".
+///
+/// `undelivered_device` names the device whose transport is down, when the
+/// variable has an Output mapping onto one. `None` means either the value
+/// is reaching the field or the variable is internal to the program (no
+/// Output mapping — nothing to deliver).
+///
+/// This is transport health only. A healthy link does NOT prove the value
+/// took effect: a slave can sit in SAFEOP, mask its own outputs, or hold
+/// the failsafe zeros after a watchdog trip. The HMI's Stop is not a
+/// safety function under any of these outcomes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteOutcome {
+    pub value: i32,
+    pub undelivered_device: Option<String>,
+}
+
 /// Reasons a variable write can't be honoured.
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeWriteError {
@@ -153,7 +176,7 @@ enum RuntimeCommand {
         name: String,
         value: i32,
         governed: bool,
-        ack: tokio::sync::oneshot::Sender<Result<i32, RuntimeWriteError>>,
+        ack: tokio::sync::oneshot::Sender<Result<WriteOutcome, RuntimeWriteError>>,
     },
     /// Pin a variable's value: every scan begins by writing `value`
     /// into the VM after the input phase but before `run_round`, so the
@@ -229,6 +252,31 @@ pub struct ProgramHandle {
     /// the active force set without a round-trip through the cmd
     /// queue.
     forces: Arc<std::sync::Mutex<HashMap<String, i32>>>,
+    /// Scan deadlines missed since this program started, summed over units,
+    /// and the longest streak any unit is currently on.
+    ///
+    /// The log says this ONCE per unit and then suppresses itself, so after
+    /// the first line scrolls away nothing answers "is it still overrunning?".
+    /// `watchdog_tripped` only answers the terminal case. These two cover the
+    /// middle: a total that climbs between polls means deadlines are being
+    /// missed right now, and the streak is the distance to
+    /// [`WATCHDOG_OVERRUN_THRESHOLD`].
+    ///
+    /// They describe the ACHIEVED cadence, which `scan_period_ms` — a
+    /// configured number — cannot.
+    scan_overruns: Arc<AtomicU64>,
+    consecutive_scan_overruns: Arc<AtomicU32>,
+    /// The fastest unit's task interval, in ms, normalised exactly as
+    /// `UnitClock::interval` is. Fixed for the life of a run, so a plain
+    /// value rather than a shared cell.
+    ///
+    /// This is the cadence at which a snapshot's `scan_count` can advance —
+    /// `scan_count` is the max across units, so the fastest task sets it.
+    /// Clients that judge "is this live data current?" need it: `interval_ms`
+    /// has no upper bound, and on a 5 s-cycle project a 4 s-old value is the
+    /// newest one that exists. Without this they have to guess from observed
+    /// gaps, which a stalled stream inflates.
+    scan_period_ms: u32,
     /// Per-device connect reports (connected/failed + EtherCAT topology),
     /// set once after the initial connect pass. Shared so the HTTP layer
     /// can serve /discover without a scan-loop round-trip.
@@ -316,7 +364,11 @@ impl ProgramHandle {
     /// first unit (tasks.toml declaration order) that declares it;
     /// `instance.variable` targets that PROGRAM instance explicitly
     /// (instance match is case-insensitive).
-    pub async fn write_variable(&self, name: &str, value: i32) -> Result<i32, RuntimeWriteError> {
+    pub async fn write_variable(
+        &self,
+        name: &str,
+        value: i32,
+    ) -> Result<WriteOutcome, RuntimeWriteError> {
         self.send_write(name, value, true).await
     }
 
@@ -332,7 +384,7 @@ impl ProgramHandle {
         &self,
         name: &str,
         value: i32,
-    ) -> Result<i32, RuntimeWriteError> {
+    ) -> Result<WriteOutcome, RuntimeWriteError> {
         self.send_write(name, value, false).await
     }
 
@@ -341,7 +393,7 @@ impl ProgramHandle {
         name: &str,
         value: i32,
         governed: bool,
-    ) -> Result<i32, RuntimeWriteError> {
+    ) -> Result<WriteOutcome, RuntimeWriteError> {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
             .send(RuntimeCommand::WriteVariable {
@@ -487,6 +539,24 @@ impl ProgramHandle {
     /// off. Stays `true` until the program is restarted — a caller seeing
     /// this must not read live variable values as plant state, because the
     /// bus is holding zeros while the VM keeps computing.
+    /// The fastest task interval in ms — the cadence at which `scan_count`
+    /// can advance. See the field docs for why a client needs it.
+    pub fn scan_period_ms(&self) -> u32 {
+        self.scan_period_ms
+    }
+
+    /// Scan deadlines missed since start, summed over units. Climbing between
+    /// two reads means the runtime is missing them now.
+    pub fn scan_overruns(&self) -> u64 {
+        self.scan_overruns.load(Ordering::Relaxed)
+    }
+
+    /// Longest overrun streak any unit is currently on; 0 when every unit made
+    /// its last deadline. Reaching [`WATCHDOG_OVERRUN_THRESHOLD`] trips.
+    pub fn consecutive_scan_overruns(&self) -> u32 {
+        self.consecutive_scan_overruns.load(Ordering::Relaxed)
+    }
+
     pub fn watchdog_tripped(&self) -> bool {
         self.watchdog_tripped.load(Ordering::Relaxed)
     }
@@ -625,6 +695,24 @@ fn spawn_units_inner(
     governance: WriteGovernance,
 ) -> ProgramHandle {
     let stop = Arc::new(AtomicBool::new(false));
+    // Normalised exactly as `UnitClock::interval` below, and MIN across
+    // units because `scan_count` is the max across units — the fastest task
+    // is the one that makes the counter move.
+    let scan_period_ms = units
+        .iter()
+        .map(|u| {
+            if u.interval_ms == 0 {
+                DEFAULT_SCAN_INTERVAL_MS
+            } else {
+                u.interval_ms
+            }
+            .max(1)
+            .min(u32::MAX as u64) as u32
+        })
+        .min()
+        .unwrap_or(DEFAULT_SCAN_INTERVAL_MS as u32);
+    let scan_overruns = Arc::new(AtomicU64::new(0));
+    let consecutive_scan_overruns = Arc::new(AtomicU32::new(0));
     let (snapshot_tx, _) = broadcast::channel(64);
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     let mode = Arc::new(std::sync::Mutex::new(RuntimeMode::Running));
@@ -642,6 +730,8 @@ fn spawn_units_inner(
     let device_reports_clone = device_reports.clone();
     let device_health_clone = device_health.clone();
     let watchdog_tripped_clone = watchdog_tripped.clone();
+    let scan_overruns_clone = scan_overruns.clone();
+    let consecutive_overruns_clone = consecutive_scan_overruns.clone();
     let device_reports_reconnect = device_reports.clone();
 
     let join_handle = std::thread::spawn(move || {
@@ -759,6 +849,8 @@ fn spawn_units_inner(
                 forces_clone,
                 device_health_clone,
                 watchdog_tripped_clone,
+                scan_overruns_clone,
+                consecutive_overruns_clone,
                 &fault_tx,
                 reconnect_rx,
                 state_path,
@@ -835,6 +927,9 @@ fn spawn_units_inner(
         cmd_tx,
         mode,
         forces,
+        scan_overruns,
+        consecutive_scan_overruns,
+        scan_period_ms,
         device_reports,
         device_health,
         watchdog_tripped,
@@ -1337,12 +1432,21 @@ fn enforce_write_governance(
     if governance.write_mode == WriteMode::Open {
         return Ok(value);
     }
+    // Identify the variable before judging it. `resolve_var` found this
+    // index in a map built from the same debug info, so a miss here is
+    // unreachable — but the two fallbacks it used to have disagreed with
+    // each other: an absent name became "" (matching nothing, denying for
+    // the wrong reason) while an absent type became "not REAL" (taking the
+    // integer lane for a REAL, comparing IEEE-754 bits as an integer).
+    // A variable we cannot identify is one we cannot bound. Deny.
+    let Some(info) = debug_maps[unit].get(&var_index) else {
+        return Err(RuntimeWriteError::GovernanceDenied(format!(
+            "{name} (no debug entry for this variable — cannot check it against any rule)"
+        )));
+    };
     // Candidate rule keys: the qualified `instance.variable` form and
     // the bare debug name — matching is case-insensitive, like the IEC.
-    let bare = debug_maps[unit]
-        .get(&var_index)
-        .map(|d| d.name.to_lowercase())
-        .unwrap_or_default();
+    let bare = info.name.to_lowercase();
     let qualified = format!("{}.{}", instances[unit].to_lowercase(), bare);
     let rule = governance.rules.iter().find(|r| {
         let key = r.variable.to_lowercase();
@@ -1374,10 +1478,11 @@ fn enforce_write_governance(
     // `write_variable_raw` and never comes through here. Clamping the
     // value the writer actually sent keeps governed and ungoverned
     // LREAL writes consistent.
-    let is_real = debug_maps[unit]
-        .get(&var_index)
-        .map(|d| d.type_name.to_ascii_uppercase().starts_with("REAL"))
-        .unwrap_or(false);
+    // `starts_with("REAL")` and not `== "REAL"` by intent, and LREAL does
+    // not match it — "LREAL" starts with L. Unsigned types wider than i32
+    // compare as signed here, which the i32 write API already bounds: a
+    // caller cannot express a value that would expose the difference.
+    let is_real = info.type_name.to_ascii_uppercase().starts_with("REAL");
     if is_real {
         let current = f32::from_bits(value as u32);
         if current.is_nan() {
@@ -1467,6 +1572,11 @@ async fn run_loop_async(
     // tell a latched run from a healthy one — see the field docs on
     // `ProgramHandle::watchdog_tripped`.
     watchdog_tripped: Arc<AtomicBool>,
+    // Achieved-cadence counters for /status: deadlines missed since start and
+    // the longest current streak. The overrun log line fires once per unit and
+    // then suppresses itself, so it cannot answer "still overrunning?".
+    scan_overruns: Arc<AtomicU64>,
+    consecutive_scan_overruns: Arc<AtomicU32>,
     // Borrowed: the wrapper keeps ownership so its panic path can also
     // record into the same channel (and so the sender drops — closing
     // the watch — only when the scan thread exits).
@@ -1574,6 +1684,25 @@ async fn run_loop_async(
             }
         }
     }
+    // Output mappings whose device never connected, resolved once, silently.
+    //
+    // `unit_outputs` only holds mappings bound to a LIVE device, so a write to
+    // a variable on a device that never came up would find nothing there and
+    // report a clean success — the exact silence this crate's undelivered
+    // reporting exists to end, just via a different door than a link that
+    // dropped after connecting. Resolved here because `pending_mappings` is
+    // drained by the reconnect worker, and because doing it per write would
+    // re-log every routing warning on every write.
+    let mut parked_output_device: Vec<HashMap<u16, String>> =
+        (0..n_units).map(|_| HashMap::new()).collect();
+    for m in &pending_mappings {
+        if let Some((unit_index, Direction::Output, rm)) =
+            resolve_mapping(m, usize::MAX, &instances, &var_index_by_name, &debug_maps)
+        {
+            parked_output_device[unit_index].insert(rm.var_index, m.device.clone());
+        }
+    }
+
     for (i, unit) in units.iter().enumerate() {
         tracing::info!(
             instance = %unit.instance,
@@ -1825,7 +1954,35 @@ async fn run_loop_async(
                             };
                             match allowed {
                                 Ok(v) => match runnings[u].write_variable(VarIndex::new(idx), v) {
-                                    Ok(()) => Ok(v),
+                                    // The value is in the VM either way. Report
+                                    // — do not refuse — when its own device
+                                    // cannot carry it out: scoped to THIS
+                                    // variable's device, so an unrelated island
+                                    // going down never costs the operator a
+                                    // control it could still have used.
+                                    Ok(()) => Ok(WriteOutcome {
+                                        value: v,
+                                        undelivered_device: unit_outputs[u]
+                                            .iter()
+                                            .find(|rm| rm.var_index == idx)
+                                            .map_or_else(
+                                                // Nothing bound: either this
+                                                // variable has no Output
+                                                // mapping at all (nothing to
+                                                // deliver, correctly silent),
+                                                // or its device never
+                                                // connected — which is
+                                                // undelivered without needing
+                                                // to ask anyone's health.
+                                                || parked_output_device[u].get(&idx).cloned(),
+                                                |rm| {
+                                                    devices
+                                                        .get(rm.device_index)
+                                                        .filter(|dev| !dev.is_healthy())
+                                                        .map(|dev| dev.name().to_string())
+                                                },
+                                            ),
+                                    }),
                                     Err(trap) => Err(RuntimeWriteError::Vm(format!("{trap:?}"))),
                                 },
                                 Err(e) => Err(e),
@@ -2077,6 +2234,9 @@ async fn run_loop_async(
                 clocks[i].consecutive_overruns = 0;
             } else {
                 clocks[i].consecutive_overruns = clocks[i].consecutive_overruns.saturating_add(1);
+                // Counted every time, unlike the warning below, which fires
+                // once per unit and then goes quiet for the life of the run.
+                scan_overruns.fetch_add(1, Ordering::Relaxed);
                 if !clocks[i].warned_overrun {
                     let overrun = after - clocks[i].next_due;
                     tracing::warn!(
@@ -2092,6 +2252,7 @@ async fn run_loop_async(
                 if !watchdog_tripped.load(Ordering::Relaxed)
                     && clocks[i].consecutive_overruns >= WATCHDOG_OVERRUN_THRESHOLD
                 {
+                    // fallthrough below trips the watchdog
                     tracing::error!(
                         instance = %instances[i],
                         consecutive = clocks[i].consecutive_overruns,
@@ -2111,6 +2272,16 @@ async fn run_loop_async(
                 }
                 clocks[i].next_due = after + clocks[i].interval;
             }
+            // The streak the watchdog actually watches is the longest one on
+            // any unit, so publish that rather than whichever unit ran last.
+            consecutive_scan_overruns.store(
+                clocks
+                    .iter()
+                    .map(|c| c.consecutive_overruns)
+                    .max()
+                    .unwrap_or(0),
+                Ordering::Relaxed,
+            );
         }
         if vm_fault {
             break;
@@ -2754,6 +2925,335 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert!(handle.device_health()[0].healthy, "recovery must surface");
+
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
+    /// Overruns short of the watchdog threshold are invisible today: the log
+    /// warns once per unit and then suppresses itself, and `watchdog_tripped`
+    /// only covers the terminal case. A runtime quietly missing every fourth
+    /// deadline looks identical on /status to one meeting all of them.
+    ///
+    /// These counters are what make "configured 2 ms, achieving something
+    /// else" answerable without grepping a journal that has already rolled.
+    #[tokio::test]
+    async fn scan_overruns_are_counted_and_the_streak_clears() {
+        let handle = spawn_units_inner(
+            vec![single_unit(trivial_container(), 5)],
+            DeviceSource::Prebuilt(vec![]),
+            Vec::new(),
+            None,
+            WriteGovernance::default(),
+        );
+
+        // Negative control. Without it a fixture that overruns on its own
+        // would make the assertions below pass for the wrong reason.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(handle.scan_overruns(), 0, "an idle 5 ms unit must keep up");
+        assert_eq!(handle.consecutive_scan_overruns(), 0);
+
+        // Stay UNDER the trip threshold: this is the middle ground that had
+        // no signal at all, not the latched end state.
+        handle
+            .inject_scan_stall(12, WATCHDOG_OVERRUN_THRESHOLD - 2)
+            .await
+            .expect("inject reaches the loop");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while handle.scan_overruns() == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let during = handle.scan_overruns();
+        assert!(
+            during > 0,
+            "12 ms stalls against a 5 ms interval must count"
+        );
+        assert!(
+            !handle.watchdog_tripped(),
+            "under the threshold must not trip"
+        );
+
+        // The streak clears once scans land on time again; the total does not.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while handle.consecutive_scan_overruns() > 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            handle.consecutive_scan_overruns(),
+            0,
+            "recovery must clear the streak — it is the distance to the trip"
+        );
+        assert!(
+            handle.scan_overruns() >= during,
+            "the total is history and must not be walked back by recovery"
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
+    /// The other door to "this write is not reaching the field": a device that
+    /// never connected at all. Its mappings are parked rather than bound, so
+    /// the live-device lookup finds nothing and — before this — the write came
+    /// back a clean success. Partial bus connectivity is an ordinary
+    /// operational state here (the runtime deliberately starts anyway), so
+    /// this is not an exotic path.
+    #[tokio::test]
+    async fn a_write_to_a_device_that_never_connected_is_undelivered_too() {
+        let container = crate::compile(
+            "PROGRAM main\n\
+                VAR tick : INT := 1; stop_cmd : INT; internal : INT; END_VAR\n\
+                tick := tick + 1;\n\
+            END_PROGRAM",
+        )
+        .expect("program compiles");
+
+        let handle = spawn_units_inner(
+            vec![single_unit(container, 5)],
+            // No devices come up at all.
+            DeviceSource::Prebuilt(vec![]),
+            vec![project::Mapping {
+                application: "main".into(),
+                variable: "stop_cmd".into(),
+                direction: project::Direction::Output,
+                device: "absent_bus".into(),
+                channel: "coil".into(),
+                unit: None,
+                min: None,
+                max: None,
+                description: None,
+            }],
+            None,
+            WriteGovernance::default(),
+        );
+
+        let parked = handle.write_variable("stop_cmd", 1).await.unwrap();
+        assert_eq!(parked.value, 1, "the write still applies to the VM");
+        assert_eq!(
+            parked.undelivered_device.as_deref(),
+            Some("absent_bus"),
+            "a device that never connected cannot carry the value either"
+        );
+
+        // Control: no Output mapping means nothing to deliver, and the parked
+        // table must not start answering for unmapped variables.
+        let internal = handle.write_variable("internal", 7).await.unwrap();
+        assert_eq!(internal.undelivered_device, None);
+
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
+    /// The empirical claim the whole write-freshness design rests on, which
+    /// until now was only inferred from reading this file: on a project whose
+    /// task is slower than the snapshot period, the snapshot stream KEEPS
+    /// FLOWING while `scan_count` sits still between scans.
+    ///
+    /// That shape is why a fixed staleness window was the wrong question. A
+    /// client watching only `scan_count` sees a counter that is frozen most of
+    /// the time and concludes the data is stale, when in fact the newest value
+    /// that exists is exactly the one it is holding. `scan_period_ms` is what
+    /// lets it tell that apart from a genuinely dead feed.
+    ///
+    /// 600 ms rather than a realistic 5 s: the relationship under test is
+    /// "task interval >> snapshot period", and 600 ms exercises it in a
+    /// second and a half instead of half a minute.
+    #[tokio::test]
+    async fn a_slow_task_keeps_streaming_while_its_scan_count_sits_still() {
+        const SLOW_MS: u64 = 600;
+        let handle = spawn_units_inner(
+            vec![single_unit(trivial_container(), SLOW_MS)],
+            DeviceSource::Prebuilt(vec![]),
+            Vec::new(),
+            None,
+            WriteGovernance::default(),
+        );
+        assert_eq!(
+            handle.scan_period_ms(),
+            SLOW_MS as u32,
+            "the reported period is what a client sizes its window from"
+        );
+
+        let mut rx = handle.subscribe();
+        let mut snaps: Vec<VarSnapshot> = Vec::new();
+        let until = Instant::now() + Duration::from_millis(1_500);
+        while Instant::now() < until {
+            let left = until - Instant::now();
+            match tokio::time::timeout(left, rx.recv()).await {
+                Ok(Ok(s)) => snaps.push(s),
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                _ => break,
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+
+        // A liveness floor, not a cadence assertion: ~13 arrive on an idle
+        // machine, and the ratio below is the structural claim. Loose enough
+        // that a loaded host does not turn this into a false red.
+        assert!(
+            snaps.len() >= 5,
+            "stream went quiet: only {} snapshots",
+            snaps.len()
+        );
+        let advances = snaps
+            .windows(2)
+            .filter(|w| w[1].scan_count > w[0].scan_count)
+            .count();
+        let frozen = snaps
+            .windows(2)
+            .filter(|w| w[1].scan_count == w[0].scan_count && w[1].timestamp_us > w[0].timestamp_us)
+            .count();
+
+        // The point: far more frames carry a frozen counter than a fresh scan.
+        assert!(
+            frozen > advances,
+            "a {SLOW_MS} ms task against a {SNAPSHOT_PERIOD:?} snapshot period must \
+             deliver mostly frozen-counter frames; got {frozen} frozen vs {advances} advancing"
+        );
+        assert!(
+            advances >= 1,
+            "the scan must still advance sometimes, or the fixture proves nothing"
+        );
+        // And those frozen frames are LIVE data, not a stalled stream: their
+        // timestamps moved. Anything judging freshness on the counter alone
+        // cannot tell this apart from a dead feed.
+        assert!(
+            frozen >= 1,
+            "expected frozen-counter frames with advancing timestamps"
+        );
+    }
+
+    /// `scan_count` is the MAX across units, so the fastest task is what
+    /// makes it move — and that is the number a client needs to size a
+    /// staleness window. Taking the max here (or the first unit's) would
+    /// hand out a window several times too wide on a mixed-cadence project.
+    #[tokio::test]
+    async fn scan_period_reports_the_fastest_unit() {
+        let handle = spawn_units_inner(
+            vec![
+                unit("slow", trivial_container(), 5_000, 1),
+                unit("fast", trivial_container(), 20, 1),
+            ],
+            DeviceSource::Prebuilt(vec![]),
+            Vec::new(),
+            None,
+            WriteGovernance::default(),
+        );
+        assert_eq!(handle.scan_period_ms(), 20);
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+
+        // Normalised exactly as UnitClock is: 0 means "unspecified", which
+        // the scheduler runs at the default rather than as a busy loop.
+        let handle = spawn_units_inner(
+            vec![unit("default", trivial_container(), 0, 1)],
+            DeviceSource::Prebuilt(vec![]),
+            Vec::new(),
+            None,
+            WriteGovernance::default(),
+        );
+        assert_eq!(handle.scan_period_ms(), DEFAULT_SCAN_INTERVAL_MS as u32);
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
+    /// A write must be judged against the device that carries THAT
+    /// variable, not against the health of the device list as a whole.
+    ///
+    /// An operator's Stop is a variable write. Refusing it because some
+    /// unrelated island dropped costs a control that would still have
+    /// worked, and there is no coupling declaration anywhere in the schema
+    /// that could honestly widen the blocked set — a device does not report
+    /// what it is coupled to. So the scope is the mapping, and the answer is
+    /// a report, not a refusal: the value lands in the VM and flushes if the
+    /// link returns, which beats a Stop that was never commanded.
+    #[tokio::test]
+    async fn a_write_names_only_its_own_down_device() {
+        let container = crate::compile(
+            "PROGRAM main\n\
+                VAR tick : INT := 1; stop_cmd : INT; internal : INT; END_VAR\n\
+                tick := tick + 1;\n\
+            END_PROGRAM",
+        )
+        .expect("program compiles");
+
+        let (mapped, mapped_healthy) = MockDevice::named("bus_mapped");
+        let (unrelated, unrelated_healthy) = MockDevice::named("bus_unrelated");
+        let handle = spawn_units_inner(
+            vec![single_unit(container, 5)],
+            DeviceSource::Prebuilt(vec![Box::new(mapped), Box::new(unrelated)]),
+            vec![project::Mapping {
+                application: "main".into(),
+                variable: "stop_cmd".into(),
+                direction: project::Direction::Output,
+                device: "bus_mapped".into(),
+                channel: "coil".into(),
+                unit: None,
+                min: None,
+                max: None,
+                description: None,
+            }],
+            None,
+            WriteGovernance::default(),
+        );
+
+        let health_of = |name: &str| {
+            handle
+                .device_health()
+                .into_iter()
+                .find(|d| d.name == name)
+                .map(|d| d.healthy)
+        };
+        let settle = |name: &'static str, want: bool| async move {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while health_of(name) != Some(want) && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert_eq!(health_of(name), Some(want), "{name} health must settle");
+        };
+
+        settle("bus_mapped", true).await;
+        let delivered = handle.write_variable("stop_cmd", 1).await.unwrap();
+        assert_eq!(
+            delivered.undelivered_device, None,
+            "healthy link warns nobody"
+        );
+
+        mapped_healthy.store(false, Ordering::Relaxed);
+        settle("bus_mapped", false).await;
+        let undelivered = handle.write_variable("stop_cmd", 1).await.unwrap();
+        assert_eq!(
+            undelivered.value, 1,
+            "an undelivered write is still applied"
+        );
+        assert_eq!(
+            undelivered.undelivered_device.as_deref(),
+            Some("bus_mapped"),
+            "the operator must not read this as a plant that obeyed"
+        );
+
+        // The point of the whole change: someone else's dead bus is not a
+        // reason to take this control away.
+        mapped_healthy.store(true, Ordering::Relaxed);
+        settle("bus_mapped", true).await;
+        unrelated_healthy.store(false, Ordering::Relaxed);
+        settle("bus_unrelated", false).await;
+        let unaffected = handle.write_variable("stop_cmd", 1).await.unwrap();
+        assert_eq!(
+            unaffected.undelivered_device, None,
+            "an unrelated island going down must not cost this control"
+        );
+
+        // No Output mapping means nothing to deliver — not a silent warning.
+        let internal = handle.write_variable("internal", 7).await.unwrap();
+        assert_eq!(internal.undelivered_device, None);
 
         tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
             .await
@@ -3472,13 +3972,17 @@ mod tests {
         );
         let bits = |f: f32| f.to_bits() as i32;
         // Inside the range: written as asked.
-        let v = handle.write_variable("sp", bits(42.5)).await.unwrap();
+        let v = handle.write_variable("sp", bits(42.5)).await.unwrap().value;
         assert_eq!(v, bits(42.5));
         // Above max: clamped to 100, and the ack says so.
-        let v = handle.write_variable("sp", bits(150.0)).await.unwrap();
+        let v = handle
+            .write_variable("sp", bits(150.0))
+            .await
+            .unwrap()
+            .value;
         assert_eq!(v, bits(100.0));
         // Below min: clamped to 0.
-        let v = handle.write_variable("sp", bits(-3.0)).await.unwrap();
+        let v = handle.write_variable("sp", bits(-3.0)).await.unwrap().value;
         assert_eq!(v, bits(0.0));
         tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
             .await
@@ -3502,7 +4006,7 @@ mod tests {
                 }],
             ),
         );
-        let v = handle.write_variable("x", 99).await.unwrap();
+        let v = handle.write_variable("x", 99).await.unwrap().value;
         assert_eq!(v, 10);
         tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
             .await
@@ -3540,7 +4044,7 @@ mod tests {
             ),
         );
         // Baseline: a plain write of 77 IS clamped to the rule's max.
-        assert_eq!(handle.write_variable("x", 77).await.unwrap(), 10);
+        assert_eq!(handle.write_variable("x", 77).await.unwrap().value, 10);
         // Unlisted variable: write denied, force allowed.
         handle
             .write_variable("y", 5)
@@ -3628,7 +4132,7 @@ mod tests {
         );
         // Not Disconnected above, and this ack proves the drain still
         // runs: the denials left the scan loop alive.
-        assert_eq!(handle.write_variable("c", 9).await.unwrap(), 9);
+        assert_eq!(handle.write_variable("c", 9).await.unwrap().value, 9);
         assert!(handle.fault().is_none(), "no fault may be recorded");
         tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
             .await
@@ -3673,7 +4177,7 @@ mod tests {
         // and the VM value is that write, not NaN.
         let bits = |f: f32| f.to_bits() as i32;
         assert_eq!(
-            handle.write_variable("sp", bits(42.5)).await.unwrap(),
+            handle.write_variable("sp", bits(42.5)).await.unwrap().value,
             bits(42.5)
         );
         let mut rx = handle.subscribe();
@@ -3709,11 +4213,11 @@ mod tests {
             ),
         );
         // Above: floor(10.6) = 10, never 11.
-        assert_eq!(handle.write_variable("x", 99).await.unwrap(), 10);
+        assert_eq!(handle.write_variable("x", 99).await.unwrap().value, 10);
         // Below: ceil(0.4) = 1, never 0.
-        assert_eq!(handle.write_variable("x", -5).await.unwrap(), 1);
+        assert_eq!(handle.write_variable("x", -5).await.unwrap().value, 1);
         // Inside: untouched.
-        assert_eq!(handle.write_variable("x", 5).await.unwrap(), 5);
+        assert_eq!(handle.write_variable("x", 5).await.unwrap().value, 5);
         tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
             .await
             .expect("shutdown");
@@ -3762,7 +4266,7 @@ mod tests {
             "unexpected error: {err:?}"
         );
         // Loop alive after the denial.
-        assert_eq!(handle.write_variable("y", 7).await.unwrap(), 7);
+        assert_eq!(handle.write_variable("y", 7).await.unwrap().value, 7);
         tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
             .await
             .expect("shutdown");
@@ -3803,14 +4307,22 @@ mod tests {
             ),
         );
         let bits = |f: f32| f.to_bits() as i32;
-        let v = handle.write_variable("hi_sp", bits(0.5)).await.unwrap();
+        let v = handle
+            .write_variable("hi_sp", bits(0.5))
+            .await
+            .unwrap()
+            .value;
         let f = f32::from_bits(v as u32);
         assert!(
             (f as f64) <= 0.1,
             "applied value {f} escapes the declared max 0.1"
         );
         assert!((f as f64) > 0.09, "clamp target should stay near the bound");
-        let v = handle.write_variable("lo_sp", bits(0.0)).await.unwrap();
+        let v = handle
+            .write_variable("lo_sp", bits(0.0))
+            .await
+            .unwrap()
+            .value;
         let f = f32::from_bits(v as u32);
         assert!(
             (f as f64) >= 0.1,
@@ -3867,7 +4379,11 @@ mod tests {
             err.to_string().contains("no representable REAL value"),
             "unexpected denial reason: {err}"
         );
-        let v = handle.write_variable("near_sp", bits(-5.0)).await.unwrap();
+        let v = handle
+            .write_variable("near_sp", bits(-5.0))
+            .await
+            .unwrap()
+            .value;
         assert_eq!(
             f32::from_bits(v as u32),
             -5.0,
@@ -3908,10 +4424,10 @@ mod tests {
         );
         // In range: passes through numerically unchanged (the f32-bits
         // decode would have read 50 as 7e-44 and "clamped" it).
-        assert_eq!(handle.write_variable("sp", 50).await.unwrap(), 50);
+        assert_eq!(handle.write_variable("sp", 50).await.unwrap().value, 50);
         // Out of range: clamped in the numeric domain the writer used.
-        assert_eq!(handle.write_variable("sp", 150).await.unwrap(), 100);
-        assert_eq!(handle.write_variable("sp", -5).await.unwrap(), 0);
+        assert_eq!(handle.write_variable("sp", 150).await.unwrap().value, 100);
+        assert_eq!(handle.write_variable("sp", -5).await.unwrap().value, 0);
         tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
             .await
             .expect("shutdown");
@@ -3949,7 +4465,10 @@ mod tests {
         let v = crate::monitor::write_with_pulse(&handle, "x", 50, Some(30))
             .await
             .expect("initial pulse write");
-        assert_eq!(v, 50);
+        assert_eq!(v.value, 50);
+        // A virtual-master fixture has no Output mapping for `x`, so there is
+        // nothing to deliver and nothing to warn about.
+        assert_eq!(v.undelivered_device, None);
         // Give the pulse task and a few scans time to land the reset.
         tokio::time::sleep(Duration::from_millis(150)).await;
         let mut rx = handle.subscribe();

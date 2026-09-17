@@ -329,6 +329,78 @@ label it Stop/Abort, style it as a control, and document the physical
 e-stop as the real safety device; a soft-PLC HMI never claims a safety
 function it cannot deliver.
 
+### Live-state revalidation for variable writes
+
+The canvas checks both direct actions and confirmed actions against the current
+live-feed store at dispatch time. A connected SSE socket alone is insufficient:
+a snapshot must have arrived after connection and its scan count and timestamp
+must have advanced within the freshness budget. Repeated frozen snapshots do not
+renew that budget. Disconnects, cleared snapshots, observed counter resets and
+repointing the stream at another runtime (Debug attach/detach) invalidate
+outstanding confirmations; reconnecting does not resend anything.
+
+The budget is 2 seconds or twice the runtime's scan cadence, whichever is
+larger, capped at 30 seconds. The cadence comes from `scan_period_ms` on
+`/status` when the runtime reports it — configuration, so a stalled stream
+cannot inflate it and a degrading scan cannot widen it. Older runtimes send
+nothing, and the panel then falls back to the cadence it observes. A fixed 2 seconds would ask the wrong
+question: `scan_count` advances once per PLC scan, `interval_ms` has no upper
+bound, and on a 5 s-cycle project a 4 s-old value *is* the current picture —
+there is nothing newer to have, so a fixed window would refuse every write for
+3 seconds out of every 5. The fallback cadence is the *lower median* of the last
+five observed gaps, so one dropped frame cannot widen the window, and both the
+reported period and the observed gaps are forgotten on every generation bump — one runtime's slowness never widens the window for
+the next. Status requests carry their starting generation; late responses from
+an old connection/run are discarded rather than restoring its cadence.
+The cap is there because the window follows the very thing it
+measures: a degrading scan must not keep buying itself more tolerance. A refusal
+names the budget in force, so a widened window is visible rather than silent.
+
+Before writing, the canvas reads the host's current runtime status (2-second
+request deadline) and requires a running, unpaused, fault-free runtime. Device
+health is deliberately NOT part of that gate: it belongs to one device, not to
+the runtime, and the canvas cannot tell which device carries the variable — the
+standalone panel has no iomap at all. Refusing on any unhealthy device took away
+every control on the screen, a configured Stop included, because an unrelated
+island dropped, and no coupling declaration exists anywhere in the schema that
+could honestly narrow that. The runtime scopes it instead: it knows the Output
+mapping, applies the write, and returns `undelivered_device` when that
+variable's own device cannot carry the value out. The canvas reports that
+caveat — applied, not delivered — and never retries. The standalone panel maps `watchdog_tripped` to an output-lock
+fault just as the IDE does, even when scan counts continue advancing. After the
+status await the canvas rechecks connection generation, snapshot freshness,
+Operate mode, screen/document identity, current `bind.enable` and variable type.
+An unresolved or false enable binding refuses the write. A failed check displays
+a reason, sends no write and does not queue a retry. Navigation remains available
+offline; alarm acknowledgment is a separate path, unchanged by these checks.
+
+Before any of that, the canvas asks whether its host can deliver a write at
+all. In the IDE, attaching to a remote edge repoints the snapshot stream at that
+edge while `writeVariable` still posts to the project server's own runtime —
+there is no edge write proxy. Commanding a runtime the operator is not looking
+at, and that every live-state check was judged against a different snapshot
+from, is worse than refusing: the canvas goes read-only for the duration, the
+write controls render disabled, and an outstanding confirmation stops being
+confirmable. MonitorPane has refused in this state from the start ("Remote
+values · read only"). Navigation is not a write and stays usable, exactly as it
+does offline. The standalone panel is never in this state — it *is* the edge.
+
+Confirmation freezes the displayed target value, including toggle direction,
+clamping and type. New live values do not silently replace that target. Only one
+variable-write check/request runs at a time; rapid clicks are not queued. Pulse
+reset still travels in the original runtime-side `pulse_ms` request. Document
+reloads invalidate old controls and discard late responses from an older screen.
+
+These are operator UI checks, not atomic PLC interlocks or a safety function.
+A condition can change after the last client check; authoritative motion limits,
+lease/watchdog handling and process interlocks still belong in the runtime/PLC.
+The freshness budget and the 2-second status-request deadline are UI policy, not
+measured stop times; the freshness budget tracks the runtime's scan cadence and
+says nothing about how fast anything stops.
+They apply to every variable action (including a configured Stop): no-confirm
+means no dialog, not bypassing live-state checks. An unavailable HMI write cannot
+be relied on to stop machinery.
+
 ## Phasing
 
 **P0 — format + runtime view + agent plumbing.** Schema/store/validate in

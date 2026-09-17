@@ -139,6 +139,29 @@ pub struct RuntimeStatus {
     /// is actually holding zeros. `running` also stays `true` — the scan loop
     /// deliberately keeps going so operators can still inspect live state.
     pub watchdog_tripped: bool,
+    /// Fastest task interval in ms — the cadence at which `scan_count` can
+    /// advance, since it is the max across units. A client judging "is this
+    /// live data current?" needs this: `interval_ms` has no upper bound, and
+    /// on a 5 s-cycle project a 4 s-old value is the newest one that exists,
+    /// so a fixed staleness window would refuse every operator write between
+    /// scans. It says nothing about how long a scan actually takes — the
+    /// overrun watchdog owns that.
+    /// `None` when nothing is running.
+    pub scan_period_ms: Option<u32>,
+    /// Scan deadlines missed since the program started, summed over units, and
+    /// the longest streak any unit is currently on.
+    ///
+    /// The overrun log line fires ONCE per unit and then suppresses itself, so
+    /// after it scrolls away nothing else answers "is this runtime still
+    /// missing deadlines?". `watchdog_tripped` only covers the terminal case.
+    /// A total that climbs between two polls means it is missing them now; the
+    /// streak is the distance to the trip threshold.
+    ///
+    /// This is the ACHIEVED cadence. `scan_period_ms` is the configured one and
+    /// says nothing about whether it is being met.
+    /// Both `None` when nothing is running.
+    pub scan_overruns: Option<u64>,
+    pub consecutive_scan_overruns: Option<u32>,
     /// Scan count from the most recent snapshot; 0 before the first one.
     pub scan_count: u64,
     /// Timestamp_us of the most recent snapshot, or 0.
@@ -203,7 +226,15 @@ pub async fn runtime_status(
     // Mode + forces come from the live ProgramHandle, when there is
     // one. Clone the handle out of the mutex briefly to avoid holding
     // the sync lock across the calls.
-    let (mode, forces, device_health, watchdog_tripped) = {
+    let (
+        mode,
+        forces,
+        device_health,
+        watchdog_tripped,
+        scan_period_ms,
+        scan_overruns,
+        consecutive_scan_overruns,
+    ) = {
         let guard = state.program.lock();
         match guard.as_ref() {
             Some(rp) => (
@@ -211,8 +242,11 @@ pub async fn runtime_status(
                 ironplc_bridge::monitor::force_entries(&rp.handle),
                 rp.handle.device_health(),
                 rp.handle.watchdog_tripped(),
+                Some(rp.handle.scan_period_ms()),
+                Some(rp.handle.scan_overruns()),
+                Some(rp.handle.consecutive_scan_overruns()),
             ),
-            None => (None, vec![], vec![], false),
+            None => (None, vec![], vec![], false, None, None, None),
         }
     };
     Json(RuntimeStatus {
@@ -222,6 +256,9 @@ pub async fn runtime_status(
         devices,
         device_health,
         watchdog_tripped,
+        scan_period_ms,
+        scan_overruns,
+        consecutive_scan_overruns,
         scan_count: snap.as_ref().map(|s| s.scan_count).unwrap_or(0),
         last_snapshot_us: snap.as_ref().map(|s| s.timestamp_us).unwrap_or(0),
         last_error,
@@ -252,6 +289,15 @@ pub struct WriteVariableRequest {
 pub struct WriteVariableResponse {
     pub name: String,
     pub value: i32,
+    /// Set when the value landed in the VM but the device carrying this
+    /// variable has a dead transport, so it is NOT reaching the field.
+    /// The write is still applied — a Stop that arrives late when the link
+    /// returns beats one that was never commanded — but a caller that
+    /// reports a bare success here would be telling the operator the plant
+    /// obeyed. `null` on an internal variable with no Output mapping, and
+    /// on a healthy link, which is transport health only: it does not
+    /// prove the value took effect.
+    pub undelivered_device: Option<String>,
 }
 
 /// Poke a variable while the program is running. Applied between scan
@@ -275,9 +321,13 @@ pub async fn write_runtime_variable(
     state.maybe_attribute_external(origin_of(&headers).as_deref(), format!("write {name}"));
     // The momentary-pulse reset guarantee lives in the shared monitor
     // core — one implementation for IDE server and edge runtime.
-    let value =
+    let outcome =
         ironplc_bridge::monitor::write_with_pulse(&handle, &name, req.value, req.pulse_ms).await?;
-    Ok(Json(WriteVariableResponse { name, value }))
+    Ok(Json(WriteVariableResponse {
+        name,
+        value: outcome.value,
+        undelivered_device: outcome.undelivered_device,
+    }))
 }
 
 // ============================================================

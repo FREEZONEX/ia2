@@ -26,8 +26,8 @@ pub use sfc_transpile::{
 pub use errors::BridgeError;
 pub use runtime::{
     spawn_units, DeviceHealth, DeviceReport, DeviceSpec, DiscoveredSlave, ProgramHandle,
-    ProgramUnit, RuntimeMode, RuntimeWriteError, VarSnapshot, VarValue, DEFAULT_SCAN_INTERVAL_MS,
-    RETAIN_FLUSH_INTERVAL, WATCHDOG_OVERRUN_THRESHOLD,
+    ProgramUnit, RuntimeMode, RuntimeWriteError, VarSnapshot, VarValue, WriteOutcome,
+    DEFAULT_SCAN_INTERVAL_MS, RETAIN_FLUSH_INTERVAL, WATCHDOG_OVERRUN_THRESHOLD,
 };
 
 // Re-exported so downstream crates (server / runtime) can name the
