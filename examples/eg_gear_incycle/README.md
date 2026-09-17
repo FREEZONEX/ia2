@@ -68,6 +68,41 @@ Force `engage 0` to clear the trip. Force `max_travel 0` and the engine
 refuses to engage (locked-by-default). Try `ratio_step -0.1` or a NaN ratio
 and nothing runs away — the engine sanitizes both.
 
+## Offline channel-contract regression
+
+With a local server running, validate and exercise the unmodified `_sim`
+project in an agent session:
+
+```bash
+cs agent run --label "Offline gear channel contract" -- bash -e -c '
+  cs project open examples/eg_gear_incycle
+  cs --project eg_gear_incycle api POST /api/project/validate
+  cs --project eg_gear_incycle sim run examples/eg_gear_incycle/scenarios/channel-contract.toml --trace gear-trace.jsonl
+  cs --project eg_gear_incycle get runtime/status
+  cs --project eg_gear_incycle get runtime/forces
+  cs --project eg_gear_incycle project close
+'
+```
+
+Validate must return `[]`; the generic `cs api` exit code alone only proves
+the HTTP call succeeded. The scenario proves default lockout, engagement,
+bounded-travel trip and disengage reset in an ideal simulated follower.
+The runner stops the runtime and removes its forces on completion. This is
+**offline regression evidence, not bench acceptance**. Never run the scenario
+after changing the device NIC away from `_sim`.
+
+The example keeps its 2 ms PLC task and gear cycle. Run on an otherwise idle
+host: heavy builds can trip the scan watchdog and latch outputs off. The
+scenario checks that watchdog explicitly; a trip is a failed run, not a gear
+pass. Retain its log and rerun from a fresh runtime after removing the load.
+
+The seven gear parameters are writable and readable echoes; `gear_engaged`
+and `gear_trip` are read-only feedback. These routes are not PDO entries.
+The scenario exercises the seven Output routes and two feedback Input routes;
+parameter Input echoes are covered by Rust mapping and adapter tests.
+The schema also reserves `ratio_apply_channel` / `ratio_ack_channel`, but
+those two are not exposed by the device facade and cannot be mapped.
+
 ## To a real two-axis bench
 
 Set `nic` to your EtherCAT NIC, add the master SV660N as `slave 1`, and change

@@ -127,7 +127,35 @@ master = { kind = "virtual" }  # software accumulator, +master_vel counts/cycle
 # master = { kind = "axis", slave_index = 2, actual_pos_offset = 4 }   # or gear off a real leader
 ```
 
-Nine parameter channels carry the slow plane and bind in `iomap` — seven PLC→engine (`gear_engage`, `ratio_num`, `ratio_den`, `ratio_step`, `phase_ofs`, `master_vel`, `gear_max_travel`) and two engine→PLC (`gear_engaged`, `gear_trip`); names overridable. **Safety is enforced inside the loop** (no slow-plane mistake bypasses it): the engine shadows `actual_position` until Operation Enabled (no jump at enable); engage is refused unless `max_travel > 0`; ratio/phase latch at the engage edge (mid-run edits inert until re-engage); travel past `±max_travel` clamps then trips to a hold that clears only when engage drops; enable loss forces a re-arm. The loop **owns `target_position` — leave it unmapped in `iomap`** (any PLC write is overwritten each cycle). Sim example: `examples/eg_gear_incycle`.
+Nine virtual channels carry the slow plane and bind in `iomap` without
+fabricated PDO entries. Seven parameters accept Output bindings and Input
+echoes: `gear_engage`, `ratio_num`, `ratio_den`, `ratio_step`, `phase_ofs`,
+`master_vel`, `gear_max_travel`. The two feedback channels, `gear_engaged`
+and `gear_trip`, accept Input only. Names are overridable per gear. Static
+validation and both adapters share this routing catalog; unknown names,
+feedback writes, and names colliding with PDOs or other gear fields remain
+errors. The schema's `ratio_apply_channel` / `ratio_ack_channel` names are
+reserved but **not routed by the device facade**; do not bind them in iomap.
+I/O diagnostics are per mapping row: a name collision makes the whole device
+unroutable, so it marks **every mapping row naming that device** — gear rows
+and plain PDO rows alike — and those rows report the collision instead of
+their own channel error until it is fixed. Devices not referenced by iomap are
+outside this check; a clean map does not replace connect-time device
+validation.
+
+**Safety is enforced inside the loop** (no slow-plane mistake bypasses it):
+the engine shadows `actual_position` until Operation Enabled (no jump at
+enable); engage is refused unless `max_travel > 0`; ratio/phase latch at the
+engage edge (mid-run edits inert until re-engage); travel past `±max_travel`
+clamps then trips to a hold that clears only when engage drops; enable loss
+forces a re-arm. The loop **owns `target_position` — leave it unmapped in
+`iomap`** (any PLC write is overwritten each cycle). Static validation now
+enforces that: an Output mapping onto an RxPDO covering the engine's four
+target bytes on the follower slave is an error, not a silent discard. Reading
+those bytes is a separate matter — they are controller→device, so an Input
+mapping onto them fails the ordinary direction rule. Sim example and
+bounded-trip scenario: `examples/eg_gear_incycle`. Simulation does not prove
+physical timing, PDO layout, or machine safety; those remain bench gates.
 
 ---
 

@@ -1,0 +1,55 @@
+description = "sim-only gear routes: lockout, bounded travel trip, disengage reset"
+
+# Only for this example's unchanged nic = "_sim" and virtual master.
+# Setpoints reach the engine through all seven Output routes. Feedback
+# expectations exercise both Input routes; no physical bus is involved.
+[[steps]]
+wait_ms = 300
+[[steps]]
+expect_watchdog = { tripped = false, during_ms = 400 }
+[[steps]]
+set = { var = "max_travel", value = 0.0 }
+[[steps]]
+set = { var = "ratio_num", value = 1.0 }
+[[steps]]
+set = { var = "ratio_den", value = 1.0 }
+[[steps]]
+set = { var = "ratio_step", value = 1.0 }
+[[steps]]
+set = { var = "phase_ofs", value = 0.0 }
+[[steps]]
+set = { var = "master_vel", value = 1.0 }
+[[steps]]
+set = { var = "engage", value = true }
+[[steps]]
+expect_never = { var = "g_engaged_fb", op = "is_true", during_ms = 400 }
+
+[[steps]]
+set = { var = "engage", value = false }
+[[steps]]
+wait_ms = 100
+# State the precondition instead of assuming it: the refused engagement
+# above must not have latched a trip.
+[[steps]]
+expect = { var = "g_trip_fb", op = "is_false", within_ms = 1000 }
+[[steps]]
+set = { var = "max_travel", value = 1000.0 }
+[[steps]]
+set = { var = "engage", value = true }
+[[steps]]
+expect = { var = "g_engaged_fb", op = "is_true", within_ms = 1000 }
+[[steps]]
+expect = { var = "g_trip_fb", op = "is_true", within_ms = 6000 }
+[[steps]]
+expect = { var = "g_engaged_fb", op = "is_false", within_ms = 1000 }
+
+[[steps]]
+set = { var = "engage", value = false }
+[[steps]]
+expect = { var = "g_trip_fb", op = "is_false", within_ms = 1000 }
+[[steps]]
+set = { var = "master_vel", value = 0.0 }
+[[steps]]
+set = { var = "max_travel", value = 0.0 }
+[[steps]]
+expect_watchdog = { tripped = false, during_ms = 400 }

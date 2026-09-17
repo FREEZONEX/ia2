@@ -35,6 +35,8 @@ use std::sync::Arc;
 
 use iocore::{ChannelValue, IoError};
 use project::{EthercatGear, GearMaster};
+// Preserve this module's public API while sharing the contract with the linter.
+pub use project::{GearParam, GearReadback};
 
 /// Lock-free slow→fast parameter mailbox plus fast→slow feedback, one per
 /// configured gear axis. f64 values are stored as `to_bits` in `AtomicU64`.
@@ -57,35 +59,6 @@ pub struct GearShared {
     trip_fb: AtomicBool,
     /// Accepted-apply counter (handshake readback for the slow plane).
     ratio_ack: AtomicU64,
-}
-
-/// Writable gear parameters (slow plane → engine).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GearParam {
-    Engage,
-    RatioApply,
-    RatioNum,
-    RatioDen,
-    RatioStep,
-    PhaseOfs,
-    MasterVel,
-    MaxTravel,
-}
-
-/// Read-only engine state (engine → slow plane).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GearReadback {
-    Engage,
-    RatioApply,
-    RatioAck,
-    RatioNum,
-    RatioDen,
-    RatioStep,
-    PhaseOfs,
-    MasterVel,
-    MaxTravel,
-    Engaged,
-    Trip,
 }
 
 impl GearShared {
@@ -481,34 +454,7 @@ pub fn validate_channels(
     gears: &[EthercatGear],
     pdo_names: &std::collections::HashSet<&str>,
 ) -> Result<(), String> {
-    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for g in gears {
-        for name in [
-            &g.engage_channel,
-            &g.ratio_num_channel,
-            &g.ratio_den_channel,
-            &g.ratio_step_channel,
-            &g.phase_channel,
-            &g.master_vel_channel,
-            &g.max_travel_channel,
-            &g.engaged_channel,
-            &g.trip_channel,
-            &g.ratio_apply_channel,
-            &g.ratio_ack_channel,
-        ] {
-            if pdo_names.contains(name.as_str()) {
-                return Err(format!(
-                    "gear channel '{name}' collides with a PDO channel name"
-                ));
-            }
-            if !seen.insert(name.as_str()) {
-                return Err(format!(
-                    "gear channel '{name}' is used by more than one gear axis or parameter"
-                ));
-            }
-        }
-    }
-    Ok(())
+    project::validate_gear_channel_names(gears, pdo_names)
 }
 
 /// Build the engines + routing tables from the device config. Returns the
@@ -519,73 +465,16 @@ pub fn build(gears: &[EthercatGear]) -> (Vec<GearEngine>, GearRouting) {
     let mut routing = GearRouting::default();
     for cfg in gears {
         let shared = Arc::new(GearShared::default());
-        let w = &mut routing.writes;
-        w.insert(
-            cfg.engage_channel.clone(),
-            (shared.clone(), GearParam::Engage),
-        );
-        w.insert(
-            cfg.ratio_num_channel.clone(),
-            (shared.clone(), GearParam::RatioNum),
-        );
-        w.insert(
-            cfg.ratio_den_channel.clone(),
-            (shared.clone(), GearParam::RatioDen),
-        );
-        w.insert(
-            cfg.ratio_step_channel.clone(),
-            (shared.clone(), GearParam::RatioStep),
-        );
-        w.insert(
-            cfg.phase_channel.clone(),
-            (shared.clone(), GearParam::PhaseOfs),
-        );
-        w.insert(
-            cfg.master_vel_channel.clone(),
-            (shared.clone(), GearParam::MasterVel),
-        );
-        w.insert(
-            cfg.max_travel_channel.clone(),
-            (shared.clone(), GearParam::MaxTravel),
-        );
-        let r = &mut routing.reads;
-        r.insert(
-            cfg.engaged_channel.clone(),
-            (shared.clone(), GearReadback::Engaged),
-        );
-        r.insert(
-            cfg.trip_channel.clone(),
-            (shared.clone(), GearReadback::Trip),
-        );
-        // Parameter echoes so an iomap input can observe what's in force.
-        r.insert(
-            cfg.engage_channel.clone(),
-            (shared.clone(), GearReadback::Engage),
-        );
-        r.insert(
-            cfg.ratio_num_channel.clone(),
-            (shared.clone(), GearReadback::RatioNum),
-        );
-        r.insert(
-            cfg.ratio_den_channel.clone(),
-            (shared.clone(), GearReadback::RatioDen),
-        );
-        r.insert(
-            cfg.ratio_step_channel.clone(),
-            (shared.clone(), GearReadback::RatioStep),
-        );
-        r.insert(
-            cfg.phase_channel.clone(),
-            (shared.clone(), GearReadback::PhaseOfs),
-        );
-        r.insert(
-            cfg.master_vel_channel.clone(),
-            (shared.clone(), GearReadback::MasterVel),
-        );
-        r.insert(
-            cfg.max_travel_channel.clone(),
-            (shared.clone(), GearReadback::MaxTravel),
-        );
+        for (name, readback) in cfg.routed_channels() {
+            if let Some(parameter) = readback.parameter() {
+                routing
+                    .writes
+                    .insert(name.into(), (shared.clone(), parameter));
+            }
+            routing
+                .reads
+                .insert(name.into(), (shared.clone(), readback));
+        }
         engines.push(GearEngine::new(cfg, shared));
     }
     (engines, routing)
@@ -618,8 +507,8 @@ mod tests {
     const OP_ENABLED: u16 = 0x1637; // real SV660N Operation Enabled word
     const RDY_ONLY: u16 = 0x1631; // Ready To Switch On (not enabled)
 
-    fn engine_virtual() -> (GearEngine, Arc<GearShared>) {
-        let cfg = EthercatGear {
+    fn virtual_config() -> EthercatGear {
+        EthercatGear {
             slave_index: 0,
             target_pos_offset: 2,
             actual_pos_offset: 4,
@@ -636,9 +525,203 @@ mod tests {
             trip_channel: "gear_trip".into(),
             ratio_apply_channel: "gear_ratio_apply".into(),
             ratio_ack_channel: "gear_ratio_ack".into(),
-        };
+        }
+    }
+
+    fn engine_virtual() -> (GearEngine, Arc<GearShared>) {
+        let cfg = virtual_config();
         let shared = Arc::new(GearShared::default());
         (GearEngine::new(&cfg, shared.clone()), shared)
+    }
+
+    #[test]
+    fn routing_keeps_the_existing_nine_channel_contract() {
+        let (_, routing) = build(&[virtual_config()]);
+        // Independent expectations pin names AND destinations. Echo-only
+        // checks could miss two parameters accidentally swapped in the catalog.
+        let expected = [
+            ("gear_engage", GearReadback::Engage, Some(GearParam::Engage)),
+            (
+                "ratio_num",
+                GearReadback::RatioNum,
+                Some(GearParam::RatioNum),
+            ),
+            (
+                "ratio_den",
+                GearReadback::RatioDen,
+                Some(GearParam::RatioDen),
+            ),
+            (
+                "ratio_step",
+                GearReadback::RatioStep,
+                Some(GearParam::RatioStep),
+            ),
+            (
+                "phase_ofs",
+                GearReadback::PhaseOfs,
+                Some(GearParam::PhaseOfs),
+            ),
+            (
+                "master_vel",
+                GearReadback::MasterVel,
+                Some(GearParam::MasterVel),
+            ),
+            (
+                "gear_max_travel",
+                GearReadback::MaxTravel,
+                Some(GearParam::MaxTravel),
+            ),
+            ("gear_engaged", GearReadback::Engaged, None),
+            ("gear_trip", GearReadback::Trip, None),
+        ];
+        assert_eq!(routing.reads.len(), 9);
+        assert_eq!(routing.writes.len(), 7);
+        for (name, readback, parameter) in expected {
+            assert_eq!(routing.reads.get(name).map(|(_, rb)| *rb), Some(readback));
+            assert_eq!(routing.writes.get(name).map(|(_, p)| *p), parameter);
+        }
+        for name in ["gear_ratio_apply", "gear_ratio_ack", "typo"] {
+            assert!(routing.read(name).is_none());
+            assert!(routing.write(name, &ChannelValue::Bool(true)).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn sim_facade_echoes_parameters_and_rejects_feedback_writes() {
+        use iocore::IoDevice;
+        let config = project::EthercatConfig {
+            nic: crate::SIM_NIC.into(),
+            cycle_us: 2_000,
+            bringup: Default::default(),
+            dc_sync: Default::default(),
+            dc_static_sync_iterations: 0,
+            slaves: vec![],
+            channels: vec![],
+            gear: vec![virtual_config()],
+        };
+        let mut device = crate::EthercatDevice::connect("sim_gear".into(), &config)
+            .await
+            .unwrap();
+        for (name, value) in [
+            ("gear_engage", ChannelValue::Bool(false)),
+            ("ratio_num", ChannelValue::F64(2.0)),
+            ("ratio_den", ChannelValue::F64(3.0)),
+            ("ratio_step", ChannelValue::F64(0.25)),
+            ("phase_ofs", ChannelValue::F64(-4.0)),
+            ("master_vel", ChannelValue::F64(5.0)),
+            ("gear_max_travel", ChannelValue::F64(0.0)),
+        ] {
+            device.write_channel(name, value).await.unwrap();
+            assert_eq!(device.read_channel(name).await.unwrap(), value);
+        }
+        for name in ["gear_engaged", "gear_trip"] {
+            assert_eq!(
+                device.read_channel(name).await.unwrap(),
+                ChannelValue::Bool(false)
+            );
+            assert!(device
+                .write_channel(name, ChannelValue::Bool(true))
+                .await
+                .is_err());
+        }
+        for name in ["gear_ratio_apply", "gear_ratio_ack", "typo"] {
+            assert!(device.read_channel(name).await.is_err());
+            assert!(device
+                .write_channel(name, ChannelValue::Bool(true))
+                .await
+                .is_err());
+        }
+        device.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn renamed_routes_use_the_configured_name() {
+        let mut cfg = virtual_config();
+        cfg.ratio_num_channel = "custom_ratio".into();
+        let (_, routing) = build(&[cfg]);
+        routing
+            .write("custom_ratio", &ChannelValue::F64(3.0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(routing.read("custom_ratio"), Some(ChannelValue::F64(3.0)));
+        assert!(routing.read("ratio_num").is_none());
+        assert!(routing
+            .write("ratio_num", &ChannelValue::F64(1.0))
+            .is_none());
+    }
+
+    #[test]
+    fn every_route_takes_its_name_from_the_config() {
+        let defaults = virtual_config();
+        let mut cfg = virtual_config();
+        for name in [
+            &mut cfg.engage_channel,
+            &mut cfg.ratio_num_channel,
+            &mut cfg.ratio_den_channel,
+            &mut cfg.ratio_step_channel,
+            &mut cfg.phase_channel,
+            &mut cfg.master_vel_channel,
+            &mut cfg.max_travel_channel,
+            &mut cfg.engaged_channel,
+            &mut cfg.trip_channel,
+        ] {
+            *name = format!("axis2_{name}");
+        }
+        let (_, routing) = build(std::slice::from_ref(&cfg));
+        assert_eq!(routing.reads.len(), 9);
+        assert_eq!(routing.writes.len(), 7);
+        assert!(routing.reads.keys().all(|k| k.starts_with("axis2_")));
+        assert!(routing.writes.keys().all(|k| k.starts_with("axis2_")));
+        // A catalog entry that hard-coded its default instead of reading the
+        // config would leave the old name routed on a fully renamed axis.
+        for (name, _) in defaults.routed_channels() {
+            assert!(routing.read(name).is_none(), "{name}");
+            assert!(
+                routing.write(name, &ChannelValue::F64(1.0)).is_none(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_bool_matches_the_runtime_value_lane() {
+        let shared = GearShared::default();
+        // Written out independently of `is_bool`, and exhaustively: a new
+        // readback variant breaks compilation here instead of silently
+        // skewing the I/O linter's boolean range warning.
+        let expects_bool = |rb: GearReadback| match rb {
+            GearReadback::Engage
+            | GearReadback::RatioApply
+            | GearReadback::Engaged
+            | GearReadback::Trip => true,
+            GearReadback::RatioAck
+            | GearReadback::RatioNum
+            | GearReadback::RatioDen
+            | GearReadback::RatioStep
+            | GearReadback::PhaseOfs
+            | GearReadback::MasterVel
+            | GearReadback::MaxTravel => false,
+        };
+        for rb in [
+            GearReadback::Engage,
+            GearReadback::RatioApply,
+            GearReadback::RatioAck,
+            GearReadback::RatioNum,
+            GearReadback::RatioDen,
+            GearReadback::RatioStep,
+            GearReadback::PhaseOfs,
+            GearReadback::MasterVel,
+            GearReadback::MaxTravel,
+            GearReadback::Engaged,
+            GearReadback::Trip,
+        ] {
+            assert_eq!(rb.is_bool(), expects_bool(rb), "{rb:?}");
+            assert_eq!(
+                matches!(shared.read(rb), ChannelValue::Bool(_)),
+                expects_bool(rb),
+                "{rb:?}"
+            );
+        }
     }
 
     fn set(shared: &GearShared, p: GearParam, v: f64) {
