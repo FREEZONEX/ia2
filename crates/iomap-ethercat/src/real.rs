@@ -597,14 +597,42 @@ impl IoDevice for RealEthercat {
     /// times that's a millisecond or two. Wait a couple of cycle
     /// periods after returning if you need to guarantee propagation
     /// before exiting (the bridge does this).
+    ///
+    /// Returns `Err` when the cyclic worker has already stopped: the mirror
+    /// is still zeroed, but nothing will transmit it, so `Ok` would be a
+    /// false report of a safe state having been commanded.
     async fn enter_failsafe(&mut self) -> Result<(), IoError> {
         // Gear axes first: drop every engage request so the engines fall
         // back to shadow/hold instead of re-driving targets over the
         // zeroed mirror below.
         self.gear_routing.disengage_all();
-        let mut pdi = self.pdi.lock().expect("pdi mirror poisoned");
-        for buf in pdi.outputs.values_mut() {
-            buf.fill(0);
+        {
+            let mut pdi = self.pdi.lock().expect("pdi mirror poisoned");
+            for buf in pdi.outputs.values_mut() {
+                buf.fill(0);
+            }
+        }
+        // Zeroing the mirror is not the failsafe — the worker's next tick
+        // putting it on the wire is. A dead worker (DoneGuard flips
+        // `stopped` on every exit path, panic included) means no tick will
+        // ever come, so reporting Ok here would tell the caller the outputs
+        // were commanded safe when nothing was sent. The SubDevices do still
+        // de-energize, via their own SyncManager watchdogs once the master
+        // stops transmitting — a different mechanism, on a different
+        // timescale, and the operator should be told which one they got.
+        // Every other adapter already reports a failsafe it could not
+        // deliver; this one always said Ok.
+        if self.stopped.load(Ordering::Relaxed) {
+            tracing::error!(
+                device = %self.name,
+                "ethercat failsafe: output PDI zeroed but the cyclic worker is not running"
+            );
+            return Err(IoError::Transport(format!(
+                "ethercat '{}': output PDI zeroed, but the cyclic worker has stopped, so no \
+                 frame will carry it — the SubDevices de-energize via their own SyncManager \
+                 watchdogs instead",
+                self.name
+            )));
         }
         tracing::info!(device = %self.name, "ethercat output PDI zeroed for failsafe");
         Ok(())
@@ -1552,6 +1580,65 @@ mod tests {
     // The bus-side paths need a real NIC + CAP_NET_RAW, so these exercise
     // the bounded-join logic in isolation — that's the part that has to
     // hold the line on shutdown latency regardless of bus health.
+
+    fn device_with_outputs(stopped_flag: bool) -> RealEthercat {
+        let mut outputs = HashMap::new();
+        outputs.insert(0u16, vec![0xffu8; 4]);
+        RealEthercat {
+            name: "axis".into(),
+            channels: HashMap::new(),
+            gear_routing: crate::gear::GearRouting {
+                writes: HashMap::new(),
+                reads: HashMap::new(),
+            },
+            pdi: Arc::new(Mutex::new(PdiMirror {
+                inputs: HashMap::new(),
+                outputs,
+            })),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            stopped: Arc::new(AtomicBool::new(stopped_flag)),
+            healthy: Arc::new(AtomicBool::new(true)),
+            discovered: Vec::new(),
+            _thread: None,
+        }
+    }
+
+    /// Zeroing the mirror is not the failsafe — the worker's next tick
+    /// putting it on the wire is. With the worker alive that tick is coming,
+    /// so `Ok` is the truth.
+    #[tokio::test]
+    async fn failsafe_zeroes_the_output_mirror_and_reports_ok_while_the_worker_runs() {
+        let mut dev = device_with_outputs(false);
+        dev.enter_failsafe().await.expect("worker alive => Ok");
+        assert_eq!(
+            dev.pdi.lock().expect("mirror").outputs[&0],
+            vec![0u8; 4],
+            "the output image must be zeroed regardless"
+        );
+    }
+
+    /// With the worker stopped no frame will ever carry those zeros. The
+    /// mirror is still zeroed — if anything revives, the safe image is what
+    /// it finds — but reporting Ok would tell the caller a safe state was
+    /// commanded when nothing was transmitted.
+    #[tokio::test]
+    async fn failsafe_reports_failure_when_the_cyclic_worker_has_stopped() {
+        let mut dev = device_with_outputs(true);
+        let err = match dev.enter_failsafe().await {
+            Err(e) => e.to_string(),
+            Ok(()) => panic!("a dead worker cannot deliver a failsafe"),
+        };
+        assert!(err.contains("cyclic worker has stopped"), "{err}");
+        assert!(
+            err.contains("SyncManager"),
+            "the fallback mechanism is named: {err}"
+        );
+        assert_eq!(
+            dev.pdi.lock().expect("mirror").outputs[&0],
+            vec![0u8; 4],
+            "the mirror is zeroed even when it cannot be sent"
+        );
+    }
 
     #[test]
     fn reinit_backoff_is_immediate_then_capped() {
