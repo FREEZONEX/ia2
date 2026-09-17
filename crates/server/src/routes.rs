@@ -2643,6 +2643,15 @@ pub async fn poke_demo_slave(
 //  LSP WebSocket bridge
 // ============================================================
 
+/// Ceiling on one LSP message body from the child. Semantic tokens for a
+/// large POU are measured in kilobytes; 16 MiB is far above anything real and
+/// far below "allocate whatever the stream claims".
+const MAX_LSP_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Ceiling on one header line. `read_line` grows its buffer until a newline
+/// arrives, so a child emitting none would grow it without limit.
+const MAX_LSP_HEADER_BYTES: usize = 8 * 1024;
+
 /// Upgrade to WebSocket and bridge to a freshly-spawned ironplc LSP
 /// process. WS frames are LSP JSON-RPC bodies (no Content-Length header);
 /// the proxy adds/strips headers when talking to stdio.
@@ -2724,35 +2733,17 @@ async fn handle_lsp_ws(mut socket: WebSocket) {
     let from_child = async move {
         let mut reader = BufReader::new(stdout);
         loop {
-            let mut content_length: Option<usize> = None;
-            // Read headers until empty line.
-            loop {
-                let mut line = String::new();
-                match reader.read_line(&mut line).await {
-                    Ok(0) => return,
-                    Ok(_) => {}
-                    Err(_) => return,
+            match read_lsp_frame(&mut reader).await {
+                Ok(Some(text)) => {
+                    if ws_tx.send(Message::Text(text.into())).await.is_err() {
+                        return;
+                    }
                 }
-                let trimmed = line.trim_end_matches(['\r', '\n']);
-                if trimmed.is_empty() {
-                    break;
+                Ok(None) => return,
+                Err(why) => {
+                    tracing::error!(%why, "lsp stdout stopped being LSP framing; closing the bridge");
+                    return;
                 }
-                if let Some(v) = trimmed.strip_prefix("Content-Length:") {
-                    content_length = v.trim().parse().ok();
-                }
-            }
-            let Some(len) = content_length else {
-                continue;
-            };
-            let mut body = vec![0u8; len];
-            if reader.read_exact(&mut body).await.is_err() {
-                return;
-            }
-            let Ok(text) = String::from_utf8(body) else {
-                continue;
-            };
-            if ws_tx.send(Message::Text(text.into())).await.is_err() {
-                return;
             }
         }
     };
@@ -2762,6 +2753,72 @@ async fn handle_lsp_ws(mut socket: WebSocket) {
         _ = from_child => {}
     }
     let _ = child.kill().await;
+}
+
+/// Read one LSP frame from a child's stdout: headers, then exactly
+/// `Content-Length` bytes of body.
+///
+/// `Ok(None)` is a clean EOF. `Err` means the stream stopped being LSP
+/// framing and re-syncing it would be guesswork — the caller closes the
+/// bridge rather than guess.
+///
+/// Both reads are bounded. The child is our own lsp-launcher, so this is not
+/// a security boundary — it is blast-radius control. A desynced or buggy
+/// child announcing a wild `Content-Length` would make `vec![0u8; len]`
+/// allocate it verbatim, and THIS process is also the one holding a running
+/// PLC program: an OOM abort here stops the plant, not just the editor's
+/// autocomplete.
+///
+/// A header block with no `Content-Length`, and a body that is not UTF-8,
+/// are both skipped rather than fatal — that is the pre-existing behaviour
+/// and it costs one message, not the session.
+async fn read_lsp_frame<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> Result<Option<String>, String> {
+    loop {
+        let mut content_length: Option<usize> = None;
+        loop {
+            let mut line = Vec::new();
+            let n = match reader
+                .take(MAX_LSP_HEADER_BYTES as u64)
+                .read_until(b'\n', &mut line)
+                .await
+            {
+                Ok(0) => return Ok(None),
+                Ok(n) => n,
+                Err(e) => return Err(format!("read: {e}")),
+            };
+            if n == MAX_LSP_HEADER_BYTES && !line.ends_with(b"\n") {
+                return Err(format!("header line exceeded {MAX_LSP_HEADER_BYTES} bytes"));
+            }
+            let Ok(line) = String::from_utf8(line) else {
+                return Err("header line was not UTF-8".into());
+            };
+            let trimmed = line.trim_end_matches(['\r', '\n']);
+            if trimmed.is_empty() {
+                break;
+            }
+            if let Some(v) = trimmed.strip_prefix("Content-Length:") {
+                content_length = v.trim().parse().ok();
+            }
+        }
+        let Some(len) = content_length else {
+            continue;
+        };
+        if len > MAX_LSP_BODY_BYTES {
+            return Err(format!(
+                "Content-Length {len} exceeds the {MAX_LSP_BODY_BYTES}-byte ceiling"
+            ));
+        }
+        let mut body = vec![0u8; len];
+        if let Err(e) = reader.read_exact(&mut body).await {
+            return Err(format!("body read: {e}"));
+        }
+        match String::from_utf8(body) {
+            Ok(text) => return Ok(Some(text)),
+            Err(_) => continue,
+        }
+    }
 }
 
 // ============================================================
@@ -3326,5 +3383,74 @@ mod project_header_tests {
             .unwrap()
             .as_deref()
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod lsp_frame_tests {
+    use super::{read_lsp_frame, MAX_LSP_BODY_BYTES, MAX_LSP_HEADER_BYTES};
+    use tokio::io::BufReader;
+
+    async fn frames(input: &[u8]) -> Result<Vec<String>, String> {
+        let mut r = BufReader::new(std::io::Cursor::new(input.to_vec()));
+        let mut out = Vec::new();
+        loop {
+            match read_lsp_frame(&mut r).await? {
+                Some(t) => out.push(t),
+                None => return Ok(out),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn back_to_back_frames_are_split_on_content_length() {
+        let got = frames(b"Content-Length: 2\r\n\r\n{}Content-Length: 5\r\n\r\n[1,2]")
+            .await
+            .expect("well-framed");
+        assert_eq!(got, vec!["{}".to_string(), "[1,2]".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_clean_eof_ends_the_stream() {
+        assert_eq!(frames(b"").await.unwrap(), Vec::<String>::new());
+    }
+
+    /// The lever this guard exists for: `vec![0u8; len]` would have
+    /// allocated whatever the stream claimed, in the process that also holds
+    /// the running PLC program.
+    #[tokio::test]
+    async fn an_implausible_content_length_is_refused_not_allocated() {
+        let input = format!("Content-Length: {}\r\n\r\n", u32::MAX);
+        let err = frames(input.as_bytes()).await.expect_err("must refuse");
+        assert!(err.contains("exceeds the"), "{err}");
+        assert!(err.contains(&MAX_LSP_BODY_BYTES.to_string()), "{err}");
+    }
+
+    /// A child that emits no newline would grow `read_line`'s buffer without
+    /// limit — same allocation lever, different door.
+    #[tokio::test]
+    async fn a_header_line_without_a_newline_is_bounded() {
+        let input = vec![b'x'; MAX_LSP_HEADER_BYTES + 10];
+        let err = frames(&input).await.expect_err("must refuse");
+        assert!(err.contains("header line exceeded"), "{err}");
+    }
+
+    /// Pre-existing tolerances kept: a header block with no Content-Length
+    /// costs one message, not the session.
+    #[tokio::test]
+    async fn a_header_block_without_content_length_is_skipped() {
+        let got = frames(b"X-Note: hi\r\n\r\nContent-Length: 2\r\n\r\n{}")
+            .await
+            .expect("skips, then reads");
+        assert_eq!(got, vec!["{}".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_body_that_is_not_utf8_costs_one_message_not_the_session() {
+        let mut input = b"Content-Length: 2\r\n\r\n".to_vec();
+        input.extend_from_slice(&[0xff, 0xfe]);
+        input.extend_from_slice(b"Content-Length: 2\r\n\r\n{}");
+        let got = frames(&input).await.expect("skips the bad body");
+        assert_eq!(got, vec!["{}".to_string()]);
     }
 }
