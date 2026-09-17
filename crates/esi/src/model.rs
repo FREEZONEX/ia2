@@ -28,8 +28,11 @@ impl Esi {
     }
 }
 
-/// One `<Device>` — its Sync-Manager and FMMU declarations plus the slot
-/// rules that bound which modules it accepts.
+/// One `<Device>`, reduced to its Sync-Manager declarations.
+///
+/// `<Fmmu>` and `<Slots>` are not parsed: the FMMU register values are
+/// derived during assembly rather than read from the file, and nothing
+/// enforces slot rules — the detected module list is trusted as given.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EsiDevice {
     pub name: String,

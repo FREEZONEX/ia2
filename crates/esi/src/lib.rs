@@ -31,9 +31,14 @@
 //! ## Scope
 //!
 //! The ESI schema is large; this parses the subset a master needs to bring
-//! a modular coupler to OP: device `<Sm>`/`<Fmmu>`, the module table
-//! (`<Module>` keyed by `ModuleIdent`), each module's `<TxPdo>`/`<RxPdo>`
-//! entries, and the `<Slots>` that bound which modules go where. Profile
+//! a modular coupler to OP: the device's `<Sm>` declarations, the module
+//! table (`<Module>` keyed by `ModuleIdent`) and each module's
+//! `<TxPdo>`/`<RxPdo>` entries. `<Fmmu>` is **not** parsed — the
+//! [`FmmuConfig`] values are derived from the assembled image (outputs at
+//! logical 0, inputs after them, each pointing at its SyncManager's start
+//! address), not read from the file. Nor are `<Slots>`: nothing here
+//! bounds which module may occupy which slot, so the detected ident list
+//! is trusted as given. Profile
 //! details unrelated to the process image (diagnostics objects, ESC
 //! vendor metadata, distributed-clock opmodes) are skipped — they can be
 //! added without breaking the parsed model because every field is

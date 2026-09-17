@@ -23,12 +23,23 @@ use project::{EthercatChannel, EthercatDataType, EthercatPdoDirection};
 pub fn assemble_channels(esi_xml: &str, detected: &[u32]) -> Result<Vec<EthercatChannel>, String> {
     let esi = esi::parse(esi_xml).map_err(|e| e.to_string())?;
     let image = esi::assemble(&esi, detected).map_err(|e| e.to_string())?;
-    Ok(image
+    let channels: Vec<EthercatChannel> = image
         .channels
         .iter()
         .enumerate()
         .map(|(i, c)| map_channel(i, c))
-        .collect())
+        .collect();
+    // Hold the assembled list to the same shape rules connect enforces.
+    // `esi` packs entries bit-contiguously and trusts the ESI to insert
+    // padding; an ESI that omits it leaves a multi-bit entry straddling a
+    // byte boundary, which the PDI accessors refuse on every read. Without
+    // this the mistake surfaced later as a connect error against a channel
+    // whose origin was no longer obvious — the point of the ESI path is to
+    // produce a config that works, so it should say so here, while the ESI
+    // is still in hand.
+    crate::validate::validate_channel_shapes(&channels)
+        .map_err(|why| format!("assembled ESI process image is unusable: {why}"))?;
+    Ok(channels)
 }
 
 /// Map one ESI channel onto a `project::EthercatChannel`. The `slot` carried
@@ -152,6 +163,41 @@ mod tests {
         assert_eq!(map_data_type("WEIRD", 8), EthercatDataType::U8);
         assert_eq!(map_data_type("WEIRD", 16), EthercatDataType::U16);
         assert_eq!(map_data_type("WEIRD", 64), EthercatDataType::U32);
+    }
+
+    /// `esi` advances a bit cursor and trusts the ESI's padding entries.
+    /// An ESI that omits them leaves a 16-bit entry at bit offset 4, which
+    /// `bits.rs` refuses on every read. Discovery must reject that while it
+    /// still knows which ESI produced it, rather than emitting a config
+    /// that fails at connect.
+    #[test]
+    fn misaligned_entry_is_refused_at_assembly() {
+        const UNPADDED: &str = r##"
+<EtherCATInfo><Descriptions>
+ <Devices><Device><Type ProductCode="#x74">CPL</Type>
+  <Sm StartAddress="#x1400" ControlByte="#x20">Inputs</Sm>
+ </Device></Devices>
+ <Modules>
+  <Module><Type ModuleIdent="#x10">4DI</Type>
+   <TxPdo><Index>#x1A00</Index>
+    <Entry><Index>#x6000</Index><SubIndex>1</SubIndex><BitLen>4</BitLen><Name>DI</Name><DataType>BIT4</DataType></Entry>
+   </TxPdo></Module>
+  <Module><Type ModuleIdent="#x30">AI</Type>
+   <TxPdo><Index>#x1A02</Index>
+    <Entry><Index>#x6200</Index><SubIndex>1</SubIndex><BitLen>16</BitLen><Name>AI</Name><DataType>UINT</DataType></Entry>
+   </TxPdo></Module>
+ </Modules>
+</Descriptions></EtherCATInfo>"##;
+        let err = assemble_channels(UNPADDED, &[0x10, 0x30]).expect_err("must refuse");
+        assert!(err.contains("non-byte-aligned"), "{err}");
+        assert!(
+            err.contains("m1_ai"),
+            "the offending channel is named: {err}"
+        );
+
+        // The same modules in an order that stays byte-aligned assemble fine,
+        // so the rule is about alignment and not about these modules.
+        assert!(assemble_channels(UNPADDED, &[0x30, 0x10]).is_ok());
     }
 
     #[test]
