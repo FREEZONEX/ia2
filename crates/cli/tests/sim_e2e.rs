@@ -8,9 +8,13 @@
 //! Requires the server binary beside `cs`: run `cargo build -p server`
 //! first, using the same target/profile as this test. A missing server
 //! fails the test instead of silently leaving the scenario unverified.
+//!
+//! Start servers only through `spawn_server` and open projects only through
+//! `TestServer::open_project`: the server persists per-user state, and those
+//! two keep it inside the test's tempdir.
 
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command as StdCommand, Stdio};
 
 use assert_cmd::Command;
@@ -53,8 +57,26 @@ fn cs(server: &str) -> Command {
     c
 }
 
-#[test]
-fn sim_run_proves_and_refutes_against_a_real_server() {
+/// A running server whose per-user state lives under `sandbox`.
+struct TestServer {
+    base: String,
+    sandbox: PathBuf,
+    home: PathBuf,
+    _child: ServerGuard,
+}
+
+/// Start a real server on a free loopback port and wait for `/health`.
+///
+/// Opening a project writes `last_opened` to `dirs::config_dir()/IA2/state.toml`
+/// and the open-projects list to `default_projects_dir()`, and startup reads
+/// both back. With the developer's real home, every `cargo test` pointed their
+/// state file at a tempdir that no longer exists, and the test server started
+/// with their real projects open. `dirs` derives those paths from `HOME`
+/// (plus `XDG_CONFIG_HOME` on Linux, where the projects dir without a
+/// `user-dirs.dirs` falls back to `./projects` under the working directory),
+/// so all three point into `sandbox`. On Windows `dirs` uses known folders,
+/// which these variables do not move.
+fn spawn_server(sandbox: &Path) -> TestServer {
     let server_bin = server_binary();
 
     // Free port: bind-then-drop; the server grabs it a moment later.
@@ -63,10 +85,8 @@ fn sim_run_proves_and_refutes_against_a_real_server() {
     drop(l);
     let base = format!("http://127.0.0.1:{port}");
 
-    // Copy the example project to a tempdir so runs never dirty the repo.
-    let tmp = tempfile::tempdir().unwrap();
-    let proj = tmp.path().join("sim_smoke");
-    copy_dir(&repo_root().join("examples/sim_smoke"), &proj);
+    let home = sandbox.join("home");
+    std::fs::create_dir_all(&home).unwrap();
 
     let child = StdCommand::new(&server_bin)
         .arg("--bind")
@@ -75,11 +95,14 @@ fn sim_run_proves_and_refutes_against_a_real_server() {
         // with a dev server on the same machine.
         .arg("--demo-modbus-addr")
         .arg("")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .current_dir(sandbox)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn server");
-    let _guard = ServerGuard(child);
+    let child = ServerGuard(child);
 
     // Wait for /health (up to ~5 s).
     let mut up = false;
@@ -99,19 +122,110 @@ fn sim_run_proves_and_refutes_against_a_real_server() {
     }
     assert!(up, "server did not come up on {base}");
 
-    cs(&base)
-        .arg("api")
-        .arg("POST")
-        .arg("/api/projects/open")
-        .arg("--from")
-        .arg("-")
-        .write_stdin(format!("{{\"path\":\"{}\"}}", proj.display()))
-        .assert()
-        .success();
+    TestServer {
+        base,
+        sandbox: sandbox.to_path_buf(),
+        home,
+        _child: child,
+    }
+}
+
+impl TestServer {
+    /// `POST /api/projects/open`, then prove the state it persisted stayed
+    /// in the sandbox.
+    fn open_project(&self, proj: &Path) {
+        cs(&self.base)
+            .arg("api")
+            .arg("POST")
+            .arg("/api/projects/open")
+            .arg("--from")
+            .arg("-")
+            .write_stdin(serde_json::json!({ "path": proj }).to_string())
+            .assert()
+            .success();
+        self.assert_state_sandboxed(proj);
+    }
+
+    /// Checked rather than assumed: a server that ignored `HOME` would still
+    /// pass every other assertion here while rewriting the real files.
+    fn assert_state_sandboxed(&self, proj: &Path) {
+        if cfg!(windows) {
+            // Known folders ignore `HOME` (see `spawn_server`), so there is
+            // no sandbox to check.
+            return;
+        }
+
+        // `dirs::config_dir()` for the HOME the server was given.
+        let config_dir = if cfg!(target_os = "macos") {
+            self.home.join("Library/Application Support")
+        } else {
+            self.home.join(".config")
+        };
+        let state_file = config_dir.join("IA2/state.toml");
+        let text = std::fs::read_to_string(&state_file).unwrap_or_else(|e| {
+            panic!("opening a project must write {}: {e}", state_file.display())
+        });
+        let state: toml::Table = toml::from_str(&text).unwrap();
+        let last_opened = state
+            .get("last_opened")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| panic!("no last_opened in {}:\n{text}", state_file.display()));
+        assert_eq!(
+            Path::new(last_opened).canonicalize().unwrap(),
+            proj.canonicalize().unwrap(),
+            "{} names the project just opened",
+            state_file.display()
+        );
+
+        // The server's own projects dir, as `GET /api/fs/browse` lists it
+        // when no path is given. A relative answer (Linux fallback) is
+        // relative to the server's working directory, the sandbox; `join`
+        // keeps an absolute one as is.
+        let out = cs(&self.base)
+            .arg("api")
+            .arg("GET")
+            .arg("/api/fs/browse")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "GET /api/fs/browse failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let listing: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let projects_dir = self
+            .sandbox
+            .join(listing["path"].as_str().expect("fs/browse path"));
+        assert!(
+            projects_dir.starts_with(&self.sandbox),
+            "server projects dir {} is outside the sandbox {}",
+            projects_dir.display(),
+            self.sandbox.display()
+        );
+        let open_list = projects_dir.join(".ia2-open-projects.json");
+        assert!(
+            open_list.is_file(),
+            "opening a project must write {}",
+            open_list.display()
+        );
+    }
+}
+
+#[test]
+fn sim_run_proves_and_refutes_against_a_real_server() {
+    // Copy the example project to a tempdir so runs never dirty the repo.
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("sim_smoke");
+    copy_dir(&repo_root().join("examples/sim_smoke"), &proj);
+
+    // Declared after `tmp`, so the server is stopped before its sandbox
+    // is deleted.
+    let server = spawn_server(tmp.path());
+    server.open_project(&proj);
 
     // The bundled scenario must pass end to end (fills tank, alarm
     // raises, no overflow) — this is the agent's self-verification loop.
-    cs(&base)
+    cs(&server.base)
         .arg("sim")
         .arg("run")
         .arg(proj.join("scenarios/fill.toml"))
@@ -126,7 +240,7 @@ fn sim_run_proves_and_refutes_against_a_real_server() {
         "[[steps]]\nexpect = { var = \"level\", op = \"lt\", value = -1.0, within_ms = 600 }\n",
     )
     .unwrap();
-    cs(&base)
+    cs(&server.base)
         .arg("sim")
         .arg("run")
         .arg(&bad)
@@ -144,57 +258,16 @@ fn sim_run_proves_and_refutes_against_a_real_server() {
 /// names to ASCII, and this codebase's operators do not write in ASCII.
 #[test]
 fn a_non_ascii_resource_name_round_trips_through_the_real_router() {
-    let server_bin = server_binary();
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = l.local_addr().unwrap().port();
-    drop(l);
-    let base = format!("http://127.0.0.1:{port}");
-
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("sim_smoke");
     copy_dir(&repo_root().join("examples/sim_smoke"), &proj);
 
-    let child = StdCommand::new(&server_bin)
-        .arg("--bind")
-        .arg(format!("127.0.0.1:{port}"))
-        .arg("--demo-modbus-addr")
-        .arg("")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn server");
-    let _guard = ServerGuard(child);
-
-    let mut up = false;
-    for _ in 0..50 {
-        if cs(&base)
-            .arg("api")
-            .arg("GET")
-            .arg("/health")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-        {
-            up = true;
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    assert!(up, "server did not come up on {base}");
-
-    cs(&base)
-        .arg("api")
-        .arg("POST")
-        .arg("/api/projects/open")
-        .arg("--from")
-        .arg("-")
-        .write_stdin(format!("{{\"path\":\"{}\"}}", proj.display()))
-        .assert()
-        .success();
+    let server = spawn_server(tmp.path());
+    server.open_project(&proj);
 
     // Created with a name the CLI never has to encode (JSON body), then
     // read back through the resource path, which it does.
-    cs(&base)
+    cs(&server.base)
         .arg("api")
         .arg("POST")
         .arg("/api/devices")
@@ -204,7 +277,7 @@ fn a_non_ascii_resource_name_round_trips_through_the_real_router() {
         .assert()
         .success();
 
-    cs(&base)
+    cs(&server.base)
         .arg("get")
         .arg("devices/泵1")
         .assert()
