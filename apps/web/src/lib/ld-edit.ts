@@ -113,10 +113,9 @@ function updateNode(
 
 export function addRung(prog: LdProgram, atIndex?: number): LdProgram {
   const id = nextRungId(prog)
-  // A fresh rung is a single placeholder contact wired to no coil yet —
-  // the user picks a variable next. Coil-less rungs would fail the
-  // transpiler's "dead-code" check, so we add a `<unbound>` coil that
-  // the user is meant to immediately replace.
+  // A fresh rung is a constant-TRUE network with no coil yet — the user
+  // adds one next. Until then the transpiler refuses the rung ("no coils
+  // — dead code"), which the editor shows as a diagnostic on it.
   const newRung = {
     id,
     label: null,
@@ -605,84 +604,103 @@ export function parseProgram(source: string): LdProgram {
 //   conducting?" — same recursion shape as drawing the node.
 // =================================================================
 
-/** Look up a variable in a live snapshot, coerce to BOOL. Falsy by
- *  default (undeclared / missing variable reads FALSE) so a partially-
- *  hydrated snapshot doesn't crash the evaluator. */
-export function readBool(values: Readonly<Record<string, boolean>>, name: string): boolean {
-  return values[name] === true
+/** Live readings for the online evaluator. `null` means the value is not
+ *  on the wire — the program is not running here, or the runtime does not
+ *  publish it (FB outputs) — and is never the same thing as FALSE or 0. */
+export type LiveReadings = {
+  bool: (name: string) => boolean | null
+  number: (name: string) => number | null
 }
 
-/** Recursively evaluate an LD node against live BOOL values.
+/** Readings over plain maps; a name absent from a map is unknown. */
+export function readingsFrom(
+  bools: Readonly<Record<string, boolean>>,
+  numerics: Readonly<Record<string, number>> = {},
+): LiveReadings {
+  return {
+    bool: (name) => (name in bools ? bools[name] === true : null),
+    number: (name) => (name in numerics ? numerics[name] : null),
+  }
+}
+
+/** Recursively evaluate an LD node against live values, in three-valued
+ *  logic: TRUE / FALSE when the readings settle it, `null` when they don't.
+ *  An AND with a FALSE branch is FALSE and an OR with a TRUE branch is TRUE
+ *  whatever the unknowns; anything else touching an unknown is unknown.
+ *
+ *  A missing value used to read as FALSE. That drew an NC contact on an
+ *  unpublished variable as closed, and every rung through an FB — whose
+ *  outputs the runtime never publishes — as dead.
  *
  *  Important: `negated` on the wire format is `#[serde(default)]` in
  *  Rust, so a JSON file with `{op:"contact", var:"x"}` (no `negated`)
  *  is valid input. On the TS side `negated` then arrives as
  *  `undefined`, and `false !== undefined` evaluates to `true` — which
  *  would silently mark every non-negated FALSE contact as conducting.
- *  Coerce to a real boolean here. Same for `LdRung.label`-style
- *  optional fields anywhere we compare.
- *
- *  Compare nodes also need numeric live values, so the evaluator
- *  takes a second optional map keyed by variable name.
+ *  Coerce to a real boolean here.
  */
-export function evaluateNode(
-  node: LdNode,
-  values: Readonly<Record<string, boolean>>,
-  numerics: Readonly<Record<string, number>> = {},
-): boolean {
+export function evaluateNode(node: LdNode, live: LiveReadings): boolean | null {
   switch (node.op) {
-    case "contact":
-      return readBool(values, node.var) !== (node.negated === true)
+    case "contact": {
+      const v = live.bool(node.var)
+      return v === null ? null : v !== (node.negated === true)
+    }
     case "const":
       return node.value === true
-    case "not":
-      return !evaluateNode(node.arg, values, numerics)
-    case "and":
-      if (node.args.length === 0) return true
-      return node.args.every((a) => evaluateNode(a, values, numerics))
-    case "or":
-      if (node.args.length === 0) return false
-      return node.args.some((a) => evaluateNode(a, values, numerics))
-    case "compare":
-      return evaluateCompare(node.left, node.cmp, node.right, numerics)
-    case "fb_call": {
-      // The actual FB body runs inside ironplc's VM; we don't simulate
-      // it here. For online colouring we look up the value of the
-      // chosen output pin as a dotted variable name (`myT.Q`). Some
-      // runtimes flatten FB member access at the bytecode layer and
-      // expose only top-level vars — in that case the lookup falls
-      // through to FALSE and the block renders as "unknown", which is
-      // honest: we don't have a value to display.
-      return readBool(values, `${node.instance}.${node.output_pin}`)
+    case "not": {
+      const v = evaluateNode(node.arg, live)
+      return v === null ? null : !v
     }
+    case "and": {
+      let unknown = false
+      for (const a of node.args) {
+        const v = evaluateNode(a, live)
+        if (v === false) return false
+        if (v === null) unknown = true
+      }
+      return unknown ? null : true
+    }
+    case "or": {
+      let unknown = false
+      for (const a of node.args) {
+        const v = evaluateNode(a, live)
+        if (v === true) return true
+        if (v === null) unknown = true
+      }
+      return unknown ? null : false
+    }
+    case "compare":
+      return evaluateCompare(node.left, node.cmp, node.right, live)
+    case "fb_call":
+      // The FB body runs in the VM, and the runtime publishes the instance,
+      // not its pins — so this is normally unknown. Read the dotted name in
+      // case a runtime does publish it.
+      return live.bool(`${node.instance}.${node.output_pin}`)
   }
 }
 
-/** Resolve a Compare operand to a number against live numeric values.
- *  Variables that aren't in `numerics` (or aren't numeric at all)
- *  read as 0 — the same forgiving fallback BOOL contacts use. */
-export function readOperand(
-  o: LdOperand,
-  numerics: Readonly<Record<string, number>>,
-): number {
-  if (o.kind === "var") return numerics[o.name] ?? 0
+/** Resolve a Compare operand to a number; `null` when a variable has no
+ *  numeric live value or a literal has no number in it. */
+export function readOperand(o: LdOperand, live: LiveReadings): number | null {
+  if (o.kind === "var") return live.number(o.name)
   // Literal: parse the raw string. TIME literals like "T#100ms" parse
   // through `parseFloat` (gives 100, the ms — close enough for online
   // colouring; full TIME semantics are the bridge's job).
   const m = String(o.value).match(/-?\d+(?:\.\d+)?/)
-  if (!m) return 0
+  if (!m) return null
   const n = parseFloat(m[0])
-  return Number.isFinite(n) ? n : 0
+  return Number.isFinite(n) ? n : null
 }
 
 function evaluateCompare(
   left: LdOperand,
   cmp: LdComparator,
   right: LdOperand,
-  numerics: Readonly<Record<string, number>>,
-): boolean {
-  const a = readOperand(left, numerics)
-  const b = readOperand(right, numerics)
+  live: LiveReadings,
+): boolean | null {
+  const a = readOperand(left, live)
+  const b = readOperand(right, live)
+  if (a === null || b === null) return null
   switch (cmp) {
     case "eq":
       return a === b

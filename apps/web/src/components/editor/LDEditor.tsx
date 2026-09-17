@@ -53,7 +53,6 @@ import {
   newFbCall,
   operandText,
   parseProgram,
-  readBool,
   removeVariable,
   serializeProgram,
   setCoilKind,
@@ -66,8 +65,10 @@ import {
   updateCompare,
   updateFbCall,
   updateVariable,
+  type LiveReadings,
   type NodePath,
 } from "@/lib/ld-edit"
+import { onlineBool, onlineNumber } from "@/lib/online-vars"
 import { fbByType, fbInputs, fbOutputs, fbPinHint, groupedFbs } from "@/lib/ld-fbs"
 import type { LdCoilKind } from "@/types/generated/LdCoilKind"
 import type { LdNode } from "@/types/generated/LdNode"
@@ -113,7 +114,7 @@ export function LDEditor({
    *  from double-counting the on-disk copy. */
   path?: string
 }) {
-  const { parsed, diagnostics, isRunning, lastSnapshot, commit } =
+  const { parsed, diagnostics, online, commit } =
     useProgramEditor<LdProgram>({
       value,
       onChange,
@@ -125,36 +126,17 @@ export function LDEditor({
     })
   const [sel, setSel] = useState<Selection>(null)
 
-  // Live values from the bridge — drives online-mode coloring.
-  //   bools    → Contact / Coil glyphs
-  //   numerics → Compare-block evaluation
-  // Both null when nothing's running; the renderer falls back to
-  // static (uncoloured) glyphs in that case.
-  const liveValues = useMemo<{
-    bools: Record<string, boolean>
-    numerics: Record<string, number>
-  } | null>(() => {
-    if (!isRunning || !lastSnapshot) return null
-    const bools: Record<string, boolean> = {}
-    const numerics: Record<string, number> = {}
-    for (const v of lastSnapshot.vars) {
-      if (v.type_name === "BOOL") {
-        bools[v.name] = v.value === "TRUE"
-      } else {
-        // The bridge ships every numeric / time / bits type as a
-        // string — REAL=3.14, DINT=42, TIME="T#100ms", BYTE="16#FF".
-        // parseFloat handles the first two cleanly; for TIME we strip
-        // the prefix; for BYTE/WORD we'd parse hex. Best-effort here
-        // since Compare blocks are almost always against a numeric.
-        const m = v.value.match(/-?\d+(?:\.\d+)?/)
-        if (m) {
-          const n = parseFloat(m[0])
-          if (Number.isFinite(n)) numerics[v.name] = n
-        }
-      }
-    }
-    return { bools, numerics }
-  }, [lastSnapshot, isRunning])
+  // Live values for THIS program — drives online-mode coloring. `null`
+  // when none are on the wire; a single unknown value reads as `null` too,
+  // and renders like "no online data" rather than as a dead wire.
+  const liveValues = useMemo<LiveReadings | null>(
+    () =>
+      online && {
+        bool: (name) => onlineBool(online, name),
+        number: (name) => onlineNumber(online, name),
+      },
+    [online],
+  )
 
   // Drop selection when the source changes externally (revert, POU
   // switch). React's referential-equality check on `value` is what
@@ -162,6 +144,17 @@ export function LDEditor({
   useEffect(() => {
     setSel(null)
   }, [value])
+
+  // Every hook runs before the parse-error return below. Hooks after an
+  // early return change the hook count whenever the source flips between
+  // parseable and not — a fatal React error, and nothing above this pane
+  // catches it, so the whole IDE unmounted.
+  // Index diagnostics by ld_location so each renderer can look up
+  // "are there errors on this element?" in O(1).
+  const diagIndex = useMemo(
+    () => indexDiagnostics(diagnostics, ldDiagnosticKey),
+    [diagnostics],
+  )
 
   if (parsed.kind === "error") {
     return (
@@ -174,13 +167,6 @@ export function LDEditor({
     )
   }
   const prog = parsed.program
-
-  // Index diagnostics by ld_location so each renderer can look up
-  // "are there errors on this element?" in O(1).
-  const diagIndex = useMemo(
-    () => indexDiagnostics(diagnostics, ldDiagnosticKey),
-    [diagnostics],
-  )
 
   return (
     <div className={cn("flex h-full min-h-0 flex-col", className)}>
@@ -586,7 +572,7 @@ function RungEditor({
   totalRungs: number
   selection: Selection
   readOnly: boolean
-  liveValues: { bools: Record<string, boolean>; numerics: Record<string, number> } | null
+  liveValues: LiveReadings | null
   rungDiagnostics: CheckDiagnostic[]
   onSelect: (s: Selection) => void
   onCommit: (next: LdProgram) => void
@@ -601,7 +587,7 @@ function RungEditor({
   // Null when not running; renderers treat null as "no online data,
   // render uncoloured static".
   const networkPowered = liveValues
-    ? evaluateNode(rung.logic, liveValues.bools, liveValues.numerics)
+    ? evaluateNode(rung.logic, liveValues)
     : null
   const layoutBox = measure(rung.logic)
   const cols = layoutBox.cols
@@ -749,9 +735,7 @@ function RungEditor({
               // the network output. Either way we colour the wire by
               // the NETWORK output (that's what's actually carrying
               // power right now), and the COIL by its var's live value.
-              const coilEnergised = liveValues
-                ? readBool(liveValues.bools, coil.var)
-                : null
+              const coilEnergised = liveValues ? liveValues.bool(coil.var) : null
               return (
                 <g key={ci}>
                   {/* horizontal wire: merge column → coil glyph */}
@@ -980,7 +964,7 @@ interface NodeRenderProps {
   rungIdx: number
   selection: Selection
   readOnly: boolean
-  liveValues: { bools: Record<string, boolean>; numerics: Record<string, number> } | null
+  liveValues: LiveReadings | null
   onSelect: (s: Selection) => void
   onCommit: (transform: (prog: LdProgram) => LdProgram) => void
 }
@@ -988,7 +972,8 @@ interface NodeRenderProps {
 // =================================================================
 //   Online-mode colour helper.
 //
-//   `powered === null`  → static rendering (program not running),
+//   `powered === null`  → static rendering (no live reading: not running
+//                         here, or a value the runtime does not publish),
 //                         neutral foreground stroke.
 //   `powered === true`  → wire / glyph is conducting, FX-Green stroke.
 //   `powered === false` → wire / glyph is NOT conducting, muted.
@@ -1004,9 +989,11 @@ function RenderNode(props: NodeRenderProps) {
     selection.rungIdx === rungIdx &&
     pathsEqual(selection.path, path)
   // Power state of this whole sub-tree. Drives glyph colouring; child
-  // recursions compute their own. Null means "not running" → static.
+  // recursions compute their own. Null means no live reading for it —
+  // nothing running here, or a value the runtime does not publish — and
+  // renders static.
   const powered = liveValues
-    ? evaluateNode(node, liveValues.bools, liveValues.numerics)
+    ? evaluateNode(node, liveValues)
     : null
 
   const click = () => onSelect(selected ? null : { kind: "node", rungIdx, path })
@@ -1179,7 +1166,7 @@ function RenderNode(props: NodeRenderProps) {
         // itself conducts — it's the branch's "tail" extending out
         // to align with longer siblings.
         const branchPowered = liveValues
-          ? evaluateNode(child, liveValues.bools, liveValues.numerics)
+          ? evaluateNode(child, liveValues)
           : null
         elems.push(
           <RenderNode

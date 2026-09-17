@@ -21,6 +21,7 @@ import type { PouLanguage } from "@/types/generated/PouLanguage"
 import type { PouType } from "@/types/generated/PouType"
 import type { ProjectListing } from "@/types/generated/ProjectListing"
 import type { ProjectTree } from "@/types/generated/ProjectTree"
+import type { RunningInfo as WireRunningInfo } from "@/types/generated/RunningInfo"
 import type { Protocol } from "@/types/generated/Protocol"
 import type { Tasks } from "@/types/generated/Tasks"
 import type { VarSnapshot } from "@/types/generated/VarSnapshot"
@@ -173,6 +174,13 @@ export function handleMutationEvent(
       void selectPouRef.current?.(event.detail.path)?.then(() => pouSpawnStore.bump())
     }
   }
+}
+
+/** The server's description of a run, in this module's shape. */
+function runningFromWire(info: WireRunningInfo): RunningInfo {
+  return info.kind === "isolated"
+    ? { kind: "isolated", program: info.program, filePath: info.file_path }
+    : { kind: "scheduled", programs: info.programs }
 }
 
 /** Which edge (if any) the IDE is currently attached to. When attached,
@@ -484,18 +492,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
         const status = await fetchRuntimeStatus()
         if (status.running) {
           setIsRunning(true)
-          if (status.running_info) {
-            const info = status.running_info
-            if (info.kind === "isolated") {
-              setRunning({
-                kind: "isolated",
-                program: info.program,
-                filePath: info.file_path,
-              })
-            } else {
-              setRunning({ kind: "scheduled", programs: info.programs })
-            }
-          }
+          if (status.running_info) setRunning(runningFromWire(status.running_info))
         }
       } catch (e) {
         setError(String(e))
@@ -567,6 +564,17 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
             case "started":
               setIsRunning(true)
               setError(null)
+              // The event carries no payload; the server records what it
+              // started before announcing it. Without this, a run started
+              // anywhere else — an agent's `cs run`, another window — left
+              // `running` empty: a blank Monitor header, and graphical
+              // editors unable to tell which program's values they show.
+              void fetchRuntimeStatus()
+                .then((status) => {
+                  if (esRef.current !== es || !status.running || !status.running_info) return
+                  setRunning(runningFromWire(status.running_info))
+                })
+                .catch(() => {})
               break
             case "stopped":
               setIsRunning(false)
