@@ -537,6 +537,9 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       : eventsUrl()
     const es = new EventSource(url)
     esRef.current = es
+    // A stream can outlive several runs. Its identity alone cannot reject
+    // a status response sampled before a stop or a newer started event.
+    let runGeneration = 0
     es.onopen = () => {
       liveFeedStore.setConnected(true)
       if (attached) {
@@ -561,8 +564,11 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
             case "snapshot":
               liveFeedStore.setSnapshot(ev.data)
               break
-            case "started":
+            case "started": {
+              const generation = ++runGeneration
               setIsRunning(true)
+              setRunning(null)
+              liveFeedStore.setSnapshot(null)
               setError(null)
               // The event carries no payload; the server records what it
               // started before announcing it. Without this, a run started
@@ -571,14 +577,17 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
               // editors unable to tell which program's values they show.
               void fetchRuntimeStatus()
                 .then((status) => {
-                  if (esRef.current !== es || !status.running || !status.running_info) return
+                  if (esRef.current !== es || generation !== runGeneration || !status.running || !status.running_info) return
                   setRunning(runningFromWire(status.running_info))
                 })
                 .catch(() => {})
               break
+            }
             case "stopped":
+              ++runGeneration
               setIsRunning(false)
               setRunning(null)
+              liveFeedStore.setSnapshot(null)
               break
             case "error":
               setError(ev.data)
