@@ -214,3 +214,51 @@ describe("changes that are not a conflict", () => {
     expect(screen.queryByRole("dialog")).toBeNull()
   })
 })
+
+describe("a newer external write while a save response is pending", () => {
+  it.each(["save", "run"] as const)("preserves the conflict after %s and asks on the next save", async (action) => {
+    await mountedWithEdit()
+    let release!: () => void
+    vi.mocked(api.savePou).mockImplementationOnce(async (_path, source) => {
+      disk = source
+      await new Promise<void>((resolve) => { release = resolve })
+      return { ok: true }
+    })
+    let pending!: Promise<void>
+    act(() => { pending = action === "save" ? runtime.saveCurrentPou() : runtime.run("Main", "main") })
+    await waitFor(() => expect(api.savePou).toHaveBeenCalledOnce())
+    act(() => runtime.setSource(MINE + " (* next edit *)"))
+    await externalWrite(THEIRS)
+    expect(runtime.externalChange?.source).toBe(THEIRS)
+    await act(async () => { release(); await pending })
+    expect(disk).toBe(THEIRS)
+    expect(runtime.externalChange?.source).toBe(THEIRS)
+    expect(api.runProgram).not.toHaveBeenCalled()
+
+    vi.mocked(api.savePou).mockClear()
+    let saving!: Promise<void>
+    act(() => { saving = runtime.saveCurrentPou() })
+    fireEvent.click(await screen.findByRole("button", { name: /cancel/i }))
+    await act(async () => { await saving })
+    expect(api.savePou).not.toHaveBeenCalled()
+    expect(disk).toBe(THEIRS)
+  })
+
+  it("loads the newer disk version when the saved buffer has no further edits", async () => {
+    await mountedWithEdit()
+    let release!: () => void
+    vi.mocked(api.savePou).mockImplementationOnce(async (_path, source) => {
+      disk = source
+      await new Promise<void>((resolve) => { release = resolve })
+      return { ok: true }
+    })
+    let saving!: Promise<void>
+    act(() => { saving = runtime.saveCurrentPou() })
+    await waitFor(() => expect(api.savePou).toHaveBeenCalledOnce())
+    await externalWrite(THEIRS)
+    await act(async () => { release(); await saving })
+    await waitFor(() => expect(runtime.source).toBe(THEIRS))
+    expect(runtime.currentPou?.source).toBe(THEIRS)
+    expect(runtime.isDirty).toBe(false)
+  })
+})

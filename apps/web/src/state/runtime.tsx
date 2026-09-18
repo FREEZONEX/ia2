@@ -1049,17 +1049,29 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     }
   }, [refreshProject])
 
+  // Save and Run acknowledge the same version. A mutation received while
+  // the PUT is in flight can describe a later write, so its conflict must
+  // survive this response. Only clear the version approved before saving,
+  // or an echo whose contents are exactly what this request wrote.
+  const saveCurrentBuffer = useCallback(async (): Promise<"saved" | "cancelled" | "conflict"> => {
+    if (!currentPou || !await settleExternalChange()) return "cancelled"
+    const approvedExternal = externalChangeRef.current
+    await savePou(currentPou.path, source)
+    const latestExternal = externalChangeRef.current
+    setCurrentPou({ ...currentPou, source })
+    setExternalDisk((disk) => disk === approvedExternal || disk?.source === source ? null : disk)
+    return latestExternal && latestExternal !== approvedExternal && latestExternal.source !== source
+      ? "conflict"
+      : "saved"
+  }, [currentPou, source, settleExternalChange])
+
   const saveCurrentPou = useCallback(async () => {
-    if (!currentPou) return
-    if (!await settleExternalChange()) return
     try {
-      await savePou(currentPou.path, source)
-      setCurrentPou({ ...currentPou, source })
-      setExternalDisk(null)
+      await saveCurrentBuffer()
     } catch (e) {
       setError(String(e))
     }
-  }, [currentPou, source, settleExternalChange])
+  }, [saveCurrentBuffer])
 
   const createPou = useCallback(
     async (
@@ -1261,10 +1273,11 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
           // Run compiles what is on disk, so this save decides what the
           // runtime executes. Never let it silently replace a version this
           // window has not seen.
-          if (!await settleExternalChange()) return
-          await savePou(currentPou.path, source)
-          setCurrentPou({ ...currentPou, source })
-          setExternalDisk(null)
+          const saved = await saveCurrentBuffer()
+          if (saved !== "saved") {
+            if (saved === "conflict") setError("Program changed on disk while saving — review the new version before running.")
+            return
+          }
         }
         await runProgram(program, file_path)
         // Record what we just kicked off so the Monitor header can
@@ -1288,7 +1301,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
         setError(String(e))
       }
     },
-    [currentPou, source, tasks, settleExternalChange],
+    [currentPou, source, tasks, saveCurrentBuffer],
   )
 
   const stop = useCallback(async () => {

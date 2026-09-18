@@ -6,6 +6,7 @@ import { HmiHostProvider, type HmiHost } from "./host"
 import { liveFeedStore } from "@/state/live-feed"
 import { fitCanvasScale } from "./canvas-viewport"
 import type { HmiDoc } from "@/types/generated/HmiDoc"
+import type { HmiNode } from "@/types/generated/HmiNode"
 
 vi.mock("@/state/hmi-live", () => ({ useHmiMutation: () => null }))
 const doc: HmiDoc = {
@@ -13,6 +14,10 @@ const doc: HmiDoc = {
   root: { id: "root", type: "group", layout: "absolute", x: 0, y: 0, w: 1000, h: 800, gap: 0, bind: {}, action: {}, children: [
     { id: "set", type: "button", label: "Set level", x: 20, y: 20, w: 100, h: 32, bind: {}, action: { tap: { kind: "write", variable: "level", value: 5, confirm: true } } },
   ] },
+}
+function rootChildren(screen: HmiDoc): HmiNode[] {
+  if (screen.root.type !== "group") throw new Error("expected a group root in the test screen")
+  return screen.root.children
 }
 let host: HmiHost
 beforeEach(() => {
@@ -40,11 +45,11 @@ describe("Arrange-mode drag", () => {
   // screen: that copy predates the agent's node and would delete it.
   it("moves only the dragged node, keeping what another writer added meanwhile", async () => {
     let server: HmiDoc = structuredClone(doc)
-    server.root.children!.push({ id: "agent_lamp", type: "lamp", x: 300, y: 20, w: 40, h: 40, bind: {}, action: {} } as never)
+    rootChildren(server).push({ id: "agent_lamp", type: "symbol", symbol: "lamp", props: {}, x: 300, y: 20, w: 40, h: 40, bind: {}, action: {} })
     const saveDoc = vi.fn(async (_path: string, next: HmiDoc) => { server = structuredClone(next) })
     ;(host as HmiHost & { saveDoc?: unknown }).saveDoc = saveDoc
     host.moveNode = vi.fn(async (_path: string, id: string, x: number, y: number) => {
-      const node = server.root.children!.find((n) => n.id === id)!
+      const node = rootChildren(server).find((n) => n.id === id)!
       node.x = x
       node.y = y
     })
@@ -59,8 +64,8 @@ describe("Arrange-mode drag", () => {
     fireEvent.pointerMove(viewport, { clientX: 130, clientY: 100, pointerId: 1 })
     fireEvent.pointerUp(viewport, { clientX: 130, clientY: 100, pointerId: 1 })
 
-    await waitFor(() => expect(server.root.children!.find((n) => n.id === "set")!.x).not.toBe(20))
-    expect(server.root.children!.map((n) => n.id)).toEqual(["set", "agent_lamp"])
+    await waitFor(() => expect(rootChildren(server).find((n) => n.id === "set")!.x).not.toBe(20))
+    expect(rootChildren(server).map((n) => n.id)).toEqual(["set", "agent_lamp"])
     expect(saveDoc).not.toHaveBeenCalled()
     expect(host.moveNode).toHaveBeenCalledWith("overview", "set", 104, 24) // 30px / 0.375 = 80, snapped to the 8-unit grid
   })
