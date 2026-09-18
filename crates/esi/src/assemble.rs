@@ -247,21 +247,19 @@ fn place(
 
 /// Channel name: the ESI entry name, namespaced by slot so two modules
 /// with same-named entries (e.g. two "DI" slices) stay unique. Falls back
-/// to the object coordinates when the ESI omits a name **or when the name
-/// survives sanitizing as nothing** — a wholly non-ASCII name (Chinese,
-/// Japanese) sanitizes to the empty string, which used to leave the
-/// channel called just `m0_`, and every such entry in a slot identical.
+/// to the object coordinates when the ESI omits a name. A non-empty name
+/// that sanitizes to nothing keeps its historical slot prefix (`m0_`):
+/// if it is unique, existing iomap references must keep resolving.
 ///
 /// Uniqueness within a slot is NOT guaranteed here: vendors routinely give
 /// every bit of a digital slice the same `<Name>` and distinguish them by
 /// `SubIndex` alone. [`disambiguate`] resolves that afterwards, once all
 /// the names are known.
 fn channel_name(slot: usize, e: &crate::model::Entry) -> String {
-    let sanitized = sanitize(&e.name);
-    let base = if sanitized.is_empty() {
+    let base = if e.name.is_empty() {
         format!("obj_{:04x}_{:02x}", e.index, e.sub_index)
     } else {
-        sanitized
+        sanitize(&e.name)
     };
     format!("m{slot}_{base}")
 }
@@ -304,10 +302,18 @@ fn disambiguate(channels: &mut [EsiChannel]) {
         if !collided.contains(&c.name) {
             continue;
         }
-        let mut candidate = format!("{}_{:04x}_{:02x}", c.name, c.object_index, c.sub_index);
+        // Wholly non-ASCII labels share just the slot prefix. Only rename
+        // them when that prefix actually collides; one such label in each
+        // slot was already usable before disambiguation was introduced.
+        let base = if c.name.ends_with('_') {
+            format!("{}obj", c.name)
+        } else {
+            c.name.clone()
+        };
+        let mut candidate = format!("{base}_{:04x}_{:02x}", c.object_index, c.sub_index);
         let mut n = 2;
         while used.contains(&candidate) {
-            candidate = format!("{}_{:04x}_{:02x}_{n}", c.name, c.object_index, c.sub_index);
+            candidate = format!("{base}_{:04x}_{:02x}_{n}", c.object_index, c.sub_index);
             n += 1;
         }
         used.insert(candidate.clone());
