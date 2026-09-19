@@ -274,8 +274,12 @@ fi
 
 # ------------------------------------------------------------ 5. start server
 START_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-HOME="$RUNDIR/home" "$SERVER_BIN" --bind "127.0.0.1:$PORT" \
-  --demo-modbus-addr "" \
+# HOME is enough on macOS. On Linux the server's config dir follows
+# XDG_CONFIG_HOME first, and its projects dir falls back to ./projects
+# under its cwd, so both are pinned to the run dir too. `exec` keeps $!
+# the server's own PID.
+(cd "$RUNDIR" && exec env HOME="$RUNDIR/home" XDG_CONFIG_HOME="$RUNDIR/home/.config" \
+  "$SERVER_BIN" --bind "127.0.0.1:$PORT" --demo-modbus-addr "") \
   > "$RUNDIR/artifacts/server.log" 2>&1 &
 SERVER_PID=$!
 disown "$SERVER_PID" 2>/dev/null || true  # no job-control noise on teardown

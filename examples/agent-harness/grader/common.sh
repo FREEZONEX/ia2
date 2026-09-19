@@ -110,7 +110,11 @@ grader_start_verify_server() {
 
     GRADER_VERIFY_HOME=$(mktemp -d "${TMPDIR:-/tmp}/ia2-grader-home.XXXXXX") || return 1
     HARNESS_VERIFY_URL="http://127.0.0.1:$port"
-    HOME="$GRADER_VERIFY_HOME" "$server_bin" --bind "127.0.0.1:$port" --demo-modbus-addr "" \
+    # Same pinning as run.sh's server: HOME, XDG_CONFIG_HOME and the cwd
+    # (Linux falls back to ./projects there) all inside the temp HOME.
+    (cd "$GRADER_VERIFY_HOME" && exec env HOME="$GRADER_VERIFY_HOME" \
+        XDG_CONFIG_HOME="$GRADER_VERIFY_HOME/.config" \
+        "$server_bin" --bind "127.0.0.1:$port" --demo-modbus-addr "") \
         >"$log" 2>&1 &
     GRADER_VERIFY_PID=$!
     export HARNESS_VERIFY_URL
