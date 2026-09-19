@@ -5,17 +5,25 @@
 //! ```text
 //! my_project/
 //! ├── project.toml          # manifest
-//! ├── applications/         # one .st file per POU
-//! │   └── main.st
+//! ├── pous/                 # one file per POU (.st / .ld.json / .fbd.json / .sfc.json)
+//! │   └── main.st           #   (older projects' applications/ is renamed on open)
 //! ├── devices/              # one .toml per device (protocol inside)
 //! │   └── tank.toml
-//! └── iomap.toml             # variable ↔ channel bindings
+//! ├── edges/                # deploy targets
+//! ├── hmi/                  # screens (.hmi.json)
+//! ├── iomap.toml            # variable ↔ channel bindings
+//! ├── tasks.toml            # schedule
+//! ├── alarms.toml           # alarm definitions
+//! └── northbound.toml       # MQTT publication
 //! ```
+//!
+//! Every file here is written through [`write_atomic`].
 
 mod alarm_check;
 mod device_check;
 mod errors;
 mod fbd;
+mod fsutil;
 mod gear_channels;
 pub mod hmi;
 mod iomap_check;
@@ -31,6 +39,7 @@ pub use errors::StoreError;
 pub use fbd::{
     FbdBlock, FbdInputBinding, FbdInputSource, FbdOutputBinding, FbdPosition, FbdProgram,
 };
+pub use fsutil::write_atomic;
 pub use gear_channels::{validate_gear_channel_names, GearParam, GearReadback, GEAR_TARGET_BYTES};
 pub use hmi::{
     apply_hmi_ops, hmi_nav_targets, hmi_variables, hmi_write_variables, validate_hmi, HmiAction,

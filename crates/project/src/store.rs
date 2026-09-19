@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::errors::StoreError;
+use crate::fsutil::write_atomic;
 use crate::types::{
     Device, Edge, IoMap, ModbusConfig, PouFileSource, PouLanguage, PouType, ProgramInstance,
     ProjectManifest, ProjectTreeSkeleton, Protocol, ProtocolConfig, Task, Tasks,
@@ -76,12 +77,12 @@ impl ProjectStore {
             version: "0.1".into(),
             governance: crate::types::WriteGovernance::default(),
         };
-        fs::write(&manifest_path, toml::to_string_pretty(&manifest)?)?;
-        fs::write(
+        write_atomic(&manifest_path, toml::to_string_pretty(&manifest)?)?;
+        write_atomic(
             root.join("iomap.toml"),
             toml::to_string_pretty(&IoMap::default())?,
         )?;
-        fs::write(root.join("pous/main.st"), SAMPLE_MAIN_ST)?;
+        write_atomic(root.join("pous/main.st"), SAMPLE_MAIN_ST)?;
         // Seed tasks.toml with a single 100 ms task running `main`. Users
         // edit this via the Tasks pane.
         let seed_tasks = Tasks {
@@ -96,7 +97,7 @@ impl ProjectStore {
                 task: "plc_task".into(),
             }],
         };
-        fs::write(
+        write_atomic(
             root.join("tasks.toml"),
             toml::to_string_pretty(&seed_tasks)?,
         )?;
@@ -249,8 +250,8 @@ impl ProjectStore {
         Ok(doc)
     }
 
-    /// Serialize + atomically write the screen (tmp + rename, like RETAIN
-    /// persistence — a crash mid-save must not corrupt a screen).
+    /// Serialize + write the screen through [`write_atomic`], like every
+    /// other project file — a crash mid-save must not corrupt a screen.
     pub fn write_hmi(&self, path: &str, doc: &crate::hmi::HmiDoc) -> Result<(), StoreError> {
         validate_path(path)?;
         let file = self.hmi_file(path);
@@ -259,9 +260,7 @@ impl ProjectStore {
         }
         let json = serde_json::to_string_pretty(doc)
             .map_err(|e| StoreError::InvalidName(format!("serialize hmi: {e}")))?;
-        let tmp = file.with_extension("hmi.json.tmp");
-        fs::write(&tmp, json)?;
-        fs::rename(&tmp, &file)?;
+        write_atomic(&file, json)?;
         Ok(())
     }
 
@@ -359,7 +358,7 @@ impl ProjectStore {
         if let Some(parent) = file.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(file, source)?;
+        write_atomic(file, source)?;
         Ok(())
     }
 
@@ -400,7 +399,7 @@ impl ProjectStore {
             ),
         };
         fs::create_dir_all(file.parent().unwrap())?;
-        fs::write(&file, &source)?;
+        write_atomic(&file, &source)?;
         Ok(source)
     }
 
@@ -493,7 +492,7 @@ impl ProjectStore {
             .join(LIBRARY_SLUG_PREFIX)
             .join(library);
         fs::create_dir_all(&dir)?;
-        fs::write(dir.join(file_name), content)?;
+        write_atomic(dir.join(file_name), content)?;
         Ok(())
     }
 
@@ -519,7 +518,7 @@ impl ProjectStore {
     }
 
     fn write_manifest_table(&self, table: &toml::Table) -> Result<(), StoreError> {
-        fs::write(
+        write_atomic(
             self.root.join("project.toml"),
             toml::to_string_pretty(table)?,
         )?;
@@ -578,7 +577,7 @@ impl ProjectStore {
             name: leaf_name,
             config: device.config.clone(),
         };
-        fs::write(path, toml::to_string_pretty(&on_disk)?)?;
+        write_atomic(path, toml::to_string_pretty(&on_disk)?)?;
         Ok(())
     }
 
@@ -654,7 +653,7 @@ impl ProjectStore {
             name: leaf_name,
             ..edge.clone()
         };
-        fs::write(path, toml::to_string_pretty(&on_disk)?)?;
+        write_atomic(path, toml::to_string_pretty(&on_disk)?)?;
         Ok(())
     }
 
@@ -761,7 +760,7 @@ impl ProjectStore {
 
     pub fn write_iomap(&self, iomap: &IoMap) -> Result<(), StoreError> {
         let path = self.root.join("iomap.toml");
-        fs::write(path, toml::to_string_pretty(iomap)?)?;
+        write_atomic(path, toml::to_string_pretty(iomap)?)?;
         Ok(())
     }
 
@@ -781,7 +780,7 @@ impl ProjectStore {
 
     pub fn write_tasks(&self, tasks: &Tasks) -> Result<(), StoreError> {
         let path = self.root.join("tasks.toml");
-        fs::write(path, toml::to_string_pretty(tasks)?)?;
+        write_atomic(path, toml::to_string_pretty(tasks)?)?;
         Ok(())
     }
 
@@ -800,7 +799,7 @@ impl ProjectStore {
 
     pub fn write_alarms(&self, alarms: &crate::types::AlarmConfig) -> Result<(), StoreError> {
         let path = self.root.join("alarms.toml");
-        fs::write(path, toml::to_string_pretty(alarms)?)?;
+        write_atomic(path, toml::to_string_pretty(alarms)?)?;
         Ok(())
     }
 
@@ -822,7 +821,7 @@ impl ProjectStore {
         config: &crate::types::NorthboundConfig,
     ) -> Result<(), StoreError> {
         let path = self.root.join("northbound.toml");
-        fs::write(path, toml::to_string_pretty(config)?)?;
+        write_atomic(path, toml::to_string_pretty(config)?)?;
         Ok(())
     }
 
@@ -1661,6 +1660,130 @@ mod ssh_target_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- crash-safe saves ----------------------------------------------
+
+    const TORN_ROOT_ENV: &str = "IA2_TORN_WRITE_ROOT";
+
+    fn iomap_with(n: usize) -> IoMap {
+        let mut text = String::new();
+        for i in 0..n {
+            text.push_str(&format!(
+                "[[mappings]]\napplication = \"main\"\nvariable = \"out_{i:03}\"\n\
+                 direction = \"output\"\ndevice = \"plc_io\"\nchannel = \"do_{i:03}\"\n\n"
+            ));
+        }
+        toml::from_str(&text).unwrap()
+    }
+
+    const TORN_FILE_ENV: &str = "IA2_TORN_WRITE_FILE";
+
+    /// The child half of the test below: overwrite one file with contents
+    /// larger than the file-size limit the parent imposed, so the kernel
+    /// stops the process partway through the write.
+    fn torn_write_child(root: &Path, which: &str) {
+        let store = ProjectStore::open(root.to_path_buf()).unwrap();
+        let result = match which {
+            "pou" => store.write_pou_source(
+                "main",
+                &format!(
+                    "PROGRAM main\n{}END_PROGRAM\n",
+                    "  (* a long program *)\n".repeat(4_000)
+                ),
+            ),
+            "iomap" => store.write_iomap(&iomap_with(2_000)),
+            other => panic!("unknown torn-write target {other}"),
+        };
+        println!("WRITE_RETURNED {result:?}");
+    }
+
+    /// A save that dies partway — process killed, disk full, power lost —
+    /// must leave the previous version. `fs::write` truncates first, so by
+    /// the time it fails the previous version is already gone; for TOML, a
+    /// cut that lands on a table boundary even parses cleanly, as a file
+    /// with fewer entries than were saved.
+    ///
+    /// The failure is real, not simulated: the save runs in a child process
+    /// under `ulimit -f`, and the kernel stops it (SIGXFSZ, or EFBIG where
+    /// that is ignored) once the file it is writing reaches the limit.
+    #[cfg(unix)]
+    #[test]
+    fn a_save_that_dies_partway_leaves_the_previous_version() {
+        if let Some(root) = std::env::var_os(TORN_ROOT_ENV) {
+            let which = std::env::var(TORN_FILE_ENV).unwrap();
+            torn_write_child(Path::new(&root), &which);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("p");
+        let store = ProjectStore::create(root.clone(), "p").unwrap();
+        let original_source = store.read_pou_source("main").unwrap();
+        store.write_iomap(&iomap_with(12)).unwrap();
+
+        let exe = std::env::current_exe().unwrap();
+        let mut children = Vec::new();
+        for which in ["pou", "iomap"] {
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                // A 32-block ceiling (16 or 32 KiB depending on the shell's
+                // block size) — far below either write.
+                .arg(
+                    "ulimit -f 32 && exec \"$0\" --exact --nocapture --test-threads=1 \
+                     store::tests::a_save_that_dies_partway_leaves_the_previous_version",
+                )
+                .arg(&exe)
+                .env(TORN_ROOT_ENV, &root)
+                .env(TORN_FILE_ENV, which)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            // The injection must actually have happened: the child was
+            // killed, or its write reported the failure.
+            assert!(
+                !out.status.success() || stdout.contains("WRITE_RETURNED Err"),
+                "the size limit did not stop the {which} write: {:?}\n{stdout}",
+                out.status
+            );
+            children.push(format!("{which}: {:?}", out.status));
+        }
+
+        let pous_before = vec!["main".to_string()];
+        let source = store.read_pou_source("main").unwrap();
+        let iomap = store
+            .read_iomap()
+            .map(|m| m.mappings.len())
+            .map_err(|e| e.to_string().lines().next().unwrap_or_default().to_string());
+        let source_report = if source == original_source {
+            "intact".to_string()
+        } else {
+            format!(
+                "{} bytes instead of the original {}, ending {:?}",
+                source.len(),
+                original_source.len(),
+                &source[source.len().saturating_sub(24)..]
+            )
+        };
+        assert!(
+            source == original_source && matches!(iomap, Ok(12)),
+            "a save that did not complete damaged the project —
+               pous/main.st: {source_report}
+               iomap.toml read back as: {iomap:?} (12 mappings were saved)
+               children: {children:?}"
+        );
+        // A killed save can leave its temporary behind; it is a dot-file,
+        // and the project must not pick it up as a POU.
+        let leftovers: Vec<_> = fs::read_dir(root.join("pous"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(
+            !leftovers.is_empty(),
+            "expected the killed save's temporary to remain"
+        );
+        assert_eq!(store.list_pou_paths().unwrap(), pous_before);
+        ProjectStore::open(root.clone()).expect("project still opens");
+    }
 
     #[test]
     fn read_hmi_distinguishes_absent_from_corrupt() {
