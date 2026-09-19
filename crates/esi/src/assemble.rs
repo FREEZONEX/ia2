@@ -160,6 +160,9 @@ pub fn assemble_for_device(
         }
     }
 
+    // Names are only knowable as a set once every module is placed.
+    disambiguate(&mut channels);
+
     let output_bytes = bits_to_bytes(out_bits, PdoDirection::Output)?;
     let input_bytes = bits_to_bytes(in_bits, PdoDirection::Input)?;
 
@@ -244,7 +247,14 @@ fn place(
 
 /// Channel name: the ESI entry name, namespaced by slot so two modules
 /// with same-named entries (e.g. two "DI" slices) stay unique. Falls back
-/// to the object coordinates when the ESI omits a name.
+/// to the object coordinates when the ESI omits a name. A non-empty name
+/// that sanitizes to nothing keeps its historical slot prefix (`m0_`):
+/// if it is unique, existing iomap references must keep resolving.
+///
+/// Uniqueness within a slot is NOT guaranteed here: vendors routinely give
+/// every bit of a digital slice the same `<Name>` and distinguish them by
+/// `SubIndex` alone. [`disambiguate`] resolves that afterwards, once all
+/// the names are known.
 fn channel_name(slot: usize, e: &crate::model::Entry) -> String {
     let base = if e.name.is_empty() {
         format!("obj_{:04x}_{:02x}", e.index, e.sub_index)
@@ -252,6 +262,63 @@ fn channel_name(slot: usize, e: &crate::model::Entry) -> String {
         sanitize(&e.name)
     };
     format!("m{slot}_{base}")
+}
+
+/// Make every channel name unique, leaving already-unique names untouched.
+///
+/// Vendor ESIs commonly name all eight entries of a digital slice `Input`
+/// and separate them only by `SubIndex`, so the natural name collides.
+/// Consumers key channels by name — ia2 rejects a duplicate outright at
+/// connect — so an assembled image with repeats is one that cannot be
+/// used, which defeats the point of generating it.
+///
+/// Colliding names get the entry's object coordinates appended, which are
+/// unique by construction for a well-formed ESI. A malformed ESI that maps
+/// the *same* object twice in one direction gets a trailing ordinal, so
+/// this always terminates with distinct names.
+///
+/// Names that do not collide are deliberately left alone: a project
+/// already bound to `m0_di` keeps working, and by definition every
+/// currently-connectable config had unique names.
+fn disambiguate(channels: &mut [EsiChannel]) {
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for c in channels.iter() {
+        *counts.entry(c.name.as_str()).or_default() += 1;
+    }
+    let collided: std::collections::HashSet<String> = counts
+        .into_iter()
+        .filter(|(_, n)| *n > 1)
+        .map(|(name, _)| name.to_string())
+        .collect();
+    if collided.is_empty() {
+        return;
+    }
+    let mut used: std::collections::HashSet<String> = channels
+        .iter()
+        .map(|c| c.name.clone())
+        .filter(|n| !collided.contains(n))
+        .collect();
+    for c in channels.iter_mut() {
+        if !collided.contains(&c.name) {
+            continue;
+        }
+        // Wholly non-ASCII labels share just the slot prefix. Only rename
+        // them when that prefix actually collides; one such label in each
+        // slot was already usable before disambiguation was introduced.
+        let base = if c.name.ends_with('_') {
+            format!("{}obj", c.name)
+        } else {
+            c.name.clone()
+        };
+        let mut candidate = format!("{base}_{:04x}_{:02x}", c.object_index, c.sub_index);
+        let mut n = 2;
+        while used.contains(&candidate) {
+            candidate = format!("{base}_{:04x}_{:02x}_{n}", c.object_index, c.sub_index);
+            n += 1;
+        }
+        used.insert(candidate.clone());
+        c.name = candidate;
+    }
 }
 
 /// Reduce an ESI entry name to a safe IEC/identifier-ish channel token:
@@ -280,6 +347,80 @@ fn bits_to_bytes(bits: u32, dir: PdoDirection) -> Result<u16, AssembleError> {
 mod tests {
     use super::*;
     use crate::model::parse;
+
+    /// Vendors name every bit of a digital slice `Input` and separate them
+    /// by `SubIndex` alone. Consumers key channels by name — ia2 refuses a
+    /// duplicate at connect — so repeats make the assembled image unusable.
+    #[test]
+    fn same_named_entries_in_one_module_get_distinct_names() {
+        const DI: &str = r##"
+<EtherCATInfo><Descriptions>
+ <Devices><Device><Type ProductCode="#x74">CPL</Type>
+  <Sm StartAddress="#x1400" ControlByte="#x20">Inputs</Sm>
+ </Device></Devices>
+ <Modules><Module><Type ModuleIdent="#x10">EL1008</Type>
+  <TxPdo><Index>#x1A00</Index>
+   <Entry><Index>#x6000</Index><SubIndex>1</SubIndex><BitLen>1</BitLen><Name>Input</Name><DataType>BOOL</DataType></Entry>
+   <Entry><Index>#x6010</Index><SubIndex>1</SubIndex><BitLen>1</BitLen><Name>Input</Name><DataType>BOOL</DataType></Entry>
+   <Entry><Index>#x6020</Index><SubIndex>1</SubIndex><BitLen>1</BitLen><Name>Input</Name><DataType>BOOL</DataType></Entry>
+  </TxPdo></Module></Modules>
+</Descriptions></EtherCATInfo>"##;
+        let esi = parse(DI).expect("parses");
+        let img = assemble(&esi, &[0x10]).expect("assembles");
+        let names: Vec<&str> = img.channels.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["m0_input_6000_01", "m0_input_6010_01", "m0_input_6020_01"],
+            "collided names take the entry's object coordinates"
+        );
+        let unique: std::collections::HashSet<_> = names.iter().collect();
+        assert_eq!(unique.len(), names.len(), "names must be unique");
+        // The bits still land where they did — only the naming changed.
+        let offsets: Vec<(u16, u8)> = img
+            .channels
+            .iter()
+            .map(|c| (c.byte_offset, c.bit_offset))
+            .collect();
+        assert_eq!(offsets, [(0, 0), (0, 1), (0, 2)]);
+    }
+
+    /// A wholly non-ASCII `<Name>` sanitizes to nothing. It used to leave
+    /// the channel called just `m0_`, so every such entry in a slot was
+    /// indistinguishable — and Chinese/Japanese names are ordinary in
+    /// vendor ESIs.
+    #[test]
+    fn non_ascii_names_fall_back_to_object_coordinates() {
+        const CN: &str = r##"
+<EtherCATInfo><Descriptions>
+ <Devices><Device><Type ProductCode="#x74">CPL</Type>
+  <Sm StartAddress="#x1400" ControlByte="#x20">Inputs</Sm>
+ </Device></Devices>
+ <Modules><Module><Type ModuleIdent="#x30">CN</Type>
+  <TxPdo><Index>#x1A02</Index>
+   <Entry><Index>#x6200</Index><SubIndex>1</SubIndex><BitLen>16</BitLen><Name>输入电压</Name><DataType>UINT</DataType></Entry>
+   <Entry><Index>#x6210</Index><SubIndex>2</SubIndex><BitLen>16</BitLen><Name>输出电流</Name><DataType>UINT</DataType></Entry>
+  </TxPdo></Module></Modules>
+</Descriptions></EtherCATInfo>"##;
+        let esi = parse(CN).expect("parses");
+        let img = assemble(&esi, &[0x30]).expect("assembles");
+        let names: Vec<&str> = img.channels.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["m0_obj_6200_01", "m0_obj_6210_02"]);
+    }
+
+    /// Unique names are left exactly as they were: a project already bound
+    /// to `m0_di` must keep working across this change.
+    #[test]
+    fn unique_names_are_not_rewritten() {
+        let esi = parse(ESI).expect("parses");
+        let img = assemble(&esi, &[0x10, 0x20]).expect("assembles");
+        for c in &img.channels {
+            assert!(
+                !c.name.contains("_6") && !c.name.contains("_7"),
+                "unique name was needlessly rewritten: {}",
+                c.name
+            );
+        }
+    }
 
     // A synthetic 2-module coupler ESI: a 16-DI input module (ident 0x10)
     // and a 16-DO output module (ident 0x20), plus an 8-channel digital
