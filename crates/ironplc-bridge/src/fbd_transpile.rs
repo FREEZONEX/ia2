@@ -750,6 +750,10 @@ mod tests {
             errors.is_empty(),
             "ironplc rejected our ST:\n{st}\nDIAG: {errors:#?}"
         );
+        // `check` is the analyzer only; codegen rejects some shapes it accepts.
+        if let Err(e) = crate::compile(&st) {
+            panic!("ironplc cannot generate code for our ST:\n{st}\n{e}");
+        }
     }
 
     #[test]
@@ -829,5 +833,9 @@ mod tests {
             errors.is_empty(),
             "ironplc rejected our ST:\n{st}\nDIAG: {errors:#?}"
         );
+        // `check` is the analyzer only; codegen rejects some shapes it accepts.
+        if let Err(e) = crate::compile(&st) {
+            panic!("ironplc cannot generate code for our ST:\n{st}\n{e}");
+        }
     }
 }

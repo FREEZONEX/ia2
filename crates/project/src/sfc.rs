@@ -54,7 +54,10 @@ pub struct SfcProgram {
 #[ts(export)]
 pub struct SfcStep {
     /// Unique within the POU. Used both as the on-the-wire identifier
-    /// and as the source-map key.
+    /// and as the source-map key. At runtime it is a STRING literal, so the
+    /// transpiler refuses names containing `'` or `$`, names longer than
+    /// 254 characters, and pairs of names the runtime would store as the
+    /// same value (it keeps only the low byte of non-Latin-1 characters).
     pub name: String,
     /// Statements that fire while this step is active, on entry, etc.
     /// Order is preserved; the transpiler emits them in author order
@@ -85,9 +88,11 @@ pub struct SfcAction {
 #[ts(export)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum SfcQualifier {
-    /// **N**on-stored: fires every scan the step is active. The most
-    /// common qualifier; covers continuous outputs like "while
-    /// `step = filling` keep `inlet_valve := TRUE`".
+    /// **N**on-stored: the body runs every scan the step is active. It is
+    /// not run again when the step ends, so an assignment it made stays
+    /// in place — `inlet_valve := TRUE` in `filling` leaves the valve open
+    /// after `filling` ends unless a later step's action closes it (the
+    /// SFC template does this with an `R` action in `idle`).
     N,
     /// **S**et: fires once when the step becomes active. Body
     /// typically latches an output (`drum_motor := TRUE`).

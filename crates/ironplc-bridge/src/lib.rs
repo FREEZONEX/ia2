@@ -10,6 +10,8 @@ mod problem_docs;
 mod retain;
 mod runtime;
 mod sfc_transpile;
+#[cfg(test)]
+mod test_vm;
 
 pub use problem_docs::{lookup_problem_doc, lookup_problem_explanation};
 

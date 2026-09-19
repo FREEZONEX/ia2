@@ -172,10 +172,14 @@ pub enum LdNode {
     /// `MEMORY/graphical-languages.md` § "Standard function block
     /// library — owned by ironplc".
     FbCall {
-        /// FB instance variable name. Must be unique across the POU.
-        /// Declared as `<instance> : <fb_type>;` in the internal
-        /// VAR block by the transpiler — users do **not** add it to
-        /// `variables` manually.
+        /// FB instance variable name. Declared once as
+        /// `<instance> : <fb_type>;` in the internal VAR block by the
+        /// transpiler — users do **not** add it to `variables` manually.
+        ///
+        /// The same instance may be placed in several rungs to read its
+        /// output, but it runs once per scan, at its first placement, so
+        /// every placement must bind the same `inputs` (the transpiler
+        /// refuses anything else).
         instance: String,
         /// IEC type name of the FB — `"TON"`, `"CTU"`, `"R_TRIG"`,
         /// etc. The transpiler does not validate this string; it's
@@ -259,9 +263,10 @@ pub struct LdCoil {
 pub enum LdCoilKind {
     /// `var := <logic>;` — assigned every scan.
     Standard,
-    /// Set / latch — `IF <logic> THEN var := TRUE; END_IF;`.
+    /// Set / latch — the network is evaluated into a rung temporary, then
+    /// `IF <temporary> THEN var := TRUE; END_IF;`.
     Set,
-    /// Reset / unlatch — `IF <logic> THEN var := FALSE; END_IF;`.
+    /// Reset / unlatch — as `Set`, assigning FALSE.
     Reset,
 }
 

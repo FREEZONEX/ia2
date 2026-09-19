@@ -41,6 +41,25 @@
 //! cycle); if profiling ever flags it we switch to DINT IDs with a
 //! commented-out lookup table.
 //!
+//! What STRING costs, and the guards that pay for it
+//! -------------------------------------------------
+//! ironplc stores STRING as Latin-1 and encodes a literal by keeping each
+//! character's low byte (`encode_string_literal`, ADR-0016). It does not
+//! process `$` escapes. Three consequences, each enforced here rather than
+//! left to surface at runtime:
+//!
+//!   * **Length.** A value longer than the declared STRING length is
+//!     truncated, so a longer step name never compares equal to its own
+//!     literal — the chart enters that step and silently stops: no action
+//!     runs, no transition leaves. The state variables are sized to the
+//!     longest name (at least 31). ironplc's comparison also misbehaves at
+//!     a declared length of 255 or more, so names are capped at 254.
+//!   * **Collisions.** Two names whose characters share low bytes (`等` is
+//!     U+7B49, stored as `I`) are the same value: both steps are active at
+//!     once. Such pairs are rejected.
+//!   * **`$`** is the IEC escape character; a raw one is malformed ST that
+//!     ironplc happens to accept. Rejected, like `'`.
+//!
 //! Limitations (deferred for later phases)
 //! ---------------------------------------
 //! - Qualifier set is N / S / R. P / P0 / P1 / L / D / SD / DS / SL
@@ -149,9 +168,33 @@ pub fn transpile_to_st_with_map(prog: &SfcProgram) -> Result<(String, SfcSourceM
                 s.name
             )));
         }
+        if s.name.contains('$') {
+            return Err(BridgeError::Parse(format!(
+                "SFC step name '{}' contains '$', the IEC string escape character — rename the step",
+                s.name
+            )));
+        }
+        let chars = s.name.chars().count();
+        if chars > MAX_STEP_NAME_CHARS {
+            return Err(BridgeError::Parse(format!(
+                "SFC step name '{}…' is {chars} characters; the runtime compares at most {MAX_STEP_NAME_CHARS}",
+                s.name.chars().take(24).collect::<String>()
+            )));
+        }
         if !step_names.insert(s.name.as_str()) {
             return Err(BridgeError::Parse(format!(
                 "SFC step name '{}' duplicated",
+                s.name
+            )));
+        }
+    }
+    let mut stored_as: std::collections::HashMap<Vec<u8>, &str> = std::collections::HashMap::new();
+    for s in &prog.steps {
+        if let Some(other) = stored_as.insert(runtime_bytes(&s.name), s.name.as_str()) {
+            return Err(BridgeError::Parse(format!(
+                "SFC steps '{other}' and '{}' are the same value to the runtime — it stores STRING as \
+                 Latin-1 and keeps only the low byte of other characters — so both would be active at \
+                 once; rename one",
                 s.name
             )));
         }
@@ -201,8 +244,16 @@ pub fn transpile_to_st_with_map(prog: &SfcProgram) -> Result<(String, SfcSourceM
         LdPouType::FunctionBlock => ("FUNCTION_BLOCK", "END_FUNCTION_BLOCK"),
     };
 
+    let state_len = prog
+        .steps
+        .iter()
+        .map(|s| s.name.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(MIN_STATE_LEN);
+
     em.line(None, format_args!("{} {}", head, prog.name));
-    write_variable_blocks(&mut em, &prog.variables, &prog.initial_step);
+    write_variable_blocks(&mut em, &prog.variables, &prog.initial_step, state_len);
     em.blank();
 
     // --- Per-step action dispatch ---
@@ -244,7 +295,26 @@ pub fn transpile_to_st_with_map(prog: &SfcProgram) -> Result<(String, SfcSourceM
 //   Helpers
 // =================================================================
 
-fn write_variable_blocks(em: &mut StEmitter, vars: &[LdVariable], initial_step: &str) {
+/// Longest step name the runtime can compare. ironplc's STRING equality
+/// fails even for exact-fit contents once the declared length reaches 255.
+const MAX_STEP_NAME_CHARS: usize = 254;
+
+/// The state variables' declared length when every name is short — kept
+/// at the historical 31 so existing charts produce unchanged ST.
+const MIN_STATE_LEN: usize = 31;
+
+/// The bytes ironplc stores for a STRING literal of `name`: one byte per
+/// character, its low eight bits (`encode_string_literal`).
+fn runtime_bytes(name: &str) -> Vec<u8> {
+    name.chars().map(|c| (u32::from(c) & 0xFF) as u8).collect()
+}
+
+fn write_variable_blocks(
+    em: &mut StEmitter,
+    vars: &[LdVariable],
+    initial_step: &str,
+    state_len: usize,
+) {
     for section in [
         LdVarSection::Input,
         LdVarSection::Output,
@@ -273,9 +343,12 @@ fn write_variable_blocks(em: &mut StEmitter, vars: &[LdVariable], initial_step: 
         if section == LdVarSection::Internal {
             em.line(
                 None,
-                format_args!("        __sfc_step : STRING[31] := '{}';", initial_step),
+                format_args!("        __sfc_step : STRING[{state_len}] := '{initial_step}';"),
             );
-            em.line(None, format_args!("        __sfc_prev : STRING[31] := '';"));
+            em.line(
+                None,
+                format_args!("        __sfc_prev : STRING[{state_len}] := '';"),
+            );
         }
         em.line(None, format_args!("    END_VAR"));
     }
@@ -626,6 +699,129 @@ mod tests {
         );
     }
 
+    // ---- step identity at runtime --------------------------------------
+
+    fn var(name: &str, ty: &str, init: Option<&str>) -> LdVariable {
+        LdVariable {
+            name: name.into(),
+            type_name: ty.into(),
+            section: LdVarSection::Internal,
+            init: init.map(Into::into),
+        }
+    }
+
+    /// idle → `middle` → done, each transition always true. `middle` counts
+    /// the scans it was active; `done` latches when reached.
+    fn chain_through(middle: &str) -> SfcProgram {
+        SfcProgram {
+            name: "chain".into(),
+            pou_type: LdPouType::Program,
+            variables: vec![
+                var("go", "BOOL", Some("TRUE")),
+                var("middle_scans", "INT", None),
+                var("reached_done", "BOOL", None),
+            ],
+            initial_step: "idle".into(),
+            steps: vec![
+                SfcStep {
+                    name: "idle".into(),
+                    actions: vec![],
+                },
+                SfcStep {
+                    name: middle.into(),
+                    actions: vec![SfcAction {
+                        qualifier: SfcQualifier::N,
+                        body: "middle_scans := middle_scans + 1;".into(),
+                    }],
+                },
+                SfcStep {
+                    name: "done".into(),
+                    actions: vec![SfcAction {
+                        qualifier: SfcQualifier::N,
+                        body: "reached_done := TRUE;".into(),
+                    }],
+                },
+            ],
+            transitions: vec![
+                SfcTransition {
+                    from: "idle".into(),
+                    to: middle.into(),
+                    condition: "go".into(),
+                },
+                SfcTransition {
+                    from: middle.into(),
+                    to: "done".into(),
+                    condition: "TRUE".into(),
+                },
+            ],
+        }
+    }
+
+    /// A step name longer than the state variable used to be truncated on
+    /// assignment, so it never equalled its own literal: the chart entered
+    /// the step and stopped there — no action, no way out — with a clean
+    /// compile.
+    #[test]
+    fn a_long_step_name_still_runs_and_leaves() {
+        for name in [
+            "wait_for_operator_confirmation_x", // 32: one past the old limit
+            &"s".repeat(254),
+            "等待操作员确认后开始加料", // non-ASCII: counted in characters
+        ] {
+            let st = transpile_to_st(&chain_through(name)).unwrap();
+            let v = crate::test_vm::run_st(&st, 10);
+            assert_eq!(
+                (v["middle_scans"], v["reached_done"]),
+                (1, 1),
+                "chart stalled in a {}-character step\n{st}",
+                name.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn short_names_keep_the_historical_declaration() {
+        let st = transpile_to_st(&batch_program()).unwrap();
+        assert!(st.contains("__sfc_step : STRING[31] := 'idle';"), "{st}");
+    }
+
+    #[test]
+    fn a_step_name_the_runtime_cannot_compare_is_refused() {
+        let err = transpile_to_st(&chain_through(&"s".repeat(255))).unwrap_err();
+        assert!(err.to_string().contains("at most 254"), "{err}");
+    }
+
+    /// `等` is U+7B49; ironplc stores its low byte, `I`. Both steps used to
+    /// be active at once.
+    #[test]
+    fn names_the_runtime_stores_identically_are_refused() {
+        let mut prog = chain_through("等");
+        prog.steps.push(SfcStep {
+            name: "I".into(),
+            actions: vec![],
+        });
+        let err = transpile_to_st(&prog).unwrap_err().to_string();
+        assert!(err.contains("'等' and 'I'"), "{err}");
+        assert!(err.contains("same value"), "{err}");
+    }
+
+    #[test]
+    fn distinct_chinese_names_still_run() {
+        let mut prog = chain_through("加料");
+        prog.steps.push(SfcStep {
+            name: "排料".into(),
+            actions: vec![],
+        });
+        let v = crate::test_vm::run_st(&transpile_to_st(&prog).unwrap(), 10);
+        assert_eq!((v["middle_scans"], v["reached_done"]), (1, 1));
+    }
+
+    #[test]
+    fn a_dollar_in_a_step_name_is_refused() {
+        let err = transpile_to_st(&chain_through("cost$")).unwrap_err();
+        assert!(err.to_string().contains("escape character"), "{err}");
+    }
+
     #[test]
     fn end_to_end_batch_compiles_via_ironplc() {
         // The acid test: ironplc must accept the ST we synthesise.
@@ -638,5 +834,9 @@ mod tests {
             errors.is_empty(),
             "ironplc rejected our SFC-derived ST:\n{st}\nDIAG: {errors:#?}",
         );
+        // `check` is the analyzer only; codegen rejects some shapes it accepts.
+        if let Err(e) = crate::compile(&st) {
+            panic!("ironplc cannot generate code for our SFC-derived ST:\n{st}\n{e}");
+        }
     }
 }

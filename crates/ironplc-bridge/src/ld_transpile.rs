@@ -141,17 +141,11 @@ pub fn transpile_to_st_with_map(prog: &LdProgram) -> Result<(String, LdSourceMap
         LdPouType::FunctionBlock => ("FUNCTION_BLOCK", "END_FUNCTION_BLOCK"),
     };
 
-    // Pre-scan: any rung with >1 coil needs a BOOL temporary so we
-    // evaluate the network exactly once and feed all coils from it.
+    // Pre-scan: which rungs evaluate their network into a BOOL temporary.
     // ironplc requires every identifier to be declared in a VAR block
-    // before use, so we collect the temp names up-front and emit them
-    // as internal variables in the VAR section.
-    let rung_temps: Vec<String> = prog
-        .rungs
-        .iter()
-        .filter(|r| r.coils.len() > 1)
-        .map(|r| format!("__rung_{}", sanitise_ident(&r.id)))
-        .collect();
+    // before use, so the names are fixed up-front and emitted as internal
+    // variables. See `needs_temp` for which rungs, and why.
+    let rung_temps = rung_temporaries(&prog.rungs);
 
     // Pre-scan: collect every FB instance referenced from any rung's
     // logic tree. Each instance becomes a `name : fb_type;` line in
@@ -161,15 +155,56 @@ pub fn transpile_to_st_with_map(prog: &LdProgram) -> Result<(String, LdSourceMap
     let fb_instances = collect_fb_instances(&prog.rungs)?;
 
     em.line(None, format_args!("{} {}", head, prog.name));
-    write_variable_blocks(&mut em, &prog.variables, &rung_temps, &fb_instances);
+    let declared_temps: Vec<String> = rung_temps.iter().flatten().cloned().collect();
+    write_variable_blocks(&mut em, &prog.variables, &declared_temps, &fb_instances);
     em.blank();
 
+    // FB instances already called this scan, with the inputs they were
+    // called with — see `emit_fb_calls_for_rung`.
+    let mut called: BTreeMap<String, String> = BTreeMap::new();
     for (idx, rung) in prog.rungs.iter().enumerate() {
-        emit_rung(&mut em, rung, idx)?;
+        emit_rung(&mut em, rung, idx, rung_temps[idx].as_deref(), &mut called)?;
     }
 
     em.line(None, format_args!("{foot}"));
     Ok((em.out, LdSourceMap { lines: em.map }))
+}
+
+/// Whether a rung evaluates its network into a temporary before driving
+/// its coils:
+///
+///   * **several coils** — evaluate once, so every coil sees the same value;
+///   * **any set / reset coil** — `IF <network> THEN …` is the shape ironplc's
+///     codegen cannot compile when the condition *begins* with an FB output
+///     (`IF t.Q THEN`, `IF NOT e.Q THEN`, `IF (e.Q OR a) THEN` all fail with
+///     P9999 "not implemented"), while the analyzer — which is all
+///     `cs check` and the editor run — accepts it. A "timer done → set lamp"
+///     rung therefore checked clean and could not be run. Assigning to a
+///     temporary compiles for any network, and `IF <temporary> THEN` does too.
+fn needs_temp(rung: &LdRung) -> bool {
+    rung.coils.len() > 1 || rung.coils.iter().any(|c| c.kind != LdCoilKind::Standard)
+}
+
+/// One slot per rung: the temporary's name, or `None`. Names derive from
+/// the rung id; two ids that sanitise alike get the rung index appended so
+/// the declarations never collide.
+fn rung_temporaries(rungs: &[LdRung]) -> Vec<Option<String>> {
+    let mut taken = std::collections::HashSet::new();
+    rungs
+        .iter()
+        .enumerate()
+        .map(|(idx, rung)| {
+            if !needs_temp(rung) {
+                return None;
+            }
+            let mut name = format!("__rung_{}", sanitise_ident(&rung.id));
+            if !taken.insert(name.clone()) {
+                name = format!("{name}_{idx}");
+                taken.insert(name.clone());
+            }
+            Some(name)
+        })
+        .collect()
 }
 
 /// Walk all rung logic trees, gathering every `FbCall` instance. Errors
@@ -276,7 +311,13 @@ fn write_variable_blocks(
     }
 }
 
-fn emit_rung(em: &mut StEmitter, rung: &project::LdRung, idx: usize) -> Result<(), BridgeError> {
+fn emit_rung(
+    em: &mut StEmitter,
+    rung: &project::LdRung,
+    idx: usize,
+    temp: Option<&str>,
+    called: &mut BTreeMap<String, String>,
+) -> Result<(), BridgeError> {
     if rung.coils.is_empty() {
         return Err(BridgeError::Parse(format!(
             "LD rung {} ({}) has no coils — a rung with no output is dead code",
@@ -301,32 +342,21 @@ fn emit_rung(em: &mut StEmitter, rung: &project::LdRung, idx: usize) -> Result<(
 
     // Emit FB call statements for any FbCall nodes in this rung's
     // logic tree, BEFORE the coil assignment. ironplc's call-by-name
-    // syntax is `inst(PIN := value, PIN := value);`. Each unique
-    // instance is called once per rung (in source order); subsequent
-    // references in the same rung read its output pin via dot syntax.
-    //
-    // Why once per rung (not once per POU): the inputs may depend on
-    // values written by earlier rungs in the same scan, and we want
-    // the FB to see the most recent values. Calling more than once
-    // is also fine — for edge detectors the second call sees CLK
-    // unchanged so it's a no-op.
-    emit_fb_calls_for_rung(em, &rung.id, &rung.logic)?;
+    // syntax is `inst(PIN := value, PIN := value);`. Each instance is
+    // called once per scan, at the first rung that places it; later
+    // references read its output pin via dot syntax.
+    emit_fb_calls_for_rung(em, &rung.id, &rung.logic, called)?;
 
-    // Most rungs have one coil; if there are several, we evaluate
-    // `logic` once via a temporary so re-running the network for each
-    // coil can't produce inconsistent reads of mid-scan signals.
-    // The temporary uses a stable identifier derived from the rung id
-    // so name collisions across rungs are impossible.
-    if rung.coils.len() == 1 {
-        emit_coil(em, &rung.coils[0], 0, &rung.id, &logic);
-    } else {
-        let tmp = format!("__rung_{}", sanitise_ident(&rung.id));
-        em.line(
-            Some(rung_span.clone()),
-            format_args!("    {tmp} := {logic};"),
-        );
-        for (i, coil) in rung.coils.iter().enumerate() {
-            emit_coil(em, coil, i, &rung.id, &tmp);
+    match temp {
+        None => emit_coil(em, &rung.coils[0], 0, &rung.id, &logic),
+        Some(tmp) => {
+            em.line(
+                Some(rung_span.clone()),
+                format_args!("    {tmp} := {logic};"),
+            );
+            for (i, coil) in rung.coils.iter().enumerate() {
+                emit_coil(em, coil, i, &rung.id, tmp);
+            }
         }
     }
     em.blank();
@@ -334,14 +364,23 @@ fn emit_rung(em: &mut StEmitter, rung: &project::LdRung, idx: usize) -> Result<(
 }
 
 /// Walk the rung's logic tree in source order and emit one
-/// `instance(PIN := value, ...);` line per unique FbCall instance.
-/// De-duplicates so each instance is called at most once per rung.
+/// `instance(PIN := value, ...);` line for each FbCall instance that has
+/// not been called yet this scan.
+///
+/// An instance runs **once per scan**, at the first rung that places it.
+/// It used to run once per rung, on the theory that a second call "sees
+/// CLK unchanged, so it's a no-op" — true of an edge detector's memory,
+/// false of its output: R_TRIG's second call computes `Q := CLK AND NOT M`
+/// with `M` already TRUE, clearing the edge before any later rung could
+/// read it. A later placement may only read the output, so it must bind
+/// exactly the same inputs; different ones are an error rather than a
+/// second, silently competing call.
 fn emit_fb_calls_for_rung(
     em: &mut StEmitter,
     rung_id: &str,
     logic: &LdNode,
+    called: &mut BTreeMap<String, String>,
 ) -> Result<(), BridgeError> {
-    let mut seen: Vec<String> = Vec::new();
     // Collect the FB calls first (order + uniqueness) before emitting,
     // so we don't have to thread the emitter through the visitor's
     // FnMut closure (which conflicts with rustc's borrow checker when
@@ -352,9 +391,20 @@ fn emit_fb_calls_for_rung(
             instance, inputs, ..
         } = node
         {
-            if !seen.iter().any(|s| s == instance) {
-                seen.push(instance.clone());
-                let args = render_fb_inputs(inputs)?;
+            let args = render_fb_inputs(inputs)?;
+            let earlier = called
+                .get(instance)
+                .or_else(|| calls.iter().find(|(i, _)| i == instance).map(|(_, a)| a));
+            if let Some(first) = earlier {
+                if *first != args {
+                    return Err(BridgeError::Parse(format!(
+                        "FB instance '{instance}' is placed again in rung '{rung_id}' with inputs \
+                         ({args}) that differ from its first placement ({first}); an instance runs \
+                         once per scan, so a later placement can only read its outputs — bind the \
+                         same inputs, or use a separate instance"
+                    )));
+                }
+            } else {
                 calls.push((instance.clone(), args));
             }
         }
@@ -362,6 +412,7 @@ fn emit_fb_calls_for_rung(
     };
     walk_in_order(logic, &mut collect)?;
     for (instance, args) in calls {
+        called.insert(instance.clone(), args.clone());
         em.line(
             Some(LdLocation::FbCall {
                 rung_id: rung_id.to_string(),
@@ -726,8 +777,20 @@ mod tests {
             ],
         };
         let st = transpile_to_st(&prog).unwrap();
-        assert!(st.contains("IF trig THEN latched := TRUE; END_IF;"));
-        assert!(st.contains("IF NOT trig THEN latched := FALSE; END_IF;"));
+        assert!(st.contains("__rung_set := trig;"), "{st}");
+        assert!(
+            st.contains("IF __rung_set THEN latched := TRUE; END_IF;"),
+            "{st}"
+        );
+        assert!(st.contains("__rung_rst := NOT trig;"), "{st}");
+        assert!(
+            st.contains("IF __rung_rst THEN latched := FALSE; END_IF;"),
+            "{st}"
+        );
+        assert!(
+            st.contains("__rung_set : BOOL;") && st.contains("__rung_rst : BOOL;"),
+            "{st}"
+        );
     }
 
     #[test]
@@ -1330,6 +1393,14 @@ mod tests {
     /// without any error diagnostics. Warnings/info are tolerated.
     fn assert_compiles_clean(prog: &LdProgram) {
         let st = transpile_to_st(prog).unwrap();
+        // The analyzer (what `check` runs) accepts shapes ironplc's codegen
+        // rejects, so a clean check alone never proved a program would run.
+        if let Err(e) = crate::compile(&st) {
+            panic!(
+                "ironplc cannot generate code for our ST for {}:\n{st}\n{e}",
+                prog.name
+            );
+        }
         let diags = crate::check(&st);
         let errors: Vec<_> = diags
             .iter()
@@ -1342,6 +1413,219 @@ mod tests {
             st,
             errors
         );
+    }
+
+    // ---- behaviour, run in the VM ---------------------------------------
+
+    fn bool_var(name: &str, init: Option<&str>) -> LdVariable {
+        LdVariable {
+            name: name.into(),
+            type_name: "BOOL".into(),
+            section: LdVarSection::Internal,
+            init: init.map(Into::into),
+        }
+    }
+
+    fn contact(var: &str) -> LdNode {
+        LdNode::Contact {
+            var: var.into(),
+            negated: false,
+        }
+    }
+
+    fn fb(instance: &str, fb_type: &str, pins: &[(&str, LdOperand)], out: &str) -> LdNode {
+        LdNode::FbCall {
+            instance: instance.into(),
+            fb_type: fb_type.into(),
+            inputs: pins
+                .iter()
+                .map(|(pin, value)| LdFbInput {
+                    pin: (*pin).into(),
+                    value: value.clone(),
+                })
+                .collect(),
+            output_pin: out.into(),
+        }
+    }
+
+    fn var_op(name: &str) -> LdOperand {
+        LdOperand::Var { name: name.into() }
+    }
+
+    fn lit(value: &str) -> LdOperand {
+        LdOperand::Literal {
+            value: value.into(),
+        }
+    }
+
+    fn rung(id: &str, logic: LdNode, coil: &str, kind: LdCoilKind) -> LdRung {
+        LdRung {
+            id: id.into(),
+            label: None,
+            logic,
+            coils: vec![LdCoil {
+                var: coil.into(),
+                kind,
+            }],
+        }
+    }
+
+    fn program(variables: Vec<LdVariable>, rungs: Vec<LdRung>) -> LdProgram {
+        LdProgram {
+            name: "p".into(),
+            pou_type: LdPouType::Program,
+            variables,
+            rungs,
+        }
+    }
+
+    /// "Timer done → set lamp" and "edge → reset": a set/reset coil whose
+    /// network begins with an FB output. `check` passed these while the
+    /// runtime could not compile them (P9999 "not implemented").
+    #[test]
+    fn set_and_reset_coils_driven_by_an_fb_compile_and_latch() {
+        let edge = || fb("stop_edge", "R_TRIG", &[("CLK", var_op("stop"))], "Q");
+        let prog = program(
+            vec![
+                bool_var("start", Some("TRUE")),
+                bool_var("stop", Some("TRUE")),
+                bool_var("lamp", None),
+                bool_var("cleared", Some("TRUE")),
+            ],
+            vec![
+                rung(
+                    "done",
+                    fb(
+                        "dwell",
+                        "TON",
+                        &[("IN", var_op("start")), ("PT", lit("T#100ms"))],
+                        "Q",
+                    ),
+                    "lamp",
+                    LdCoilKind::Set,
+                ),
+                rung(
+                    "clear",
+                    LdNode::Not {
+                        arg: Box::new(LdNode::Not {
+                            arg: Box::new(edge()),
+                        }),
+                    },
+                    "cleared",
+                    LdCoilKind::Reset,
+                ),
+            ],
+        );
+        let st = transpile_to_st(&prog).unwrap();
+        let v = crate::test_vm::run_st(&st, 5);
+        assert_eq!(v["lamp"], 1, "the set coil never latched:\n{st}");
+        assert_eq!(v["cleared"], 0, "the reset coil never unlatched:\n{st}");
+    }
+
+    /// One R_TRIG placed in two rungs. The second rung used to call it
+    /// again, which clears Q in the same scan — so it never saw the edge.
+    #[test]
+    fn every_rung_placing_an_edge_detector_sees_the_edge() {
+        let edge = || fb("start_edge", "R_TRIG", &[("CLK", var_op("btn"))], "Q");
+        let seal = |id: &str, var: &str| {
+            rung(
+                id,
+                LdNode::Or {
+                    args: vec![contact(var), edge()],
+                },
+                var,
+                LdCoilKind::Standard,
+            )
+        };
+        let prog = program(
+            vec![
+                bool_var("btn", Some("TRUE")),
+                bool_var("seen_first", None),
+                bool_var("seen_second", None),
+            ],
+            vec![seal("r1", "seen_first"), seal("r2", "seen_second")],
+        );
+        let st = transpile_to_st(&prog).unwrap();
+        assert_eq!(st.matches("start_edge(").count(), 1, "{st}");
+        let v = crate::test_vm::run_st(&st, 5);
+        assert_eq!(
+            (v["seen_first"], v["seen_second"]),
+            (1, 1),
+            "a later rung missed the rising edge:\n{st}"
+        );
+    }
+
+    #[test]
+    fn placing_an_instance_again_with_different_inputs_is_refused() {
+        let prog = program(
+            vec![
+                bool_var("a", None),
+                bool_var("b", None),
+                bool_var("x", None),
+            ],
+            vec![
+                rung(
+                    "r1",
+                    fb("e", "R_TRIG", &[("CLK", var_op("a"))], "Q"),
+                    "x",
+                    LdCoilKind::Standard,
+                ),
+                rung(
+                    "r2",
+                    fb("e", "R_TRIG", &[("CLK", var_op("b"))], "Q"),
+                    "x",
+                    LdCoilKind::Standard,
+                ),
+            ],
+        );
+        let err = transpile_to_st(&prog).unwrap_err().to_string();
+        assert!(
+            err.contains("'e'") && err.contains("r2") && err.contains("once per scan"),
+            "{err}"
+        );
+
+        // The same mismatch inside one rung is refused too.
+        let prog = program(
+            vec![
+                bool_var("a", None),
+                bool_var("b", None),
+                bool_var("x", None),
+            ],
+            vec![rung(
+                "r1",
+                LdNode::Or {
+                    args: vec![
+                        fb("e", "R_TRIG", &[("CLK", var_op("a"))], "Q"),
+                        fb("e", "R_TRIG", &[("CLK", var_op("b"))], "Q"),
+                    ],
+                },
+                "x",
+                LdCoilKind::Standard,
+            )],
+        );
+        assert!(transpile_to_st(&prog).is_err());
+    }
+
+    #[test]
+    fn rung_ids_that_sanitise_alike_get_distinct_temporaries() {
+        let prog = program(
+            vec![
+                bool_var("a", None),
+                bool_var("x", None),
+                bool_var("y", None),
+            ],
+            vec![
+                rung("r-1", contact("a"), "x", LdCoilKind::Set),
+                rung("r_1", contact("a"), "y", LdCoilKind::Set),
+            ],
+        );
+        let st = transpile_to_st(&prog).unwrap();
+        assert!(
+            st.contains("__rung_r_1 : BOOL;") && st.contains("__rung_r_1_1 : BOOL;"),
+            "{st}"
+        );
+        let v = crate::test_vm::run_st(&st, 1);
+        assert_eq!((v["x"], v["y"]), (0, 0));
     }
 
     #[test]
