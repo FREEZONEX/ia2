@@ -51,9 +51,14 @@ export type HmiHost = {
    *  it changes — which is what invalidates an outstanding confirmation. */
   writesBlocked?: string | null
   fetchDoc(path: string): Promise<HmiDoc>
-  /** Persist a whole document (Arrange-mode drag). Absent → layout is
-   *  read-only, which is the edge panel's case. */
-  saveDoc?(path: string, doc: HmiDoc): Promise<unknown>
+  /** Move one element (Arrange-mode drag). Absent → layout is read-only,
+   *  which is the edge panel's case.
+   *
+   *  Deliberately a single-node operation, not a whole-document save: the
+   *  canvas's copy of the screen can predate another writer's change (an
+   *  agent's `cs hmi op` whose reload has not landed yet), and writing that
+   *  copy back deleted whatever it did not contain. */
+  moveNode?(path: string, id: string, x: number, y: number): Promise<unknown>
   /** Write one variable. `typeName` comes from the live snapshot so the
    *  host can bit-pack REALs correctly. `pulseMs` asks the RUNTIME to
    *  write 0 back after that many ms — the pulse reset must survive the

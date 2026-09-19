@@ -19,6 +19,8 @@ export function ProgramPane() {
     source,
     setSource,
     isDirty,
+    externalChange,
+    loadExternalChange,
     saveCurrentPou,
     isRunning,
     run,
@@ -183,6 +185,17 @@ export function ProgramPane() {
         </>}
       />
       {actionError && <div role="alert" className="border-b border-border bg-destructive/5 px-4 py-2 text-[13px] text-destructive">{actionError}</div>}
+      {externalChange && (
+        <div role="alert" className="flex items-center gap-3 border-b border-warn/50 bg-warn/10 px-4 py-2 text-[13px] text-warn">
+          <span className="min-w-0 flex-1">
+            Changed on disk while you were editing — another writer saved a different version.
+            Save and Run will ask before replacing it.
+          </span>
+          <Button variant="outline" size="sm" className="shrink-0" onClick={loadExternalChange}>
+            Load disk version
+          </Button>
+        </div>
+      )}
       <div className="flex min-h-0 flex-1">
         <div className={cn("relative min-h-0 min-w-0 flex-1", sweeping && "pou-sweep")}>
           {/* Library blocks open as a datasheet (interface + docs, with

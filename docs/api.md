@@ -94,7 +94,7 @@ read-only device-template catalog used to pre-fill devices from a bus scan.
 | `GET` | `/api/hmi` | List the project's HMI screens: `HmiListEntry[] { path, title, level }`. |
 | `POST` | `/api/hmi` | Create an empty screen. Body `{ path, title? }`; returns the fresh `HmiDoc`. Emits SSE `hmi` mutation. |
 | `GET` | `/api/hmi/{path}` | Read one screen as `HmiDoc` (slug percent-encoded into one segment, like `/api/pous/{path}`). |
-| `PUT` | `/api/hmi/{path}` | Replace the whole document (editor saves). Rejects structural errors; returns remaining warnings as `HmiIssue[]`. Emits SSE `hmi` mutation with empty `touched`. |
+| `PUT` | `/api/hmi/{path}` | Replace the whole document (`cs set hmi/…`). A blind overwrite: anything another writer added after the caller read the document is gone — which is why the IDE canvas, drags included, edits through `/ops` instead. Rejects structural errors; returns remaining warnings as `HmiIssue[]`. Emits SSE `hmi` mutation with empty `touched`. |
 | `DELETE` | `/api/hmi/{path}` | Delete the screen. Emits SSE `hmi` mutation (`hmi_deleted`). |
 | `POST` | `/api/hmi/{path}/ops` | THE incremental authoring surface: body `{ ops: HmiOp[] }` (`add_node` / `update_node` / `remove_node` / `set_meta`), applied atomically. Returns `{ touched, issues }`; the SSE `hmi` mutation carries the same `touched` node ids so every open canvas spawn-animates exactly the elements this batch placed. |
 | `GET` | `/api/hmi/{path}/check` | Structural validation plus variable-existence warnings against the project's POUs. Returns `HmiIssue[]`. |

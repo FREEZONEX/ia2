@@ -68,6 +68,7 @@ import {
 import { LspClient, pouDocumentUri } from "@/lib/lsp-client"
 
 import { useDiscardChanges } from "@/lib/use-discard-changes"
+import { useExternalChangePrompt } from "@/lib/use-external-change"
 
 export type View = "app" | "device" | "iomap" | "edge" | "tasks" | "hmi"
 
@@ -209,6 +210,12 @@ type AppState = {
   source: string
   setSource: (s: string) => void
   isDirty: boolean
+  /** The open program as it now stands on disk, when another writer changed
+   *  it while this window held unsaved edits. Null otherwise. Save and Run
+   *  ask before writing over it. */
+  externalChange: Pou | null
+  /** Replace the buffer with `externalChange`, discarding unsaved edits. */
+  loadExternalChange: () => void
   confirmDiscard: () => Promise<boolean>
   diagnostics: CheckDiagnostic[]
   /** Bumps on every project-tree refresh. Editors put it in their
@@ -302,6 +309,18 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
   const [currentPou, setCurrentPou] = useState<Pou | null>(null)
   const [source, setSource] = useState("")
   const { confirmDiscard, discardDialog } = useDiscardChanges(!!currentPou && source !== currentPou.source)
+  const { askExternalChange, externalChangeDialog } = useExternalChangePrompt()
+  // What another writer left on disk while this buffer was dirty. Kept raw
+  // and compared against the base on every render, so this window's own
+  // save — whose echo can arrive before the PUT returns — stops counting
+  // the moment the base catches up, without guessing who wrote it.
+  const [externalDisk, setExternalDisk] = useState<Pou | null>(null)
+  const externalChange =
+    externalDisk && currentPou && externalDisk.path === currentPou.path && externalDisk.source !== currentPou.source
+      ? externalDisk
+      : null
+  const externalChangeRef = useRef<Pou | null>(null)
+  externalChangeRef.current = externalChange
   const pouSelectionRef = useRef(0)
   const [diagnostics, setDiagnostics] = useState<CheckDiagnostic[]>([])
   const [projectEpoch, setProjectEpoch] = useState(0)
@@ -756,26 +775,79 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
   // newest source on disk. If the local buffer has unsaved edits
   // we deliberately skip the silent refetch (the SSE handler will
   // surface a Reload toast instead).
+  //
+  // A dirty buffer is never replaced, but the change is always fetched and
+  // recorded: skipping the fetch used to leave nothing behind (the Reload
+  // toast it deferred to was removed), so the next Save or Run wrote the
+  // stale buffer over the other writer's version without a word.
   useEffect(() => {
     const path = currentPou?.path
+    setExternalDisk(null)
     if (!path) return
     return invalidationBus.subscribe(Topic.pou(path), () => {
-      // Re-read the current dirty state via refs to avoid stale
-      // closure values — `currentPou` and `source` snapshot at
-      // subscribe time would mis-classify rapid edits.
-      const cur = currentPouRef.current
-      if (!cur || cur.path !== path) return
-      if (sourceRef.current !== cur.source) return  // dirty — let toast handle it
+      if (currentPouRef.current?.path !== path) return
       void fetchPou(path)
         .then((fresh) => {
-          if (currentPouRef.current?.path !== path) return  // user moved away
+          // Re-read through refs at resolve time: `currentPou` and
+          // `source` captured at subscribe time would mis-classify edits
+          // made while the fetch was in flight.
+          const cur = currentPouRef.current
+          if (cur?.path !== path) return  // user moved away
+          if (fresh.source === cur.source) {
+            setExternalDisk(null)
+            return
+          }
+          if (sourceRef.current === fresh.source) {
+            // Disk already holds exactly this buffer (typically our own
+            // save, echoed before its PUT returned): adopt it as the base.
+            setCurrentPou(fresh)
+            setExternalDisk(null)
+            return
+          }
+          if (sourceRef.current !== cur.source) {
+            setExternalDisk(fresh)
+            return
+          }
           setCurrentPou(fresh)
           setSource(fresh.source)
+          setExternalDisk(null)
           pouSpawnStore.bump()
         })
         .catch(() => {})
     })
   }, [currentPou?.path])
+
+  // Clean buffer + recorded change = the user reverted (or typed their way
+  // back to the base). There is nothing left to protect, and leaving the
+  // stale base on screen would present the other writer's version as if it
+  // did not exist.
+  useEffect(() => {
+    if (!externalChange || !currentPou || source !== currentPou.source) return
+    setCurrentPou(externalChange)
+    setSource(externalChange.source)
+    setExternalDisk(null)
+  }, [externalChange, currentPou, source])
+
+  const loadExternalChange = useCallback(() => {
+    const ext = externalChangeRef.current
+    if (!ext) return
+    setCurrentPou(ext)
+    setSource(ext.source)
+    setExternalDisk(null)
+    pouSpawnStore.bump()
+  }, [])
+
+  /** Before writing the buffer: settle a recorded external change. Returns
+   *  false when nothing should be written. Loading the disk version never
+   *  continues into the caller's write or run — the user sees it first. */
+  const settleExternalChange = useCallback(async (): Promise<boolean> => {
+    const ext = externalChangeRef.current
+    if (!ext) return true
+    const choice = await askExternalChange(ext.path)
+    if (choice === "overwrite") return true
+    if (choice === "load") loadExternalChange()
+    return false
+  }, [askExternalChange, loadExternalChange])
 
   // Per-device / per-edge live-reload, mirroring the per-POU pattern
   // above: while an editor pane is open on it, an agent-side `cs device
@@ -977,15 +1049,29 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     }
   }, [refreshProject])
 
+  // Save and Run acknowledge the same version. A mutation received while
+  // the PUT is in flight can describe a later write, so its conflict must
+  // survive this response. Only clear the version approved before saving,
+  // or an echo whose contents are exactly what this request wrote.
+  const saveCurrentBuffer = useCallback(async (): Promise<"saved" | "cancelled" | "conflict"> => {
+    if (!currentPou || !await settleExternalChange()) return "cancelled"
+    const approvedExternal = externalChangeRef.current
+    await savePou(currentPou.path, source)
+    const latestExternal = externalChangeRef.current
+    setCurrentPou({ ...currentPou, source })
+    setExternalDisk((disk) => disk === approvedExternal || disk?.source === source ? null : disk)
+    return latestExternal && latestExternal !== approvedExternal && latestExternal.source !== source
+      ? "conflict"
+      : "saved"
+  }, [currentPou, source, settleExternalChange])
+
   const saveCurrentPou = useCallback(async () => {
-    if (!currentPou) return
     try {
-      await savePou(currentPou.path, source)
-      setCurrentPou({ ...currentPou, source })
+      await saveCurrentBuffer()
     } catch (e) {
       setError(String(e))
     }
-  }, [currentPou, source])
+  }, [saveCurrentBuffer])
 
   const createPou = useCallback(
     async (
@@ -1184,8 +1270,14 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
         // re-reads the project from disk on compile, so unsaved edits
         // would otherwise be silently ignored.
         if (currentPou && source !== currentPou.source) {
-          await savePou(currentPou.path, source)
-          setCurrentPou({ ...currentPou, source })
+          // Run compiles what is on disk, so this save decides what the
+          // runtime executes. Never let it silently replace a version this
+          // window has not seen.
+          const saved = await saveCurrentBuffer()
+          if (saved !== "saved") {
+            if (saved === "conflict") setError("Program changed on disk while saving — review the new version before running.")
+            return
+          }
         }
         await runProgram(program, file_path)
         // Record what we just kicked off so the Monitor header can
@@ -1209,7 +1301,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
         setError(String(e))
       }
     },
-    [currentPou, source, tasks],
+    [currentPou, source, tasks, saveCurrentBuffer],
   )
 
   const stop = useCallback(async () => {
@@ -1240,6 +1332,8 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       source,
       setSource,
       isDirty,
+      externalChange,
+      loadExternalChange,
       confirmDiscard,
       diagnostics,
       projectEpoch,
@@ -1293,6 +1387,8 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       source,
       setSource,
       isDirty,
+      externalChange,
+      loadExternalChange,
       confirmDiscard,
       diagnostics,
       projectEpoch,
@@ -1339,7 +1435,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     ],
   )
 
-  return <Ctx.Provider value={value}>{children}{discardDialog}</Ctx.Provider>
+  return <Ctx.Provider value={value}>{children}{discardDialog}{externalChangeDialog}</Ctx.Provider>
 }
 
 export function useRuntime() {

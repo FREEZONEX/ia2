@@ -314,15 +314,17 @@ export function HmiCanvas({
     const d = dragRef.current
     dragRef.current = null
     setDragPos(null)
-    if (mode !== "arrange" || !d || !doc || !d.moved || !host.saveDoc) return
+    if (mode !== "arrange" || !d || !doc || !d.moved || !host.moveNode) return
     const next = structuredClone(doc)
     const target = findNode(next.root, d.id)
     if (target) {
+      // Optimistic local position; the server applies only this move, and
+      // its mutation event reloads the real document either way.
       target.x = d.curX
       target.y = d.curY
       setDoc(next)
       try {
-        await host.saveDoc(path, next)
+        await host.moveNode(path, d.id, d.curX, d.curY)
       } catch (error) {
         setActionError(`Layout was not saved: ${String(error)}`)
         void load() // server rejected — resync to truth

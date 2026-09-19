@@ -857,20 +857,6 @@ export async function createHmi(
   )
 }
 
-export async function saveHmi(
-  path: string,
-  doc: HmiDoc,
-): Promise<HmiIssue[]> {
-  return jsonOrThrow(
-    await apiFetch(`/api/hmi/${encodeURIComponent(path)}`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(doc),
-    }),
-    "PUT /api/hmi/{path}",
-  )
-}
-
 export async function deleteHmi(path: string): Promise<void> {
   await jsonOrThrow(
     await apiFetch(`/api/hmi/${encodeURIComponent(path)}`, {
