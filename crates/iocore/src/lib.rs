@@ -14,10 +14,35 @@ use thiserror::Error;
 
 pub use health::{HealthTracker, HealthTransition};
 
+/// One field value crossing the adapter boundary.
+///
+/// **Signedness lives in the variant, not in the bits.** There is no
+/// signed-8 or signed-16 lane: a negative value of *any* width is carried
+/// as [`ChannelValue::I32`], sign-extended. `U16` means an unsigned
+/// number, and every consumer reads it that way — `to_i32` widens it
+/// without sign extension, so a two's-complement bit pattern parked in
+/// `U16` is read back as a large positive number.
+///
+/// This is the rule the bridge already depends on: its output direction
+/// (`value_for_type`) maps every signed IEC type to `I32` and only the
+/// unsigned ones to `U16`. An adapter that decodes a signed field into
+/// `U16` therefore breaks the round trip — the value it writes to the
+/// wire comes back as a different number.
+///
+/// The failure is invisible on narrow variables and only appears on wide
+/// ones: a 16-bit pattern written to an `INT` is truncated back to 16
+/// bits by the VM and reads correctly by accident, while the same value
+/// in a `DINT`, `LINT`, `REAL` or `LREAL` is off by 65536.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub enum ChannelValue {
     Bool(bool),
+    /// An **unsigned** integer up to 16 bits (U8/USINT, U16/UINT, BYTE,
+    /// WORD). Never a signed value: see the type-level note above.
     U16(u16),
+    /// A **signed** integer up to 32 bits — the lane for every signed
+    /// field regardless of its width on the wire (I8, I16, I32), and the
+    /// carrier for unsigned 32-bit fields, whose bit pattern round-trips
+    /// even though the numeric view may be negative.
     I32(i32),
     /// IEEE-754 single — analog values (OPC UA Float tags, EtherCAT REAL
     /// PDOs, scaled 4-20 mA). Carried as a real float so fractional
@@ -170,6 +195,26 @@ pub trait IoDevice: Send {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lane contract, pinned: `U16` is unsigned and widens without a
+    /// sign; a signed field of any width belongs on `I32`. Adapters were
+    /// choosing differently (EtherCAT and OPC UA parked two's-complement
+    /// patterns in `U16`), so the rule is asserted here rather than left
+    /// as a comment in whichever decoder happened to get it right.
+    #[test]
+    fn u16_is_the_unsigned_lane_and_i32_carries_the_sign() {
+        // 0xFFFE is -2 as a 16-bit two's-complement pattern.
+        let smuggled = ChannelValue::U16(0xFFFE);
+        assert_eq!(smuggled.to_i32(), 65534, "U16 widens unsigned, by design");
+        assert_eq!(smuggled.to_f64(), 65534.0);
+
+        let correct = ChannelValue::I32(-2);
+        assert_eq!(correct.to_i32(), -2);
+        assert_eq!(correct.to_f32(), -2.0);
+        assert_eq!(correct.to_f64(), -2.0);
+        // And it reaches a REAL variable as the float -2.0, not 65534.0.
+        assert_eq!(correct.to_vm_bits(true), (-2.0f32).to_bits() as i32);
+    }
 
     #[test]
     fn vm_bits_for_real_vars_are_ieee754() {

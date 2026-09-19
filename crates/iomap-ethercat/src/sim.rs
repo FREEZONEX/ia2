@@ -278,10 +278,8 @@ fn byte_size(bit_length: u8) -> u16 {
 fn zero_for(ty: EthercatDataType) -> ChannelValue {
     match ty {
         EthercatDataType::Bool => ChannelValue::Bool(false),
-        EthercatDataType::U8
-        | EthercatDataType::I8
-        | EthercatDataType::U16
-        | EthercatDataType::I16 => ChannelValue::U16(0),
+        EthercatDataType::U8 | EthercatDataType::U16 => ChannelValue::U16(0),
+        EthercatDataType::I8 | EthercatDataType::I16 => ChannelValue::I32(0),
         EthercatDataType::U32 | EthercatDataType::I32 => ChannelValue::I32(0),
         EthercatDataType::Real => ChannelValue::Real(0.0),
     }
@@ -290,10 +288,11 @@ fn zero_for(ty: EthercatDataType) -> ChannelValue {
 fn coerce_to_type(value: ChannelValue, ty: EthercatDataType) -> ChannelValue {
     match ty {
         EthercatDataType::Bool => ChannelValue::Bool(value.to_i32() != 0),
-        EthercatDataType::U8
-        | EthercatDataType::I8
-        | EthercatDataType::U16
-        | EthercatDataType::I16 => ChannelValue::U16(value.to_i32() as u16),
+        EthercatDataType::U8 | EthercatDataType::U16 => ChannelValue::U16(value.to_i32() as u16),
+        // Same lane as the real adapter: signed narrow fields are I32.
+        // The sim shared the bug, which is why no sim-backed test caught it.
+        EthercatDataType::I8 => ChannelValue::I32(value.to_i32() as i8 as i32),
+        EthercatDataType::I16 => ChannelValue::I32(value.to_i32() as i16 as i32),
         EthercatDataType::U32 | EthercatDataType::I32 => ChannelValue::I32(value.to_i32()),
         // Keep the fraction — sim mirrors what a real REAL PDO carries.
         EthercatDataType::Real => ChannelValue::Real(value.to_f32()),

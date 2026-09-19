@@ -3930,6 +3930,148 @@ mod tests {
         assert_eq!(var_value(&snap, "b.mirror"), "0");
     }
 
+    /// A device that parks a two's-complement bit pattern in the unsigned
+    /// `U16` lane — what the EtherCAT and OPC UA adapters used to do for
+    /// signed 8/16-bit fields.
+    ///
+    /// This test is the *consequence* half of that bug, and it is why the
+    /// adapter-level fix matters: the bridge's input phase converts with
+    /// `to_vm_bits(false)` -> `to_i32()`, which widens `U16` without sign
+    /// extension. A 16-bit variable hides the error, because the VM
+    /// truncates the slot back to 16 bits on read; anything wider does
+    /// not. Adapters must decode signed fields to `ChannelValue::I32`
+    /// (see the type-level note on `ChannelValue`).
+    struct RawU16Device {
+        name: String,
+        raw: u16,
+    }
+
+    #[async_trait::async_trait]
+    impl IoDevice for RawU16Device {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        async fn read_channel(&mut self, _channel: &str) -> Result<ChannelValue, IoError> {
+            Ok(ChannelValue::U16(self.raw))
+        }
+        async fn write_channel(
+            &mut self,
+            _channel: &str,
+            _value: ChannelValue,
+        ) -> Result<(), IoError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn unsigned_lane_widens_without_a_sign() {
+        let prog = crate::compile(
+            "PROGRAM p\n\
+                VAR narrow : INT; wide : DINT; n_mirror : INT; w_mirror : DINT; END_VAR\n\
+                n_mirror := narrow;\n\
+                w_mirror := wide;\n\
+            END_PROGRAM",
+        )
+        .expect("compiles");
+
+        // 0xFFFE is what the EtherCAT lane produces for an I16 reading -2.
+        let devices: Vec<Box<dyn IoDevice>> = vec![Box::new(RawU16Device {
+            name: "ec".into(),
+            raw: 0xFFFEu16,
+        })];
+        let m = |var: &str| project::Mapping {
+            application: "p".into(),
+            variable: var.into(),
+            direction: project::Direction::Input,
+            device: "ec".into(),
+            channel: "sig".into(),
+            unit: None,
+            min: None,
+            max: None,
+            description: None,
+        };
+        let handle = spawn_units_inner(
+            vec![single_unit(prog, 10)],
+            DeviceSource::Prebuilt(devices),
+            vec![m("narrow"), m("wide")],
+            None,
+            WriteGovernance::default(),
+        );
+        let mut rx = handle.subscribe();
+        let snap = last_snapshot_within(&mut rx, Duration::from_millis(250)).await;
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown joins");
+
+        // The 16-bit variable is right either way — the VM truncates the
+        // slot, so the bug is invisible here. This is documented rather
+        // than asserted-as-correct: it is the reason the defect survived.
+        assert_eq!(var_value(&snap, "narrow"), "-2");
+        assert_eq!(var_value(&snap, "n_mirror"), "-2");
+        // The wide variable is where an unsigned widening shows: a `U16`
+        // lane carrying 0xFFFE reads 65534 here instead of -2.
+        assert_eq!(
+            var_value(&snap, "wide"),
+            "65534",
+            "U16 is the UNSIGNED lane — widening it must not invent a sign"
+        );
+        assert_eq!(var_value(&snap, "w_mirror"), "65534");
+    }
+
+    /// The same value decoded the correct way round: on the `I32` lane
+    /// every variable width agrees.
+    ///
+    /// This pins the assumption the adapter-side fix rests on — it is not
+    /// itself red without that fix, because it feeds the bridge `I32`
+    /// directly. The red half lives in the adapters
+    /// (`bits::tests::i16_negative_roundtrip`,
+    /// `iomap-opcua … negative_int16_tag_stays_negative`).
+    #[tokio::test]
+    async fn signed_channel_reaches_a_wide_variable_intact() {
+        let prog = crate::compile(
+            "PROGRAM p\n\
+                VAR narrow : INT; wide : DINT; scaled : REAL; END_VAR\n\
+            END_PROGRAM",
+        )
+        .expect("compiles");
+
+        let devices: Vec<Box<dyn IoDevice>> = vec![Box::new(ConstInputDevice {
+            name: "ec".into(),
+            value: -2,
+        })];
+        let m = |var: &str| project::Mapping {
+            application: "p".into(),
+            variable: var.into(),
+            direction: project::Direction::Input,
+            device: "ec".into(),
+            channel: "sig".into(),
+            unit: None,
+            min: None,
+            max: None,
+            description: None,
+        };
+        let handle = spawn_units_inner(
+            vec![single_unit(prog, 10)],
+            DeviceSource::Prebuilt(devices),
+            vec![m("narrow"), m("wide"), m("scaled")],
+            None,
+            WriteGovernance::default(),
+        );
+        let mut rx = handle.subscribe();
+        let snap = last_snapshot_within(&mut rx, Duration::from_millis(250)).await;
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown joins");
+
+        assert_eq!(var_value(&snap, "narrow"), "-2");
+        assert_eq!(
+            var_value(&snap, "wide"),
+            "-2",
+            "the width must not change the value"
+        );
+        assert_eq!(var_value(&snap, "scaled"), "-2", "REAL target too");
+    }
+
     /// A STRING var initialised to a literal must surface as the quoted
     /// IEC value in the snapshot. Exercises the data-region read path
     /// (`[max_len][cur_len][bytes…]` at the layout-table offset) end to
