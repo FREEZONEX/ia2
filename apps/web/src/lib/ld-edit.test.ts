@@ -300,33 +300,61 @@ describe("round-trip", () => {
 // =================================================================
 //   evaluateNode — online-mode evaluator
 // =================================================================
-import { evaluateNode } from "./ld-edit"
+import { evaluateNode, readingsFrom } from "./ld-edit"
 
 describe("evaluateNode", () => {
   it("contact conducts when var is true and not negated", () => {
     expect(
-      evaluateNode({ op: "contact", var: "a", negated: false }, { a: true }),
+      evaluateNode({ op: "contact", var: "a", negated: false }, readingsFrom({ a: true })),
     ).toBe(true)
     expect(
-      evaluateNode({ op: "contact", var: "a", negated: false }, { a: false }),
+      evaluateNode({ op: "contact", var: "a", negated: false }, readingsFrom({ a: false })),
     ).toBe(false)
   })
 
   it("negated contact inverts", () => {
     expect(
-      evaluateNode({ op: "contact", var: "a", negated: true }, { a: true }),
+      evaluateNode({ op: "contact", var: "a", negated: true }, readingsFrom({ a: true })),
     ).toBe(false)
     expect(
-      evaluateNode({ op: "contact", var: "a", negated: true }, { a: false }),
+      evaluateNode({ op: "contact", var: "a", negated: true }, readingsFrom({ a: false })),
     ).toBe(true)
   })
 
-  it("missing variable reads as false", () => {
+  it("a variable with no live value is unknown, not FALSE", () => {
+    // Reading it as FALSE drew an NC contact on an unpublished variable as
+    // closed — e.g. a pressed e-stop whose name arrived instance-qualified.
     expect(
-      evaluateNode({ op: "contact", var: "missing", negated: false }, {}),
-    ).toBe(false)
+      evaluateNode({ op: "contact", var: "missing", negated: false }, readingsFrom({})),
+    ).toBe(null)
     expect(
-      evaluateNode({ op: "contact", var: "missing", negated: true }, {}),
+      evaluateNode({ op: "contact", var: "missing", negated: true }, readingsFrom({})),
+    ).toBe(null)
+  })
+
+  it("settles what the known values settle, and nothing more", () => {
+    const a = { op: "contact", var: "a", negated: false } as const
+    const u = { op: "contact", var: "unknown", negated: false } as const
+    const and = (...args: LdNode[]): LdNode => ({ op: "and", args })
+    const or = (...args: LdNode[]): LdNode => ({ op: "or", args })
+    const off = readingsFrom({ a: false })
+    const on = readingsFrom({ a: true })
+    expect(evaluateNode(and(a, u), off)).toBe(false)
+    expect(evaluateNode(and(a, u), on)).toBe(null)
+    expect(evaluateNode(or(a, u), on)).toBe(true)
+    expect(evaluateNode(or(a, u), off)).toBe(null)
+    expect(evaluateNode({ op: "not", arg: u }, on)).toBe(null)
+    expect(
+      evaluateNode(
+        { op: "compare", left: { kind: "var", name: "temp" }, cmp: "gt", right: { kind: "literal", value: "50" } },
+        readingsFrom({}, {}),
+      ),
+    ).toBe(null)
+    expect(
+      evaluateNode(
+        { op: "compare", left: { kind: "var", name: "temp" }, cmp: "gt", right: { kind: "literal", value: "50" } },
+        readingsFrom({}, { temp: 60 }),
+      ),
     ).toBe(true)
   })
 
@@ -338,9 +366,9 @@ describe("evaluateNode", () => {
         { op: "contact", var: "b", negated: false },
       ],
     }
-    expect(evaluateNode(tree, { a: true, b: true })).toBe(true)
-    expect(evaluateNode(tree, { a: true, b: false })).toBe(false)
-    expect(evaluateNode(tree, { a: false, b: true })).toBe(false)
+    expect(evaluateNode(tree, readingsFrom({ a: true, b: true }))).toBe(true)
+    expect(evaluateNode(tree, readingsFrom({ a: true, b: false }))).toBe(false)
+    expect(evaluateNode(tree, readingsFrom({ a: false, b: true }))).toBe(false)
   })
 
   it("OR fires when any child fires", () => {
@@ -351,9 +379,9 @@ describe("evaluateNode", () => {
         { op: "contact", var: "b", negated: false },
       ],
     }
-    expect(evaluateNode(tree, { a: false, b: false })).toBe(false)
-    expect(evaluateNode(tree, { a: true, b: false })).toBe(true)
-    expect(evaluateNode(tree, { a: false, b: true })).toBe(true)
+    expect(evaluateNode(tree, readingsFrom({ a: false, b: false }))).toBe(false)
+    expect(evaluateNode(tree, readingsFrom({ a: true, b: false }))).toBe(true)
+    expect(evaluateNode(tree, readingsFrom({ a: false, b: true }))).toBe(true)
   })
 
   it("evaluates the seal-in pattern correctly", () => {
@@ -371,19 +399,21 @@ describe("evaluateNode", () => {
         },
       ],
     }
+    const at = (start: boolean, motor_run: boolean, stop: boolean) =>
+      evaluateNode(tree, readingsFrom({ start, motor_run, stop }))
     // not yet started
-    expect(evaluateNode(tree, {})).toBe(false)
+    expect(at(false, false, false)).toBe(false)
     // press start
-    expect(evaluateNode(tree, { start: true })).toBe(true)
+    expect(at(true, false, false)).toBe(true)
     // start released, motor running, stop not pressed -> sealed in
-    expect(evaluateNode(tree, { motor_run: true })).toBe(true)
+    expect(at(false, true, false)).toBe(true)
     // stop pressed releases
-    expect(evaluateNode(tree, { motor_run: true, stop: true })).toBe(false)
+    expect(at(false, true, true)).toBe(false)
   })
 
   it("empty AND/OR collapse to identity", () => {
-    expect(evaluateNode({ op: "and", args: [] }, {})).toBe(true)
-    expect(evaluateNode({ op: "or", args: [] }, {})).toBe(false)
+    expect(evaluateNode({ op: "and", args: [] }, readingsFrom({}))).toBe(true)
+    expect(evaluateNode({ op: "or", args: [] }, readingsFrom({}))).toBe(false)
   })
 
   it("treats omitted `negated` field as false (serde-default round-trip)", () => {
@@ -392,21 +422,20 @@ describe("evaluateNode", () => {
     // undefined, and a naïve `var !== undefined` would always be
     // true. Regression test for that exact bug.
     const node = { op: "contact", var: "x" } as unknown as LdNode
-    expect(evaluateNode(node, { x: false })).toBe(false)
-    expect(evaluateNode(node, { x: true })).toBe(true)
+    expect(evaluateNode(node, readingsFrom({ x: false }))).toBe(false)
+    expect(evaluateNode(node, readingsFrom({ x: true }))).toBe(true)
     // explicit-false should match the omitted case
     expect(
       evaluateNode(
-        { op: "contact", var: "x", negated: false } as LdNode,
-        { x: false },
-      ),
+        { op: "contact", var: "x", negated: false } as LdNode, readingsFrom({ x: false })),
     ).toBe(false)
   })
 
   it("fb_call reads instance.outputPin as a dotted variable name", () => {
     // The evaluator can't simulate a TON itself; it reads whatever
     // value the runtime exposes under `inst.Q` (or `.QU`, `.Q1`...).
-    // Verify both branches: missing → false (forgiving), present → use.
+    // Missing — the normal case, the runtime publishes the instance only —
+    // is unknown; present is used.
     const node: LdNode = {
       op: "fb_call",
       instance: "myT",
@@ -414,12 +443,12 @@ describe("evaluateNode", () => {
       inputs: [],
       output_pin: "Q",
     }
-    expect(evaluateNode(node, {})).toBe(false)
-    expect(evaluateNode(node, { "myT.Q": false })).toBe(false)
-    expect(evaluateNode(node, { "myT.Q": true })).toBe(true)
+    expect(evaluateNode(node, readingsFrom({}))).toBe(null)
+    expect(evaluateNode(node, readingsFrom({ "myT.Q": false }))).toBe(false)
+    expect(evaluateNode(node, readingsFrom({ "myT.Q": true }))).toBe(true)
     // Other instances or other pins must not be picked up
-    expect(evaluateNode(node, { "other.Q": true })).toBe(false)
-    expect(evaluateNode(node, { "myT.ET": true })).toBe(false)
+    expect(evaluateNode(node, readingsFrom({ "other.Q": true }))).toBe(null)
+    expect(evaluateNode(node, readingsFrom({ "myT.ET": true }))).toBe(null)
   })
 
   it("fb_call participates in AND/OR like any other boolean leaf", () => {
@@ -440,11 +469,14 @@ describe("evaluateNode", () => {
       ],
     }
     // btn down but timer not done → false
-    expect(evaluateNode(tree, { btn: true, "myT.Q": false })).toBe(false)
+    expect(evaluateNode(tree, readingsFrom({ btn: true, "myT.Q": false }))).toBe(false)
     // btn down + timer done → true (this is the "delayed start" pattern)
-    expect(evaluateNode(tree, { btn: true, "myT.Q": true })).toBe(true)
+    expect(evaluateNode(tree, readingsFrom({ btn: true, "myT.Q": true }))).toBe(true)
     // btn up overrides timer
-    expect(evaluateNode(tree, { btn: false, "myT.Q": true })).toBe(false)
+    expect(evaluateNode(tree, readingsFrom({ btn: false, "myT.Q": true }))).toBe(false)
+    // …even when the timer's output is not published at all
+    expect(evaluateNode(tree, readingsFrom({ btn: false }))).toBe(false)
+    expect(evaluateNode(tree, readingsFrom({ btn: true }))).toBe(null)
   })
 })
 

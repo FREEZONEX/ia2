@@ -6,14 +6,16 @@
  *
  *   - a `useMemo` that parses the JSON source into a typed program,
  *   - a 350 ms-debounced poll of the `check` endpoint for diagnostics,
- *   - the live-runtime reads (`useLastSnapshot`, `isRunning`), and
+ *   - the live values that belong to THIS program (`online`), and
  *   - a `commit(next)` that serialises and calls `onChange`.
  *
  * `useProgramEditor` owns that skeleton. Each editor supplies its own
  * `parse` (the language-specific validation / normalisation) and
  * `serialize`, then derives its own online-mode overlay from the
- * returned `lastSnapshot` / `isRunning` and renders `<ParseErrorView>`
- * on a parse error.
+ * returned `online` lookup and renders `<ParseErrorView>` on a parse
+ * error. `online` is scoped to the open POU (see `lib/online-vars.ts`):
+ * reading the raw snapshot instead would colour this diagram with
+ * whichever program happens to be running.
  *
  * `parse` must be a stable reference (a module-level function) so the
  * parse memo only re-runs when `value` changes.
@@ -22,11 +24,12 @@
 import { useEffect, useMemo, useState } from "react"
 
 import { checkProgram } from "@/lib/api"
+import { onlineScope, onlineVars, type OnlineVars } from "@/lib/online-vars"
 import { cn } from "@/lib/utils"
 import { useLastSnapshot } from "@/state/live-feed"
 import { useRuntime } from "@/state/runtime"
 import type { CheckDiagnostic } from "@/types/generated/CheckDiagnostic"
-import type { VarSnapshot } from "@/types/generated/VarSnapshot"
+import type { LdPouType } from "@/types/generated/LdPouType"
 
 /** Result of an editor's `safeParse`: a typed program or a human error. */
 export type ParseResult<P> =
@@ -37,16 +40,15 @@ export type ParseResult<P> =
 export interface ProgramEditorShell<P> {
   parsed: ParseResult<P>
   diagnostics: CheckDiagnostic[]
-  /** True while a program is running on the bridge — editors use it to
-   *  gate their online-mode overlays. */
-  isRunning: boolean
-  /** Last high-frequency runtime snapshot, or `null` when idle. */
-  lastSnapshot: VarSnapshot | null
+  /** This program's live values, or `null` when none are on the wire —
+   *  nothing running, a different program running, a FUNCTION_BLOCK, or a
+   *  program scheduled more than once. */
+  online: OnlineVars | null
   /** Serialise + `onChange`, unless the editor is read-only. */
   commit: (next: P) => void
 }
 
-export function useProgramEditor<P>(opts: {
+export function useProgramEditor<P extends { name: string; pou_type: LdPouType }>(opts: {
   value: string
   onChange: (next: string) => void
   readOnly: boolean
@@ -63,8 +65,22 @@ export function useProgramEditor<P>(opts: {
   const parsed = useMemo(() => parse(value), [value, parse])
 
   // Live runtime reads — drive each editor's online-mode overlay.
-  const { isRunning, projectEpoch } = useRuntime()
+  const { isRunning, running, tasks, projectEpoch } = useRuntime()
   const lastSnapshot = useLastSnapshot()
+  const program = parsed.kind === "ok" ? parsed.program : null
+  const scope = useMemo(
+    () =>
+      isRunning
+        ? onlineScope({
+            running,
+            tasks,
+            path,
+            program: program && { name: program.name, pou_type: program.pou_type },
+          })
+        : null,
+    [isRunning, running, tasks, path, program?.name, program?.pou_type],
+  )
+  const online = useMemo(() => onlineVars(lastSnapshot, scope), [lastSnapshot, scope])
 
   // Diagnostics — 350 ms debounced poll of the HTTP `check` endpoint.
   // ironplc's LSP doesn't speak graphical JSON, so we re-check whenever
@@ -97,7 +113,7 @@ export function useProgramEditor<P>(opts: {
     onChange(serialize(next))
   }
 
-  return { parsed, diagnostics, isRunning, lastSnapshot, commit }
+  return { parsed, diagnostics, online, commit }
 }
 
 /** The parse-error fallback all three editors rendered identically

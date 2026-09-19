@@ -58,6 +58,7 @@ import {
   setOutputBinding,
 } from "@/lib/fbd-edit"
 import { fbByType, fbInputs, fbPinHint, groupedFbs } from "@/lib/ld-fbs"
+import { onlineBool } from "@/lib/online-vars"
 import { cn } from "@/lib/utils"
 import { Input } from "@/components/ui/input"
 import {
@@ -74,6 +75,12 @@ import type { FbdBlock } from "@/types/generated/FbdBlock"
 import type { FbdInputSource } from "@/types/generated/FbdInputSource"
 import type { FbdLocation } from "@/types/generated/FbdLocation"
 import type { FbdProgram } from "@/types/generated/FbdProgram"
+
+/** Layout input while the source does not parse (never rendered). */
+const EMPTY_FBD: FbdProgram = { name: "", pou_type: "program", variables: [], blocks: [], outputs: [] }
+
+/** Live state of a block output pin; `null` when it is not on the wire. */
+type LivePins = { pin: (block: FbdBlock, pin: string) => boolean | null }
 
 // =================================================================
 //   Wire-drag state (port-to-port connection gesture)
@@ -133,7 +140,7 @@ export function FBDEditor({
    *  from double-counting the on-disk copy. */
   path?: string
 }) {
-  const { parsed, diagnostics, isRunning, lastSnapshot, commit } =
+  const { parsed, diagnostics, online, commit } =
     useProgramEditor<FbdProgram>({
       value,
       onChange,
@@ -144,17 +151,22 @@ export function FBDEditor({
       serialize: serializeProgram,
     })
 
-  // Live values for online-mode wire coloring.
-  const liveValues = useMemo<{ bools: Record<string, boolean> } | null>(() => {
-    if (!isRunning || !lastSnapshot) return null
-    const bools: Record<string, boolean> = {}
-    for (const v of lastSnapshot.vars) {
-      if (v.type_name === "BOOL") {
-        bools[v.name] = v.value === "TRUE"
-      }
+  // Live values for online-mode wire coloring, scoped to this program.
+  // Every FBD wire leaves a block output pin, and the runtime publishes FB
+  // instances, not their pins — so reading `instance.pin` left every wire
+  // looking dead. A pin bound to an output variable IS readable: the
+  // binding copies it at the end of the scan, and the snapshot is taken
+  // after that. Anything else is unknown (`null`), drawn without live state.
+  const liveValues = useMemo<LivePins | null>(() => {
+    if (!online || parsed.kind !== "ok") return null
+    const outputs = parsed.program.outputs
+    return {
+      pin: (block, pin) => {
+        const bound = outputs.find((o) => o.from_block === block.id && o.from_pin === pin)
+        return onlineBool(online, bound ? bound.variable : `${block.instance}.${pin}`)
+      },
     }
-    return { bools }
-  }, [lastSnapshot, isRunning])
+  }, [online, parsed])
 
   // ---- Selection ----
   const [selectedBlockId, setSelectedBlockId] = useState<string | null>(null)
@@ -172,6 +184,19 @@ export function FBDEditor({
     setWireDrag(null)
   }, [value])
 
+  // Every hook runs before the parse-error return below. Hooks after an
+  // early return change the hook count whenever the source flips between
+  // parseable and not — a fatal React error, and nothing above this pane
+  // catches it, so the whole IDE unmounted.
+  const layout = useMemo(
+    () => layoutBlocks(parsed.kind === "ok" ? parsed.program : EMPTY_FBD),
+    [parsed],
+  )
+  const diagIndex = useMemo(
+    () => indexDiagnostics(diagnostics, fbdDiagnosticKey),
+    [diagnostics],
+  )
+
   if (parsed.kind === "error") {
     return (
       <ParseErrorView
@@ -184,11 +209,6 @@ export function FBDEditor({
   }
 
   const prog = parsed.program
-  const layout = useMemo(() => layoutBlocks(prog), [prog])
-  const diagIndex = useMemo(
-    () => indexDiagnostics(diagnostics, fbdDiagnosticKey),
-    [diagnostics],
-  )
 
   const selectedBlock = selectedBlockId
     ? prog.blocks.find((b) => b.id === selectedBlockId) ?? null
@@ -463,7 +483,7 @@ function FbdCanvas({
 }: {
   prog: FbdProgram
   layout: FbdLayout
-  liveValues: { bools: Record<string, boolean> } | null
+  liveValues: LivePins | null
   diagIndex: DiagnosticIndex
   selectedBlockId: string | null
   readOnly: boolean
@@ -602,11 +622,8 @@ function FbdCanvas({
             const dx = Math.max(20, (x2 - x1) / 2)
             const d = `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`
             const srcBlock = prog.blocks.find((bb) => bb.id === src.block_id)
-            const wireKey = srcBlock ? `${srcBlock.instance}.${src.pin}` : null
             const powered =
-              liveValues && wireKey
-                ? liveValues.bools[wireKey] === true
-                : null
+              liveValues && srcBlock ? liveValues.pin(srcBlock, src.pin) : null
             return (
               <path
                 key={`wire-${i}-${j}`}
@@ -701,9 +718,8 @@ function FbdCanvas({
         const y1 = outputPinCy(prog.blocks, from, o.from_block, o.from_pin)
         const x2 = x1 + 40
         const srcBlock = prog.blocks.find((b) => b.id === o.from_block)
-        const wireKey = srcBlock ? `${srcBlock.instance}.${o.from_pin}` : null
         const powered =
-          liveValues && wireKey ? liveValues.bools[wireKey] === true : null
+          liveValues && srcBlock ? liveValues.pin(srcBlock, o.from_pin) : null
         return (
           <g key={`out-${i}`}>
             <line
@@ -743,7 +759,7 @@ function BlockGlyph({
 }: {
   block: FbdBlock
   layout: BlockLayout
-  liveValues: { bools: Record<string, boolean> } | null
+  liveValues: LivePins | null
   hasError: boolean
   selected: boolean
   readOnly: boolean
@@ -906,9 +922,7 @@ function BlockGlyph({
           network. */}
       {outputs.map((pin, i, arr) => {
         const cy = layout.y + HEADER_H + ((i + 0.5) * (layout.h - HEADER_H)) / arr.length
-        const live = liveValues
-          ? liveValues.bools[`${block.instance}.${pin}`] === true
-          : null
+        const live = liveValues ? liveValues.pin(block, pin) : null
         return (
           <g key={pin}>
             {/* Pin name, inside-right, bold — matches the input

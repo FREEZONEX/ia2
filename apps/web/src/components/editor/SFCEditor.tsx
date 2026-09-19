@@ -56,6 +56,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import { runtimeStringLiteral } from "@/lib/online-vars"
 import { cn } from "@/lib/utils"
 import {
   addAction,
@@ -79,6 +80,8 @@ import type { SfcLocation } from "@/types/generated/SfcLocation"
 import type { SfcProgram } from "@/types/generated/SfcProgram"
 import type { SfcQualifier } from "@/types/generated/SfcQualifier"
 import type { SfcTransition } from "@/types/generated/SfcTransition"
+
+const NO_TRANSITIONS: SfcTransition[] = []
 
 // =================================================================
 //   Selection state
@@ -112,7 +115,7 @@ export function SFCEditor({
    *  from double-counting the on-disk copy. */
   path?: string
 }) {
-  const { parsed, diagnostics, isRunning, lastSnapshot, commit } =
+  const { parsed, diagnostics, online, commit } =
     useProgramEditor<SfcProgram>({
       value,
       onChange,
@@ -123,17 +126,45 @@ export function SFCEditor({
       serialize: serializeProgram,
     })
 
-  // Online-mode current step lookup (see also LDEditor / FBDEditor).
+  // Online-mode current step, from THIS program's `__sfc_step`. The value
+  // is the runtime's STRING — each character's low byte, printed as an IEC
+  // literal — so it is matched against each step name encoded the same
+  // way. Stripping the quotes and comparing to the name used to miss every
+  // step with a non-ASCII or `$` in its name, and with several charts
+  // running the bare `__sfc_step` was not even this chart's.
   const activeStep = useMemo<string | null>(() => {
-    if (!isRunning || !lastSnapshot) return null
-    const v = lastSnapshot.vars.find((x) => x.name === "__sfc_step")
-    if (!v) return null
-    return v.value.replace(/^'/, "").replace(/'$/, "")
-  }, [lastSnapshot, isRunning])
+    const v = online?.("__sfc_step")
+    if (!v || parsed.kind !== "ok") return null
+    return parsed.program.steps.find((st) => runtimeStringLiteral(st.name) === v.value)?.name ?? null
+  }, [online, parsed])
 
   const [sel, setSel] = useState<Selection>(null)
   // Drop selection on external source changes (revert, POU switch).
   useEffect(() => setSel(null), [value])
+
+  // Every hook runs before the parse-error return below. Hooks after an
+  // early return change the hook count whenever the source flips between
+  // parseable and not — a fatal React error, and nothing above this pane
+  // catches it, so the whole IDE unmounted.
+  const diagIndex = useMemo(
+    () => indexDiagnostics(diagnostics, sfcDiagnosticKey),
+    [diagnostics],
+  )
+
+  // Cache outbound transitions per step so the render pass doesn't
+  // re-scan transitions[] for every step. Also keep the **global**
+  // transition index for each entry — SfcTransition has no id, the
+  // detail bar needs an index to mutate by.
+  const transitions = parsed.kind === "ok" ? parsed.program.transitions : NO_TRANSITIONS
+  const outboundByStep = useMemo(() => {
+    const m = new Map<string, Array<{ t: SfcTransition; index: number }>>()
+    transitions.forEach((t, index) => {
+      const list = m.get(t.from) ?? []
+      list.push({ t, index })
+      m.set(t.from, list)
+    })
+    return m
+  }, [transitions])
 
   if (parsed.kind === "error") {
     return (
@@ -147,24 +178,6 @@ export function SFCEditor({
   }
 
   const prog = parsed.program
-  const diagIndex = useMemo(
-    () => indexDiagnostics(diagnostics, sfcDiagnosticKey),
-    [diagnostics],
-  )
-
-  // Cache outbound transitions per step so the render pass doesn't
-  // re-scan transitions[] for every step. Also keep the **global**
-  // transition index for each entry — SfcTransition has no id, the
-  // detail bar needs an index to mutate by.
-  const outboundByStep = useMemo(() => {
-    const m = new Map<string, Array<{ t: SfcTransition; index: number }>>()
-    prog.transitions.forEach((t, index) => {
-      const list = m.get(t.from) ?? []
-      list.push({ t, index })
-      m.set(t.from, list)
-    })
-    return m
-  }, [prog.transitions])
 
   return (
     <div className={cn("flex h-full min-h-0 flex-col", className)}>
