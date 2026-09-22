@@ -241,6 +241,7 @@ IA2 is the master side of a point-to-point conversation with one node; per-chann
 - `index`/`sub_index`: object-dictionary address, decimal (`24641` = `0x6041`); editor renders hex.
 - `transport`: `{"kind":"sdo"}` polls/writes via SDO at `poll_interval_ms` (config-rate lane — setpoints, parameters). `tpdo`/`rpdo` ride process data on the CiA 301 predefined COB-IDs (`slot` 1–4, `byte_offset` into the ≤8-byte frame) using the node's existing mapping. Objects >4 bytes (segmented SDO) unsupported — bind a scalar.
 - `heartbeat_timeout_ms`: no heartbeat this long → unhealthy (inputs freeze at last-known); `0` disables (SDO failures flip health instead).
+- A healthy heartbeat is not a channel measurement. Unreceived inputs remain stale, and after link loss each channel needs a new TPDO/SDO sample before it becomes fresh again; heartbeat recovery alone does not revive its old value.
 - `start_on_connect`: NMT Start so a pre-operational node enters Operational (PDOs only run there). Leave on unless another master owns NMT.
 - `failsafe`: as OPC UA — only `write` channels with a value are written on trip; the adapter never sends NMT Stop (other tools may share the bus).
 

@@ -112,7 +112,7 @@ An `init_sdo` entry targets a CoE object the drive doesn't have. A failed startu
 ## CANopen
 
 - **All values frozen at 0, device unhealthy after `heartbeat_timeout_ms`** — node absent or wrong `node_id`. On a real bus check `ip link` (interface up? bitrate right?) and `candump can0` for the node's 0x700+id heartbeat.
-- **PDO channels never update but SDO ones do** — the node is not in Operational (PDOs only run there). Leave `start_on_connect` on, or start it from the vendor tool; also verify the PDO slot/offsets match the node's actual mapping.
+- **PDO channels stay stale despite healthy heartbeats** — the node may be pre-operational (PDOs only run in Operational), or its PDO mapping is wrong. Leave `start_on_connect` on, or start it from the vendor tool; verify the PDO slot/offsets match the node's actual mapping. No sample is not a zero measurement, and recovery requires new channel data, not just a heartbeat.
 - **`needs a segmented SDO transfer (>4 bytes)`** — the object is a string/array/domain. Bind a scalar sub-object instead; segmented transfers are out of scope.
 - **macOS: `SocketCAN requires a Linux edge`** — expected; real CAN interfaces exist on the Linux edge only. Use `interface = "_sim"` for development.
 
