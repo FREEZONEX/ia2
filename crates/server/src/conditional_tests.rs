@@ -62,6 +62,19 @@ async fn read(app: &Router, url: &str) -> (String, serde_json::Value) {
     (etag, serde_json::from_slice(&bytes).unwrap())
 }
 
+#[tokio::test]
+async fn built_in_alarm_ids_cannot_be_shadowed_by_project_definitions() {
+    let (_dir, app) = setup();
+    let response = app.oneshot(Request::put("/api/alarms")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::json!({"alarms": [{
+            "id": "__device/bus0", "variable": "x", "condition": "is_true", "message": "shadow"
+        }]}).to_string())).unwrap()).await.unwrap();
+    assert!(response.status().is_client_error());
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("reserved"));
+}
+
 fn put(url: &str, body: &str, etag: Option<&str>) -> Request<Body> {
     let mut request = Request::put(url).header("Content-Type", "application/json");
     if let Some(etag) = etag {

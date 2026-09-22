@@ -429,6 +429,31 @@ fn unavailable_device_has_stale_inputs_and_an_acknowledgeable_default_alarm() {
     assert_eq!(input["input"]["stale"], true);
     assert_eq!(input["input"]["device"], "bus0");
     assert_eq!(input["input"]["channel"], "input");
+    // The IDE receives SSE, not the one-shot route: prove the wire event
+    // preserves quality as well, including snapshots forwarded by the server.
+    use std::io::BufRead;
+    let stream = ureq::get(&format!("{}/api/events", server.base))
+        .timeout(std::time::Duration::from_secs(3))
+        .call()
+        .unwrap();
+    let event = std::io::BufReader::new(stream.into_reader())
+        .lines()
+        .take(30)
+        .find_map(|line| {
+            let line = line.unwrap();
+            let data = line.strip_prefix("data:")?;
+            let event: serde_json::Value = serde_json::from_str(data.trim()).unwrap();
+            (event["type"] == "snapshot").then_some(event)
+        })
+        .expect("SSE must emit a snapshot");
+    let streamed = event["data"]["vars"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["name"] == "input_value")
+        .unwrap();
+    assert_eq!(streamed["input"], input["input"]);
+    assert_eq!(event["data"]["device_health"][0]["healthy"], false);
     assert!(vars
         .iter()
         .find(|v| v["name"] == "ticks")
