@@ -209,6 +209,29 @@ the *deployed* edge runtime, proxy the same ops through
 
 ## Runtime history & alarms
 
+Snapshots include `device_health: [{ name, healthy }]` and, on each mapped
+input variable, `input: { device, channel, stale }`. An unavailable device,
+failed input read, or mapping awaiting its first successful read makes that
+input stale. `value`/`bits` remain the VM's last value, **not a fresh field
+measurement**. Recovery clears `stale` only after a successful input read;
+recovering a link while paused is insufficient. Internal and output variables
+have no `input` field; this is not transitive provenance through PLC logic.
+Transport health does not claim a per-channel acquisition timestamp.
+
+Every configured device gets a built-in high-severity alarm
+`__device/<device-name>` after 1 s of continuously observed unhealthy state,
+including failed startup connections. No `alarms.toml` entry is required.
+Recovery returns it, but an unacknowledged occurrence remains standing until
+acknowledged. URL-encode the entire id for the existing ack route (including
+the slash). The `__device/` prefix is reserved. These alarms share the existing
+state/journal/ack machinery on server and edge; they do not change PLC logic
+or output safety policy. Process alarms watching stale inputs neither raise
+nor clear, and their pending debounce resets until valid input returns.
+
+History points add optional `stale: true` when any sample in the bucket was
+stale. Consumers must show a gap/unknown interval, not a fresh flat line;
+the edge's persisted history retains this flag across restarts.
+
 Served by the shared monitor layer (`ironplc_bridge::monitor`): an
 in-memory 1 Hz historian (~2 h window; the edge runtime persists the
 same rings to disk) and the alarm engine over the project's

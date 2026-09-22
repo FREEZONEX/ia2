@@ -38,6 +38,10 @@ pub struct HistoryPoint {
     pub max: f64,
     /// Last sample in the bucket — what a stepped trend line draws.
     pub v: f64,
+    /// True if any sample in this bucket was stale; do not plot as live data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub stale: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
@@ -59,7 +63,7 @@ pub struct HistoryResponse {
 }
 
 struct Inner {
-    series: HashMap<String, Vec<(u64, f64)>>, // ring via rotate-trim
+    series: HashMap<String, Vec<(u64, f64, bool)>>, // ring via rotate-trim
     last_sample_us: u64,
     persist: Option<Persist>,
 }
@@ -148,6 +152,7 @@ impl Historian {
         inner.last_sample_us = snap.timestamp_us;
 
         let mut line = serde_json::Map::new();
+        let mut stale_vars = Vec::new();
         for var in &snap.vars {
             let tv = typed_value(&var.type_name, var.bits, &var.value);
             let v = tv
@@ -155,7 +160,11 @@ impl Historian {
                 .or_else(|| tv.as_bool().map(|b| if b { 1.0 } else { 0.0 }));
             let Some(v) = v else { continue };
             let ring = inner.series.entry(var.name.clone()).or_default();
-            ring.push((snap.timestamp_us, v));
+            let stale = var.input.as_ref().is_some_and(|q| q.stale);
+            ring.push((snap.timestamp_us, v, stale));
+            if stale {
+                stale_vars.push(var.name.as_str());
+            }
             if ring.len() > self.capacity {
                 let excess = ring.len() - self.capacity;
                 ring.drain(..excess);
@@ -164,7 +173,7 @@ impl Historian {
         }
 
         if let Some(persist) = inner.persist.as_mut() {
-            persist_line(persist, snap.timestamp_us, &line);
+            persist_line(persist, snap.timestamp_us, &line, &stale_vars);
         }
     }
 
@@ -190,11 +199,11 @@ impl Historian {
             .iter()
             .map(|name| {
                 let samples = inner.series.get(name).map(Vec::as_slice).unwrap_or(&[]);
-                if let Some((t, _)) = samples.first() {
+                if let Some((t, _, _)) = samples.first() {
                     oldest = oldest.min(*t);
                 }
                 let mut points: Vec<HistoryPoint> = Vec::new();
-                for (t, v) in samples {
+                for (t, v, stale) in samples {
                     if *t < from_us || (to_us > 0 && *t > to_us) {
                         continue;
                     }
@@ -204,12 +213,16 @@ impl Historian {
                             p.min = p.min.min(*v);
                             p.max = p.max.max(*v);
                             p.v = *v;
+                            if *stale {
+                                p.stale = Some(true);
+                            }
                         }
                         _ => points.push(HistoryPoint {
                             t_us: bucket,
                             min: *v,
                             max: *v,
                             v: *v,
+                            stale: stale.then_some(true),
                         }),
                     }
                 }
@@ -230,12 +243,17 @@ impl Historian {
 /// Append one JSONL line, rotating segments as they grow. Failures
 /// degrade to memory-only with one warning — history must never take
 /// the scan loop down.
-fn persist_line(p: &mut Persist, t_us: u64, values: &serde_json::Map<String, serde_json::Value>) {
+fn persist_line(
+    p: &mut Persist,
+    t_us: u64,
+    values: &serde_json::Map<String, serde_json::Value>,
+    stale: &[&str],
+) {
     if p.file.is_none() || p.written > SEGMENT_MAX_BYTES {
         rotate(p);
     }
     let Some(file) = p.file.as_mut() else { return };
-    let line = serde_json::json!({ "t": t_us, "v": values }).to_string();
+    let line = serde_json::json!({ "t": t_us, "v": values, "stale": stale }).to_string();
     match writeln!(file, "{line}") {
         Ok(()) => p.written += line.len() as u64 + 1,
         Err(e) => {
@@ -294,7 +312,7 @@ fn rotate(p: &mut Persist) {
 
 /// Load the newest segments into fresh rings so an edge restart keeps
 /// its recent history. Reads oldest→newest so rings end up in order.
-fn preload(series: &mut HashMap<String, Vec<(u64, f64)>>, dir: &PathBuf, capacity: usize) {
+fn preload(series: &mut HashMap<String, Vec<(u64, f64, bool)>>, dir: &PathBuf, capacity: usize) {
     for seg in segment_paths(dir) {
         let Ok(file) = std::fs::File::open(&seg) else {
             continue;
@@ -312,7 +330,11 @@ fn preload(series: &mut HashMap<String, Vec<(u64, f64)>>, dir: &PathBuf, capacit
             for (name, v) in vals {
                 if let Some(v) = v.as_f64() {
                     let ring = series.entry(name.clone()).or_default();
-                    ring.push((t, v));
+                    let stale = row
+                        .get("stale")
+                        .and_then(|s| s.as_array())
+                        .is_some_and(|s| s.iter().any(|s| s.as_str() == Some(name)));
+                    ring.push((t, v, stale));
                     if ring.len() > capacity {
                         ring.remove(0);
                     }
@@ -331,11 +353,13 @@ mod tests {
         VarSnapshot {
             timestamp_us: t_us,
             scan_count: 0,
+            device_health: None,
             vars: vec![VarValue {
                 name: "flow".into(),
                 type_name: "REAL".into(),
                 value: format!("{v}"),
                 bits: v.to_bits() as u64,
+                input: None,
             }],
         }
     }
@@ -430,5 +454,33 @@ mod tests {
         let pts = &resp.series[0].points;
         assert_eq!(pts.len(), 2, "history survived the restart");
         assert_eq!(pts[1].v, 2.5);
+    }
+
+    #[test]
+    fn stale_quality_survives_bucketing_and_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = Historian::new(1_000_000, 100, Some(dir.path().to_path_buf()));
+        h.note_snapshot(&snap(1_000_000, 1.5));
+        let mut stale = snap(2_000_000, 1.5);
+        stale.vars[0].input = Some(crate::InputQuality {
+            device: "meter".into(),
+            channel: "flow".into(),
+            stale: true,
+        });
+        h.note_snapshot(&stale);
+        h.note_snapshot(&snap(3_000_000, 2.5));
+        let all = h.query(&[], 0, 0, 10_000);
+        assert_eq!(
+            all.series[0].points[0].stale,
+            Some(true),
+            "mixed bucket is not fresh"
+        );
+        drop(h);
+        let h = Historian::new(1_000_000, 100, Some(dir.path().to_path_buf()));
+        let points = &h.query(&[], 0, 0, 1_000).series[0].points;
+        assert_eq!(points.len(), 3);
+        assert_eq!(points[0].stale, None);
+        assert_eq!(points[1].stale, Some(true));
+        assert_eq!(points[2].stale, None, "recovery resumes fresh samples");
     }
 }

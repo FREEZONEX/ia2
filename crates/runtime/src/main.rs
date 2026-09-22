@@ -442,7 +442,7 @@ async fn main() -> Result<()> {
             )))
         }
         Err(e) => {
-            tracing::warn!(%e, "alarms.toml unreadable; alarms disabled");
+            tracing::warn!(%e, "alarms.toml unreadable; process alarms disabled, device health alarms remain enabled");
             Arc::new(Mutex::new(ironplc_bridge::monitor::AlarmEngine::default()))
         }
     };

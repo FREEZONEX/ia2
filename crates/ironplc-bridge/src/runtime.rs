@@ -52,6 +52,19 @@ pub struct VarValue {
     /// the browser.
     #[ts(type = "number")]
     pub bits: u64,
+    /// Field input provenance and quality. Absent for internal/output variables.
+    /// A stale value is last-known (or not yet acquired), never live feedback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub input: Option<InputQuality>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export)]
+pub struct InputQuality {
+    pub device: String,
+    pub channel: String,
+    pub stale: bool,
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
@@ -60,6 +73,10 @@ pub struct VarSnapshot {
     pub timestamp_us: u64,
     pub scan_count: u64,
     pub vars: Vec<VarValue>,
+    /// Health sampled with these values, including devices that never connected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub device_health: Option<Vec<DeviceHealth>>,
 }
 
 /// One subdevice on an EtherCAT bus, as reported by `/discover`.
@@ -1664,7 +1681,25 @@ async fn run_loop_async(
     // background reconnect worker may still deliver that device mid-run,
     // at which point they bind exactly like the startup ones below.
     let mut pending_mappings: Vec<Mapping> = Vec::new();
+    let mut input_quality: Vec<HashMap<u16, InputQuality>> =
+        (0..n_units).map(|_| HashMap::new()).collect();
     for m in mappings {
+        // Resolve input provenance even if connect failed: its initial VM
+        // value is not a measurement. Recovery clears stale only after a read.
+        if m.direction == Direction::Input {
+            if let Some((u, _, rm)) =
+                resolve_mapping(&m, usize::MAX, &instances, &var_index_by_name, &debug_maps)
+            {
+                input_quality[u].insert(
+                    rm.var_index,
+                    InputQuality {
+                        device: m.device.clone(),
+                        channel: m.channel.clone(),
+                        stale: true,
+                    },
+                );
+            }
+        }
         let Some(&device_index) = device_index_by_name.get(&m.device) else {
             tracing::warn!(
                 device = %m.device,
@@ -2049,7 +2084,7 @@ async fn run_loop_async(
             prev_paused = true;
             if last_snapshot.elapsed() >= SNAPSHOT_PERIOD {
                 let now_us = start.elapsed().as_micros() as u64;
-                let snapshot = build_snapshot(
+                let mut snapshot = build_snapshot(
                     &runnings,
                     &debug_maps,
                     &string_layouts,
@@ -2057,6 +2092,14 @@ async fn run_loop_async(
                     &shared_names,
                     &clocks,
                     now_us,
+                );
+                annotate_input_quality(
+                    &mut snapshot,
+                    &mut input_quality,
+                    &debug_maps,
+                    &instances,
+                    &shared_names,
+                    &device_health,
                 );
                 let _ = snapshot_tx.send(snapshot);
                 last_snapshot = Instant::now();
@@ -2125,7 +2168,7 @@ async fn run_loop_async(
                 };
                 match dev.read_channel(&rm.channel).await {
                     Ok(value) => {
-                        let _ = if rm.is_lreal {
+                        let written = if rm.is_lreal {
                             // 64-bit lane: any channel value widens to f64
                             // losslessly; the slot takes the double's bits.
                             runnings[i].write_variable_raw(
@@ -2138,8 +2181,16 @@ async fn run_loop_async(
                                 value.to_vm_bits(rm.is_real),
                             )
                         };
+                        if let Some(q) = input_quality[i].get_mut(&rm.var_index) {
+                            q.stale = written.is_err() || !dev.is_healthy();
+                        }
                     }
-                    Err(e) => tracing::debug!(channel = %rm.channel, %e, "input read failed"),
+                    Err(e) => {
+                        if let Some(q) = input_quality[i].get_mut(&rm.var_index) {
+                            q.stale = true;
+                        }
+                        tracing::debug!(channel = %rm.channel, %e, "input read failed");
+                    }
                 }
             }
 
@@ -2305,7 +2356,7 @@ async fn run_loop_async(
         // idle wake-ups are capped at SNAPSHOT_PERIOD below).
         if last_snapshot.elapsed() >= SNAPSHOT_PERIOD {
             let now_us = start.elapsed().as_micros() as u64;
-            let snapshot = build_snapshot(
+            let mut snapshot = build_snapshot(
                 &runnings,
                 &debug_maps,
                 &string_layouts,
@@ -2313,6 +2364,14 @@ async fn run_loop_async(
                 &shared_names,
                 &clocks,
                 now_us,
+            );
+            annotate_input_quality(
+                &mut snapshot,
+                &mut input_quality,
+                &debug_maps,
+                &instances,
+                &shared_names,
+                &device_health,
             );
             let _ = snapshot_tx.send(snapshot);
             last_snapshot = Instant::now();
@@ -2506,6 +2565,7 @@ fn build_snapshot(
                 type_name: info.type_name.clone(),
                 value: format_value(raw, info, string_layouts[u].get(&i).copied(), data_region),
                 bits: raw,
+                input: None,
             });
         }
     }
@@ -2513,7 +2573,39 @@ fn build_snapshot(
         timestamp_us: now_us,
         scan_count: max_scan_count(clocks),
         vars,
+        device_health: None,
     }
+}
+
+/// Attach quality using the very same instance/name rules as the snapshot.
+/// Observing link loss latches stale until an input phase acquires a live value;
+/// merely recovering the transport (especially while paused) cannot clear it.
+fn annotate_input_quality(
+    snap: &mut VarSnapshot,
+    inputs: &mut [HashMap<u16, InputQuality>],
+    debug_maps: &[HashMap<u16, VarDebugInfo>],
+    instances: &[String],
+    shared_names: &std::collections::HashSet<String>,
+    health: &std::sync::Mutex<Vec<DeviceHealth>>,
+) {
+    let health = health.lock().map(|h| h.clone()).unwrap_or_default();
+    for (u, vars) in inputs.iter_mut().enumerate() {
+        for (idx, quality) in vars {
+            quality.stale |= !health.iter().any(|h| h.name == quality.device && h.healthy);
+            let Some(info) = debug_maps[u].get(idx) else {
+                continue;
+            };
+            let name = if shared_names.contains(&info.name) {
+                format!("{}.{}", instances[u], info.name)
+            } else {
+                info.name.clone()
+            };
+            if let Some(var) = snap.vars.iter_mut().find(|v| v.name == name) {
+                var.input = Some(quality.clone());
+            }
+        }
+    }
+    snap.device_health = Some(health);
 }
 
 /// Render a variable's slot value. STRING vars don't live in the slot —
@@ -2861,6 +2953,26 @@ mod tests {
             !handle.device_health()[0].healthy,
             "failed connect must surface as unhealthy"
         );
+        let mut rx = handle.subscribe();
+        let snap = last_snapshot_within(&mut rx, Duration::from_millis(300)).await;
+        let quality = snap
+            .vars
+            .iter()
+            .find(|v| v.name == "x")
+            .unwrap()
+            .input
+            .as_ref()
+            .unwrap();
+        assert!(quality.stale, "a never-connected input is not a fresh zero");
+        assert_eq!(quality.device, "pm");
+        assert_eq!(quality.channel, "hr0");
+        assert!(snap
+            .vars
+            .iter()
+            .find(|v| v.name == "y")
+            .unwrap()
+            .input
+            .is_none());
 
         // Bring a real slave up on the reserved port with hr[0] = 42.
         let slave = iomap_modbus::DemoSlave::new();
@@ -2890,7 +3002,15 @@ mod tests {
         let mut seen = false;
         while Instant::now() < deadline && !seen {
             let snap = last_snapshot_within(&mut rx, Duration::from_millis(300)).await;
-            seen = var_value(&snap, "x") == "42";
+            seen = var_value(&snap, "x") == "42"
+                && snap
+                    .vars
+                    .iter()
+                    .find(|v| v.name == "x")
+                    .unwrap()
+                    .input
+                    .as_ref()
+                    .is_some_and(|q| !q.stale);
         }
         assert!(
             seen,
@@ -2951,6 +3071,71 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
             .await
             .expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn input_quality_latches_loss_until_a_post_recovery_input_read() {
+        let (dev, healthy) = MockDevice::named("bus0");
+        let container = crate::compile(
+            "PROGRAM main VAR x: INT; local: INT; END_VAR local := local + 1; END_PROGRAM",
+        )
+        .unwrap();
+        let handle = spawn_units_inner(
+            vec![single_unit(container, 5)],
+            DeviceSource::Prebuilt(vec![Box::new(dev)]),
+            vec![Mapping {
+                application: "main".into(),
+                variable: "x".into(),
+                direction: Direction::Input,
+                device: "bus0".into(),
+                channel: "input".into(),
+                unit: None,
+                min: None,
+                max: None,
+                description: None,
+            }],
+            None,
+            WriteGovernance::default(),
+        );
+        let mut rx = handle.subscribe();
+        let quality = |s: &VarSnapshot| {
+            s.vars
+                .iter()
+                .find(|v| v.name == "x")
+                .unwrap()
+                .input
+                .as_ref()
+                .unwrap()
+                .clone()
+        };
+        let snap = last_snapshot_within(&mut rx, Duration::from_millis(300)).await;
+        assert!(!quality(&snap).stale);
+        assert!(snap
+            .vars
+            .iter()
+            .find(|v| v.name == "local")
+            .unwrap()
+            .input
+            .is_none());
+        handle.pause();
+        healthy.store(false, Ordering::Relaxed);
+        let snap = last_snapshot_within(&mut rx, Duration::from_millis(300)).await;
+        assert!(quality(&snap).stale);
+        assert!(!snap.device_health.as_ref().unwrap()[0].healthy);
+        healthy.store(true, Ordering::Relaxed);
+        let snap = last_snapshot_within(&mut rx, Duration::from_millis(300)).await;
+        assert!(snap.device_health.as_ref().unwrap()[0].healthy);
+        assert!(
+            quality(&snap).stale,
+            "link recovery alone does not refresh a paused input"
+        );
+        handle.resume();
+        let snap = last_snapshot_within(&mut rx, Duration::from_millis(300)).await;
+        assert!(
+            !quality(&snap).stale,
+            "successful input read restores freshness"
+        );
+        handle.shutdown().await;
     }
 
     /// Overruns short of the watchdog threshold are invisible today: the log

@@ -99,6 +99,21 @@ per-POU attribution, so that one still needs a run to notice.
 
 ## Alarms — declared in the project, evaluated by the runtime
 
+Device loss also has a zero-config alarm: `__device/<device-name>` raises at
+high severity after 1 s continuously unhealthy, including a device that never
+connected. It uses the same alarm journal and acknowledgement commands;
+recovery alone does not dismiss an unacknowledged occurrence. Do not define
+ids beginning `__device/` in `alarms.toml` (reserved). These alerts do not change
+the scan program or failsafe policy.
+
+Inspect `snapshot.vars[].input` for mapped field inputs: `{device, channel,
+stale}`. A stale value is last-known, not live; a link recovering while paused
+does not clear it until input is read again. `snapshot.device_health` includes
+all configured devices. Internal/output values do not inherit this metadata.
+Process alarms neither raise nor clear on stale inputs; debounce restarts on
+valid input. History buckets containing stale samples carry `stale: true`,
+including persisted edge history: graph them as gaps, not healthy flat lines.
+
 Definitions are project config (`alarms.toml`), authored like any other
 doc — and YOU should author them alongside the control logic; a program
 that can misbehave silently is only half-delivered:

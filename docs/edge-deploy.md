@@ -233,6 +233,18 @@ one carrying your SSH / management traffic.
 
 ## Caveats
 
+- Field-input quality travels with each snapshot: mapped input variables carry
+  `input: { device, channel, stale }`, and the snapshot carries `device_health`.
+  Keep last-known values distinct from fresh measurements. MQTT snapshots keep
+  the existing `values` object and add `inputs` (variable-name → the same quality
+  object) and `device_health`; consumers must inspect quality before using a value.
+  This does not trace dependencies through PLC calculations.
+- Sustained device loss automatically raises `__device/<name>` after 1 s,
+  even with no `alarms.toml`. Recovery returns the alarm; acknowledgement is
+  still required for an unacknowledged occurrence. The existing `/alarms`,
+  `/alarms-journal`, and encoded-id ack endpoint expose it. Process alarms do
+  not evaluate stale field inputs, and persisted history marks stale buckets.
+
 - **No EtherCAT hardware on the dev machine**: leave `nic = "_sim"`. The
   IDE will let you configure PDOs and the bridge will respond in sim
   mode. On the edge, configure the real NIC.

@@ -794,10 +794,13 @@ impl ProjectStore {
             return Ok(crate::types::AlarmConfig::default());
         }
         let text = fs::read_to_string(&path)?;
-        Ok(toml::from_str(&text)?)
+        let config: crate::types::AlarmConfig = toml::from_str(&text)?;
+        validate_alarm_ids(&config)?;
+        Ok(config)
     }
 
     pub fn write_alarms(&self, alarms: &crate::types::AlarmConfig) -> Result<(), StoreError> {
+        validate_alarm_ids(alarms)?;
         let path = self.root.join("alarms.toml");
         write_atomic(path, toml::to_string_pretty(alarms)?)?;
         Ok(())
@@ -1182,6 +1185,25 @@ fn validate_ssh_target(
 fn validate_edge_target(edge: &Edge) -> Result<(), StoreError> {
     validate_ssh_target("host", &edge.host, false)?;
     validate_ssh_target("ssh_user", &edge.ssh_user, true)
+}
+
+fn validate_alarm_ids(config: &crate::types::AlarmConfig) -> Result<(), StoreError> {
+    if let Some(def) = config
+        .alarms
+        .iter()
+        .find(|d| d.id.starts_with(crate::DEVICE_ALARM_PREFIX))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "alarm id '{}' uses the reserved device-health prefix '{}'",
+                def.id,
+                crate::DEVICE_ALARM_PREFIX
+            ),
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn validate_single_segment(name: &str) -> Result<(), StoreError> {
@@ -1660,6 +1682,25 @@ mod ssh_target_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alarm_store_refuses_reserved_ids_on_read_and_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProjectStore::create(dir.path().join("project"), "test").unwrap();
+        let text = "[[alarms]]\nid = '__device/bus0'\nvariable = 'x'\ncondition = 'is_true'\nmessage = 'shadow'\n";
+        let config = toml::from_str(text).unwrap();
+        assert!(store
+            .write_alarms(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("reserved"));
+        fs::write(store.root.join("alarms.toml"), text).unwrap();
+        assert!(store
+            .read_alarms()
+            .unwrap_err()
+            .to_string()
+            .contains("reserved"));
+    }
 
     // ---- crash-safe saves ----------------------------------------------
 

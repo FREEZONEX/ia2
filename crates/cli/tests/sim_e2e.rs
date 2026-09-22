@@ -303,3 +303,65 @@ fn copy_dir(src: &PathBuf, dst: &PathBuf) {
         }
     }
 }
+
+#[test]
+fn unavailable_device_has_stale_inputs_and_an_acknowledgeable_default_alarm() {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("device_health");
+    copy_dir(&repo_root().join("examples/device_health"), &proj);
+    // Own the port for the whole test but never answer a Modbus request.
+    // This is deterministic communication loss on loopback, not a bench probe.
+    let unavailable = TcpListener::bind("127.0.0.1:0").unwrap();
+    let device = proj.join("devices/bus0.toml");
+    let config = std::fs::read_to_string(&device).unwrap().replace(
+        "port = 65534",
+        &format!("port = {}", unavailable.local_addr().unwrap().port()),
+    );
+    std::fs::write(&device, config).unwrap();
+    assert!(!proj.join("alarms.toml").exists(), "zero-config regression");
+    let server = spawn_server(tmp.path());
+    server.open_project(&proj);
+    cs(&server.base)
+        .args(["api", "POST", "/api/run"])
+        .assert()
+        .success();
+    cs(&server.base)
+        .args(["sim", "run", "--no-run"])
+        .arg(proj.join("scenarios/unavailable.toml"))
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("scenario passed"));
+    let output = cs(&server.base)
+        .args(["api", "GET", "/api/runtime/snapshot"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let snapshot: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let vars = snapshot["vars"].as_array().unwrap();
+    let input = vars.iter().find(|v| v["name"] == "input_value").unwrap();
+    assert_eq!(input["input"]["stale"], true);
+    assert_eq!(input["input"]["device"], "bus0");
+    assert_eq!(input["input"]["channel"], "input");
+    assert!(vars
+        .iter()
+        .find(|v| v["name"] == "ticks")
+        .unwrap()
+        .get("input")
+        .is_none());
+    let output = cs(&server.base)
+        .args(["api", "POST", "/api/runtime/alarms/__device%2Fbus0/ack"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let alarm: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(alarm["active"], true);
+    assert_eq!(alarm["acked"], true);
+    cs(&server.base)
+        .args(["api", "POST", "/api/stop"])
+        .assert()
+        .success();
+}

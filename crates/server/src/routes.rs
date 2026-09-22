@@ -1777,6 +1777,13 @@ pub async fn put_alarms(
 ) -> Result<Json<RunResponse>, ApiError> {
     let mut seen = std::collections::HashSet::new();
     for def in &config.alarms {
+        if def.id.starts_with(project::DEVICE_ALARM_PREFIX) {
+            return Err(ApiError::BadRequest(format!(
+                "alarm id '{}' uses the reserved device-health prefix '{}'",
+                def.id,
+                project::DEVICE_ALARM_PREFIX
+            )));
+        }
         if !seen.insert(def.id.as_str()) {
             return Err(ApiError::BadRequest(format!(
                 "duplicate alarm id '{}'",

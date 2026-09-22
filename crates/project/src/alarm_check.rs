@@ -17,6 +17,9 @@ use std::collections::HashSet;
 
 use crate::types::AlarmDef;
 
+/// Reserved for runtime-generated device-health alarms, not project definitions.
+pub const DEVICE_ALARM_PREFIX: &str = "__device/";
+
 /// One finding, keyed to its position in `alarms.toml` (0-based) so a caller
 /// can cite the offending entry. Every finding is an error: an alarm that
 /// cannot fire is not a style question.
@@ -55,6 +58,16 @@ pub fn validate_alarms(
 ) -> Vec<AlarmIssue> {
     let mut issues = Vec::new();
     for (index, def) in alarms.iter().enumerate() {
+        if def.id.starts_with(DEVICE_ALARM_PREFIX) {
+            issues.push(AlarmIssue {
+                alarm_index: index,
+                id: def.id.clone(),
+                message: format!(
+                    "alarm id '{}' uses the reserved device-health prefix '{DEVICE_ALARM_PREFIX}'",
+                    def.id
+                ),
+            });
+        }
         if resolves(&def.variable, declared, instances) {
             continue;
         }
@@ -116,6 +129,13 @@ mod tests {
     fn a_declared_bare_name_is_fine() {
         assert!(check(&[alarm("a", "level")], &["level", "tick"], &["main"]).is_empty());
         assert!(check(&[], &["level"], &["main"]).is_empty());
+    }
+
+    #[test]
+    fn device_health_alarm_ids_are_reserved() {
+        let issues = check(&[alarm("__device/bus0", "level")], &["level"], &["main"]);
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].message.contains("reserved"));
     }
 
     #[test]
