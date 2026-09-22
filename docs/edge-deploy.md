@@ -182,6 +182,23 @@ rollback is just "point `current` at an older version and restart".
   If you find a legitimate access blocked, loosen carefully — these are
   there to limit what a misbehaving runtime can touch.
 
+## Shutdown and failsafe evidence
+
+A completed bridge drain means the failsafe and teardown **attempts**
+finished, not that every physical output was confirmed safe. The scan
+loop's final log includes `failsafe_failed` and `shutdown_failed` device
+counts; inspect the preceding device/channel errors whenever either is
+nonzero. Even zero counts do not replace physical readback or a hardware
+safety circuit.
+
+For Modbus, `protocol: modbus exception: …` means the slave replied but
+rejected that write; the failsafe sweep continues to the remaining
+writable channels and reports that some outputs are unconfirmed.
+`transport: …` means the link failed (or timed out), so the sweep aborts
+the remaining writes to keep shutdown bounded. A later transport failure
+takes precedence over an earlier protocol rejection. Neither case is
+reported as “outputs in failsafe”.
+
 ## EtherCAT mode selection
 
 `iomap-ethercat` picks between two implementations based on the device

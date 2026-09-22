@@ -622,7 +622,9 @@ async fn main() -> Result<()> {
         "shutdown signalled; draining bridge (stop scan loop -> failsafe -> join fieldbus)"
     );
     match tokio::time::timeout(BRIDGE_DRAIN_TIMEOUT, handle.shutdown()).await {
-        Ok(()) => tracing::info!("bridge drained; outputs in failsafe"),
+        Ok(()) => tracing::info!(
+            "bridge drained; inspect failsafe/shutdown results above for unconfirmed outputs"
+        ),
         Err(_) => tracing::error!(
             timeout_s = BRIDGE_DRAIN_TIMEOUT.as_secs(),
             "bridge drain timed out; exiting anyway (outputs fall back to the drive watchdog)"

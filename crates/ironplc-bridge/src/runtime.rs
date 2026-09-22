@@ -332,8 +332,8 @@ impl ProgramHandle {
     /// round; expect a few extra rounds before it actually exits.
     ///
     /// Fire-and-forget: returns immediately, doesn't wait for the failsafe
-    /// pass. Use `shutdown` when you need the plant guaranteed safe before
-    /// proceeding (clean process exit).
+    /// pass. Use `shutdown` to wait for the bounded failsafe/teardown
+    /// attempts before proceeding (clean process exit).
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
     }
@@ -342,7 +342,8 @@ impl ProgramHandle {
     /// then JOINS the scan thread — which runs its always-on failsafe pass
     /// (zero every device's outputs) and each device's `shutdown` (joining
     /// the EtherCAT cyclic worker so the zeroed controlword is on the wire)
-    /// before it returns. When this completes, outputs are in failsafe.
+    /// before it returns. Device failures are logged; completion is not
+    /// a guarantee that physical outputs reached their safe state.
     ///
     /// Unlike `stop`, this waits for completion, so the runtime can drive
     /// the plant safe before exiting rather than racing the service
@@ -357,7 +358,7 @@ impl ProgramHandle {
             Ok(Ok(())) => {}
             Ok(Err(_)) => {
                 tracing::error!(
-                    "scan thread panicked during shutdown (outputs were failsafed first)"
+                    "scan thread panicked during shutdown; inspect preceding failsafe errors"
                 )
             }
             Err(e) => tracing::error!(%e, "failed to join scan thread on shutdown"),
@@ -894,8 +895,10 @@ fn spawn_units_inner(
             // device's outputs to zero so a hung / panicked / stopped
             // program doesn't leave actuators energized.
             let dev_count = devices.len();
+            let mut failsafe_failed = 0usize;
             for dev in devices.iter_mut() {
                 if let Err(e) = dev.enter_failsafe().await {
+                    failsafe_failed += 1;
                     tracing::warn!(device = %dev.name(), %e, "failsafe call failed");
                 }
             }
@@ -908,8 +911,10 @@ fn spawn_units_inner(
             // controlword is guaranteed on the wire before we exit — not
             // left to the drive's own watchdog after the master is gone.
             // Runs on both the clean and panicked paths (before re-panic).
+            let mut shutdown_failed = 0usize;
             for dev in devices.iter_mut() {
                 if let Err(e) = dev.shutdown().await {
+                    shutdown_failed += 1;
                     tracing::warn!(device = %dev.name(), %e, "device shutdown failed");
                 }
             }
@@ -920,16 +925,20 @@ fn spawn_units_inner(
             match &result {
                 Ok(()) => tracing::info!(
                     devices = dev_count,
-                    "scan loop exited cleanly; failsafe applied"
+                    failsafe_failed,
+                    shutdown_failed,
+                    "scan loop exited cleanly; failsafe and shutdown attempts completed"
                 ),
                 Err(_) => tracing::error!(
                     devices = dev_count,
-                    "scan loop PANICKED; failsafe applied before re-panic"
+                    failsafe_failed,
+                    shutdown_failed,
+                    "scan loop PANICKED; failsafe and shutdown attempts completed before re-panic"
                 ),
             }
             if let Err(panic) = result {
                 // Re-raise so the thread dies with a useful backtrace
-                // in tests / logs. Outputs are already safe.
+                // in tests / logs. Failsafe was attempted on every device.
                 std::panic::resume_unwind(panic);
             }
         });
