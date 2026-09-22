@@ -128,14 +128,6 @@ impl Client {
         self.request("POST", path, Body::Json(body), None)
     }
 
-    pub fn put(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
-        self.request("PUT", path, Body::Json(body), None)
-    }
-
-    pub fn put_text(&self, path: &str, body: &str) -> Result<serde_json::Value> {
-        self.request("PUT", path, Body::Text(body), None)
-    }
-
     pub fn delete(&self, path: &str) -> Result<serde_json::Value> {
         self.request("DELETE", path, Body::None, None)
     }
@@ -162,6 +154,19 @@ impl Client {
         body: Body<'_>,
         timeout: Option<std::time::Duration>,
     ) -> Result<serde_json::Value> {
+        self.request_versioned(method, path, body, timeout, &[])
+            .map(|(body, _)| body)
+    }
+
+    /// Return the version of this specific response, never a shared cache.
+    pub fn request_versioned(
+        &self,
+        method: &str,
+        path: &str,
+        body: Body<'_>,
+        timeout: Option<std::time::Duration>,
+        headers: &[(&str, &str)],
+    ) -> Result<(serde_json::Value, Option<String>)> {
         let url = self.url(path);
         // `method` lives for the whole error's lifetime; leak-free
         // static mapping for the common verbs.
@@ -193,6 +198,9 @@ impl Client {
         // the session label; outside a session the server labels the
         // action "… — cs (no session)" rather than suppressing it.
         req = req.set("X-IA2-Origin", "cs");
+        for (key, value) in headers {
+            req = req.set(key, value);
+        }
 
         let outcome = match body {
             Body::None => req.call(),
@@ -226,14 +234,19 @@ impl Client {
         };
 
         // 2xx. Most endpoints answer JSON; tolerate empty bodies.
+        let etag = resp
+            .header("ETag")
+            .or_else(|| resp.header("X-IA2-Version"))
+            .map(str::to_owned);
         let text = resp
             .into_string()
             .with_context(|| format!("reading response from {url}"))?;
         if text.trim().is_empty() {
-            return Ok(serde_json::Value::Null);
+            return Ok((serde_json::Value::Null, etag));
         }
         serde_json::from_str(&text)
             .with_context(|| format!("decoding JSON from {url} (got: {})", truncate(&text, 200)))
+            .map(|body| (body, etag))
     }
 }
 

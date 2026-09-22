@@ -11,6 +11,7 @@ The CLI is bash-sized and **designed for you**. Five meta-primitives cover every
 
 Contracts you can rely on (and must preserve when reporting):
 
+- **Safe document replacement:** existing documents require `cs get <path> --etag-file version` → edit that content → `cs set <path> --from file --if-match @version`. Keep the version per edit, never in a shared latest-version cache. HTTP 412 / exit 2 means re-read and reapply the edit; retain your local changes. `--force` explicitly opts into an unconditional full replacement. New named resources need no flag. See `references/02-cli-reference.md`.
 - **Exit codes**: 0 success · 1 problems in YOUR content (diagnostics, failed probe/deploy/sim) · 2 bad request — the server's reason (e.g. ``missing field `application` ``) prints VERBATIM on stderr; read it before retrying · ≥3 infrastructure.
 - **Heartbeat**: only MUTATING commands light the IDE's takeover overlay; reads (`ls`/`get`/`check`/`probe`/`runtime status`/`snapshot`) stay silent.
 - **`--project NAME` is global** and applies to every request — no command silently drops it.

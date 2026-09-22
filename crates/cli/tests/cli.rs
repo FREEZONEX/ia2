@@ -491,7 +491,7 @@ impl MockServer {
                     _ => "X",
                 };
                 let resp = format!(
-                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                    "HTTP/1.1 {status} {reason}\r\nETag: \"mock-read-version\"\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
                     resp_body.len()
                 );
                 let _ = stream.write_all(resp.as_bytes());
@@ -557,6 +557,7 @@ fn server_4xx_body_reaches_stderr_and_exits_two() {
         .arg(&mock.addr)
         .arg("set")
         .arg("iomap")
+        .arg("--force")
         .arg("--from")
         .arg("-")
         .write_stdin("{\"mappings\":[]}")
@@ -623,6 +624,7 @@ fn project_flag_adds_header_on_every_request() {
         .arg("lineB")
         .arg("set")
         .arg("tasks")
+        .arg("--force")
         .arg("--from")
         .arg("-")
         .write_stdin("{\"tasks\":[]}")
@@ -671,6 +673,81 @@ fn set_pou_creates_then_puts_when_missing() {
     assert!(seen[0].starts_with("GET /api/pous/newpou"));
     assert!(seen[1].starts_with("POST /api/pous"));
     assert!(seen[2].starts_with("PUT /api/pous/newpou"));
+    assert!(seen[2]
+        .to_ascii_lowercase()
+        .contains("if-match: \"mock-read-version\""));
+}
+
+#[test]
+fn get_keeps_version_in_a_separate_explicit_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let etag = dir.path().join("main.etag");
+    let source = "PROGRAM main\nEND_PROGRAM\n";
+    let mock = MockServer::start(
+        vec![(
+            "GET",
+            "/api/pous/main",
+            200,
+            serde_json::json!({"source": source}).to_string(),
+        )],
+        1,
+    );
+    cs().args(["--server", &mock.addr, "get", "pous/main.st", "--etag-file"])
+        .arg(&etag)
+        .assert()
+        .success()
+        .stdout(source);
+    assert_eq!(fs::read_to_string(etag).unwrap(), "\"mock-read-version\"\n");
+    mock.finish();
+}
+
+#[test]
+fn stale_set_sends_the_original_explicit_version_and_reports_412_as_exit_two() {
+    let dir = tempfile::tempdir().unwrap();
+    let etag = dir.path().join("alarms.etag");
+    fs::write(&etag, "\"original-read\"\n").unwrap();
+    let mock = MockServer::start(
+        vec![(
+            "PUT",
+            "/api/alarms",
+            412,
+            "document changed since it was read; re-read it and reapply your edit".into(),
+        )],
+        2,
+    );
+    cs().args([
+        "--server",
+        &mock.addr,
+        "set",
+        "alarms",
+        "--from",
+        "-",
+        "--if-match",
+    ])
+    .arg(format!("@{}", etag.display()))
+    .write_stdin("{\"alarms\":[]}")
+    .assert()
+    .code(2)
+    .stderr(contains("re-read it"));
+    let seen = mock.finish();
+    assert!(seen.iter().any(|h| h
+        .to_ascii_lowercase()
+        .contains("if-match: \"original-read\"")));
+    assert!(
+        !seen.iter().any(|h| h.starts_with("GET ")),
+        "must not vouch for a stale edit using a new GET"
+    );
+}
+
+#[test]
+fn existing_document_cannot_be_blindly_replaced_by_default() {
+    let mock = MockServer::start(vec![], 1); // heartbeat only, never PUT
+    cs().args(["--server", &mock.addr, "set", "alarms", "--from", "-"])
+        .write_stdin("{\"alarms\":[]}")
+        .assert()
+        .code(2)
+        .stderr(contains("--if-match"));
+    assert!(!mock.finish().iter().any(|h| h.starts_with("PUT ")));
 }
 
 #[test]

@@ -249,6 +249,91 @@ fn sim_run_proves_and_refutes_against_a_real_server() {
         .stderr(predicates::str::contains("scenario FAILED"));
 }
 
+#[test]
+fn stale_agent_cannot_remove_another_writers_alarm_or_program_edit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("sim_smoke");
+    copy_dir(&repo_root().join("examples/sim_smoke"), &proj);
+    let server = spawn_server(tmp.path());
+    server.open_project(&proj);
+
+    cs(&server.base)
+        .args(["set", "pous/fresh.st", "--from", "-"])
+        .write_stdin("PROGRAM fresh\nEND_PROGRAM\n")
+        .assert()
+        .success();
+    cs(&server.base)
+        .args(["get", "pous/fresh.st"])
+        .assert()
+        .success()
+        .stdout("PROGRAM fresh\nEND_PROGRAM\n");
+
+    for resource in ["alarms", "pous/main.st"] {
+        let version = tmp
+            .path()
+            .join(format!("{}.etag", resource.replace('/', "-")));
+        let old = cs(&server.base)
+            .args(["get", resource, "--etag-file"])
+            .arg(&version)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let other = if resource == "alarms" {
+            let mut doc: serde_json::Value = serde_json::from_slice(&old).unwrap();
+            doc["alarms"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "id":"overflow_trip", "variable":"overflow", "condition":"is_true",
+                    "severity":"critical", "message":"Overflow trip"
+                }));
+            doc.to_string()
+        } else {
+            format!(
+                "{}\n(* another writer's interlock edit *)\n",
+                String::from_utf8(old.clone()).unwrap()
+            )
+        };
+        cs(&server.base)
+            .args(["set", resource, "--from", "-", "--if-match"])
+            .arg(format!("@{}", version.display()))
+            .write_stdin(other.clone())
+            .assert()
+            .success();
+        // A second agent/IDE read must NOT replace the first writer's version.
+        cs(&server.base).args(["get", resource]).assert().success();
+        cs(&server.base)
+            .args(["set", resource, "--from", "-", "--if-match"])
+            .arg(format!("@{}", version.display()))
+            .write_stdin(old)
+            .assert()
+            .code(2)
+            .stderr(predicates::str::contains("HTTP 412"))
+            .stderr(predicates::str::contains("re-read"));
+        let saved = cs(&server.base)
+            .args(["get", resource])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        if resource == "alarms" {
+            let saved: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+            assert!(saved["alarms"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|alarm| alarm["id"] == "overflow_trip"));
+        } else {
+            assert!(String::from_utf8(saved)
+                .unwrap()
+                .contains("another writer's interlock edit"));
+        }
+    }
+}
+
 /// A resource name with non-ASCII characters must survive the trip through
 /// the CLI's URL encoder and the server's router.
 ///

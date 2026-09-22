@@ -10,7 +10,11 @@ Each entry: the symptom you'll see, the cause, the fix.
 
 ### `409` Conflict
 **Cause:** a create-only or read-only path. Devices/edges don't hit this — `cs set` is upsert, so reconfiguring replaces in place. What does 409: `cs hmi generate <slug>` on a screen that already exists (curated by a human — pass `--force` only if you mean to overwrite), or writing a `pous/lib/<name>/…` block imported from a library (read-only through the generic POU routes — copy it out of `lib/` to own it).
-**Fix:** for a rewrite you intend, `cs ls devices` / `cs ls hmi` to confirm the name, then `cs set <path> --from -` (or `--force` for generate).
+**Fix:** for a rewrite you intend, read the document with `cs get <path> --etag-file version`, edit that content, then `cs set <path> --from - --if-match @version` (or `--force` for a deliberately replacing generate).
+
+### `412` Precondition Failed / `set` asks for `--if-match`
+**Cause:** another writer changed the document after your read, or no original-read version was supplied. This includes changes made directly on disk.
+**Fix:** keep your local edit, re-read with `get --etag-file NEW_VERSION`, and reapply it to the new content. Never use a newer version to endorse the old body, and never use `--force` just to silence a conflict. A deliberate full replacement may use `--force`. New named resources need no flag; default config documents still need a version. See `02-cli-reference.md`.
 
 ### `422` on `cs set iomap` / `cs set devices/<n>` / `cs set tasks`
 **Cause:** wrong JSON shape. For iomap, almost always a missing `application` field. For a device, a transport union missing its `kind`.

@@ -41,14 +41,30 @@ operating.
 ```
 cs ls                          # resource-kind overview (start here)
 cs ls pous|devices|edges|hmi|library|projects|device-catalog
-cs get <path>                  # read one resource
-cs set <path> [--from f|-]     # create-or-replace (upsert)
+cs get <path> --etag-file version    # read document + this read's version
+cs set <path> --from f|- --if-match @version  # replace only that version
+cs set <new-path> [--from f|-]       # create a named resource
 cs rm  <path>                  # delete (trailing / = folder)
 ```
 
 Path grammar: first segment = resource kind; the rest is the resource's
 own slash-path (the same one it has on disk and in the API). Nested
 names are fine (`pous/lib/pid/fb_pid`).
+
+**Preserve other writers:** `get --etag-file FILE` leaves stdout unchanged
+(raw POU source or JSON) and writes the quoted ETag separately. Keep a
+different version file for each edited document/task. Edit the content you
+read, then pass `set --if-match @FILE` (or the literal quoted ETag). There is
+no implicit cache. Existing targets require this version or explicit
+`--force`, which deliberately discards any intervening changes. A new named
+POU/device/edge/HMI needs neither flag; its creation response protects its
+initial write. Config resources (`iomap`, `tasks`, `alarms`, `northbound`)
+always have a readable default, so capture their version first.
+
+On **412 / exit 2**, re-read and reapply your edit; do not just fetch a newer
+ETag and retry the old body. `cs api` remains raw and does not add this guard.
+Use `--force` only for a deliberate full replacement, not to silence a
+conflict. Files read directly from disk carry no API version.
 
 | Path | get | set | notes |
 |---|---|---|---|

@@ -129,6 +129,9 @@ pub(crate) enum Command {
     /// `hmi/<slug>`, `hmi-symbols`.
     Get {
         path: String,
+        /// Write this read's quoted ETag to a file, for `set --if-match @FILE`.
+        #[arg(long)]
+        etag_file: Option<PathBuf>,
         /// Extra query params, repeatable: `--query tail=500`.
         #[arg(long = "query", value_name = "K=V")]
         query: Vec<String>,
@@ -137,19 +140,27 @@ pub(crate) enum Command {
     /// Create-or-replace a resource (upsert; the write half of
     /// get → edit → set).
     ///
-    /// `cs set pous/motor.st --from -`        POU source from stdin
+    /// `cs set pous/motor.st --from - --if-match @motor.etag`  replace source
     /// `cs set pous/seal.ld.json`             scaffold a new LD POU
     /// `cs set devices/plc1 --protocol modbus`  create empty device
-    /// `cs set devices/plc1 --from cfg.json`  replace full config
+    /// `cs set devices/plc1 --from cfg.json --if-match @plc1.etag`  replace config
     /// `cs set edges/pi --host pi@plc.local`  create edge
-    /// `cs set iomap --from iomap.json`       single-doc configs
+    /// `cs set iomap --from iomap.json --if-match @iomap.etag`  single-doc config
     /// `cs set pous/util/`                    create a folder
     ///
     /// New POUs take their language from the path's extension
     /// (.st / .ld.json / .fbd.json / .sfc.json).
+    /// Capture the version with `cs get <path> --etag-file FILE` BEFORE
+    /// editing. Existing targets need --if-match or intentional --force.
     #[command(verbatim_doc_comment)]
     Set {
         path: String,
+        /// Replace only the version read earlier: quoted ETag or @FILE.
+        #[arg(long, conflicts_with = "force")]
+        if_match: Option<String>,
+        /// Deliberately replace an existing document without checking its version.
+        #[arg(long)]
+        force: bool,
         /// Content file, or `-` for stdin. POU paths take raw source;
         /// everything else takes the JSON shape `cs get` returns.
         #[arg(long)]
@@ -582,12 +593,18 @@ fn main() {
 
     let result = match args.command {
         Command::Ls { path } => cmd_ls(&client, path.as_deref(), json),
-        Command::Get { path, query } => match parse_query(&query).map_err(UsageError::wrap) {
-            Ok(q) => cmd_get(&client, &path, &q, json),
+        Command::Get {
+            path,
+            query,
+            etag_file,
+        } => match parse_query(&query).map_err(UsageError::wrap) {
+            Ok(q) => cmd_get(&client, &path, &q, json, etag_file.as_deref()),
             Err(e) => Err(e),
         },
         Command::Set {
             path,
+            if_match,
+            force,
             from,
             protocol,
             host,
@@ -597,6 +614,8 @@ fn main() {
             &client,
             &path,
             &SetArgs {
+                if_match: if_match.as_deref(),
+                force,
                 from: from.as_deref(),
                 protocol: protocol.as_deref(),
                 host: host.as_deref(),

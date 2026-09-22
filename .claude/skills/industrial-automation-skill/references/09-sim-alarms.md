@@ -119,8 +119,8 @@ doc — and YOU should author them alongside the control logic; a program
 that can misbehave silently is only half-delivered:
 
 ```bash
-cs get alarms                       # current definitions
-cs set alarms --from -              # replace (applies on the NEXT run)
+cs get alarms --etag-file alarms.etag       # current definitions + their version
+cs set alarms --from - --if-match @alarms.etag  # replace (applies on the NEXT run)
 ```
 
 ```json

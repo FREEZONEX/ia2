@@ -10,6 +10,7 @@ pub enum ApiError {
     NoProject,
     NotFound(String),
     Conflict(String),
+    PreconditionFailed,
     BadRequest(String),
     /// 422 — the request was well-formed but the resulting state fails
     /// validation (e.g. an HMI ops batch whose result has structural
@@ -75,6 +76,8 @@ impl IntoResponse for ApiError {
             Self::NoProject => (StatusCode::CONFLICT, "no project open".to_string()),
             Self::NotFound(s) => (StatusCode::NOT_FOUND, s),
             Self::Conflict(s) => (StatusCode::CONFLICT, s),
+            Self::PreconditionFailed => (StatusCode::PRECONDITION_FAILED,
+                "document changed since it was read; re-read it and reapply your edit (local edits have not been saved)".into()),
             Self::BadRequest(s) => (StatusCode::BAD_REQUEST, s),
             Self::Unprocessable(s) => (StatusCode::UNPROCESSABLE_ENTITY, s),
             Self::Forbidden(s) => (StatusCode::FORBIDDEN, s),

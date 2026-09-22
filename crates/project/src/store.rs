@@ -109,6 +109,28 @@ impl ProjectStore {
         &self.root
     }
 
+    /// Validated backing file for a whole-document API resource. Centralized
+    /// here so HTTP version checks use exactly the store's path grammar.
+    pub fn document_path(&self, kind: &str, name: &str) -> Result<PathBuf, StoreError> {
+        match kind {
+            "iomap" | "tasks" | "alarms" | "northbound" => {
+                Ok(self.root.join(format!("{kind}.toml")))
+            }
+            "pous" | "hmi" | "devices" | "edges" => {
+                validate_path(name)?;
+                match kind {
+                    "pous" => Ok(self
+                        .pou_file_path(name)
+                        .map(|(path, _)| path)
+                        .unwrap_or_else(|| self.root.join("pous").join(format!("{name}.st")))),
+                    "hmi" => Ok(self.hmi_file(name)),
+                    _ => Ok(self.root.join(kind).join(format!("{name}.toml"))),
+                }
+            }
+            _ => Err(StoreError::InvalidName(kind.into())),
+        }
+    }
+
     pub fn name(&self) -> &str {
         &self.manifest.name
     }
