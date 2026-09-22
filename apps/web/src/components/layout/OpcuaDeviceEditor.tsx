@@ -33,7 +33,7 @@ const OPCUA_DATA_TYPES: { value: OpcuaDataType; label: string }[] = [
 ]
 
 export function OpcuaDeviceEditor({ device, onSave, link }: DeviceEditorProps) {
-  const { draft, setDraft, dirty } = useDeviceDraft(device)
+  const { draft, setDraft, dirty, reload, conflict } = useDeviceDraft(device)
   if (draft.protocol !== "opcua") return null
 
   const update = (patch: Partial<typeof draft>) =>
@@ -98,6 +98,8 @@ export function OpcuaDeviceEditor({ device, onSave, link }: DeviceEditorProps) {
         protocol="OPC UA"
         dirty={dirty}
         onSave={() => onSave(draft)}
+        reload={reload}
+        conflict={conflict}
       />
 
       <div className="min-h-0 flex-1 space-y-6 overflow-auto p-4">

@@ -28,12 +28,45 @@ import type { Tasks } from "@/types/generated/Tasks"
 import type { VariableInfo } from "@/types/generated/VariableInfo"
 import type { WriteVariableResponse } from "@/types/generated/WriteVariableResponse"
 
+// Metadata belongs to this particular read/draft, never to a URL cache.
+// Enumerable symbols survive object spread but are omitted by JSON.stringify.
+const documentVersionKey = Symbol("IA2 document version")
+type Versioned = { [documentVersionKey]?: string }
+
+export function documentVersion(document: object): string | undefined {
+  return (document as Versioned)[documentVersionKey]
+}
+
+/** A successful save creates a new base; never upgrade another draft's token. */
+export function withDocumentVersion<T extends object>(document: T, response: object): T {
+  return { ...document, [documentVersionKey]: documentVersion(response) }
+}
+
+function matchVersion(document: object, contentType = "application/json"): HeadersInit {
+  const version = documentVersion(document)
+  if (!version) throw new Error("Document version unavailable. Reload from disk before saving; local changes have been kept.")
+  return { "Content-Type": contentType, "If-Match": version }
+}
+
+export class DocumentConflictError extends Error {
+  constructor(label: string) {
+    super(`${label} → 412: Changed on disk. Local changes have been kept. Reload and reconcile before saving again.`)
+    this.name = "DocumentConflictError"
+  }
+}
+
 async function jsonOrThrow<T>(res: Response, label: string): Promise<T> {
   if (!res.ok) {
+    if (res.status === 412) throw new DocumentConflictError(label)
     const text = await res.text().catch(() => "")
     throw new Error(`${label} → ${res.status} ${text}`.trim())
   }
-  return res.json() as Promise<T>
+  const body = await res.json() as T
+  const version = res.headers.get("ETag") ?? res.headers.get("X-IA2-Version")
+  if (version && body !== null && typeof body === "object") {
+    Object.defineProperty(body, documentVersionKey, { value: version, enumerable: true })
+  }
+  return body
 }
 
 // ---------- Multi-project routing --------------------------------
@@ -175,11 +208,12 @@ export async function createPou(
 export async function savePou(
   path: string,
   source: string,
+  base: Pou,
 ): Promise<RunResponse> {
   return jsonOrThrow(
     await apiFetch(`/api/pous/${encodeURIComponent(path)}`, {
       method: "PUT",
-      headers: { "Content-Type": "text/plain" },
+      headers: matchVersion(base, "text/plain"),
       body: source,
     }),
     `PUT /api/pous/${path}`,
@@ -243,7 +277,7 @@ export async function updateDevice(
   return jsonOrThrow(
     await apiFetch(`/api/devices/${encodeURIComponent(name)}`, {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
+      headers: matchVersion(device),
       body: JSON.stringify(device),
     }),
     `PUT /api/devices/${name}`,
@@ -296,7 +330,7 @@ export async function updateTasks(tasks: Tasks): Promise<RunResponse> {
   return jsonOrThrow(
     await apiFetch(`/api/tasks`, {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
+      headers: matchVersion(tasks),
       body: JSON.stringify(tasks),
     }),
     "PUT /api/tasks",
@@ -327,7 +361,7 @@ export async function updateIomap(iomap: IoMap): Promise<RunResponse> {
   return jsonOrThrow(
     await apiFetch(`/api/iomap`, {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
+      headers: matchVersion(iomap),
       body: JSON.stringify(iomap),
     }),
     "PUT /api/iomap",
@@ -646,7 +680,7 @@ export async function updateEdge(name: string, edge: Edge): Promise<RunResponse>
   return jsonOrThrow(
     await apiFetch(`/api/edges/${encodeURIComponent(name)}`, {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
+      headers: matchVersion(edge),
       body: JSON.stringify(edge),
     }),
     `PUT /api/edges/${name}`,

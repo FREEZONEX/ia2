@@ -1,11 +1,13 @@
 import { Link2, Save, X } from "@/components/ui/icons"
-import { useEffect, useMemo, useState } from "react"
+import { useMemo, useState } from "react"
 
 import { Button } from "@/components/ui/button"
 import { EnumSelect } from "@/components/ui/enum-select"
 import { Input } from "@/components/ui/input"
 import { PaneHeader } from "@/components/ui/pane-header"
 import { ErrorBox } from "@/components/ui/error-box"
+import { fetchDevice } from "@/lib/api"
+import { DocumentReloadButton, useDocumentDraft } from "@/lib/use-document-draft"
 import type { Device } from "@/types/generated/Device"
 import type { Direction } from "@/types/generated/Direction"
 import type { IoMap } from "@/types/generated/IoMap"
@@ -36,22 +38,16 @@ export type DeviceEditorProps = {
 }
 
 /**
- * Draft/dirty scaffold shared by all three editors: seed local state from
- * the device, reset when the upstream device changes, and derive `dirty` by
+ * Draft/dirty scaffold shared by all protocol editors: retain the document
+ * version with local edits, refresh only clean forms, and derive `dirty` by
  * value comparison. Each editor keeps its own one-line `update` (typed to
  * its narrowed variant) because `Device` is a discriminated union — a
  * union-wide `Partial<Device>` would only expose the keys common to every
  * protocol.
  */
 export function useDeviceDraft(device: Device) {
-  const [draft, setDraft] = useState<Device>(device)
-  // Reset the draft whenever the upstream device changes (e.g. a different
-  // device is selected in the tree).
-  useEffect(() => {
-    setDraft(device)
-  }, [device])
-  const dirty = JSON.stringify(draft) !== JSON.stringify(device)
-  return { draft, setDraft, dirty }
+  const state = useDocumentDraft(device, device.name)
+  return { ...state, reload: () => state.reload(() => fetchDevice(device.name)) }
 }
 
 /** The name + protocol + modified badges + Save button strip atop each
@@ -62,11 +58,15 @@ export function DeviceSaveBar({
   protocol,
   dirty,
   onSave,
+  reload,
+  conflict,
 }: {
   name: string
   protocol: string
   dirty: boolean
   onSave: () => Promise<void>
+  reload: () => Promise<void>
+  conflict: boolean
 }) {
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -89,10 +89,13 @@ export function DeviceSaveBar({
         description={protocol}
         meta={dirty ? <span className="text-warn">Unsaved changes</span> : undefined}
         actions={
-          <Button size="sm" onClick={() => void save()} disabled={!dirty || saving} aria-busy={saving}>
-            <Save className="size-4" />
-            {saving ? "Saving…" : "Save changes"}
-          </Button>
+          <>
+            <DocumentReloadButton reload={reload} conflict={conflict} />
+            <Button size="sm" onClick={() => void save()} disabled={!dirty || saving} aria-busy={saving}>
+              <Save className="size-4" />
+              {saving ? "Saving…" : "Save changes"}
+            </Button>
+          </>
         }
       />
       {error && <ErrorBox className="m-4 mb-0">{error}</ErrorBox>}
@@ -153,6 +156,11 @@ export function LinkedToCell({
   link: LinkProps
 }) {
   const [adding, setAdding] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const attempt = async (operation: () => Promise<void>) => {
+    setError(null)
+    try { await operation() } catch (e) { setError(String(e)) }
+  }
   const [draft, setDraft] = useState<{
     application: string
     variable: string
@@ -178,6 +186,7 @@ export function LinkedToCell({
 
   const remove = async (target: Mapping) => {
     const next: IoMap = {
+      ...link.iomap,
       mappings: link.iomap.mappings.filter(
         (m) => m.device !== link.deviceName || mappingKey(m) !== mappingKey(target) || m.channel !== channelName,
       ),
@@ -206,6 +215,7 @@ export function LinkedToCell({
     )
     if (!exists) {
       await link.saveIomap({
+        ...link.iomap,
         mappings: [...link.iomap.mappings, newMapping],
       })
     }
@@ -244,7 +254,7 @@ export function LinkedToCell({
           </span>
           <button
             type="button"
-            onClick={() => void remove(m)}
+            onClick={() => void attempt(() => remove(m))}
             className="inline-flex size-6 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-accent/40 hover:text-destructive"
             title="Unlink"
           >
@@ -252,6 +262,7 @@ export function LinkedToCell({
           </button>
         </span>
       ))}
+      {error && <span role="alert" className="text-xs text-destructive">{error}</span>}
       {adding ? (
         <div className="flex flex-wrap items-center gap-2 bg-muted/40 p-2">
           <EnumSelect
@@ -266,7 +277,7 @@ export function LinkedToCell({
             value={draft.variable}
             onChange={(e) => setDraft({ ...draft, variable: e.target.value })}
             onKeyDown={(e) => {
-              if (e.key === "Enter") void commit()
+              if (e.key === "Enter") void attempt(commit)
               if (e.key === "Escape") setAdding(false)
             }}
             placeholder="variable"
@@ -292,7 +303,7 @@ export function LinkedToCell({
           <Button
             size="sm"
             variant="outline"
-            onClick={() => void commit()}
+            onClick={() => void attempt(commit)}
             disabled={!draft.variable.trim() || !draft.application}
             className="h-7 px-2 text-xs"
           >

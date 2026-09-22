@@ -60,7 +60,7 @@ export function EthercatDeviceEditor({
   onSave,
   link,
 }: DeviceEditorProps) {
-  const { draft, setDraft, dirty } = useDeviceDraft(device)
+  const { draft, setDraft, dirty, reload, conflict } = useDeviceDraft(device)
   if (draft.protocol !== "ethercat") return null
 
   const update = (patch: Partial<typeof draft>) =>
@@ -136,6 +136,8 @@ export function EthercatDeviceEditor({
         protocol="EtherCAT"
         dirty={dirty}
         onSave={() => onSave(draft)}
+        reload={reload}
+        conflict={conflict}
       />
 
       <div className="min-h-0 flex-1 space-y-6 overflow-auto p-4">

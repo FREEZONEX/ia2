@@ -23,12 +23,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { fetchProjectPous } from "@/lib/api"
+import { fetchProjectPous, fetchTasks } from "@/lib/api"
+import { DocumentReloadButton, useDocumentDraft } from "@/lib/use-document-draft"
 import { useRuntime } from "@/state/runtime"
 import type { PouInProject } from "@/types/generated/PouInProject"
 import type { ProgramInstance } from "@/types/generated/ProgramInstance"
 import type { Task } from "@/types/generated/Task"
-import type { Tasks } from "@/types/generated/Tasks"
 
 /**
  * Project-level scheduling editor.
@@ -49,7 +49,7 @@ import type { Tasks } from "@/types/generated/Tasks"
 export function TasksPane() {
   const { project, tasks, saveTasks, migrateTasks, isRunning, run, stop } =
     useRuntime()
-  const [draft, setDraft] = useState<Tasks>(tasks)
+  const { draft, setDraft, dirty, conflict, reload } = useDocumentDraft(tasks, project?.name ?? "")
   const [migrating, setMigrating] = useState(false)
   const [migrationNote, setMigrationNote] = useState<string | null>(null)
   // Parser-driven list of every IEC POU declared anywhere in the project.
@@ -57,10 +57,6 @@ export function TasksPane() {
   // side by side); the file-level `application.kind` is a heuristic, not
   // the truth — we use this list instead.
   const [pous, setPous] = useState<PouInProject[]>([])
-
-  useEffect(() => {
-    setDraft(tasks)
-  }, [tasks])
 
   // Refresh the POU declaration list whenever the project changes (POU
   // added/renamed/source edited). Failures are tolerated — the dropdown
@@ -78,8 +74,6 @@ export function TasksPane() {
       cancelled = true
     }
   }, [project])
-
-  const dirty = JSON.stringify(draft) !== JSON.stringify(tasks)
 
   // Only PROGRAM-kind POUs are schedulable. IEC enforces this — FBs and
   // FUNCTIONs are used INSIDE programs, not bound to tasks directly.
@@ -144,7 +138,7 @@ export function TasksPane() {
         p.task === prev.name ? { ...p, task: patch.name! } : p,
       )
     }
-    setDraft({ tasks: next, programs })
+    setDraft({ ...draft, tasks: next, programs })
   }
 
   const addTask = () => {
@@ -225,7 +219,8 @@ export function TasksPane() {
 
   return (
     <main className="ia2-pane">
-      <Header dirty={dirty} isRunning={isRunning} run={run} stop={stop} save={() => saveTasks(draft)} />
+      <Header dirty={dirty} isRunning={isRunning} run={run} stop={stop} save={() => saveTasks(draft)}
+        reload={() => reload(fetchTasks)} conflict={conflict} />
 
       <div className="min-h-0 flex-1 space-y-5 overflow-auto p-4">
         {offerMigration && (
@@ -299,18 +294,20 @@ export function TasksPane() {
 //  Subcomponents
 // ============================================================
 
-function Header({ dirty, isRunning, run, stop, save }: {
+function Header({ dirty, isRunning, run, stop, save, reload, conflict }: {
   dirty: boolean
   isRunning: boolean
   run: () => Promise<void>
   stop: () => Promise<void>
   save: () => Promise<void>
+  reload: () => Promise<void>
+  conflict: boolean
 }) {
   const [pending, setPending] = useState<"save" | "run" | "stop" | null>(null)
   const act = async (action: "save" | "run" | "stop") => {
     if (pending) return
     setPending(action)
-    try { await ({ save, run, stop })[action]() } finally { setPending(null) }
+    try { await ({ save, run, stop })[action]() } catch { /* provider displays the error */ } finally { setPending(null) }
   }
   return (
     <PaneHeader
@@ -318,6 +315,7 @@ function Header({ dirty, isRunning, run, stop, save }: {
       description="Schedule programs and set their scan intervals"
       meta={dirty ? <span className="text-warn">Unsaved changes</span> : undefined}
       actions={<>
+        <DocumentReloadButton reload={reload} conflict={conflict} />
         <Button size="sm" variant={dirty ? "default" : "outline"} disabled={!dirty || pending !== null} onClick={() => void act("save")}>
           <Save className="size-4" /> {pending === "save" ? "Saving…" : "Save changes"}
         </Button>

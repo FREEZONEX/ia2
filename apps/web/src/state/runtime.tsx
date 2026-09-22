@@ -46,6 +46,7 @@ import {
   deleteEdge as apiDeleteEdge,
   deletePou as apiDeletePou,
   detachEdge as apiDetachEdge,
+  DocumentConflictError,
   eventsUrl,
   fetchDevice,
   fetchEdge,
@@ -65,6 +66,7 @@ import {
   updateEdge as apiUpdateEdge,
   updateIomap as apiUpdateIomap,
   updateTasks as apiUpdateTasks,
+  withDocumentVersion,
 } from "@/lib/api"
 import { LspClient, pouDocumentUri } from "@/lib/lsp-client"
 
@@ -529,12 +531,17 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project])
 
-  // Keep the iomap + tasks state in sync with the tree.
+  // Nested tree values have no per-file version. Always fetch the full
+  // documents before a client can use them as replacement-write bases.
   useEffect(() => {
-    if (project) {
-      setIomap(project.iomap)
-      setTasks(project.tasks)
-    }
+    if (!project) return
+    let cancelled = false
+    void Promise.all([fetchIomap(), fetchTasks()]).then(([map, schedule]) => {
+      if (cancelled) return
+      setIomap(map)
+      setTasks(schedule)
+    }).catch((e) => { if (!cancelled) setError(String(e)) })
+    return () => { cancelled = true }
   }, [project])
 
   // ---------------- SSE source ----------------
@@ -857,11 +864,11 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
   /** Before writing the buffer: settle a recorded external change. Returns
    *  false when nothing should be written. Loading the disk version never
    *  continues into the caller's write or run — the user sees it first. */
-  const settleExternalChange = useCallback(async (): Promise<boolean> => {
+  const settleExternalChange = useCallback(async (): Promise<Pou | null | false> => {
     const ext = externalChangeRef.current
-    if (!ext) return true
+    if (!ext) return null
     const choice = await askExternalChange(ext.path)
-    if (choice === "overwrite") return true
+    if (choice === "overwrite") return ext
     if (choice === "load") loadExternalChange()
     return false
   }, [askExternalChange, loadExternalChange])
@@ -1011,11 +1018,12 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     async (device: Device) => {
       setError(null)
       try {
-        await apiUpdateDevice(device.name, device)
-        setCurrentDevice(device)
+        const saved = await apiUpdateDevice(device.name, device)
+        setCurrentDevice(withDocumentVersion(device, saved))
         await refreshProject()
       } catch (e) {
         setError(String(e))
+        throw e
       }
     },
     [refreshProject],
@@ -1025,11 +1033,12 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     async (next: IoMap) => {
       setError(null)
       try {
-        await apiUpdateIomap(next)
-        setIomap(next)
+        const saved = await apiUpdateIomap(next)
+        setIomap(withDocumentVersion(next, saved))
         await refreshProject()
       } catch (e) {
         setError(String(e))
+        throw e
       }
     },
     [refreshProject],
@@ -1039,11 +1048,12 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     async (next: Tasks) => {
       setError(null)
       try {
-        await apiUpdateTasks(next)
-        setTasks(next)
+        const saved = await apiUpdateTasks(next)
+        setTasks(withDocumentVersion(next, saved))
         await refreshProject()
       } catch (e) {
         setError(String(e))
+        throw e
       }
     },
     [refreshProject],
@@ -1071,11 +1081,23 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
   // survive this response. Only clear the version approved before saving,
   // or an echo whose contents are exactly what this request wrote.
   const saveCurrentBuffer = useCallback(async (): Promise<"saved" | "cancelled" | "conflict"> => {
-    if (!currentPou || !await settleExternalChange()) return "cancelled"
-    const approvedExternal = externalChangeRef.current
-    await savePou(currentPou.path, source)
+    if (!currentPou) return "cancelled"
+    const approvedExternal = await settleExternalChange()
+    if (approvedExternal === false) return "cancelled"
+    let saved
+    try {
+      saved = await savePou(currentPou.path, source, approvedExternal ?? currentPou)
+    } catch (error) {
+      if (error instanceof DocumentConflictError) {
+        // Catch changes whose SSE event was delayed or lost, without replacing
+        // the user's buffer or retrying the write against a newer version.
+        const fresh = await fetchPou(currentPou.path).catch(() => null)
+        if (fresh && currentPouRef.current?.path === currentPou.path) setExternalDisk(fresh)
+      }
+      throw error
+    }
     const latestExternal = externalChangeRef.current
-    setCurrentPou({ ...currentPou, source })
+    setCurrentPou(withDocumentVersion({ ...currentPou, source }, saved))
     setExternalDisk((disk) => disk === approvedExternal || disk?.source === source ? null : disk)
     return latestExternal && latestExternal !== approvedExternal && latestExternal.source !== source
       ? "conflict"
@@ -1225,11 +1247,12 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     async (edge: Edge) => {
       setError(null)
       try {
-        await apiUpdateEdge(edge.name, edge)
-        setCurrentEdge(edge)
+        const saved = await apiUpdateEdge(edge.name, edge)
+        setCurrentEdge(withDocumentVersion(edge, saved))
         await refreshProject()
       } catch (e) {
         setError(String(e))
+        throw e
       }
     },
     [refreshProject],
