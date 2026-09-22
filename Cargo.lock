@@ -127,6 +127,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d902e3d592a523def97af8f317b08ce16b7ab854c1985a0c671e6f15cebc236"
 
 [[package]]
+name = "arrayvec"
+version = "0.7.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+
+[[package]]
 name = "asn1-rs"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -695,6 +701,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "blake3"
+version = "1.8.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d9e454fc11f76977dc803893aff6304ed33d6a26efae8696573bea74baa27ae"
+dependencies = [
+ "arrayvec",
+ "cc",
+ "cfg-if",
+ "constant_time_eq",
+ "cpufeatures 0.3.1",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -978,6 +997,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "constant_time_eq"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
+
+[[package]]
+name = "container_derive"
+version = "0.244.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.6",
+]
+
+[[package]]
 name = "convert_case"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -988,9 +1022,9 @@ dependencies = [
 
 [[package]]
 name = "convert_case"
-version = "0.11.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "affbf0190ed2caf063e3def54ff444b449371d55c58e513a95ab98eca50adb49"
+checksum = "1af709f1f33454bf52eadfc8c78b3b9ef9cb26fb54d16dc9cd9a7299f899fd1b"
 dependencies = [
  "unicode-segmentation",
 ]
@@ -1157,20 +1191,13 @@ dependencies = [
 
 [[package]]
 name = "ctor"
-version = "0.11.1"
+version = "1.0.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "400a21f1014a968ec518c7ccdf9b4a4ed0cac8c56ccb6d604f8b91f00110501e"
+checksum = "914a755b7c2d4af2bdcff7ce1739e2db9a1b81a9b07123d8015786ae03c0980d"
 dependencies = [
- "ctor-proc-macro",
- "dtor",
  "link-section",
+ "linktime-proc-macro",
 ]
-
-[[package]]
-name = "ctor-proc-macro"
-version = "0.0.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a949c44fcacbbbb7ada007dc7acb34603dd97cd47de5d054f2b6493ecebb483"
 
 [[package]]
 name = "data-encoding"
@@ -1295,29 +1322,14 @@ dependencies = [
 
 [[package]]
 name = "dsl_macro_derive"
-version = "0.212.0"
+version = "0.244.0"
 dependencies = [
- "convert_case 0.11.0",
+ "convert_case 0.12.0",
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 3.0.6",
  "trybuild",
 ]
-
-[[package]]
-name = "dtor"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96eb86b441d67a711e6e76b410de7135385fec1b8cd304e99d11c56ae542e2fc"
-dependencies = [
- "dtor-proc-macro",
-]
-
-[[package]]
-name = "dtor-proc-macro"
-version = "0.0.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2647271c92754afcb174e758003cfd1cbf1e43e5a7853d7b1813e63e19e39a73"
 
 [[package]]
 name = "either"
@@ -2346,19 +2358,23 @@ dependencies = [
 
 [[package]]
 name = "ironplc-analyzer"
-version = "0.212.0"
+version = "0.244.0"
 dependencies = [
  "ctor",
  "env_logger",
  "fixedbitset",
+ "indexmap",
+ "ironplc-container",
  "ironplc-dsl",
  "ironplc-parser",
  "ironplc-problems",
+ "ironplc-spec-requirements-gen",
  "ironplc-test",
  "log",
  "petgraph",
  "phf",
  "rstest",
+ "spec_test_macro",
 ]
 
 [[package]]
@@ -2366,6 +2382,7 @@ name = "ironplc-bridge"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "blake3",
  "futures-util",
  "iocore",
  "iomap-canopen",
@@ -2390,7 +2407,7 @@ dependencies = [
 
 [[package]]
 name = "ironplc-cli"
-version = "0.212.0"
+version = "0.244.0"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -2400,6 +2417,7 @@ dependencies = [
  "encoding_rs",
  "env_logger",
  "ironplc-analyzer",
+ "ironplc-cli-support",
  "ironplc-codegen",
  "ironplc-container",
  "ironplc-dsl",
@@ -2417,20 +2435,32 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "ironplc-cli-support"
+version = "0.244.0"
+dependencies = [
+ "env_logger",
+ "log",
+ "tempfile",
  "time",
 ]
 
 [[package]]
 name = "ironplc-codegen"
-version = "0.212.0"
+version = "0.244.0"
 dependencies = [
+ "blake3",
  "ironplc-analyzer",
  "ironplc-container",
  "ironplc-dsl",
  "ironplc-parser",
  "ironplc-problems",
+ "ironplc-sources",
  "ironplc-spec-requirements-gen",
  "ironplc-vm",
+ "paste",
  "proptest",
  "rstest",
  "spec_test_macro",
@@ -2438,15 +2468,18 @@ dependencies = [
 
 [[package]]
 name = "ironplc-container"
-version = "0.212.0"
+version = "0.244.0"
 dependencies = [
+ "blake3",
+ "container_derive",
  "ironplc-spec-requirements-gen",
+ "rstest",
  "spec_test_macro",
 ]
 
 [[package]]
 name = "ironplc-dsl"
-version = "0.212.0"
+version = "0.244.0"
 dependencies = [
  "dsl_macro_derive",
  "ironplc-problems",
@@ -2454,61 +2487,70 @@ dependencies = [
  "logos",
  "paste",
  "regex",
- "time",
-]
-
-[[package]]
-name = "ironplc-parser"
-version = "0.212.0"
-dependencies = [
- "ironplc-dsl",
- "ironplc-problems",
- "ironplc-test",
- "logos",
- "peg",
- "phf",
  "rstest",
  "time",
 ]
 
 [[package]]
+name = "ironplc-parser"
+version = "0.244.0"
+dependencies = [
+ "ironplc-container",
+ "ironplc-dsl",
+ "ironplc-problems",
+ "ironplc-spec-requirements-gen",
+ "ironplc-test",
+ "logos",
+ "peg",
+ "phf",
+ "rstest",
+ "spec_test_macro",
+ "time",
+]
+
+[[package]]
 name = "ironplc-plc2plc"
-version = "0.212.0"
+version = "0.244.0"
 dependencies = [
  "dsl_macro_derive",
  "ironplc-dsl",
  "ironplc-parser",
+ "ironplc-spec-requirements-gen",
  "ironplc-test",
  "paste",
+ "rstest",
+ "spec_test_macro",
 ]
 
 [[package]]
 name = "ironplc-problems"
-version = "0.212.0"
+version = "0.244.0"
 dependencies = [
  "csv",
 ]
 
 [[package]]
 name = "ironplc-project"
-version = "0.212.0"
+version = "0.244.0"
 dependencies = [
  "ctor",
  "env_logger",
  "ironplc-analyzer",
+ "ironplc-codegen",
  "ironplc-container",
  "ironplc-dsl",
  "ironplc-parser",
  "ironplc-problems",
  "ironplc-sources",
  "log",
+ "rstest",
  "serde_json",
  "tempfile",
 ]
 
 [[package]]
 name = "ironplc-sources"
-version = "0.212.0"
+version = "0.244.0"
 dependencies = [
  "ctor",
  "encoding_rs",
@@ -2516,29 +2558,35 @@ dependencies = [
  "ironplc-dsl",
  "ironplc-parser",
  "ironplc-problems",
+ "ironplc-spec-requirements-gen",
  "ironplc-test",
  "log",
  "roxmltree",
+ "spec_test_macro",
  "tempfile",
  "time",
+ "toml 1.1.2+spec-1.1.0",
 ]
 
 [[package]]
 name = "ironplc-spec-requirements-gen"
-version = "0.212.0"
+version = "0.244.0"
 
 [[package]]
 name = "ironplc-test"
-version = "0.212.0"
+version = "0.244.0"
 
 [[package]]
 name = "ironplc-vm"
-version = "0.212.0"
+version = "0.244.0"
 dependencies = [
  "csv",
  "ironplc-container",
+ "ironplc-spec-requirements-gen",
  "ironplc-vm",
  "proptest",
+ "rstest",
+ "spec_test_macro",
 ]
 
 [[package]]
@@ -2676,9 +2724,15 @@ dependencies = [
 
 [[package]]
 name = "link-section"
-version = "0.11.0"
+version = "0.19.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8acde40189b7f4b102f876f43a98ec1f5899f96e9a144945d36d9ce0be7f99c7"
+checksum = "39c29a617ce3df32c08497bdc1ab6e2376e0b17948ac166a2fbe5977c5954cd9"
+
+[[package]]
+name = "linktime-proc-macro"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e57c38c1e860fd37c604281cdfb1dd2216977fd76a50f85ba2f388ef3219616"
 
 [[package]]
 name = "linux-raw-sys"
@@ -2761,9 +2815,9 @@ dependencies = [
 
 [[package]]
 name = "lsp-server"
-version = "0.7.9"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d6ada348dbc2703cbe7637b2dda05cff84d3da2819c24abcb305dd613e0ba2e"
+checksum = "3ee25a31f2e571e426eef2896179450cafc7e2f5be00d8a93b1c2d21c0ff7656"
 dependencies = [
  "crossbeam-channel",
  "log",
@@ -3319,9 +3373,9 @@ dependencies = [
 
 [[package]]
 name = "phf"
-version = "0.13.1"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1562dc717473dbaa4c1f85a36410e03c047b2e7df7f45ee938fbef64ae7fadf"
+checksum = "010378780309880b08997fae13be7834dba947d36393bd372f2b1556deb2a2f6"
 dependencies = [
  "phf_macros",
  "phf_shared",
@@ -3330,9 +3384,9 @@ dependencies = [
 
 [[package]]
 name = "phf_generator"
-version = "0.13.1"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "135ace3a761e564ec88c03a77317a7c6b80bb7f7135ef2544dbe054243b89737"
+checksum = "aeb62e0959d5a1bebc965f4d15d9e2b7cea002b6b0f5ba8cde6cc26738467100"
 dependencies = [
  "fastrand",
  "phf_shared",
@@ -3340,9 +3394,9 @@ dependencies = [
 
 [[package]]
 name = "phf_macros"
-version = "0.13.1"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "812f032b54b1e759ccd5f8b6677695d5268c588701effba24601f6932f8269ef"
+checksum = "5fa8d0ca26d424d27630da600c6624696e7dec8bf7b3b492b383c5dc49e5e085"
 dependencies = [
  "phf_generator",
  "phf_shared",
@@ -3353,9 +3407,9 @@ dependencies = [
 
 [[package]]
 name = "phf_shared"
-version = "0.13.1"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e57fef6bc5981e38c2ce2d63bfa546861309f875b8a75f092d1d54ae2d64f266"
+checksum = "c6fd9027e2d9319be6349febd1db4e8d02aa544921200c9b777720ac34a3aa89"
 dependencies = [
  "siphasher",
 ]
@@ -3873,9 +3927,9 @@ dependencies = [
 
 [[package]]
 name = "rstest"
-version = "0.26.1"
+version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5a3193c063baaa2a95a33f03035c8a72b83d97a54916055ba22d35ed3839d49"
+checksum = "948203e6d13b83e51a90d7cf236dd58a0065f23f4b902f00f306e7eb2bd09b9c"
 dependencies = [
  "futures-timer",
  "futures-util",
@@ -3884,9 +3938,9 @@ dependencies = [
 
 [[package]]
 name = "rstest_macros"
-version = "0.26.1"
+version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c845311f0ff7951c5506121a9ad75aec44d083c31583b2ea5a30bcb0b0abba0"
+checksum = "a8d92eaf7b6e51e12471d71ddc72608e7151573de44099aacfbb1128177c0da4"
 dependencies = [
  "cfg-if",
  "glob",
@@ -4468,11 +4522,11 @@ dependencies = [
 
 [[package]]
 name = "spec_test_macro"
-version = "0.212.0"
+version = "0.244.0"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -4543,6 +4597,17 @@ name = "syn"
 version = "2.0.117"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e665b8803e7b1d2a727f4023456bbbbe74da67099c585258af0ad9c5013b9b99"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
+name = "syn"
+version = "3.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8593e8e72159ed2257d083c7a454a85cbf854f37a0966d8d483aff8c8a3ebcee"
 dependencies = [
  "proc-macro2",
  "quote",

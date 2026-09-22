@@ -99,7 +99,7 @@ export function onlineNumber(vars: OnlineVars, name: string): number | null {
 /** How the snapshot shows the STRING the runtime stores for `text`.
  *  ironplc keeps each character's low byte (Latin-1, `encode_string_literal`)
  *  and the bridge prints the bytes as an IEC literal
- *  (`format_iec_string_literal`) — so `等待` arrives as `'I$85'`. */
+ *  (ironplc's `VariableRenderer`) — so `等待` arrives as `'I$85'`. */
 export function runtimeStringLiteral(text: string): string {
   let out = "'"
   for (const ch of text) {

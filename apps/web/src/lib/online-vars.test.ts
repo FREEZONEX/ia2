@@ -93,7 +93,7 @@ describe("onlineVars", () => {
 
 describe("runtimeStringLiteral", () => {
   // Mirrors ironplc's `encode_string_literal` (low byte per character) and
-  // the bridge's `format_iec_string_literal`.
+  // ironplc's `VariableRenderer` narrow-string rendering.
   it.each([
     ["idle", "'idle'"],
     ["等待", "'I$85'"], // U+7B49 → 0x49, U+5F85 → 0x85

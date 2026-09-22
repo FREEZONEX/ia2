@@ -32,6 +32,7 @@ iomap-opcua = { path = "../iomap-opcua" }
 iomap-canopen = { path = "../iomap-canopen" }
 
 [dev-dependencies]
+blake3 = "1"
 tempfile = "3"
 # Implement the `IoDevice` trait (which is `#[async_trait]`) for the mock
 # device used in the shutdown-sequencing tests.

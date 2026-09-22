@@ -20,6 +20,12 @@ license = "Apache-2.0"
 publish = false
 repository = "https://github.com/supcon-international/ia2"
 
+# Vendored ironplc crates inherit these through path dependencies. IA2
+# crates do not opt in; keep these aligned with the pinned upstream tag.
+[workspace.lints.rust]
+unsafe_code = "deny"
+deprecated = "deny"
+
 [workspace.dependencies]
 # async runtime
 tokio = { version = "1", features = ["full"] }

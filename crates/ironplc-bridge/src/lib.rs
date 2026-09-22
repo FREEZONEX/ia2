@@ -45,14 +45,26 @@ use ironplc_dsl::core::FileId;
 use ironplc_dsl::diagnostic::{Diagnostic, LineColumn};
 use ironplc_parser::options::CompilerOptions;
 use serde::Serialize;
+use std::collections::HashMap;
 use ts_rs::TS;
+
+/// Exact parser inputs, including generated ST. Codegen uses these for
+/// source hashes and line maps instead of silently disabling drift checks.
+#[derive(Default)]
+struct Sources(HashMap<FileId, String>);
+
+impl ironplc_codegen::SourceLookup for Sources {
+    fn source_bytes(&self, file_id: &FileId) -> Option<&[u8]> {
+        self.0.get(file_id).map(|source| source.as_bytes())
+    }
+}
 
 /// Per-program metadata derived from the source's AST that the runtime
 /// needs but the bytecode `Container` itself doesn't preserve.
 ///
 /// Right now this is just the set of `VAR RETAIN`-qualified variable
 /// names — `ironplc`'s codegen flattens qualifiers away once it lowers
-/// to bytecode (see `vendor/ironplc/compiler/container/src/debug_format.rs`),
+/// to bytecode (see `vendor/ironplc/compiler/container/src/debug_format/`),
 /// so we re-derive them from the parsed `Library` for the persistence
 /// layer to consume.
 #[derive(Debug, Clone, Default)]
@@ -65,7 +77,8 @@ pub struct ProgramMetadata {
 }
 
 /// Compile an IEC 61131-3 Structured Text source string into an executable
-/// ironplc bytecode `Container`. Uses dialect Ed2 with no vendor extensions.
+/// ironplc bytecode `Container`. Uses Ed2 plus IA2's historical syntax
+/// allowances (empty VAR blocks, top-level globals, integer bit literals).
 ///
 /// Thin convenience wrapper around `compile_with_metadata` that drops the
 /// metadata; for code paths that *do* need retain info (the run path),
@@ -89,7 +102,8 @@ pub fn compile_with_metadata(source: &str) -> Result<(Container, ProgramMetadata
         retain_vars: extract_retain_vars(&library),
     };
 
-    let container = compile_library(&library)?;
+    let sources = Sources(HashMap::from([(file_id, source.to_owned())]));
+    let container = compile_library(&library, &sources)?;
     Ok((container, metadata))
 }
 
@@ -99,6 +113,8 @@ pub fn compile_with_metadata(source: &str) -> Result<(Container, ProgramMetadata
 fn parser_options() -> CompilerOptions {
     CompilerOptions {
         allow_empty_var_blocks: true,
+        allow_top_level_var_global: true,
+        allow_int_literal_to_bit_string: true,
         ..Default::default()
     }
 }
@@ -106,7 +122,7 @@ fn parser_options() -> CompilerOptions {
 /// Analyze + codegen a parsed `Library` into a bytecode container —
 /// the shared tail of `compile_with_metadata` and
 /// `compile_project_units`.
-fn compile_library(library: &Library) -> Result<Container, BridgeError> {
+fn compile_library(library: &Library, sources: &Sources) -> Result<Container, BridgeError> {
     let options = parser_options();
     let (analyzed, context) = ironplc_analyzer::stages::analyze(&[library], &options)
         .map_err(|ds| BridgeError::Analyze(format!("{ds:?}")))?;
@@ -116,7 +132,7 @@ fn compile_library(library: &Library) -> Result<Container, BridgeError> {
     }
 
     let codegen_options = ironplc_codegen::CodegenOptions::default();
-    ironplc_codegen::compile(&analyzed, &context, &codegen_options)
+    ironplc_codegen::compile(&analyzed, &context, &codegen_options, sources)
         .map_err(|d| BridgeError::Codegen(format!("{d:?}")))
 }
 
@@ -205,9 +221,8 @@ pub fn compile_project(store: &project::ProjectStore) -> Result<Vec<ProgramUnit>
 /// per PROGRAM instance, round-robin scheduled on a single scan thread").
 ///
 /// Each unit's library is assembled at the AST level:
-///   1. the instance's own `ProgramDeclaration`, hoisted to the front —
-///      ironplc's codegen compiles the FIRST PROGRAM it finds, so this
-///      is what makes "which program runs" deterministic even when one
+///   1. the instance's own `ProgramDeclaration` — ironplc supports one
+///      PROGRAM per container, so exclude the others even when one
 ///      `.st` file declares several PROGRAMs;
 ///   2. every non-PROGRAM declaration from every POU file
 ///      (FUNCTION_BLOCKs, FUNCTIONs, data types, top-level globals) so
@@ -247,6 +262,7 @@ pub fn compile_project_units(
     // real source file instead of an offset into a concatenated blob.
     let mut program_decls: Vec<(String, ironplc_dsl::common::ProgramDeclaration)> = Vec::new();
     let mut shared_elements: Vec<LibraryElementKind> = Vec::new();
+    let mut sources = Sources::default();
     for path in &pou_paths {
         let language = store
             .pou_file_language(path)
@@ -259,6 +275,7 @@ pub fn compile_project_units(
         let file_id = FileId::from_string(path);
         let library = ironplc_parser::parse_program(&cleaned, &file_id, &options)
             .map_err(|d| BridgeError::Parse(format!("parsing '{path}': {d:?}")))?;
+        sources.0.insert(file_id, cleaned);
         for element in library.elements {
             match element {
                 LibraryElementKind::ProgramDeclaration(p) => {
@@ -320,6 +337,7 @@ pub fn compile_project_units(
                     p.instance
                 ))
             })?;
+        sources.0.insert(FileId::default(), config_text);
 
         let mut elements =
             Vec::with_capacity(1 + shared_elements.len() + config_lib.elements.len());
@@ -329,7 +347,7 @@ pub fn compile_project_units(
         let unit_library = Library { elements };
 
         let retain_vars = extract_retain_vars(&unit_library);
-        let container = compile_library(&unit_library).map_err(|e| {
+        let container = compile_library(&unit_library, &sources).map_err(|e| {
             let tag = |m: String| format!("instance '{}': {m}", p.instance);
             match e {
                 BridgeError::Parse(m) => BridgeError::Parse(tag(m)),
@@ -724,10 +742,7 @@ pub fn check_pou_in_project(
 pub fn check_sources_together(
     files: &[(String, String, project::PouLanguage)],
 ) -> Vec<Vec<CheckDiagnostic>> {
-    let options = CompilerOptions {
-        allow_empty_var_blocks: true,
-        ..Default::default()
-    };
+    let options = parser_options();
     // Parse every file once up front; a file that doesn't parse simply
     // contributes no declarations (its own slot still gets checked and
     // reports the parse error there).
@@ -822,10 +837,7 @@ fn project_context_libraries(
     } else {
         Vec::new()
     };
-    let options = CompilerOptions {
-        allow_empty_var_blocks: true,
-        ..Default::default()
-    };
+    let options = parser_options();
     let mut out = Vec::new();
     for path in &paths {
         if buffer_path == Some(path.as_str()) {
@@ -922,10 +934,7 @@ fn check_inner(source: &str, map: SourceMapKind<'_>, context: &[Library]) -> Vec
     // `allow_empty_var_blocks` mirrors the ironplc CLI flag. POU templates
     // we ship intentionally start with empty VAR / VAR_INPUT / VAR_OUTPUT
     // blocks — those should compile, not error.
-    let options = CompilerOptions {
-        allow_empty_var_blocks: true,
-        ..Default::default()
-    };
+    let options = parser_options();
 
     let library = match ironplc_parser::parse_program(source, &file_id, &options) {
         Ok(l) => l,
@@ -1054,10 +1063,7 @@ pub fn extract_pou_declarations(
 fn extract_st_declarations(source: &str) -> Vec<project::PouDecl> {
     use project::{PouDecl, PouLanguage, PouType};
     let file_id = FileId::default();
-    let options = CompilerOptions {
-        allow_empty_var_blocks: true,
-        ..Default::default()
-    };
+    let options = parser_options();
     let Ok(library) = ironplc_parser::parse_program(source, &file_id, &options) else {
         return vec![];
     };
@@ -1160,10 +1166,7 @@ pub fn extract_variables(source: &str) -> Vec<VariableInfo> {
     // `allow_empty_var_blocks` mirrors the ironplc CLI flag. POU templates
     // we ship intentionally start with empty VAR / VAR_INPUT / VAR_OUTPUT
     // blocks — those should compile, not error.
-    let options = CompilerOptions {
-        allow_empty_var_blocks: true,
-        ..Default::default()
-    };
+    let options = parser_options();
     let library = match ironplc_parser::parse_program(source, &file_id, &options) {
         Ok(l) => l,
         Err(_) => return vec![],
@@ -1214,7 +1217,7 @@ fn init_type_name(init: &InitialValueAssignmentKind) -> String {
         Simple(s) => s.type_name.to_string(),
         String(s) => s.type_name().to_string(),
         FunctionBlock(fb) => fb.type_name.to_string(),
-        LateResolvedType(t) => t.to_string(),
+        LateResolvedType(t) => t.type_name.to_string(),
         EnumeratedType(e) => e.type_name.to_string(),
         Structure(s) => s.type_name.to_string(),
         Array(_) => "ARRAY".into(),
@@ -1327,7 +1330,6 @@ mod project_units_tests {
     use super::{
         compile_isolated_in_project_full, compile_project_units, extract_project_global_vars,
     };
-    use ironplc_container::debug_format::build_var_debug_map;
     use project::{PouLanguage, PouType, ProgramInstance, ProjectStore, Task, Tasks};
 
     /// Tempdir-backed project: a cross-file FUNCTION_BLOCK, two
@@ -1408,8 +1410,10 @@ mod project_units_tests {
     }
 
     fn debug_names(container: &super::Container) -> Vec<String> {
-        build_var_debug_map(container)
-            .values()
+        container
+            .debug_section
+            .iter()
+            .flat_map(|debug| &debug.var_names)
             .map(|i| i.name.clone())
             .collect()
     }

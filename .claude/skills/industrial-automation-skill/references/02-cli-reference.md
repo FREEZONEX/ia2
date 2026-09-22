@@ -122,6 +122,14 @@ Value encoding for force/write: human notation — `TRUE`/`FALSE`/`1`/`0`
 for BOOL, `50.0` for REAL (the CLI bit-packs by the variable's live
 type). Negative numbers after `--`: `cs runtime force setpoint -- -5`.
 
+Snapshot `value` is display text from ironplc's `VariableRenderer`:
+STRING is a single-quoted Latin-1 IEC literal; WSTRING is double-quoted
+with UTF-16 `$XXXX` escapes; enums show `NAME (ordinal)`; aggregates
+show `<TYPE>`, not a fake numeric value. TIME remains `T#1500ms`.
+`bits` remains the unmodified VM slot (not string content); numeric
+consumers must decode it by IEC type, never parse display text. IA2 owns
+the task cadence: a paused step executes one scan of every scheduled unit.
+
 The value must FIT that type: `40000` on an `INT` exits 2 naming the
 range, rather than arriving as -25536. `UDINT`/`DWORD` may exceed
 `i32::MAX` and ride the wire as their bit pattern, which is lossless

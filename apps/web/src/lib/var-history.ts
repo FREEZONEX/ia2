@@ -35,7 +35,7 @@ export function isBoolType(typeName: string): boolean {
  *  the trace because they're internal byte-offset bookkeeping.
  *
  *  Categorisation is by the type-name string the bridge reports
- *  (`format_variable_value` already preserves these via ironplc's
+ *  (`VariableRenderer` already preserves these via ironplc's
  *  debug section), so this is the one place to extend when new IEC
  *  types come online. */
 export type VarCategory =

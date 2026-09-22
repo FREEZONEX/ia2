@@ -23,11 +23,10 @@ use std::time::{Duration, Instant};
 
 use crate::retain;
 use iocore::{ChannelValue, IoDevice};
-use ironplc_container::debug_format::{build_var_debug_map, format_variable_value, VarDebugInfo};
+use ironplc_container::debug_format::VariableRenderer;
 use ironplc_container::debug_section::iec_type_tag;
 use ironplc_container::Container;
 use ironplc_container::VarIndex;
-use ironplc_container::STRING_HEADER_BYTES;
 use ironplc_vm::{Vm, VmBuffers, VmRunning};
 use project::{Direction, Mapping, ProtocolConfig, WriteGovernance, WriteMode};
 use serde::{Deserialize, Serialize};
@@ -644,15 +643,11 @@ pub struct ProgramUnit {
 
 /// Start the scan thread hosting one `VmRunning` per unit.
 ///
-/// Each unit is throttled to its own `interval_ms` regardless of what
-/// (if anything) its compiled CONFIGURATION requested. Why the bridge
-/// owns the cadence rather than the VM scheduler: as of the currently-
-/// vendored ironplc, codegen does NOT populate `container.task_table`,
-/// so the VM sees zero cyclic tasks and `next_due_us()` returns `None`.
-/// Until upstream wires CONFIGURATION → task_table, the per-unit anchor
-/// here is the source of truth for "the scan period the user asked for
-/// in tasks.toml" (and `run_round` executes the unit's single PROGRAM
-/// unconditionally each call).
+/// Each unit is throttled to its own `interval_ms` regardless of its
+/// compiled CONFIGURATION. Before loading the VM, its task table is made
+/// freewheeling: IA2's UnitClock is the sole scheduler, including re-anchoring
+/// on resume and executing individual paused steps. Upstream's cyclic task
+/// timer must not silently skip a scan that IA2 has already counted.
 ///
 /// RETAIN variables across all units persist into one state file when
 /// `state_path` is set; keys are `instance.variable` when there is more
@@ -1325,7 +1320,7 @@ fn resolve_mapping(
     device_index: usize,
     instances: &[String],
     var_index_by_name: &[HashMap<String, u16>],
-    debug_maps: &[HashMap<u16, VarDebugInfo>],
+    debug_maps: &[VariableRenderer],
 ) -> Option<(usize, Direction, ResolvedMapping)> {
     let n_units = instances.len();
     let unit_index = match instances
@@ -1363,7 +1358,7 @@ fn resolve_mapping(
     };
     let var_index = var_index_by_name[unit_index][&m.variable];
     let type_tag = debug_maps[unit_index]
-        .get(&var_index)
+        .var(var_index)
         .map(|d| d.iec_type_tag)
         .unwrap_or(0);
     Some((
@@ -1446,7 +1441,7 @@ fn enforce_write_governance(
     var_index: u16,
     value: i32,
     instances: &[String],
-    debug_maps: &[HashMap<u16, VarDebugInfo>],
+    debug_maps: &[VariableRenderer],
 ) -> Result<i32, RuntimeWriteError> {
     if governance.write_mode == WriteMode::Open {
         return Ok(value);
@@ -1458,7 +1453,7 @@ fn enforce_write_governance(
     // the wrong reason) while an absent type became "not REAL" (taking the
     // integer lane for a REAL, comparing IEEE-754 bits as an integer).
     // A variable we cannot identify is one we cannot bound. Deny.
-    let Some(info) = debug_maps[unit].get(&var_index) else {
+    let Some(info) = debug_maps[unit].var(var_index) else {
         return Err(RuntimeWriteError::GovernanceDenied(format!(
             "{name} (no debug entry for this variable — cannot check it against any rule)"
         )));
@@ -1574,7 +1569,7 @@ fn warn_clamped(name: &str, requested: f64, written: f64) {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_loop_async(
-    units: Vec<ProgramUnit>,
+    mut units: Vec<ProgramUnit>,
     // Devices are borrowed so the outer wrapper retains ownership for
     // its always-run failsafe pass (see `spawn_units_inner`'s async
     // block).
@@ -1609,6 +1604,16 @@ async fn run_loop_async(
     }
     let n_units = units.len();
 
+    // IA2 owns cadence, pause and step. Upstream now compiles cyclic task
+    // tables; normalize even caller-supplied CONFIGURATIONs so every bridge
+    // scan executes exactly once, without a second scheduler skipping it.
+    for unit in &mut units {
+        for task in &mut unit.container.task_table.tasks {
+            task.task_type = ironplc_container::TaskType::Freewheeling;
+            task.interval_us = 0;
+        }
+    }
+
     // ---- Start one VM per unit ----
     // `VmRunning` borrows its container and its buffers, so both live
     // in Vecs that outlive `runnings` and are never structurally
@@ -1628,21 +1633,18 @@ async fn run_loop_async(
         }
     }
 
-    let debug_maps: Vec<HashMap<u16, VarDebugInfo>> = units
+    let debug_maps: Vec<VariableRenderer> = units
         .iter()
-        .map(|u| build_var_debug_map(&u.container))
+        .map(|u| VariableRenderer::new(&u.container))
         .collect();
-    // Parallel to debug_maps: per-unit `var_index -> data_offset` for STRING
-    // vars, whose bytes live in the VM data region rather than the slot.
-    let string_layouts: Vec<HashMap<u16, u32>> = units
+    let var_index_by_name: Vec<HashMap<String, u16>> = units
         .iter()
-        .map(|u| build_string_layout_map(&u.container))
-        .collect();
-    let var_index_by_name: Vec<HashMap<String, u16>> = debug_maps
-        .iter()
-        .map(|dm| {
-            dm.iter()
-                .map(|(idx, info)| (info.name.clone(), *idx))
+        .map(|unit| {
+            unit.container
+                .debug_section
+                .iter()
+                .flat_map(|debug| &debug.var_names)
+                .map(|info| (info.name.clone(), info.var_index.raw()))
                 .collect()
         })
         .collect();
@@ -2087,7 +2089,6 @@ async fn run_loop_async(
                 let mut snapshot = build_snapshot(
                     &runnings,
                     &debug_maps,
-                    &string_layouts,
                     &instances,
                     &shared_names,
                     &clocks,
@@ -2359,7 +2360,6 @@ async fn run_loop_async(
             let mut snapshot = build_snapshot(
                 &runnings,
                 &debug_maps,
-                &string_layouts,
                 &instances,
                 &shared_names,
                 &clocks,
@@ -2520,8 +2520,7 @@ fn persist_retain_values(
 /// no UI churn.
 fn build_snapshot(
     runnings: &[VmRunning],
-    debug_maps: &[HashMap<u16, VarDebugInfo>],
-    string_layouts: &[HashMap<u16, u32>],
+    debug_maps: &[VariableRenderer],
     instances: &[String],
     shared_names: &std::collections::HashSet<String>,
     clocks: &[UnitClock],
@@ -2549,7 +2548,7 @@ fn build_snapshot(
                 Ok(r) => r,
                 Err(_) => continue,
             };
-            let Some(info) = debug_maps[u].get(&i) else {
+            let Some(info) = debug_maps[u].var(i) else {
                 continue;
             };
             if !seen.insert(info.name.clone()) {
@@ -2563,7 +2562,7 @@ fn build_snapshot(
             vars.push(VarValue {
                 name,
                 type_name: info.type_name.clone(),
-                value: format_value(raw, info, string_layouts[u].get(&i).copied(), data_region),
+                value: debug_maps[u].render(i, raw, data_region).text,
                 bits: raw,
                 input: None,
             });
@@ -2583,7 +2582,7 @@ fn build_snapshot(
 fn annotate_input_quality(
     snap: &mut VarSnapshot,
     inputs: &mut [HashMap<u16, InputQuality>],
-    debug_maps: &[HashMap<u16, VarDebugInfo>],
+    debug_maps: &[VariableRenderer],
     instances: &[String],
     shared_names: &std::collections::HashSet<String>,
     health: &std::sync::Mutex<Vec<DeviceHealth>>,
@@ -2592,7 +2591,7 @@ fn annotate_input_quality(
     for (u, vars) in inputs.iter_mut().enumerate() {
         for (idx, quality) in vars {
             quality.stale |= !health.iter().any(|h| h.name == quality.device && h.healthy);
-            let Some(info) = debug_maps[u].get(idx) else {
+            let Some(info) = debug_maps[u].var(*idx) else {
                 continue;
             };
             let name = if shared_names.contains(&info.name) {
@@ -2607,101 +2606,6 @@ fn annotate_input_quality(
     }
     snap.device_health = Some(health);
 }
-
-/// Render a variable's slot value. STRING vars don't live in the slot —
-/// their bytes are at `data_offset` in the VM's data region with layout
-/// `[max_len: u16][cur_len: u16][bytes…]`; we read them out and format
-/// as a single-quoted IEC literal. WSTRING isn't yet populated by
-/// ironplc's codegen (literal encoding `unreachable!`s on char_width=2),
-/// so we surface a placeholder rather than fake content. Everything else
-/// delegates to ironplc's standard formatter.
-fn format_value(
-    raw: u64,
-    info: &VarDebugInfo,
-    string_offset: Option<u32>,
-    data_region: &[u8],
-) -> String {
-    match info.iec_type_tag {
-        iec_type_tag::STRING => {
-            match string_offset.and_then(|off| read_string_value(data_region, off)) {
-                Some(text) => text,
-                // No layout entry, or the offset is bogus — show that we
-                // know it's a string but couldn't decode it, not a lie.
-                None => "'<invalid>'".into(),
-            }
-        }
-        // ironplc's codegen doesn't yet emit WSTRING data; see
-        // `compiler/codegen/src/compile.rs` `unreachable!("WSTRING literal
-        // encoding is not yet supported")`. Until upstream lands it, we
-        // surface a placeholder so operators know what's missing.
-        iec_type_tag::WSTRING => "'<wstring>'".into(),
-        _ => format_variable_value(raw, info.iec_type_tag),
-    }
-}
-
-/// Reads a STRING value at `data_offset` in the VM's data region and
-/// renders it as an IEC 61131-3 single-quoted literal (e.g. `'STARTUP'`).
-///
-/// Wire format: `[max_len: u16][cur_len: u16][cur_len bytes of UTF-8]`,
-/// little-endian, as written by ironplc's codegen (see
-/// `compiler/codegen/src/compile_setup.rs` `string_region_size`).
-/// Non-printable bytes, `$`, and `'` are escaped per IEC string-literal
-/// rules so the resulting text is a valid round-trippable literal.
-///
-/// Returns `None` when the layout offset is past the end of the data
-/// region or the recorded `cur_len` would read off the end (e.g. a stale
-/// debug section). Bridging a `None` to a placeholder is the caller's job.
-fn read_string_value(data_region: &[u8], data_offset: u32) -> Option<String> {
-    let off = data_offset as usize;
-    if off + STRING_HEADER_BYTES > data_region.len() {
-        return None;
-    }
-    let cur_len = u16::from_le_bytes([data_region[off + 2], data_region[off + 3]]) as usize;
-    let start = off + STRING_HEADER_BYTES;
-    let end = start + cur_len;
-    if end > data_region.len() {
-        return None;
-    }
-    Some(format_iec_string_literal(&data_region[start..end]))
-}
-
-/// Renders raw STRING bytes as an IEC 61131-3 single-quoted string literal.
-/// Each byte is either passed through as printable ASCII, replaced with one
-/// of the named `$`-escapes (`$T`, `$L`, `$P`, `$R`, `$$`, `$'`), or emitted
-/// as a `$XX` two-digit hex escape. Mirrors the format ironplc uses in its
-/// playground variable dump.
-fn format_iec_string_literal(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() + 2);
-    out.push('\'');
-    for &b in bytes {
-        match b {
-            b'$' => out.push_str("$$"),
-            b'\'' => out.push_str("$'"),
-            0x09 => out.push_str("$T"),
-            0x0A => out.push_str("$L"),
-            0x0C => out.push_str("$P"),
-            0x0D => out.push_str("$R"),
-            0x20..=0x7E => out.push(b as char),
-            _ => out.push_str(&format!("${b:02X}")),
-        }
-    }
-    out.push('\'');
-    out
-}
-
-/// Build a `var_index → data_offset` map from the container's STRING
-/// layout sub-table (debug section Tag 4). Empty when no STRING vars
-/// were declared.
-fn build_string_layout_map(container: &Container) -> HashMap<u16, u32> {
-    let mut map = HashMap::new();
-    if let Some(debug) = &container.debug_section {
-        for entry in &debug.string_layouts {
-            map.insert(entry.var_index.raw(), entry.data_offset);
-        }
-    }
-    map
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4259,9 +4163,8 @@ mod tests {
 
     /// A STRING var initialised to a literal must surface as the quoted
     /// IEC value in the snapshot. Exercises the data-region read path
-    /// (`[max_len][cur_len][bytes…]` at the layout-table offset) end to
-    /// end through the live scan loop, not just the formatter — and the
-    /// per-unit `string_layouts[u]` / `runnings[u].data_region()` wiring.
+    /// (`[max_len][cur_len][char_width][bytes…]` at the layout-table offset)
+    /// end to end through the per-unit VariableRenderer and VM data region.
     #[tokio::test]
     async fn snapshot_renders_string_var_as_quoted_iec_literal() {
         let prog = crate::compile(
