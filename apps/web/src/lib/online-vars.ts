@@ -74,7 +74,8 @@ export function onlineVars(snapshot: VarSnapshot | null, scope: OnlineScope | nu
     // A name this POU declares is either qualified with its instance (when
     // another program shares it) or bare (when it is unique — and therefore
     // this program's).
-    return (prefix ? byName.get(prefix + key) : undefined) ?? byName.get(key)
+    const found = (prefix ? byName.get(prefix + key) : undefined) ?? byName.get(key)
+    return found?.input?.stale ? undefined : found
   }
 }
 

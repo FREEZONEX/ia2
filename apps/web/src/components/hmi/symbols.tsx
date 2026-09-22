@@ -12,6 +12,7 @@
 
 import { cn } from "@/lib/utils"
 import { cssColor } from "@/lib/hmi-binding"
+import { sampleSegments } from "@/lib/var-history"
 
 export type SymbolLive = Record<string, number | null>
 
@@ -25,7 +26,7 @@ type Props = {
    *  Wins over `props.color`; both fall back to the symbol default. */
   liveColor?: string | null
   /** Recent samples for history-drawing symbols (sparkline). */
-  history?: number[]
+  history?: (number | null)[]
 }
 
 const on = (v: number | null | undefined) => (v ?? 0) !== 0
@@ -584,26 +585,27 @@ function Sparkline({
   h: number
   live: SymbolLive
   props: Record<string, unknown>
-  history: number[]
+  history: (number | null)[]
 }) {
   const lbl = label(props)
   const svgH = h - (lbl ? 14 : 0)
-  const pts = history.length >= 2 ? history : [0, 0]
-  let lo = Math.min(...pts)
-  let hi = Math.max(...pts)
+  const segments = sampleSegments(history)
+  const readings = segments.flatMap(run => run.map(p => p.value))
+  let lo = readings.length ? Math.min(...readings) : 0
+  let hi = readings.length ? Math.max(...readings) : 1
   if (hi - lo < 1e-9) {
     lo -= 1
     hi += 1
   }
-  const step = w / (pts.length - 1)
-  const d = pts
+  const step = w / Math.max(1, history.length - 1)
+  const d = segments.map(run => run
     .map(
-      (v, i) =>
-        `${i === 0 ? "M" : "L"}${(i * step).toFixed(1)} ${(
-          svgH - 3 - ((v - lo) / (hi - lo)) * (svgH - 6)
+      ({ index, value }, i) =>
+        `${i === 0 ? "M" : "L"}${(index * step).toFixed(1)} ${(
+          svgH - 3 - ((value - lo) / (hi - lo)) * (svgH - 6)
         ).toFixed(1)}`,
     )
-    .join(" ")
+    .join(" ")).join(" ")
   const v = live["value"]
   return (
     <div className="flex h-full w-full flex-col">

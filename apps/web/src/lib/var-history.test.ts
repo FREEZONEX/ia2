@@ -8,6 +8,7 @@ import {
   mergeHistory,
   pushTimedHistory,
   seedTimedBuffer,
+  sampleSegments,
   windowSlice,
   type TimedSample,
 } from "./var-history"
@@ -74,6 +75,13 @@ function pt(t_us: number, min: number, max: number, v: number): HistoryPoint {
 }
 
 describe("historyToSamples", () => {
+  it("keeps stale buckets as timed gaps and resumes only at a fresh sample", () => {
+    const out = historyToSamples([pt(1_000_000, 3, 9, 7), { ...pt(2_000_000, 3, 9, 7), stale: true }, pt(3_000_000, 4, 8, 6)])
+    expect(out[1]).toEqual({ t: 2, v: null, lo: undefined, hi: undefined })
+    expect(sampleSegments(out.map(p => p.v))).toEqual([
+      [{ index: 0, value: 7 }], [{ index: 2, value: 6 }],
+    ])
+  })
   it("puts micros onto the seconds axis and carries the band", () => {
     const out = historyToSamples([pt(2_000_000, 3, 9, 7)])
     expect(out).toEqual([{ t: 2, v: 7, lo: 3, hi: 9 }])

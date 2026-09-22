@@ -15,6 +15,7 @@
 import type { HmiBinding } from "@/types/generated/HmiBinding"
 import type { HmiMapEntry } from "@/types/generated/HmiMapEntry"
 import type { VarSnapshot } from "@/types/generated/VarSnapshot"
+import type { VarValue } from "@/types/generated/VarValue"
 
 export function bindingVariable(b: HmiBinding): string {
   return typeof b === "string" ? b : b.variable
@@ -25,19 +26,29 @@ export function bindingVariable(b: HmiBinding): string {
  *  but ONLY when that tail is unambiguous. Two programs both owning a
  *  `level` must show "—", not whichever happened to serialize first;
  *  `cs hmi check` flags the ambiguity so it gets qualified, not guessed. */
-export function lookupVar(
+export function snapshotVariable(
   snapshot: VarSnapshot | null,
   name: string,
-): { raw: string; type_name: string } | null {
+): VarValue | null {
   if (!snapshot) return null
   const exact = snapshot.vars.find((v) => v.name === name)
-  if (exact) return { raw: exact.value, type_name: exact.type_name }
+  if (exact) return exact
   const tail = name.split(".").pop() ?? name
   const hits = snapshot.vars.filter(
     (v) => (v.name.split(".").pop() ?? v.name) === tail,
   )
-  return hits.length === 1
-    ? { raw: hits[0].value, type_name: hits[0].type_name }
+  return hits.length === 1 ? hits[0] : null
+}
+
+/** Resolve identity BEFORE quality: filtering stale candidates first
+ * would turn an ambiguous name into the wrong healthy program's value. */
+export function lookupVar(
+  snapshot: VarSnapshot | null,
+  name: string,
+): { raw: string; type_name: string } | null {
+  const found = snapshotVariable(snapshot, name)
+  return found && !found.input?.stale
+    ? { raw: found.value, type_name: found.type_name }
     : null
 }
 

@@ -114,7 +114,7 @@ export function stripHexPrefix(raw: string): string {
 
 /** Push `next` onto `buf` in place, trimming from the head once we hit
  *  `MAX_HISTORY`. Returns the same array for chaining / spread. */
-export function pushHistory(buf: number[], next: number): number[] {
+export function pushHistory(buf: (number | null)[], next: number | null): (number | null)[] {
   buf.push(next)
   if (buf.length > MAX_HISTORY) {
     // Drop ~10% at a time so we're not shift()ing every tick once full.
@@ -136,7 +136,7 @@ export const MAX_TIMED_HISTORY = 4096
  *  a count cap makes the visible window silently vary with snapshot
  *  rate. `lo`/`hi` carry a history bucket's min/max envelope; live
  *  single samples leave them undefined (the band collapses to `v`). */
-export type TimedSample = { t: number; v: number; lo?: number; hi?: number }
+export type TimedSample = { t: number; v: number | null; lo?: number; hi?: number }
 
 /** Push one timestamped sample in place, trimming samples older than
  *  `windowS` seconds behind the newest one, then enforcing the hard
@@ -145,7 +145,7 @@ export type TimedSample = { t: number; v: number; lo?: number; hi?: number }
 export function pushTimedHistory(
   buf: TimedSample[],
   t: number,
-  v: number,
+  v: number | null,
   windowS: number,
 ): TimedSample[] {
   buf.push({ t, v })
@@ -202,10 +202,26 @@ export function colorFor(index: number): string {
 export function historyToSamples(points: HistoryPoint[]): TimedSample[] {
   return points.map((p) => ({
     t: Number(p.t_us) / 1e6,
-    v: p.v,
-    lo: p.min,
-    hi: p.max,
+    v: p.stale ? null : p.v,
+    lo: p.stale ? undefined : p.min,
+    hi: p.stale ? undefined : p.max,
   }))
+}
+
+/** Contiguous finite readings, retaining original indices so a gap
+ * occupies its real time/position instead of joining across stale data. */
+export function sampleSegments(values: (number | null)[]): { index: number; value: number }[][] {
+  const segments: { index: number; value: number }[][] = []
+  let current: { index: number; value: number }[] = []
+  values.forEach((value, index) => {
+    if (value === null || !Number.isFinite(value)) {
+      current = []
+    } else {
+      if (current.length === 0) segments.push(current)
+      current.push({ index, value })
+    }
+  })
+  return segments
 }
 
 /** Merge stored history (older, ~1 Hz) with the live ring buffer

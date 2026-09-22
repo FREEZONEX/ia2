@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { HmiCanvas, type CanvasMode } from "./HmiCanvas"
 import { HmiHostProvider, type HmiHost } from "./host"
@@ -37,6 +37,33 @@ beforeEach(() => {
 })
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
 const canvas = (mode: CanvasMode) => <HmiHostProvider value={host}><HmiCanvas path="overview" mode={mode} selected={null} onSelect={vi.fn()} /></HmiHostProvider>
+
+it("marks only stale-bound nodes, blocks their interlock, and leaves explicit Stop available", async () => {
+  const input = { name: "permit", type_name: "BOOL", value: "TRUE", bits: 1, input: { device: "remote_io", channel: "permit", stale: true } }
+  const output = { name: "run", type_name: "BOOL", value: "TRUE", bits: 1 }
+  liveFeedStore.setSnapshot({ timestamp_us: 1n, scan_count: 1n, vars: [input, output] })
+  const screenDoc = structuredClone(doc)
+  const nodes = rootChildren(screenDoc)
+  nodes.splice(0, nodes.length,
+    { id: "start", type: "button", label: "Start", x: 20, y: 20, w: 100, h: 32, bind: { enable: "permit" }, action: { tap: { kind: "write", variable: "run", value: 1, confirm: false } } },
+    { id: "stop", type: "button", label: "Stop", x: 20, y: 80, w: 100, h: 32, bind: {}, action: { tap: { kind: "write", variable: "run", value: 0, confirm: false } } },
+  )
+  host.fetchDoc = vi.fn().mockResolvedValue(screenDoc)
+  render(canvas("operate"))
+  const start = await screen.findByRole("button", { name: "Start" })
+  expect((start as HTMLButtonElement).disabled).toBe(true)
+  expect(screen.getByText("Stale · remote_io/permit")).toBeTruthy()
+  expect(start.closest("[data-hmi-id]")?.getAttribute("data-stale-input")).toBe("true")
+  const stop = screen.getByRole("button", { name: "Stop" })
+  expect(stop.closest("[data-hmi-id]")?.getAttribute("data-stale-input")).toBeNull()
+  fireEvent.click(start)
+  expect(host.write).not.toHaveBeenCalled()
+  fireEvent.click(stop)
+  await waitFor(() => expect(host.write).toHaveBeenCalledWith("run", 0, "BOOL", undefined))
+  act(() => liveFeedStore.setSnapshot({ timestamp_us: 2n, scan_count: 2n, vars: [{ ...input, input: { ...input.input, stale: false } }, output] }))
+  expect((start as HTMLButtonElement).disabled).toBe(false)
+  expect(screen.queryByText("Stale · remote_io/permit")).toBeNull()
+})
 
 describe("Arrange-mode drag", () => {
   // An agent's `cs hmi op` lands on disk; this canvas has not reloaded yet

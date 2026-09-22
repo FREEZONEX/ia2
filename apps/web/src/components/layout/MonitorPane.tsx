@@ -141,7 +141,7 @@ export function MonitorPane({ collapsed, onToggleCollapse }: { collapsed: boolea
   // sparklines read; `timedRef` holds a timestamped buffer per PINNED
   // variable (seeded from stored history, fed by the live feed) that the
   // pinned TrendChart reads — only pinned vars carry the heavier buffer.
-  const historyRef = useRef<Map<string, number[]>>(new Map())
+  const historyRef = useRef<Map<string, (number | null)[]>>(new Map())
   const timedRef = useRef<Map<string, TimedSample[]>>(new Map())
   const typeRef = useRef<Map<string, string>>(new Map())
   const [, setTick] = useState(0)
@@ -171,7 +171,7 @@ export function MonitorPane({ collapsed, onToggleCollapse }: { collapsed: boolea
         arr = []
         historyRef.current.set(v.name, arr)
       }
-      const n = parseVarValue(v)
+      const n = v.input?.stale ? null : parseVarValue(v)
       pushHistory(arr, n)
       // timedRef only holds pinned vars (created by the seed effect).
       if (timeOk) {
@@ -430,7 +430,7 @@ function Tag({
 
 interface VarRowProps {
   v: VarValue
-  history: number[]
+  history: (number | null)[]
   isPinned: boolean
   sparkColor: string | undefined
   onPin: (name: string) => void
@@ -446,14 +446,20 @@ interface VarRowProps {
 function VarRow({ v, history, isPinned, sparkColor, onPin, stale, canWrite, forced, onToggleForce, onWrite }: VarRowProps) {
   const category = classifyType(v.type_name)
   const trendable = category === "numeric" || category === "bool" || category === "bits"
-  const writable = canWrite && canWriteMonitorType(v.type_name)
-  return <tr className={cn("h-9 border-b border-border/50 hover:bg-muted/50", stale && "text-muted-foreground", isPinned && "bg-selection/50")}>
+  const inputStale = v.input?.stale === true
+  const writable = canWrite && !inputStale && canWriteMonitorType(v.type_name)
+  // Removing an existing override does not derive a new value from the
+  // stale input. Keep this escape path even while new writes are disabled.
+  const forceable = writable || (canWrite && forced && canWriteMonitorType(v.type_name))
+  return <tr className={cn("h-9 border-b border-border/50 hover:bg-muted/50", (stale || inputStale) && "text-muted-foreground", isPinned && "bg-selection/50")}>
     <td className="px-2">{trendable && <Button variant="ghost" size="icon-xs" aria-label={`${isPinned ? "Unpin" : "Pin"} ${v.name} ${isPinned ? "from" : "to"} trend`} aria-pressed={isPinned} onClick={() => onPin(v.name)} title={isPinned ? "Unpin from trend" : "Pin to trend"}><Pin className={cn(isPinned ? "text-foreground" : "text-muted-foreground", isPinned && "fill-current rotate-45")} /></Button>}</td>
-    <th scope="row" className="max-w-56 truncate px-2 text-left font-mono font-normal" title={v.name}>{v.name}</th>
+    <th scope="row" className="max-w-56 truncate px-2 text-left font-mono font-normal" title={v.name}>{v.name}
+      {inputStale && <span className="ml-2 text-xs text-warn" title="Last-known input, not live feedback">Stale · {v.input!.device}/{v.input!.channel}</span>}
+    </th>
     <td className="px-2 font-mono text-xs text-muted-foreground">{v.type_name}</td>
     <td className="w-1/3 min-w-24 px-2"><div className="h-5 max-w-72"><CategoryVisual cat={category} v={v} history={history} sparkColor={sparkColor} /></div></td>
     <td className="px-2 text-right"><ValueCell v={v} cat={category} canWrite={writable} onWrite={onWrite} /></td>
-    <td className="px-2 text-center">{writable ? <Button variant="ghost" size="icon-xs" aria-label={`${forced ? "Unforce" : "Force"} ${v.name}`} aria-pressed={forced} onClick={() => onToggleForce(v)} title={forced ? `Unforce ${v.name} (resume program control)` : `Force ${v.name} = current value`}>
+    <td className="px-2 text-center">{forceable ? <Button variant="ghost" size="icon-xs" aria-label={`${forced ? "Unforce" : "Force"} ${v.name}`} aria-pressed={forced} onClick={() => onToggleForce(v)} title={forced ? `Unforce ${v.name} (resume program control)` : `Force ${v.name} = current value`}>
       {forced ? <Lock className="text-destructive" /> : <Unlock className="text-muted-foreground" />}
     </Button> : forced ? <Lock aria-label={`${v.name} is forced`} className="mx-auto size-4 text-destructive" /> : <span className="text-muted-foreground">—</span>}</td>
   </tr>
@@ -511,7 +517,7 @@ function CategoryVisual({
 }: {
   cat: VarCategory
   v: VarValue
-  history: number[]
+  history: (number | null)[]
   sparkColor: string | undefined
 }) {
   switch (cat) {
@@ -547,7 +553,7 @@ function BoolStrip({
   history,
   sparkColor,
 }: {
-  history: number[]
+  history: (number | null)[]
   sparkColor: string | undefined
 }) {
   // Take the last 80 ticks (the strip is 120 px wide → 1.5 px per cell).
@@ -562,13 +568,14 @@ function BoolStrip({
             key={i}
             className={cn(
               "h-2.5 flex-1 rounded-[1px]",
-              v > 0.5
+              v === null ? "bg-transparent" : v > 0.5
                 ? sparkColor
                   ? ""
                   : "bg-highlight/80"
                 : "bg-muted-foreground/20",
             )}
-            style={v > 0.5 && sparkColor ? { backgroundColor: sparkColor } : undefined}
+            title={v === null ? "Stale input" : undefined}
+            style={v !== null && v > 0.5 && sparkColor ? { backgroundColor: sparkColor } : undefined}
           />
         ))
       )}
