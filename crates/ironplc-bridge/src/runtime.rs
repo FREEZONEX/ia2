@@ -23,11 +23,10 @@ use std::time::{Duration, Instant};
 
 use crate::retain;
 use iocore::{ChannelValue, IoDevice};
-use ironplc_container::debug_format::{build_var_debug_map, format_variable_value, VarDebugInfo};
+use ironplc_container::debug_format::VariableRenderer;
 use ironplc_container::debug_section::iec_type_tag;
 use ironplc_container::Container;
 use ironplc_container::VarIndex;
-use ironplc_container::STRING_HEADER_BYTES;
 use ironplc_vm::{Vm, VmBuffers, VmRunning};
 use project::{Direction, Mapping, ProtocolConfig, WriteGovernance, WriteMode};
 use serde::{Deserialize, Serialize};
@@ -52,6 +51,19 @@ pub struct VarValue {
     /// the browser.
     #[ts(type = "number")]
     pub bits: u64,
+    /// Field input provenance and quality. Absent for internal/output variables.
+    /// A stale value is last-known (or not yet acquired), never live feedback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub input: Option<InputQuality>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export)]
+pub struct InputQuality {
+    pub device: String,
+    pub channel: String,
+    pub stale: bool,
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
@@ -60,6 +72,10 @@ pub struct VarSnapshot {
     pub timestamp_us: u64,
     pub scan_count: u64,
     pub vars: Vec<VarValue>,
+    /// Health sampled with these values, including devices that never connected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub device_health: Option<Vec<DeviceHealth>>,
 }
 
 /// One subdevice on an EtherCAT bus, as reported by `/discover`.
@@ -316,8 +332,8 @@ impl ProgramHandle {
     /// round; expect a few extra rounds before it actually exits.
     ///
     /// Fire-and-forget: returns immediately, doesn't wait for the failsafe
-    /// pass. Use `shutdown` when you need the plant guaranteed safe before
-    /// proceeding (clean process exit).
+    /// pass. Use `shutdown` to wait for the bounded failsafe/teardown
+    /// attempts before proceeding (clean process exit).
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
     }
@@ -326,7 +342,8 @@ impl ProgramHandle {
     /// then JOINS the scan thread — which runs its always-on failsafe pass
     /// (zero every device's outputs) and each device's `shutdown` (joining
     /// the EtherCAT cyclic worker so the zeroed controlword is on the wire)
-    /// before it returns. When this completes, outputs are in failsafe.
+    /// before it returns. Device failures are logged; completion is not
+    /// a guarantee that physical outputs reached their safe state.
     ///
     /// Unlike `stop`, this waits for completion, so the runtime can drive
     /// the plant safe before exiting rather than racing the service
@@ -341,7 +358,7 @@ impl ProgramHandle {
             Ok(Ok(())) => {}
             Ok(Err(_)) => {
                 tracing::error!(
-                    "scan thread panicked during shutdown (outputs were failsafed first)"
+                    "scan thread panicked during shutdown; inspect preceding failsafe errors"
                 )
             }
             Err(e) => tracing::error!(%e, "failed to join scan thread on shutdown"),
@@ -627,15 +644,11 @@ pub struct ProgramUnit {
 
 /// Start the scan thread hosting one `VmRunning` per unit.
 ///
-/// Each unit is throttled to its own `interval_ms` regardless of what
-/// (if anything) its compiled CONFIGURATION requested. Why the bridge
-/// owns the cadence rather than the VM scheduler: as of the currently-
-/// vendored ironplc, codegen does NOT populate `container.task_table`,
-/// so the VM sees zero cyclic tasks and `next_due_us()` returns `None`.
-/// Until upstream wires CONFIGURATION → task_table, the per-unit anchor
-/// here is the source of truth for "the scan period the user asked for
-/// in tasks.toml" (and `run_round` executes the unit's single PROGRAM
-/// unconditionally each call).
+/// Each unit is throttled to its own `interval_ms` regardless of its
+/// compiled CONFIGURATION. Before loading the VM, its task table is made
+/// freewheeling: IA2's UnitClock is the sole scheduler, including re-anchoring
+/// on resume and executing individual paused steps. Upstream's cyclic task
+/// timer must not silently skip a scan that IA2 has already counted.
 ///
 /// RETAIN variables across all units persist into one state file when
 /// `state_path` is set; keys are `instance.variable` when there is more
@@ -882,8 +895,10 @@ fn spawn_units_inner(
             // device's outputs to zero so a hung / panicked / stopped
             // program doesn't leave actuators energized.
             let dev_count = devices.len();
+            let mut failsafe_failed = 0usize;
             for dev in devices.iter_mut() {
                 if let Err(e) = dev.enter_failsafe().await {
+                    failsafe_failed += 1;
                     tracing::warn!(device = %dev.name(), %e, "failsafe call failed");
                 }
             }
@@ -896,8 +911,10 @@ fn spawn_units_inner(
             // controlword is guaranteed on the wire before we exit — not
             // left to the drive's own watchdog after the master is gone.
             // Runs on both the clean and panicked paths (before re-panic).
+            let mut shutdown_failed = 0usize;
             for dev in devices.iter_mut() {
                 if let Err(e) = dev.shutdown().await {
+                    shutdown_failed += 1;
                     tracing::warn!(device = %dev.name(), %e, "device shutdown failed");
                 }
             }
@@ -908,16 +925,20 @@ fn spawn_units_inner(
             match &result {
                 Ok(()) => tracing::info!(
                     devices = dev_count,
-                    "scan loop exited cleanly; failsafe applied"
+                    failsafe_failed,
+                    shutdown_failed,
+                    "scan loop exited cleanly; failsafe and shutdown attempts completed"
                 ),
                 Err(_) => tracing::error!(
                     devices = dev_count,
-                    "scan loop PANICKED; failsafe applied before re-panic"
+                    failsafe_failed,
+                    shutdown_failed,
+                    "scan loop PANICKED; failsafe and shutdown attempts completed before re-panic"
                 ),
             }
             if let Err(panic) = result {
                 // Re-raise so the thread dies with a useful backtrace
-                // in tests / logs. Outputs are already safe.
+                // in tests / logs. Failsafe was attempted on every device.
                 std::panic::resume_unwind(panic);
             }
         });
@@ -1308,7 +1329,7 @@ fn resolve_mapping(
     device_index: usize,
     instances: &[String],
     var_index_by_name: &[HashMap<String, u16>],
-    debug_maps: &[HashMap<u16, VarDebugInfo>],
+    debug_maps: &[VariableRenderer],
 ) -> Option<(usize, Direction, ResolvedMapping)> {
     let n_units = instances.len();
     let unit_index = match instances
@@ -1346,7 +1367,7 @@ fn resolve_mapping(
     };
     let var_index = var_index_by_name[unit_index][&m.variable];
     let type_tag = debug_maps[unit_index]
-        .get(&var_index)
+        .var(var_index)
         .map(|d| d.iec_type_tag)
         .unwrap_or(0);
     Some((
@@ -1429,7 +1450,7 @@ fn enforce_write_governance(
     var_index: u16,
     value: i32,
     instances: &[String],
-    debug_maps: &[HashMap<u16, VarDebugInfo>],
+    debug_maps: &[VariableRenderer],
 ) -> Result<i32, RuntimeWriteError> {
     if governance.write_mode == WriteMode::Open {
         return Ok(value);
@@ -1441,7 +1462,7 @@ fn enforce_write_governance(
     // the wrong reason) while an absent type became "not REAL" (taking the
     // integer lane for a REAL, comparing IEEE-754 bits as an integer).
     // A variable we cannot identify is one we cannot bound. Deny.
-    let Some(info) = debug_maps[unit].get(&var_index) else {
+    let Some(info) = debug_maps[unit].var(var_index) else {
         return Err(RuntimeWriteError::GovernanceDenied(format!(
             "{name} (no debug entry for this variable — cannot check it against any rule)"
         )));
@@ -1557,7 +1578,7 @@ fn warn_clamped(name: &str, requested: f64, written: f64) {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_loop_async(
-    units: Vec<ProgramUnit>,
+    mut units: Vec<ProgramUnit>,
     // Devices are borrowed so the outer wrapper retains ownership for
     // its always-run failsafe pass (see `spawn_units_inner`'s async
     // block).
@@ -1592,6 +1613,16 @@ async fn run_loop_async(
     }
     let n_units = units.len();
 
+    // IA2 owns cadence, pause and step. Upstream now compiles cyclic task
+    // tables; normalize even caller-supplied CONFIGURATIONs so every bridge
+    // scan executes exactly once, without a second scheduler skipping it.
+    for unit in &mut units {
+        for task in &mut unit.container.task_table.tasks {
+            task.task_type = ironplc_container::TaskType::Freewheeling;
+            task.interval_us = 0;
+        }
+    }
+
     // ---- Start one VM per unit ----
     // `VmRunning` borrows its container and its buffers, so both live
     // in Vecs that outlive `runnings` and are never structurally
@@ -1611,21 +1642,18 @@ async fn run_loop_async(
         }
     }
 
-    let debug_maps: Vec<HashMap<u16, VarDebugInfo>> = units
+    let debug_maps: Vec<VariableRenderer> = units
         .iter()
-        .map(|u| build_var_debug_map(&u.container))
+        .map(|u| VariableRenderer::new(&u.container))
         .collect();
-    // Parallel to debug_maps: per-unit `var_index -> data_offset` for STRING
-    // vars, whose bytes live in the VM data region rather than the slot.
-    let string_layouts: Vec<HashMap<u16, u32>> = units
+    let var_index_by_name: Vec<HashMap<String, u16>> = units
         .iter()
-        .map(|u| build_string_layout_map(&u.container))
-        .collect();
-    let var_index_by_name: Vec<HashMap<String, u16>> = debug_maps
-        .iter()
-        .map(|dm| {
-            dm.iter()
-                .map(|(idx, info)| (info.name.clone(), *idx))
+        .map(|unit| {
+            unit.container
+                .debug_section
+                .iter()
+                .flat_map(|debug| &debug.var_names)
+                .map(|info| (info.name.clone(), info.var_index.raw()))
                 .collect()
         })
         .collect();
@@ -1664,7 +1692,25 @@ async fn run_loop_async(
     // background reconnect worker may still deliver that device mid-run,
     // at which point they bind exactly like the startup ones below.
     let mut pending_mappings: Vec<Mapping> = Vec::new();
+    let mut input_quality: Vec<HashMap<u16, InputQuality>> =
+        (0..n_units).map(|_| HashMap::new()).collect();
     for m in mappings {
+        // Resolve input provenance even if connect failed: its initial VM
+        // value is not a measurement. Recovery clears stale only after a read.
+        if m.direction == Direction::Input {
+            if let Some((u, _, rm)) =
+                resolve_mapping(&m, usize::MAX, &instances, &var_index_by_name, &debug_maps)
+            {
+                input_quality[u].insert(
+                    rm.var_index,
+                    InputQuality {
+                        device: m.device.clone(),
+                        channel: m.channel.clone(),
+                        stale: true,
+                    },
+                );
+            }
+        }
         let Some(&device_index) = device_index_by_name.get(&m.device) else {
             tracing::warn!(
                 device = %m.device,
@@ -2049,14 +2095,21 @@ async fn run_loop_async(
             prev_paused = true;
             if last_snapshot.elapsed() >= SNAPSHOT_PERIOD {
                 let now_us = start.elapsed().as_micros() as u64;
-                let snapshot = build_snapshot(
+                let mut snapshot = build_snapshot(
                     &runnings,
                     &debug_maps,
-                    &string_layouts,
                     &instances,
                     &shared_names,
                     &clocks,
                     now_us,
+                );
+                annotate_input_quality(
+                    &mut snapshot,
+                    &mut input_quality,
+                    &debug_maps,
+                    &instances,
+                    &shared_names,
+                    &device_health,
                 );
                 let _ = snapshot_tx.send(snapshot);
                 last_snapshot = Instant::now();
@@ -2125,7 +2178,7 @@ async fn run_loop_async(
                 };
                 match dev.read_channel(&rm.channel).await {
                     Ok(value) => {
-                        let _ = if rm.is_lreal {
+                        let written = if rm.is_lreal {
                             // 64-bit lane: any channel value widens to f64
                             // losslessly; the slot takes the double's bits.
                             runnings[i].write_variable_raw(
@@ -2138,8 +2191,16 @@ async fn run_loop_async(
                                 value.to_vm_bits(rm.is_real),
                             )
                         };
+                        if let Some(q) = input_quality[i].get_mut(&rm.var_index) {
+                            q.stale = written.is_err() || !dev.is_healthy();
+                        }
                     }
-                    Err(e) => tracing::debug!(channel = %rm.channel, %e, "input read failed"),
+                    Err(e) => {
+                        if let Some(q) = input_quality[i].get_mut(&rm.var_index) {
+                            q.stale = true;
+                        }
+                        tracing::debug!(channel = %rm.channel, %e, "input read failed");
+                    }
                 }
             }
 
@@ -2305,14 +2366,21 @@ async fn run_loop_async(
         // idle wake-ups are capped at SNAPSHOT_PERIOD below).
         if last_snapshot.elapsed() >= SNAPSHOT_PERIOD {
             let now_us = start.elapsed().as_micros() as u64;
-            let snapshot = build_snapshot(
+            let mut snapshot = build_snapshot(
                 &runnings,
                 &debug_maps,
-                &string_layouts,
                 &instances,
                 &shared_names,
                 &clocks,
                 now_us,
+            );
+            annotate_input_quality(
+                &mut snapshot,
+                &mut input_quality,
+                &debug_maps,
+                &instances,
+                &shared_names,
+                &device_health,
             );
             let _ = snapshot_tx.send(snapshot);
             last_snapshot = Instant::now();
@@ -2461,8 +2529,7 @@ fn persist_retain_values(
 /// no UI churn.
 fn build_snapshot(
     runnings: &[VmRunning],
-    debug_maps: &[HashMap<u16, VarDebugInfo>],
-    string_layouts: &[HashMap<u16, u32>],
+    debug_maps: &[VariableRenderer],
     instances: &[String],
     shared_names: &std::collections::HashSet<String>,
     clocks: &[UnitClock],
@@ -2490,7 +2557,7 @@ fn build_snapshot(
                 Ok(r) => r,
                 Err(_) => continue,
             };
-            let Some(info) = debug_maps[u].get(&i) else {
+            let Some(info) = debug_maps[u].var(i) else {
                 continue;
             };
             if !seen.insert(info.name.clone()) {
@@ -2504,8 +2571,9 @@ fn build_snapshot(
             vars.push(VarValue {
                 name,
                 type_name: info.type_name.clone(),
-                value: format_value(raw, info, string_layouts[u].get(&i).copied(), data_region),
+                value: debug_maps[u].render(i, raw, data_region).text,
                 bits: raw,
+                input: None,
             });
         }
     }
@@ -2513,103 +2581,40 @@ fn build_snapshot(
         timestamp_us: now_us,
         scan_count: max_scan_count(clocks),
         vars,
+        device_health: None,
     }
 }
 
-/// Render a variable's slot value. STRING vars don't live in the slot —
-/// their bytes are at `data_offset` in the VM's data region with layout
-/// `[max_len: u16][cur_len: u16][bytes…]`; we read them out and format
-/// as a single-quoted IEC literal. WSTRING isn't yet populated by
-/// ironplc's codegen (literal encoding `unreachable!`s on char_width=2),
-/// so we surface a placeholder rather than fake content. Everything else
-/// delegates to ironplc's standard formatter.
-fn format_value(
-    raw: u64,
-    info: &VarDebugInfo,
-    string_offset: Option<u32>,
-    data_region: &[u8],
-) -> String {
-    match info.iec_type_tag {
-        iec_type_tag::STRING => {
-            match string_offset.and_then(|off| read_string_value(data_region, off)) {
-                Some(text) => text,
-                // No layout entry, or the offset is bogus — show that we
-                // know it's a string but couldn't decode it, not a lie.
-                None => "'<invalid>'".into(),
+/// Attach quality using the very same instance/name rules as the snapshot.
+/// Observing link loss latches stale until an input phase acquires a live value;
+/// merely recovering the transport (especially while paused) cannot clear it.
+fn annotate_input_quality(
+    snap: &mut VarSnapshot,
+    inputs: &mut [HashMap<u16, InputQuality>],
+    debug_maps: &[VariableRenderer],
+    instances: &[String],
+    shared_names: &std::collections::HashSet<String>,
+    health: &std::sync::Mutex<Vec<DeviceHealth>>,
+) {
+    let health = health.lock().map(|h| h.clone()).unwrap_or_default();
+    for (u, vars) in inputs.iter_mut().enumerate() {
+        for (idx, quality) in vars {
+            quality.stale |= !health.iter().any(|h| h.name == quality.device && h.healthy);
+            let Some(info) = debug_maps[u].var(*idx) else {
+                continue;
+            };
+            let name = if shared_names.contains(&info.name) {
+                format!("{}.{}", instances[u], info.name)
+            } else {
+                info.name.clone()
+            };
+            if let Some(var) = snap.vars.iter_mut().find(|v| v.name == name) {
+                var.input = Some(quality.clone());
             }
         }
-        // ironplc's codegen doesn't yet emit WSTRING data; see
-        // `compiler/codegen/src/compile.rs` `unreachable!("WSTRING literal
-        // encoding is not yet supported")`. Until upstream lands it, we
-        // surface a placeholder so operators know what's missing.
-        iec_type_tag::WSTRING => "'<wstring>'".into(),
-        _ => format_variable_value(raw, info.iec_type_tag),
     }
+    snap.device_health = Some(health);
 }
-
-/// Reads a STRING value at `data_offset` in the VM's data region and
-/// renders it as an IEC 61131-3 single-quoted literal (e.g. `'STARTUP'`).
-///
-/// Wire format: `[max_len: u16][cur_len: u16][cur_len bytes of UTF-8]`,
-/// little-endian, as written by ironplc's codegen (see
-/// `compiler/codegen/src/compile_setup.rs` `string_region_size`).
-/// Non-printable bytes, `$`, and `'` are escaped per IEC string-literal
-/// rules so the resulting text is a valid round-trippable literal.
-///
-/// Returns `None` when the layout offset is past the end of the data
-/// region or the recorded `cur_len` would read off the end (e.g. a stale
-/// debug section). Bridging a `None` to a placeholder is the caller's job.
-fn read_string_value(data_region: &[u8], data_offset: u32) -> Option<String> {
-    let off = data_offset as usize;
-    if off + STRING_HEADER_BYTES > data_region.len() {
-        return None;
-    }
-    let cur_len = u16::from_le_bytes([data_region[off + 2], data_region[off + 3]]) as usize;
-    let start = off + STRING_HEADER_BYTES;
-    let end = start + cur_len;
-    if end > data_region.len() {
-        return None;
-    }
-    Some(format_iec_string_literal(&data_region[start..end]))
-}
-
-/// Renders raw STRING bytes as an IEC 61131-3 single-quoted string literal.
-/// Each byte is either passed through as printable ASCII, replaced with one
-/// of the named `$`-escapes (`$T`, `$L`, `$P`, `$R`, `$$`, `$'`), or emitted
-/// as a `$XX` two-digit hex escape. Mirrors the format ironplc uses in its
-/// playground variable dump.
-fn format_iec_string_literal(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() + 2);
-    out.push('\'');
-    for &b in bytes {
-        match b {
-            b'$' => out.push_str("$$"),
-            b'\'' => out.push_str("$'"),
-            0x09 => out.push_str("$T"),
-            0x0A => out.push_str("$L"),
-            0x0C => out.push_str("$P"),
-            0x0D => out.push_str("$R"),
-            0x20..=0x7E => out.push(b as char),
-            _ => out.push_str(&format!("${b:02X}")),
-        }
-    }
-    out.push('\'');
-    out
-}
-
-/// Build a `var_index → data_offset` map from the container's STRING
-/// layout sub-table (debug section Tag 4). Empty when no STRING vars
-/// were declared.
-fn build_string_layout_map(container: &Container) -> HashMap<u16, u32> {
-    let mut map = HashMap::new();
-    if let Some(debug) = &container.debug_section {
-        for entry in &debug.string_layouts {
-            map.insert(entry.var_index.raw(), entry.data_offset);
-        }
-    }
-    map
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2861,6 +2866,26 @@ mod tests {
             !handle.device_health()[0].healthy,
             "failed connect must surface as unhealthy"
         );
+        let mut rx = handle.subscribe();
+        let snap = last_snapshot_within(&mut rx, Duration::from_millis(300)).await;
+        let quality = snap
+            .vars
+            .iter()
+            .find(|v| v.name == "x")
+            .unwrap()
+            .input
+            .as_ref()
+            .unwrap();
+        assert!(quality.stale, "a never-connected input is not a fresh zero");
+        assert_eq!(quality.device, "pm");
+        assert_eq!(quality.channel, "hr0");
+        assert!(snap
+            .vars
+            .iter()
+            .find(|v| v.name == "y")
+            .unwrap()
+            .input
+            .is_none());
 
         // Bring a real slave up on the reserved port with hr[0] = 42.
         let slave = iomap_modbus::DemoSlave::new();
@@ -2890,7 +2915,15 @@ mod tests {
         let mut seen = false;
         while Instant::now() < deadline && !seen {
             let snap = last_snapshot_within(&mut rx, Duration::from_millis(300)).await;
-            seen = var_value(&snap, "x") == "42";
+            seen = var_value(&snap, "x") == "42"
+                && snap
+                    .vars
+                    .iter()
+                    .find(|v| v.name == "x")
+                    .unwrap()
+                    .input
+                    .as_ref()
+                    .is_some_and(|q| !q.stale);
         }
         assert!(
             seen,
@@ -2951,6 +2984,71 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
             .await
             .expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn input_quality_latches_loss_until_a_post_recovery_input_read() {
+        let (dev, healthy) = MockDevice::named("bus0");
+        let container = crate::compile(
+            "PROGRAM main VAR x: INT; local: INT; END_VAR local := local + 1; END_PROGRAM",
+        )
+        .unwrap();
+        let handle = spawn_units_inner(
+            vec![single_unit(container, 5)],
+            DeviceSource::Prebuilt(vec![Box::new(dev)]),
+            vec![Mapping {
+                application: "main".into(),
+                variable: "x".into(),
+                direction: Direction::Input,
+                device: "bus0".into(),
+                channel: "input".into(),
+                unit: None,
+                min: None,
+                max: None,
+                description: None,
+            }],
+            None,
+            WriteGovernance::default(),
+        );
+        let mut rx = handle.subscribe();
+        let quality = |s: &VarSnapshot| {
+            s.vars
+                .iter()
+                .find(|v| v.name == "x")
+                .unwrap()
+                .input
+                .as_ref()
+                .unwrap()
+                .clone()
+        };
+        let snap = last_snapshot_within(&mut rx, Duration::from_millis(300)).await;
+        assert!(!quality(&snap).stale);
+        assert!(snap
+            .vars
+            .iter()
+            .find(|v| v.name == "local")
+            .unwrap()
+            .input
+            .is_none());
+        handle.pause();
+        healthy.store(false, Ordering::Relaxed);
+        let snap = last_snapshot_within(&mut rx, Duration::from_millis(300)).await;
+        assert!(quality(&snap).stale);
+        assert!(!snap.device_health.as_ref().unwrap()[0].healthy);
+        healthy.store(true, Ordering::Relaxed);
+        let snap = last_snapshot_within(&mut rx, Duration::from_millis(300)).await;
+        assert!(snap.device_health.as_ref().unwrap()[0].healthy);
+        assert!(
+            quality(&snap).stale,
+            "link recovery alone does not refresh a paused input"
+        );
+        handle.resume();
+        let snap = last_snapshot_within(&mut rx, Duration::from_millis(300)).await;
+        assert!(
+            !quality(&snap).stale,
+            "successful input read restores freshness"
+        );
+        handle.shutdown().await;
     }
 
     /// Overruns short of the watchdog threshold are invisible today: the log
@@ -4074,9 +4172,8 @@ mod tests {
 
     /// A STRING var initialised to a literal must surface as the quoted
     /// IEC value in the snapshot. Exercises the data-region read path
-    /// (`[max_len][cur_len][bytes…]` at the layout-table offset) end to
-    /// end through the live scan loop, not just the formatter — and the
-    /// per-unit `string_layouts[u]` / `runnings[u].data_region()` wiring.
+    /// (`[max_len][cur_len][char_width][bytes…]` at the layout-table offset)
+    /// end to end through the per-unit VariableRenderer and VM data region.
     #[tokio::test]
     async fn snapshot_renders_string_var_as_quoted_iec_literal() {
         let prog = crate::compile(

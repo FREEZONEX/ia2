@@ -3,6 +3,9 @@
 //! Grouped by concern (project lifecycle / POUs / devices / iomap / runtime
 //! / health) but kept in one file because the layer is still small.
 
+use crate::conditional::{self, Versioned};
+use axum::http::HeaderMap;
+
 use std::convert::Infallible;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -616,34 +619,40 @@ pub async fn get_pou(
     State(state): State<AppState>,
     project: ProjectName,
     AxumPath(path): AxumPath<String>,
-) -> Result<Json<Pou>, ApiError> {
+) -> Result<Versioned<Pou>, ApiError> {
     with_project(&state, &project, |store| {
-        let language = store.pou_file_language(&path)?;
-        let source = store.read_pou_source(&path)?;
-        Ok(Pou {
-            path: path.clone(),
-            declarations: ironplc_bridge::extract_pou_declarations(&source, language),
-            source,
+        let file = conditional::file(store, "pous", &path)?;
+        conditional::read(&file, || {
+            let language = store.pou_file_language(&path)?;
+            let source = store.read_pou_source(&path)?;
+            Ok(Pou {
+                path: path.clone(),
+                declarations: ironplc_bridge::extract_pou_declarations(&source, language),
+                source,
+            })
         })
     })
-    .map(Json)
 }
 
 pub async fn create_pou(
     State(state): State<AppState>,
     project: ProjectName,
     Json(req): Json<CreatePouRequest>,
-) -> Result<Json<Pou>, ApiError> {
+) -> Result<Versioned<Pou>, ApiError> {
     reject_library_path(&req.path)?;
     let created_path = req.path.clone();
     let pou = with_project(&state, &project, |store| {
         let language = req.language;
         let source = store.create_pou_file(&req.path, req.type_, language)?;
-        Ok(Pou {
-            path: req.path,
-            declarations: ironplc_bridge::extract_pou_declarations(&source, language),
-            source,
-        })
+        let file = conditional::file(store, "pous", &req.path)?;
+        conditional::reply(
+            &file,
+            Pou {
+                path: req.path,
+                declarations: ironplc_bridge::extract_pou_declarations(&source, language),
+                source,
+            },
+        )
     })?;
     emit_mutation(
         &state,
@@ -651,18 +660,22 @@ pub async fn create_pou(
         topic::PROJECT,
         MutationDetail::PouCreated { path: created_path },
     );
-    Ok(Json(pou))
+    Ok(pou)
 }
 
 pub async fn save_pou(
     State(state): State<AppState>,
     project: ProjectName,
+    headers: HeaderMap,
     AxumPath(path): AxumPath<String>,
     body: String,
-) -> Result<Json<RunResponse>, ApiError> {
+) -> Result<Versioned<RunResponse>, ApiError> {
     reject_library_path(&path)?;
-    with_project(&state, &project, |store| {
-        store.write_pou_source(&path, &body).map_err(Into::into)
+    let response = with_project(&state, &project, |store| {
+        let file = conditional::file(store, "pous", &path)?;
+        conditional::check(&file, &headers)?;
+        store.write_pou_source(&path, &body)?;
+        conditional::written(&file, RunResponse { ok: true })
     })?;
     // Fire two topics: the per-POU one (specific editor refetches its
     // own source) AND the project-wide one (declarations may have
@@ -679,7 +692,7 @@ pub async fn save_pou(
         topic::PROJECT,
         MutationDetail::PouUpdated { path },
     );
-    Ok(Json(RunResponse { ok: true }))
+    Ok(response)
 }
 
 pub async fn delete_pou(
@@ -1124,48 +1137,51 @@ pub async fn get_device(
     State(state): State<AppState>,
     project: ProjectName,
     AxumPath(name): AxumPath<String>,
-) -> Result<Json<Device>, ApiError> {
+) -> Result<Versioned<Device>, ApiError> {
     with_project(&state, &project, |store| {
-        store.read_device(&name).map_err(Into::into)
+        let file = conditional::file(store, "devices", &name)?;
+        conditional::read(&file, || store.read_device(&name).map_err(Into::into))
     })
-    .map(Json)
 }
 
 pub async fn create_device(
     State(state): State<AppState>,
     project: ProjectName,
     Json(req): Json<CreateDeviceRequest>,
-) -> Result<Json<Device>, ApiError> {
+) -> Result<Versioned<Device>, ApiError> {
     let device = with_project(&state, &project, |store| {
-        store
-            .create_device(&req.name, req.protocol)
-            .map_err(Into::into)
+        let value = store.create_device(&req.name, req.protocol)?;
+        conditional::reply(&conditional::file(store, "devices", &req.name)?, value)
     })?;
     emit_mutation(
         &state,
         &project,
         topic::DEVICES,
         MutationDetail::DeviceUpserted {
-            name: device.name.clone(),
+            name: device.1.name.clone(),
         },
     );
-    Ok(Json(device))
+    Ok(device)
 }
 
 pub async fn update_device(
     State(state): State<AppState>,
     project: ProjectName,
+    headers: HeaderMap,
     AxumPath(name): AxumPath<String>,
     Json(device): Json<Device>,
-) -> Result<Json<RunResponse>, ApiError> {
+) -> Result<Versioned<RunResponse>, ApiError> {
     if device.name != name {
         return Err(ApiError::BadRequest(format!(
             "path name '{name}' does not match body name '{}'",
             device.name
         )));
     }
-    with_project(&state, &project, |store| {
-        store.write_device(&device).map_err(Into::into)
+    let response = with_project(&state, &project, |store| {
+        let file = conditional::file(store, "devices", &name)?;
+        conditional::check(&file, &headers)?;
+        store.write_device(&device)?;
+        conditional::written(&file, RunResponse { ok: true })
     })?;
     emit_mutation(
         &state,
@@ -1179,7 +1195,7 @@ pub async fn update_device(
         topic::device(&name),
         MutationDetail::DeviceUpserted { name },
     );
-    Ok(Json(RunResponse { ok: true }))
+    Ok(response)
 }
 
 /// Body for `POST /api/devices/{name}/esi-assemble`: the module idents the
@@ -1369,46 +1385,51 @@ pub async fn get_edge(
     State(state): State<AppState>,
     project: ProjectName,
     AxumPath(name): AxumPath<String>,
-) -> Result<Json<Edge>, ApiError> {
+) -> Result<Versioned<Edge>, ApiError> {
     with_project(&state, &project, |store| {
-        store.read_edge(&name).map_err(Into::into)
+        let file = conditional::file(store, "edges", &name)?;
+        conditional::read(&file, || store.read_edge(&name).map_err(Into::into))
     })
-    .map(Json)
 }
 
 pub async fn create_edge(
     State(state): State<AppState>,
     project: ProjectName,
     Json(req): Json<CreateEdgeRequest>,
-) -> Result<Json<Edge>, ApiError> {
+) -> Result<Versioned<Edge>, ApiError> {
     let edge = with_project(&state, &project, |store| {
-        store.create_edge(&req.name, &req.host).map_err(Into::into)
+        let value = store.create_edge(&req.name, &req.host)?;
+        conditional::reply(&conditional::file(store, "edges", &req.name)?, value)
     })?;
     emit_mutation(
         &state,
         &project,
         topic::EDGES,
         MutationDetail::EdgeUpserted {
-            name: edge.name.clone(),
+            name: edge.1.name.clone(),
         },
     );
-    Ok(Json(edge))
+    Ok(edge)
 }
 
 pub async fn update_edge(
     State(state): State<AppState>,
     project: ProjectName,
+    headers: HeaderMap,
     AxumPath(name): AxumPath<String>,
     Json(edge): Json<Edge>,
-) -> Result<Json<RunResponse>, ApiError> {
+) -> Result<Versioned<RunResponse>, ApiError> {
     if edge.name != name {
         return Err(ApiError::BadRequest(format!(
             "path name '{name}' does not match body name '{}'",
             edge.name
         )));
     }
-    with_project(&state, &project, |store| {
-        store.write_edge(&edge).map_err(Into::into)
+    let response = with_project(&state, &project, |store| {
+        let file = conditional::file(store, "edges", &name)?;
+        conditional::check(&file, &headers)?;
+        store.write_edge(&edge)?;
+        conditional::written(&file, RunResponse { ok: true })
     })?;
     emit_mutation(
         &state,
@@ -1422,7 +1443,7 @@ pub async fn update_edge(
         topic::edge(&name),
         MutationDetail::EdgeUpserted { name },
     );
-    Ok(Json(RunResponse { ok: true }))
+    Ok(response)
 }
 
 pub async fn delete_edge(
@@ -1708,23 +1729,27 @@ fn is_linux_elf(path: &std::path::Path) -> bool {
 pub async fn get_iomap(
     State(state): State<AppState>,
     project: ProjectName,
-) -> Result<Json<IoMap>, ApiError> {
+) -> Result<Versioned<IoMap>, ApiError> {
     with_project(&state, &project, |store| {
-        store.read_iomap().map_err(Into::into)
+        let file = conditional::file(store, "iomap", "")?;
+        conditional::read(&file, || store.read_iomap().map_err(Into::into))
     })
-    .map(Json)
 }
 
 pub async fn put_iomap(
     State(state): State<AppState>,
     project: ProjectName,
+    headers: HeaderMap,
     Json(iomap): Json<IoMap>,
-) -> Result<Json<RunResponse>, ApiError> {
-    with_project(&state, &project, |store| {
-        store.write_iomap(&iomap).map_err(Into::into)
+) -> Result<Versioned<RunResponse>, ApiError> {
+    let response = with_project(&state, &project, |store| {
+        let file = conditional::file(store, "iomap", "")?;
+        conditional::check(&file, &headers)?;
+        store.write_iomap(&iomap)?;
+        conditional::written(&file, RunResponse { ok: true })
     })?;
     emit_mutation(&state, &project, topic::IOMAP, MutationDetail::IoMapChanged);
-    Ok(Json(RunResponse { ok: true }))
+    Ok(response)
 }
 
 // ============================================================
@@ -1734,22 +1759,26 @@ pub async fn put_iomap(
 pub async fn get_northbound(
     State(state): State<AppState>,
     project: ProjectName,
-) -> Result<Json<project::NorthboundConfig>, ApiError> {
+) -> Result<Versioned<project::NorthboundConfig>, ApiError> {
     with_project(&state, &project, |store| {
-        store.read_northbound().map_err(Into::into)
+        let file = conditional::file(store, "northbound", "")?;
+        conditional::read(&file, || store.read_northbound().map_err(Into::into))
     })
-    .map(Json)
 }
 
 pub async fn put_northbound(
     State(state): State<AppState>,
     project: ProjectName,
+    headers: HeaderMap,
     Json(config): Json<project::NorthboundConfig>,
-) -> Result<Json<RunResponse>, ApiError> {
-    with_project(&state, &project, |store| {
-        store.write_northbound(&config).map_err(Into::into)
+) -> Result<Versioned<RunResponse>, ApiError> {
+    let response = with_project(&state, &project, |store| {
+        let file = conditional::file(store, "northbound", "")?;
+        conditional::check(&file, &headers)?;
+        store.write_northbound(&config)?;
+        conditional::written(&file, RunResponse { ok: true })
     })?;
-    Ok(Json(RunResponse { ok: true }))
+    Ok(response)
 }
 
 // ============================================================
@@ -1759,11 +1788,11 @@ pub async fn put_northbound(
 pub async fn get_alarms(
     State(state): State<AppState>,
     project: ProjectName,
-) -> Result<Json<project::AlarmConfig>, ApiError> {
+) -> Result<Versioned<project::AlarmConfig>, ApiError> {
     with_project(&state, &project, |store| {
-        store.read_alarms().map_err(Into::into)
+        let file = conditional::file(store, "alarms", "")?;
+        conditional::read(&file, || store.read_alarms().map_err(Into::into))
     })
-    .map(Json)
 }
 
 /// Replace alarms.toml. Rejects duplicate ids and numeric conditions
@@ -1773,10 +1802,18 @@ pub async fn get_alarms(
 pub async fn put_alarms(
     State(state): State<AppState>,
     project: ProjectName,
+    headers: HeaderMap,
     Json(config): Json<project::AlarmConfig>,
-) -> Result<Json<RunResponse>, ApiError> {
+) -> Result<Versioned<RunResponse>, ApiError> {
     let mut seen = std::collections::HashSet::new();
     for def in &config.alarms {
+        if def.id.starts_with(project::DEVICE_ALARM_PREFIX) {
+            return Err(ApiError::BadRequest(format!(
+                "alarm id '{}' uses the reserved device-health prefix '{}'",
+                def.id,
+                project::DEVICE_ALARM_PREFIX
+            )));
+        }
         if !seen.insert(def.id.as_str()) {
             return Err(ApiError::BadRequest(format!(
                 "duplicate alarm id '{}'",
@@ -1794,10 +1831,13 @@ pub async fn put_alarms(
             )));
         }
     }
-    with_project(&state, &project, |store| {
-        store.write_alarms(&config).map_err(Into::into)
+    let response = with_project(&state, &project, |store| {
+        let file = conditional::file(store, "alarms", "")?;
+        conditional::check(&file, &headers)?;
+        store.write_alarms(&config)?;
+        conditional::written(&file, RunResponse { ok: true })
     })?;
-    Ok(Json(RunResponse { ok: true }))
+    Ok(response)
 }
 
 // ============================================================
@@ -1807,23 +1847,27 @@ pub async fn put_alarms(
 pub async fn get_tasks(
     State(state): State<AppState>,
     project: ProjectName,
-) -> Result<Json<Tasks>, ApiError> {
+) -> Result<Versioned<Tasks>, ApiError> {
     with_project(&state, &project, |store| {
-        Ok(store.read_tasks()?.unwrap_or_default())
+        let file = conditional::file(store, "tasks", "")?;
+        conditional::read(&file, || Ok(store.read_tasks()?.unwrap_or_default()))
     })
-    .map(Json)
 }
 
 pub async fn put_tasks(
     State(state): State<AppState>,
     project: ProjectName,
+    headers: HeaderMap,
     Json(tasks): Json<Tasks>,
-) -> Result<Json<RunResponse>, ApiError> {
-    with_project(&state, &project, |store| {
-        store.write_tasks(&tasks).map_err(Into::into)
+) -> Result<Versioned<RunResponse>, ApiError> {
+    let response = with_project(&state, &project, |store| {
+        let file = conditional::file(store, "tasks", "")?;
+        conditional::check(&file, &headers)?;
+        store.write_tasks(&tasks)?;
+        conditional::written(&file, RunResponse { ok: true })
     })?;
     emit_mutation(&state, &project, topic::TASKS, MutationDetail::TasksChanged);
-    Ok(Json(RunResponse { ok: true }))
+    Ok(response)
 }
 
 #[derive(Debug, Serialize, TS)]

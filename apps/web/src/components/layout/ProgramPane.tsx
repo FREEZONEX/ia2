@@ -130,6 +130,7 @@ export function ProgramPane() {
               let suffix = 1
               while (taken.has(instance)) instance = `${programName}_inst_${suffix++}`
               await saveTasks({
+                ...tasks,
                 tasks: nextTasks,
                 programs: [...tasks.programs, { instance, program: programName, task: taskName }],
               })

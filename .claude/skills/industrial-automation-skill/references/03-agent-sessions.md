@@ -22,7 +22,8 @@ The banner is no longer `cs`-only. Every mutating request may carry `X-IA2-Origi
 ```bash
 cs agent run --label "Human-readable description" --server "$SRV" -- bash -c '
   set +e   # decide per-workflow whether one failure should abort the rest
-  cs --project foo set pous/main.st --server "'"$SRV"'" --from - <<"ST"
+  cs --project foo get pous/main.st --etag-file main.etag --server "'"$SRV"'"
+  cs --project foo set pous/main.st --if-match @main.etag --server "'"$SRV"'" --from - <<"ST"
   PROGRAM main ... END_PROGRAM
 ST
   cs --project foo project check ...
@@ -53,7 +54,8 @@ Quoting gets fiddly when you nest a heredoc inside `bash -c '...'`. Two reliable
 cat > /tmp/ia2_build.sh <<'OUTER'
 set -e
 SRV="$1"
-cs --project foo set pous/main.st --server "$SRV" --from - <<'ST'
+cs --project foo get pous/main.st --etag-file main.etag --server "$SRV"
+cs --project foo set pous/main.st --if-match @main.etag --server "$SRV" --from - <<'ST'
 PROGRAM main
   VAR x : INT := 0; END_VAR
   x := x + 1;

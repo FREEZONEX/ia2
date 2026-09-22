@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from "react"
+import { sampleSegments } from "@/lib/var-history"
 
 /** One plotted sample. `t` (seconds, snapshot time base) places the
  *  point on the time axis; without it the series falls back to uniform
  *  index spacing. `lo`/`hi` draw a min/max band under the line (history
  *  buckets carry them; live single samples leave them undefined). */
-export type TrendPoint = { t?: number; v: number; lo?: number; hi?: number }
+export type TrendPoint = { t?: number; v: number | null; lo?: number; hi?: number }
 
 export type TrendSeries = {
   name: string
@@ -171,7 +172,7 @@ export function TrendChart({ series, height = 130, fit = false, windowS }: Props
               />
               <span className="font-mono text-foreground">{s.name}</span>
               <span className="font-mono tabular-nums text-muted-foreground">
-                {val === undefined ? "—" : fmtVal(val)}
+                {val == null ? "—" : fmtVal(val)}
               </span>
               {!shared && series.length > 1 && (
                 <span className="font-mono tabular-nums text-muted-foreground/50">
@@ -320,6 +321,7 @@ function seriesRange(s: TrendSeries): [number, number] {
   let mn = Infinity
   let mx = -Infinity
   for (const p of s.points) {
+    if (p.v === null || !Number.isFinite(p.v)) continue
     const lo = p.lo ?? p.v
     const hi = p.hi ?? p.v
     if (lo < mn) mn = lo
@@ -332,7 +334,7 @@ function seriesRange(s: TrendSeries): [number, number] {
 
 function hasBand(s: TrendSeries): boolean {
   return s.points.some(
-    (p) => p.lo !== undefined && p.hi !== undefined && p.hi > p.lo,
+    (p) => p.v !== null && p.lo !== undefined && p.hi !== undefined && p.hi > p.lo,
   )
 }
 
@@ -343,16 +345,17 @@ function bandPath(
   toY: (scale: [number, number], v: number) => number,
   xFracOf: (s: TrendSeries, i: number) => number,
 ): string {
-  const upper: string[] = []
-  const lower: string[] = []
-  for (let i = 0; i < s.points.length; i++) {
-    const p = s.points[i]
-    const x = (xFracOf(s, i) * W).toFixed(1)
-    upper.push(`${x},${toY(scale, p.hi ?? p.v).toFixed(1)}`)
-    lower.push(`${x},${toY(scale, p.lo ?? p.v).toFixed(1)}`)
-  }
-  lower.reverse()
-  return `M${upper.join(" L")} L${lower.join(" L")} Z`
+  return sampleSegments(s.points.map(p => p.v)).map(run => {
+    const upper: string[] = []
+    const lower: string[] = []
+    for (const { index, value } of run) {
+      const p = s.points[index]
+      const x = (xFracOf(s, index) * W).toFixed(1)
+      upper.push(`${x},${toY(scale, p.hi ?? value).toFixed(1)}`)
+      lower.push(`${x},${toY(scale, p.lo ?? value).toFixed(1)}`)
+    }
+    return `M${upper.join(" L")} L${lower.reverse().join(" L")} Z`
+  }).join(" ")
 }
 
 function renderLine(
@@ -363,19 +366,16 @@ function renderLine(
   xFracOf: (s: TrendSeries, i: number) => number,
 ) {
   if (s.points.length < 2) return null
-  const pts: string[] = []
-  for (let j = 0; j < s.points.length; j++) {
-    const x = xFracOf(s, j) * W
-    const y = toY(scale, s.points[j].v)
-    if (s.binary && j > 0) {
-      // Stair-step: hold the previous level to the new x before stepping.
-      pts.push(`${x.toFixed(1)},${toY(scale, s.points[j - 1].v).toFixed(1)}`)
-    }
-    pts.push(`${x.toFixed(1)},${y.toFixed(1)}`)
-  }
-  return (
+  return sampleSegments(s.points.map(p => p.v)).map((run, segment) => {
+    const pts: string[] = []
+    run.forEach(({ index, value }, j) => {
+      const x = xFracOf(s, index) * W
+      if (s.binary && j > 0) pts.push(`${x.toFixed(1)},${toY(scale, run[j - 1].value).toFixed(1)}`)
+      pts.push(`${x.toFixed(1)},${toY(scale, value).toFixed(1)}`)
+    })
+    return (
     <polyline
-      key={`line-${s.name}-${i}`}
+      key={`line-${s.name}-${i}-${segment}`}
       points={pts.join(" ")}
       fill="none"
       stroke={s.color}
@@ -385,7 +385,8 @@ function renderLine(
       strokeLinecap="round"
       opacity={0.95}
     />
-  )
+    )
+  })
 }
 
 function clamp(v: number, lo: number, hi: number): number {

@@ -132,12 +132,12 @@ impl XferError {
         }
     }
 
-    /// Boundary mapping — both flavors surface to callers as
-    /// `IoError::Transport`, preserving the adapter's existing error
-    /// surface (`modbus exception: …` messages included).
+    /// Preserve classification at the adapter boundary: a slave's
+    /// rejection is not a dead connection (and failsafe keeps sweeping).
     fn into_io(self) -> IoError {
         match self {
-            XferError::Protocol(m) | XferError::Transport(m) => IoError::Transport(m),
+            XferError::Protocol(m) => IoError::Protocol(m),
+            XferError::Transport(m) => IoError::Transport(m),
         }
     }
 }
@@ -730,7 +730,10 @@ async fn do_failsafe(
         }
     }
     match first_err {
-        Some(e) => Err(e),
+        Some(e) => {
+            tracing::warn!(device = %device, "modbus failsafe sweep completed with rejected writes; some outputs unconfirmed");
+            Err(e)
+        }
         None => {
             tracing::info!(device = %device, "modbus failsafe applied (outputs zeroed)");
             Ok(())

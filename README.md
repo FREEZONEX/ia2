@@ -77,8 +77,9 @@ alias cs=./target/debug/cs
 # the mental model is bash-sized: 4 resource verbs + an API escape hatch
 cs ls                                   # what resource kinds exist? (start here)
 cs ls pous                              # enumerate any collection
-cs get devices/plc1                     # read any resource (JSON, or raw POU source)
-cs set devices/plc1 --from cfg.json     # create-or-replace (get → edit → set)
+cs get devices/plc1 --etag-file plc1.etag > cfg.json   # preserve this read's version
+# edit cfg.json, then replace only the version just read:
+cs set devices/plc1 --from cfg.json --if-match @plc1.etag
 cs rm  hmi/overview                     # delete
 cs api POST /api/edges/pi/attach        # anything else in docs/api.md — full parity
 
@@ -89,9 +90,13 @@ printf '...' | cs set pous/motor.ld.json --from -   # extension picks the langua
 cs library import process-control --blocks fb_pid.st
 
 # wiring / scheduling / alarms — single-doc configs, one shape each
-cs set iomap  --from iomap.json         # variable ↔ device.channel bindings
-cs set tasks  --from tasks.json         # PROGRAM ↔ task schedule
-cs set alarms --from alarms.json        # declarative alarm definitions (alarms.toml)
+cs get iomap --etag-file iomap.etag > iomap.json
+cs get tasks --etag-file tasks.etag > tasks.json
+cs get alarms --etag-file alarms.etag > alarms.json
+# edit these documents, preserving other writers' fields, then:
+cs set iomap --from iomap.json --if-match @iomap.etag
+cs set tasks --from tasks.json --if-match @tasks.etag
+cs set alarms --from alarms.json --if-match @alarms.etag
 
 # run · simulate · debug
 cs run                                  # schedule everything in tasks.toml
@@ -113,6 +118,12 @@ cs agent run --label "build my_line" -- bash -c 'cs project create my_line; cs s
 
 Every command's `--help` explains when to call it and
 what to call next — written for agent readers.
+
+Existing documents require the ETag from the original read, or explicit
+`cs set --force` for an intentional full replacement. A stale version gets
+HTTP 412 / CLI exit 2: re-read and reapply your edit, without discarding the
+other writer's changes. New named resources need no flag. Raw `cs api`
+requests remain compatible and unconditional unless a precondition is sent.
 
 ## Project on disk
 

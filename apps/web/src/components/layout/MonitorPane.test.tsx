@@ -31,6 +31,33 @@ function mountMonitor(collapsed = false) {
 }
 
 describe("confirmed Monitor controls", () => {
+  it("still permits releasing an existing force on a stale input", async () => {
+    mocks.snapshot.mockReturnValue({ timestamp_us: 1000000n, scan_count: 1n,
+      vars: [{ ...level, input: { device: "io", channel: "level", stale: true } }] })
+    mocks.fetchRuntimeStatus.mockResolvedValue({ ...runningStatus(), forces: [{ name: "level", value: 2.5 }] })
+    mountMonitor()
+    fireEvent.click(await screen.findByRole("button", { name: "Unforce level" }))
+    await waitFor(() => expect(mocks.unforceVariable).toHaveBeenCalledWith("level"))
+  })
+  it("labels last-known inputs and gaps their traces without blocking unrelated writes", async () => {
+    const vars = [level, { name: "run", type_name: "BOOL", value: "TRUE", bits: 1 }]
+    mocks.snapshot.mockReturnValue({ timestamp_us: 1000000n, scan_count: 1n, vars })
+    const view = mountMonitor()
+    await waitFor(() => expect(mocks.fetchRuntimeStatus).toHaveBeenCalled())
+    mocks.snapshot.mockReturnValue({ timestamp_us: 2000000n, scan_count: 2n,
+      vars: [{ ...level, input: { device: "sensor_io", channel: "level", stale: true } }, vars[1]] })
+    view.rerender(<MonitorPane collapsed={false} onToggleCollapse={vi.fn()} />)
+    expect(screen.getByText("Stale · sensor_io/level")).toBeTruthy()
+    expect(screen.getByText("2.5")).toBeTruthy()
+    expect(screen.queryByRole("button", { name: "Force level" })).toBeNull()
+    fireEvent.click(screen.getByRole("button", { name: "Toggle run" }))
+    await waitFor(() => expect(mocks.writeVariable).toHaveBeenCalledWith("run", 0, "BOOL"))
+    mocks.snapshot.mockReturnValue({ timestamp_us: 3000000n, scan_count: 3n, vars })
+    view.rerender(<MonitorPane collapsed={false} onToggleCollapse={vi.fn()} />)
+    expect(screen.queryByText("Stale · sensor_io/level")).toBeNull()
+    const row = screen.getByRole("button", { name: "Force level" }).closest("tr")!
+    expect(row.querySelectorAll("polyline").length).toBe(2) // separate fresh segments
+  })
   it.each([
     { action: "Resume", initialMode: "paused", failure: "resume denied", api: mocks.resumeRuntime },
     { action: "Step", initialMode: "paused", failure: "step denied", api: mocks.stepRuntime },

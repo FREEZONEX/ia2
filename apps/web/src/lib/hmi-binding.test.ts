@@ -31,6 +31,17 @@ const snap: VarSnapshot = {
 } as unknown as VarSnapshot
 
 describe("lookupVar", () => {
+  it("rejects stale input values without substituting a healthy same-tail variable", () => {
+    const stale: VarSnapshot = { ...snap, vars: snap.vars.map(v =>
+      ["line_a.temp", "pump_run"].includes(v.name)
+        ? { ...v, input: { device: "io_a", channel: "input", stale: true } } : v) }
+    expect(lookupVar(stale, "temp")).toBeNull()
+    expect(lookupVar(stale, "line_a.temp")).toBeNull()
+    expect(lookupVar(stale, "line_b.temp")?.raw).toBe("80")
+    expect(displayBinding(stale, "line_a.temp")).toBeNull()
+    expect(resolveOn(stale, "pump_run")).toBe(false)
+    expect(lookupVar(snap, "line_a.temp")?.raw).toBe("20") // recovered snapshot
+  })
   it("matches exact names and instance tails", () => {
     expect(lookupVar(snap, "level_pct")?.raw).toBe("42.5")
     expect(lookupVar(snap, "speed_rpm")?.raw).toBe("1500")

@@ -1,0 +1,6 @@
+[[mappings]]
+application = "main"
+variable = "input_value"
+direction = "input"
+device = "bus0"
+channel = "input"

@@ -221,16 +221,22 @@ async fn handle_write(ctx: &NorthboundCtx, payload: &[u8]) {
 /// truth, with the display string only as the STRING-type fallback.
 fn snapshot_json(snap: &VarSnapshot) -> String {
     let mut values = serde_json::Map::with_capacity(snap.vars.len());
+    let mut inputs = serde_json::Map::new();
     for v in &snap.vars {
         values.insert(
             v.name.clone(),
             ironplc_bridge::monitor::typed_value(&v.type_name, v.bits, &v.value),
         );
+        if let Some(input) = &v.input {
+            inputs.insert(v.name.clone(), serde_json::json!(input));
+        }
     }
     serde_json::json!({
         "ts_us": snap.timestamp_us,
         "scan": snap.scan_count,
         "values": values,
+        "inputs": inputs,
+        "device_health": snap.device_health,
     })
     .to_string()
 }
@@ -246,6 +252,7 @@ mod tests {
             type_name: type_name.into(),
             value: value.into(),
             bits,
+            input: None,
         }
     }
 
@@ -254,6 +261,7 @@ mod tests {
         let snap = VarSnapshot {
             timestamp_us: 42,
             scan_count: 7,
+            device_health: None,
             vars: vec![
                 var("run", "BOOL", "TRUE", 1),
                 var("flow", "REAL", "12.5", 12.5f32.to_bits() as u64),
@@ -270,6 +278,30 @@ mod tests {
         assert_eq!(json["values"]["mask"], serde_json::json!(0x1637));
         assert_eq!(json["values"]["delta"], serde_json::json!(-42));
         assert_eq!(json["values"]["label"], serde_json::json!("'hello'"));
+    }
+
+    #[test]
+    fn snapshot_preserves_last_value_and_marks_its_field_quality() {
+        let mut input = var("flow", "REAL", "12.5", 12.5f32.to_bits() as u64);
+        input.input = Some(ironplc_bridge::InputQuality {
+            device: "meter".into(),
+            channel: "flow".into(),
+            stale: true,
+        });
+        let snap = VarSnapshot {
+            timestamp_us: 42,
+            scan_count: 7,
+            vars: vec![input],
+            device_health: Some(vec![ironplc_bridge::DeviceHealth {
+                name: "meter".into(),
+                healthy: false,
+            }]),
+        };
+        let json: serde_json::Value = serde_json::from_str(&snapshot_json(&snap)).unwrap();
+        assert_eq!(json["values"]["flow"], 12.5);
+        assert_eq!(json["inputs"]["flow"]["stale"], true);
+        assert_eq!(json["inputs"]["flow"]["device"], "meter");
+        assert_eq!(json["device_health"][0]["healthy"], false);
     }
 }
 
@@ -400,10 +432,12 @@ mod governance_roundtrip_tests {
             type_name: tn.into(),
             value: "0".into(),
             bits: 0,
+            input: None,
         };
         let latest = Arc::new(Mutex::new(Some(VarSnapshot {
             timestamp_us: 0,
             scan_count: 0,
+            device_health: None,
             vars: vec![mk("sp", "REAL"), mk("jog", "REAL")],
         })));
 

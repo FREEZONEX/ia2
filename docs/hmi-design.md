@@ -307,6 +307,15 @@ agent's knowledge of the palette in sync with the code instead of in prose.
 
 ## Safety semantics
 
+Field-input freshness is per variable, not just per SSE connection.
+`VarValue.input = { device, channel, stale }` identifies mapped input values;
+stale ones are unknown to HMI bindings and expression/interlock evaluation.
+Affected nodes show a device-quality warning while unrelated live variables
+remain usable. Monitor keeps the last value visibly marked stale; trends break
+across stale samples/buckets. This metadata does not propagate through arbitrary
+PLC calculations, and it does not disable explicit Stop writes merely because
+an unrelated device is down.
+
 Reads are unrestricted — the snapshot is already public to every IDE
 surface. Writes get three fences, all in v1: actions are the only write
 path and each declares itself in the reviewable document (a diff shows

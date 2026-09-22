@@ -3,20 +3,27 @@
 The JSON shapes below are the real content of this file. **One command pattern reaches all of them** — get → edit → set, whole-document:
 
 ```bash
-cs get devices/<name>            # read the full Device JSON
-cs set devices/<name> --from -   # create-or-replace (upsert; a body carrying "protocol" creates)
-cs set iomap  --from -           # whole-doc replace (body starts at "mappings")
-cs set tasks  --from -           # whole-doc replace (body starts at "tasks")
+cs get devices/<name> --etag-file device.etag   # read the full Device JSON
+cs set devices/<name> --from - --if-match @device.etag  # replace the version you read
+cs get iomap --etag-file iomap.etag
+cs set iomap --from - --if-match @iomap.etag  # body starts at "mappings"
+cs get tasks --etag-file tasks.etag
+cs set tasks --from - --if-match @tasks.etag  # body starts at "tasks"
 ```
 
 Field names are snake_case; a wrong shape 422s with the reason on stderr (exit 2) — read it before retrying. Two device actions have no porcelain and go through `cs api`:
+
+Keep each version with its original content while editing. A new named device
+needs no `--if-match`; an existing target needs that original version or an
+explicit `--force` for a deliberate full replacement. On 412, re-read and
+reapply the edit instead of supplying a fresh version for stale content.
 
 ```bash
 echo '{"detected":[16,32,48]}'    | cs api POST /api/devices/<name>/esi-assemble --from -   # modular EtherCAT, decimal idents
 echo '{"node_id":"ns=2;s=Line1"}' | cs api POST /api/devices/<name>/opcua-browse --from -   # omit node_id for ObjectsFolder
 ```
 
-> **The device body is the full `Device`**: a top-level `"name"` (must equal `<name>`, else 400) **and** a `"protocol"` discriminator (`modbus` | `ethercat` | `opcua` | `canopen`), then that protocol's fields — exactly what `cs get devices/<name>` prints, so it round-trips. `iomap` / `tasks` have no envelope (bodies start at `mappings` / `tasks`). Alarm *definitions* live in `alarms.toml` on the same pattern (`cs get alarms` / `cs set alarms --from -`); shape + sim/alarm workflow are in `09-sim-alarms.md`.
+> **The device body is the full `Device`**: a top-level `"name"` (must equal `<name>`, else 400) **and** a `"protocol"` discriminator (`modbus` | `ethercat` | `opcua` | `canopen`), then that protocol's fields — exactly what `cs get devices/<name>` prints, so it round-trips. `iomap` / `tasks` have no envelope (bodies start at `mappings` / `tasks`). Alarm *definitions* live in `alarms.toml` on the same pattern (`cs get alarms --etag-file alarms.etag` / `cs set alarms --from - --if-match @alarms.etag`); shape + sim/alarm workflow are in `09-sim-alarms.md`.
 
 ---
 
@@ -234,6 +241,7 @@ IA2 is the master side of a point-to-point conversation with one node; per-chann
 - `index`/`sub_index`: object-dictionary address, decimal (`24641` = `0x6041`); editor renders hex.
 - `transport`: `{"kind":"sdo"}` polls/writes via SDO at `poll_interval_ms` (config-rate lane — setpoints, parameters). `tpdo`/`rpdo` ride process data on the CiA 301 predefined COB-IDs (`slot` 1–4, `byte_offset` into the ≤8-byte frame) using the node's existing mapping. Objects >4 bytes (segmented SDO) unsupported — bind a scalar.
 - `heartbeat_timeout_ms`: no heartbeat this long → unhealthy (inputs freeze at last-known); `0` disables (SDO failures flip health instead).
+- A healthy heartbeat is not a channel measurement. Unreceived inputs remain stale, and after link loss each channel needs a new TPDO/SDO sample before it becomes fresh again; heartbeat recovery alone does not revive its old value.
 - `start_on_connect`: NMT Start so a pre-operational node enters Operational (PDOs only run there). Leave on unless another master owns NMT.
 - `failsafe`: as OPC UA — only `write` channels with a value are written on trip; the adapter never sends NMT Stop (other tools may share the bus).
 
@@ -241,7 +249,7 @@ IA2 is the master side of a point-to-point conversation with one node; per-chann
 
 ## Northbound (northbound.toml — MQTT to supOS / Tier0)
 
-How the **edge runtime** publishes live data up to the plant platform. MQTT only. `cs get northbound` / `cs set northbound --from -`, or edit `northbound.toml`; the edge applies it at startup (redeploy/restart to change).
+How the **edge runtime** publishes live data up to the plant platform. MQTT only. `cs get northbound --etag-file northbound.etag` / `cs set northbound --from - --if-match @northbound.etag`, or edit `northbound.toml`; the edge applies it at startup (redeploy/restart to change).
 
 ```json
 {

@@ -34,7 +34,7 @@ const CANOPEN_DATA_TYPES: { value: CanopenDataType; label: string }[] = [
 type TransportKind = "sdo" | "tpdo" | "rpdo"
 
 export function CanopenDeviceEditor({ device, onSave, link }: DeviceEditorProps) {
-  const { draft, setDraft, dirty } = useDeviceDraft(device)
+  const { draft, setDraft, dirty, reload, conflict } = useDeviceDraft(device)
   if (draft.protocol !== "canopen") return null
 
   const update = (patch: Partial<typeof draft>) =>
@@ -83,6 +83,8 @@ export function CanopenDeviceEditor({ device, onSave, link }: DeviceEditorProps)
         protocol="CANopen"
         dirty={dirty}
         onSave={() => onSave(draft)}
+        reload={reload}
+        conflict={conflict}
       />
 
       <div className="min-h-0 flex-1 space-y-6 overflow-auto p-4">

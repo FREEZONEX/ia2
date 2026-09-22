@@ -10,7 +10,7 @@
 
 use anyhow::{anyhow, Context, Result};
 
-use crate::http::{print_json, read_blob, url_encode, Client, UsageError};
+use crate::http::{print_json, read_blob, url_encode, Body, Client, UsageError};
 use crate::resource::{self, Plan, Render, SetPlan, KINDS};
 
 /// Usage-shaped failure: exits 2 (caller can fix the invocation).
@@ -221,10 +221,15 @@ pub(crate) fn cmd_get(
     path: &str,
     query: &[(String, String)],
     json: bool,
+    etag_file: Option<&std::path::Path>,
 ) -> Result<i32> {
     match resource::resolve_get(path).map_err(UsageError::wrap)? {
         Plan::GetPou { slug } => {
-            let v = client.get(&format!("/api/pous/{}", url_encode(&slug)))?;
+            let v = get_document(
+                client,
+                &format!("/api/pous/{}", url_encode(&slug)),
+                etag_file,
+            )?;
             if json {
                 return print_json(&v);
             }
@@ -242,7 +247,7 @@ pub(crate) fn cmd_get(
         }
         Plan::Get { path, render } => {
             let full = append_query(&path, query);
-            let v = client.get(&full)?;
+            let v = get_document(client, &full, etag_file)?;
             if json || render == Render::Json {
                 return print_json(&v);
             }
@@ -255,6 +260,21 @@ pub(crate) fn cmd_get(
         }
         _ => unreachable!(),
     }
+}
+
+fn get_document(
+    client: &Client,
+    path: &str,
+    etag_file: Option<&std::path::Path>,
+) -> Result<serde_json::Value> {
+    let (body, etag) = client.request_versioned("GET", path, Body::None, None, &[])?;
+    if let Some(file) = etag_file {
+        let etag =
+            etag.ok_or_else(|| usage("this resource/server does not provide an ETag".into()))?;
+        std::fs::write(file, format!("{etag}\n"))
+            .map_err(|e| usage(format!("writing {}: {e}", file.display())))?;
+    }
+    Ok(body)
 }
 
 fn append_query(path: &str, query: &[(String, String)]) -> String {
@@ -281,6 +301,8 @@ pub(crate) fn parse_query(raw: &[String]) -> Result<Vec<(String, String)>> {
 // --------------------------------------------------------------- set
 
 pub(crate) struct SetArgs<'a> {
+    pub if_match: Option<&'a str>,
+    pub force: bool,
     pub from: Option<&'a str>,
     pub protocol: Option<&'a str>,
     pub host: Option<&'a str>,
@@ -290,6 +312,14 @@ pub(crate) struct SetArgs<'a> {
 
 pub(crate) fn cmd_set(client: &Client, path: &str, args: &SetArgs<'_>, json: bool) -> Result<i32> {
     let plan = resource::resolve_set(path).map_err(UsageError::wrap)?;
+    let expected = args.if_match.map(|s| {
+        let value = if let Some(file) = s.strip_prefix('@') { read_blob(file)? } else { s.to_string() };
+        let value = value.trim();
+        if !value.starts_with('"') || !value.ends_with('"') || value.len() < 2 {
+            return Err(usage("--if-match requires a quoted strong ETag from `get --etag-file FILE`; use --force for an intentional blind replacement".into()));
+        }
+        Ok(value.to_owned())
+    }).transpose()?;
     let resp = match plan {
         SetPlan::Config { kind } => {
             let from = args.from.ok_or_else(|| {
@@ -299,7 +329,13 @@ pub(crate) fn cmd_set(client: &Client, path: &str, args: &SetArgs<'_>, json: boo
             })?;
             let body: serde_json::Value = serde_json::from_str(&read_blob(from)?)
                 .map_err(|e| usage(format!("parsing JSON from {from}: {e}")))?;
-            client.put(&format!("/api/{kind}"), &body)?
+            replace_document(
+                client,
+                &format!("/api/{kind}"),
+                Body::Json(&body),
+                expected.as_deref(),
+                args.force,
+            )?
         }
         SetPlan::Folder { kind, path } => client.post(
             &format!("/api/{kind}/folders"),
@@ -308,20 +344,34 @@ pub(crate) fn cmd_set(client: &Client, path: &str, args: &SetArgs<'_>, json: boo
         SetPlan::Pou { slug, language } => {
             let api = format!("/api/pous/{}", url_encode(&slug));
             let exists = client.exists(&api)?;
+            let mut version = expected.clone();
             if !exists {
+                if version.is_some() {
+                    return Err(usage(
+                        "document no longer exists; re-read before editing".into(),
+                    ));
+                }
                 let lang = language.clone().ok_or_else(|| {
                     usage(format!(
                         "POU `{slug}` doesn't exist — write the path with its extension so the \
                          language is known (e.g. `cs set pous/{slug}.st` or `pous/{slug}.ld.json`)"
                     ))
                 })?;
-                client.post(
+                let (_, created_version) = client.request_versioned("POST",
                     "/api/pous",
-                    &serde_json::json!({ "path": slug, "language": lang, "type": args.pou_type }),
+                    Body::Json(&serde_json::json!({ "path": slug, "language": lang, "type": args.pou_type })),
+                    None, &[],
                 )?;
+                version = created_version;
             }
             match args.from {
-                Some(from) => client.put_text(&api, &read_blob(from)?)?,
+                Some(from) => replace_document(
+                    client,
+                    &api,
+                    Body::Text(&read_blob(from)?),
+                    version.as_deref(),
+                    args.force,
+                )?,
                 // No body: creating the scaffold was the whole job.
                 None if !exists => client.get(&api)?,
                 None => {
@@ -341,7 +391,13 @@ pub(crate) fn cmd_set(client: &Client, path: &str, args: &SetArgs<'_>, json: boo
                 None => None,
             };
             let exists = client.exists(&api)?;
+            let mut version = expected.clone();
             if !exists {
+                if version.is_some() {
+                    return Err(usage(
+                        "document no longer exists; re-read before editing".into(),
+                    ));
+                }
                 let create = match kind {
                     "devices" => {
                         let protocol = args
@@ -379,10 +435,14 @@ pub(crate) fn cmd_set(client: &Client, path: &str, args: &SetArgs<'_>, json: boo
                     _ => unreachable!(),
                 };
                 let endpoint = format!("/api/{kind}");
-                client.post(&endpoint, &create)?;
+                let (_, created_version) =
+                    client.request_versioned("POST", &endpoint, Body::Json(&create), None, &[])?;
+                version = created_version;
             }
             match body {
-                Some(b) => client.put(&api, &b)?,
+                Some(b) => {
+                    replace_document(client, &api, Body::Json(&b), version.as_deref(), args.force)?
+                }
                 None if !exists => client
                     .get(&api)
                     .unwrap_or(serde_json::json!({ "ok": true })),
@@ -401,6 +461,23 @@ pub(crate) fn cmd_set(client: &Client, path: &str, args: &SetArgs<'_>, json: boo
         eprintln!("✓ set {path}");
         Ok(0)
     }
+}
+
+fn replace_document(
+    client: &Client,
+    path: &str,
+    body: Body<'_>,
+    etag: Option<&str>,
+    force: bool,
+) -> Result<serde_json::Value> {
+    let headers = match etag {
+        Some(tag) => vec![("If-Match", tag)],
+        None if force => vec![],
+        None => return Err(usage("replacing an existing document requires --if-match <ETag|@FILE> from your original `cs get --etag-file FILE`, or --force for an intentional replacement; re-read and reapply your edit, never fetch a fresh version for a stale copy".into())),
+    };
+    client
+        .request_versioned("PUT", path, body, None, &headers)
+        .map(|(body, _)| body)
 }
 
 // ---------------------------------------------------------------- rm

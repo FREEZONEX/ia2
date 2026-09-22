@@ -15,6 +15,7 @@ import type { ProjectTree } from "@/types/generated/ProjectTree"
 vi.mock("@/lib/api", async (original) => ({
   ...await original<typeof import("@/lib/api")>(),
   fetchProject: vi.fn(), fetchPou: vi.fn(), fetchProjects: vi.fn(), fetchRuntimeStatus: vi.fn(),
+  fetchTasks: vi.fn(), fetchIomap: vi.fn(),
   checkProgram: vi.fn(), savePou: vi.fn(), runProgram: vi.fn(),
 }))
 vi.mock("@/lib/lsp-client", () => ({
@@ -50,6 +51,8 @@ beforeEach(() => {
   vi.stubGlobal("EventSource", class { close() {} })
   window.history.replaceState(null, "", "/?project=Current")
   vi.mocked(api.fetchProject).mockResolvedValue(tree)
+  vi.mocked(api.fetchTasks).mockResolvedValue(tree.tasks)
+  vi.mocked(api.fetchIomap).mockResolvedValue(tree.iomap)
   vi.mocked(api.fetchPou).mockImplementation(async () => pou(disk))
   vi.mocked(api.savePou).mockImplementation(async (_path, source) => { disk = source; return { ok: true } })
   vi.mocked(api.runProgram).mockResolvedValue({ ok: true })
@@ -86,6 +89,35 @@ async function externalWrite(source: string) {
 }
 
 describe("an external change to the open program while it has unsaved edits", () => {
+  it.each(["save", "run"] as const)("keeps input after an unseen change rejects %s with 412", async (action) => {
+    await mountedWithEdit()
+    disk = THEIRS // no SSE has arrived
+    vi.mocked(api.savePou).mockRejectedValueOnce(new api.DocumentConflictError("PUT main"))
+    await act(async () => {
+      if (action === "save") await runtime.saveCurrentPou()
+      else await runtime.run("Main", "main")
+    })
+    expect(api.savePou).toHaveBeenCalledWith("main", MINE, pou(ORIGINAL))
+    expect(runtime.source).toBe(MINE)
+    expect(runtime.currentPou?.source).toBe(ORIGINAL)
+    expect(runtime.externalChange?.source).toBe(THEIRS)
+    expect(runtime.error).toMatch(/412/)
+    expect(api.savePou).toHaveBeenCalledOnce()
+    expect(api.runProgram).not.toHaveBeenCalled()
+  })
+
+  it("uses the version shown for approval even when a newer event arrives while the dialog is open", async () => {
+    await mountedWithEdit()
+    await externalWrite(THEIRS)
+    let saving!: Promise<void>
+    act(() => { saving = runtime.saveCurrentPou() })
+    await screen.findByRole("dialog", { name: /changed on disk/i })
+    await externalWrite(THEIRS + " (* newer *)")
+    fireEvent.click(screen.getByRole("button", { name: /overwrite/i }))
+    await act(async () => { await saving })
+    expect(api.savePou).toHaveBeenCalledWith("main", MINE, pou(THEIRS))
+  })
+
   it("is announced in the editor instead of being dropped", async () => {
     await mountedWithEdit()
     await externalWrite(THEIRS)
@@ -119,7 +151,7 @@ describe("an external change to the open program while it has unsaved edits", ()
     act(() => { saving = runtime.saveCurrentPou() })
     fireEvent.click(await screen.findByRole("button", { name: /overwrite/i }))
     await act(async () => { await saving })
-    expect(api.savePou).toHaveBeenCalledWith("main", MINE)
+    expect(api.savePou).toHaveBeenCalledWith("main", MINE, pou(THEIRS))
     expect(disk).toBe(MINE)
     await waitFor(() => expect(runtime.externalChange).toBeNull())
   })
@@ -190,7 +222,7 @@ describe("changes that are not a conflict", () => {
     vi.mocked(api.savePou).mockClear()
     await act(async () => { await runtime.saveCurrentPou() })
     expect(screen.queryByRole("dialog")).toBeNull()
-    expect(api.savePou).toHaveBeenCalledWith("main", MINE + " (* more *)")
+    expect(api.savePou).toHaveBeenCalledWith("main", MINE + " (* more *)", expect.objectContaining(pou(MINE)))
   })
 
   it("does not mistake an echo that arrives before our save returns", async () => {

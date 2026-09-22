@@ -136,10 +136,9 @@ async fn pdos_stay_silent_without_nmt_start() {
     )];
     let mut dev = CanopenDevice::connect("servo".into(), &cfg).await.unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
-    // No TPDO arrived — mirror still empty, read falls back to zero,
-    // and the node's heartbeat (pre-op) keeps us healthy.
-    let v = dev.read_channel("echo").await.unwrap();
-    assert_eq!(v.to_i32(), 0);
+    // Heartbeats prove the node is present, not that a measurement exists.
+    // An empty mirror must never invent a fresh zero for the scan loop.
+    assert!(dev.read_channel("echo").await.is_err());
     assert!(dev.is_healthy());
     dev.shutdown().await.unwrap();
 }

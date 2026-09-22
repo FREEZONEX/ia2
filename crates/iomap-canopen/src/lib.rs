@@ -20,6 +20,9 @@
 //! Health: heartbeat is the authoritative signal when the node produces
 //! one (`heartbeat_timeout_ms > 0`); otherwise consecutive SDO failures
 //! flip the flag, same contract as the Modbus/OPC UA adapters.
+//! A heartbeat is not a channel sample: reads fail until that channel has
+//! received data, and link loss invalidates the mirror until new samples
+//! arrive. The scan loop retains its last value and marks the input stale.
 //!
 //! Failsafe: opt-in per channel, like OPC UA — only `write` channels
 //! with an explicit `failsafe` value get written on shutdown/trip. The
@@ -231,15 +234,17 @@ impl IoDevice for CanopenDevice {
     }
 
     async fn read_channel(&mut self, channel: &str) -> Result<ChannelValue, IoError> {
-        let ch = self.channel(channel)?;
-        let zero = frame::bytes_to_value(&[0u8; 4], ch.data_type).expect("4 bytes fits every type");
-        Ok(self
-            .mirror
+        self.channel(channel)?;
+        self.mirror
             .read()
             .expect("mirror poisoned")
             .get(channel)
             .copied()
-            .unwrap_or(zero))
+            .ok_or_else(|| {
+                IoError::Transport(format!(
+                    "canopen channel '{channel}' has no sample since connect or link loss"
+                ))
+            })
     }
 
     async fn write_channel(&mut self, channel: &str, value: ChannelValue) -> Result<(), IoError> {
@@ -436,7 +441,17 @@ impl IoTask {
     }
 
     fn set_healthy(&self, up: bool) {
-        self.healthy.store(up, Ordering::Relaxed);
+        // Heartbeats can recover before any PDO/SDO data. Remove samples
+        // from the old connection so transport recovery alone cannot make
+        // those values look fresh; subsequent real samples refill the map.
+        if !up {
+            let mut mirror = self.mirror.write().expect("mirror poisoned");
+            if self.healthy.swap(false, Ordering::Relaxed) {
+                mirror.clear();
+            }
+        } else {
+            self.healthy.store(true, Ordering::Relaxed);
+        }
     }
     fn recompute_health(&self) {
         let hb = self.heartbeat_timeout.is_none() || self.hb_ok;
@@ -703,5 +718,105 @@ impl IoTask {
                 self.record_sdo(false);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod quality_tests {
+    use super::*;
+    use project::CanopenDataType;
+
+    #[tokio::test]
+    async fn heartbeat_recovery_needs_new_samples_for_each_channel() {
+        let mut config = CanopenConfig {
+            interface: "_sim".into(),
+            node_id: 34,
+            bitrate: None,
+            poll_interval_ms: 40,
+            heartbeat_timeout_ms: 400,
+            start_on_connect: false,
+            channels: vec![],
+        };
+        for (name, transport) in [
+            (
+                "pdo",
+                CanopenTransport::Tpdo {
+                    slot: 1,
+                    byte_offset: 0,
+                },
+            ),
+            ("sdo", CanopenTransport::Sdo),
+        ] {
+            config.channels.push(CanopenChannel {
+                name: name.into(),
+                index: 0x2000,
+                sub_index: 0,
+                data_type: CanopenDataType::U16,
+                access: CanopenAccess::Read,
+                transport,
+                failsafe: None,
+            });
+        }
+        let mut dev = CanopenDevice::connect("node".into(), &config)
+            .await
+            .unwrap();
+        // Drive the I/O state machine deterministically, without timer races.
+        dev.shutdown().await.unwrap();
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
+        let mut io = IoTask::new(
+            "node".into(),
+            &config,
+            Box::new(bus::SimBus::connect(&config)),
+            dev.mirror.clone(),
+            dev.healthy.clone(),
+            cmd_rx,
+        );
+        dev.mirror.write().unwrap().extend([
+            ("pdo".into(), ChannelValue::U16(10)),
+            ("sdo".into(), ChannelValue::U16(20)),
+        ]);
+        assert_eq!(dev.read_channel("pdo").await.unwrap().to_i32(), 10);
+        io.hb_ok = false;
+        io.recompute_health();
+        assert!(!dev.is_healthy());
+        assert!(dev.read_channel("pdo").await.is_err());
+        assert!(dev.read_channel("sdo").await.is_err());
+
+        io.on_frame(CanFrame::new(frame::cob::heartbeat(config.node_id), &[5]))
+            .await;
+        assert!(dev.is_healthy());
+        assert!(
+            dev.read_channel("pdo").await.is_err(),
+            "heartbeat is not a new PDO"
+        );
+        assert!(
+            dev.read_channel("sdo").await.is_err(),
+            "heartbeat is not a new SDO"
+        );
+
+        io.on_frame(CanFrame::new(
+            frame::cob::tpdo(1, config.node_id),
+            &42u16.to_le_bytes(),
+        ))
+        .await;
+        assert_eq!(dev.read_channel("pdo").await.unwrap().to_i32(), 42);
+        assert!(dev.read_channel("sdo").await.is_err());
+        io.in_flight = Some(PendingSdo {
+            index: 0x2000,
+            sub: 0,
+            kind: PendingKind::Read {
+                channel: "sdo".into(),
+                ty: CanopenDataType::U16,
+            },
+            deadline: Instant::now() + SDO_TIMEOUT,
+        });
+        io.on_sdo_response(SdoResponse::UploadOk {
+            index: 0x2000,
+            sub: 0,
+            data: [77, 0, 0, 0],
+            len: 2,
+        })
+        .await;
+        assert_eq!(dev.read_channel("sdo").await.unwrap().to_i32(), 77);
     }
 }

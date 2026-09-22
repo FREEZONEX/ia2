@@ -1,0 +1,7 @@
+description = "An unavailable field device raises an alarm without alarms.toml while the PLC keeps scanning"
+
+[[steps]]
+expect = { var = "ticks", op = "gt", value = 2, within_ms = 3000 }
+
+[[steps]]
+expect_alarm = { id = "__device/bus0", active = true, within_ms = 5000 }

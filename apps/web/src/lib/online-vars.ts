@@ -74,7 +74,8 @@ export function onlineVars(snapshot: VarSnapshot | null, scope: OnlineScope | nu
     // A name this POU declares is either qualified with its instance (when
     // another program shares it) or bare (when it is unique — and therefore
     // this program's).
-    return (prefix ? byName.get(prefix + key) : undefined) ?? byName.get(key)
+    const found = (prefix ? byName.get(prefix + key) : undefined) ?? byName.get(key)
+    return found?.input?.stale ? undefined : found
   }
 }
 
@@ -99,7 +100,7 @@ export function onlineNumber(vars: OnlineVars, name: string): number | null {
 /** How the snapshot shows the STRING the runtime stores for `text`.
  *  ironplc keeps each character's low byte (Latin-1, `encode_string_literal`)
  *  and the bridge prints the bytes as an IEC literal
- *  (`format_iec_string_literal`) — so `等待` arrives as `'I$85'`. */
+ *  (ironplc's `VariableRenderer`) — so `等待` arrives as `'I$85'`. */
 export function runtimeStringLiteral(text: string): string {
   let out = "'"
   for (const ch of text) {

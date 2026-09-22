@@ -78,6 +78,17 @@ describe("onlineVars", () => {
     expect(vars("state")?.value).toBe("'idle'")
   })
 
+  it("returns unknown for stale field input without falling back to another value", () => {
+    const stale = { ...snap, vars: snap.vars.map(v => v.name === "main_inst.estop"
+      ? { ...v, input: { device: "io", channel: "stop", stale: true } } : v) }
+    stale.vars.push({ name: "estop", type_name: "BOOL", value: "FALSE", bits: 0 })
+    const vars = onlineVars(stale, { instance: "main_inst" })!
+    expect(vars("estop")).toBeUndefined()
+    expect(onlineBool(vars, "estop")).toBeNull()
+    expect(onlineNumber(vars, "level")).toBe(3.5)
+    expect(onlineBool(onlineVars(snap, { instance: "main_inst" })!, "estop")).toBe(true)
+  })
+
   it("reads nothing without a snapshot or a scope", () => {
     expect(onlineVars(null, { instance: null })).toBeNull()
     expect(onlineVars(snap, null)).toBeNull()
@@ -93,7 +104,7 @@ describe("onlineVars", () => {
 
 describe("runtimeStringLiteral", () => {
   // Mirrors ironplc's `encode_string_literal` (low byte per character) and
-  // the bridge's `format_iec_string_literal`.
+  // ironplc's `VariableRenderer` narrow-string rendering.
   it.each([
     ["idle", "'idle'"],
     ["等待", "'I$85'"], // U+7B49 → 0x49, U+5F85 → 0x85

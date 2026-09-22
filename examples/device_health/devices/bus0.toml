@@ -1,0 +1,19 @@
+# Offline regression only: no physical endpoint. The e2e test reserves a
+# loopback port and substitutes it here; it never answers Modbus requests.
+name = "bus0"
+protocol = "modbus"
+slave_id = 1
+poll_interval_ms = 20
+timeout_ms = 100
+
+[transport]
+kind = "tcp"
+host = "127.0.0.1"
+port = 65534
+
+[[channels]]
+name = "input"
+kind = "holding_register"
+address = 0
+data_type = "u16"
+access = "read"

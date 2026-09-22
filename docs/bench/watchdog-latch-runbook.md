@@ -88,14 +88,14 @@ Source trees:
 cd ~/soft-PLC/ia2
 WT=/tmp/ia2-prefix
 git worktree add --detach "$WT" "$PREFIX"
-# vendor/ironplc is a submodule; the worktree starts with it empty. The pin
-# is identical at PREFIX and HEAD (72d6ac4), so copy the checked-out tree:
-rsync -a --exclude .git vendor/ironplc/ "$WT/vendor/ironplc/"
+# Check out this revision's own compiler pin. Current HEAD uses newer
+# upstream APIs and must not be copied into the historical pre-fix tree.
+git -C "$WT" submodule update --init --recursive
 git -C "$WT" log -1 --oneline            # must print the PREFIX commit, NOT 34995e7
 ```
 
-(`git -C "$WT" submodule update --init --recursive` is the network route to
-the same result if you prefer it.)
+The historical fork remains available for old pins; each source tree must
+build with the submodule revision recorded by that tree.
 
 Pick the target triple from the `uname -m` check in § 0:
 

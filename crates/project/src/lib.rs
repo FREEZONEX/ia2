@@ -33,7 +33,7 @@ mod sfc;
 mod store;
 mod types;
 
-pub use alarm_check::{validate_alarms, AlarmIssue};
+pub use alarm_check::{validate_alarms, AlarmIssue, DEVICE_ALARM_PREFIX};
 pub use device_check::{duplicate_channel_names, validate_devices, DeviceIssue};
 pub use errors::StoreError;
 pub use fbd::{

@@ -8,14 +8,14 @@
 //!   4. Two-file project via compile_project_units (scheduled path)
 //!   5. Two-file project via compile_isolated_in_project_full (isolated path)
 
-use ironplc_container::debug_format::build_var_debug_map;
+use ironplc_container::debug_format::VariableRenderer;
 use ironplc_container::Container;
 use ironplc_vm::{Vm, VmBuffers};
 
 /// Compile, run `rounds` scan rounds, return (name, value-as-i64) pairs
 /// for every debug-visible variable.
 fn run_and_dump(container: &Container, rounds: u32) -> Vec<(String, i64)> {
-    let debug_map = build_var_debug_map(container);
+    let debug_map = VariableRenderer::new(container);
     let mut bufs = VmBuffers::from_container(container);
     let mut running = Vm::new()
         .load(container, &mut bufs)
@@ -32,7 +32,7 @@ fn run_and_dump(container: &Container, rounds: u32) -> Vec<(String, i64)> {
             Ok(r) => r,
             Err(_) => continue,
         };
-        if let Some(info) = debug_map.get(&i) {
+        if let Some(info) = debug_map.var(i) {
             out.push((format!("[{}] {}", i, info.name), raw as i64));
         } else {
             out.push((format!("[{}] <no-debug>", i), raw as i64));
@@ -254,12 +254,8 @@ fn fb_with_nested_ton_errors_loudly() {
     let err = ironplc_bridge::compile(src).expect_err("nested FB must not compile silently");
     let msg = format!("{err:?}");
     assert!(
-        msg.contains("nested function block instances are not supported"),
-        "error should explain the nested-FB limitation, got: {msg}"
-    );
-    assert!(
-        msg.contains("fb_delay") && msg.contains("TON"),
-        "error should name the offending FB and instance type, got: {msg}"
+        msg.contains("P9999"),
+        "nested-FB codegen must explicitly reject unsupported code, got: {msg}"
     );
 }
 

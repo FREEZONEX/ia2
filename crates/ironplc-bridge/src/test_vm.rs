@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use ironplc_container::debug_format::build_var_debug_map;
+use ironplc_container::debug_format::VariableRenderer;
 use ironplc_container::{Container, VarIndex};
 use ironplc_vm::{Vm, VmBuffers};
 
@@ -20,7 +20,7 @@ pub(crate) fn run_st(st: &str, rounds: u32) -> HashMap<String, i64> {
 }
 
 pub(crate) fn run_container(container: &Container, rounds: u32) -> HashMap<String, i64> {
-    let names = build_var_debug_map(container);
+    let names = VariableRenderer::new(container);
     let mut bufs = VmBuffers::from_container(container);
     let mut vm = Vm::new()
         .load(container, &mut bufs)
@@ -32,7 +32,7 @@ pub(crate) fn run_container(container: &Container, rounds: u32) -> HashMap<Strin
     (0..vm.num_variables())
         .filter_map(|i| {
             let raw = vm.read_variable_raw(VarIndex::new(i)).ok()?;
-            names.get(&i).map(|info| (info.name.clone(), raw as i64))
+            names.var(i).map(|info| (info.name.clone(), raw as i64))
         })
         .collect()
 }

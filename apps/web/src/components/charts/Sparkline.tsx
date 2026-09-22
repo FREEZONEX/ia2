@@ -1,5 +1,7 @@
+import { sampleSegments } from "@/lib/var-history"
+
 type Props = {
-  values: number[]
+  values: (number | null)[]
   /** Force a 0/1 Y scale for BOOL — renders as a stair-step. */
   binary?: boolean
   width?: number
@@ -40,15 +42,17 @@ export function Sparkline({
     min = 0
     max = 1
   } else {
-    min = values[0]
-    max = values[0]
+    min = Infinity
+    max = -Infinity
     for (const v of values) {
+      if (v === null || !Number.isFinite(v)) continue
       if (v < min) min = v
       if (v > max) max = v
     }
     if (max === min) {
       max = min + 1
     }
+    if (!Number.isFinite(min)) { min = 0; max = 1 }
   }
   const range = max - min
   const padY = 1.5
@@ -61,29 +65,15 @@ export function Sparkline({
 
   // For BOOL render a literal stair-step so transitions are vertical;
   // for analog values use a smooth polyline.
-  const points: string[] = []
-  if (binary) {
-    for (let i = 0; i < n; i++) {
-      const x = i * stepX
-      const y = toY(values[i])
-      if (i === 0) {
-        points.push(`${x},${y}`)
-      } else {
-        const prevY = toY(values[i - 1])
-        points.push(`${x},${prevY}`)
-        points.push(`${x},${y}`)
-      }
-    }
-  } else {
-    for (let i = 0; i < n; i++) {
-      points.push(`${(i * stepX).toFixed(1)},${toY(values[i]).toFixed(1)}`)
-    }
-  }
-  const polylinePoints = points.join(" ")
-  const areaPath =
-    filled && !binary
-      ? `M0,${height} L ${polylinePoints} L ${width},${height} Z`
-      : null
+  const segments = sampleSegments(values).map((run) => {
+    const points: string[] = []
+    run.forEach(({ index, value }, i) => {
+      const x = (index * stepX).toFixed(1)
+      if (binary && i > 0) points.push(`${x},${toY(run[i - 1].value).toFixed(1)}`)
+      points.push(`${x},${toY(value).toFixed(1)}`)
+    })
+    return { points: points.join(" "), start: run[0].index * stepX, end: run[run.length - 1].index * stepX }
+  })
 
   return (
     <svg
@@ -96,16 +86,17 @@ export function Sparkline({
       className="block h-full w-full"
       style={{ color: color ?? "currentColor" }}
     >
-      {areaPath && (
+      {segments.map((segment, i) => <g key={i}>
+      {filled && !binary && (
         <path
-          d={areaPath}
+          d={`M${segment.start},${height} L ${segment.points} L ${segment.end},${height} Z`}
           fill="currentColor"
           fillOpacity={0.1}
           vectorEffect="non-scaling-stroke"
         />
       )}
       <polyline
-        points={polylinePoints}
+        points={segment.points}
         fill="none"
         stroke="currentColor"
         strokeWidth={1}
@@ -113,6 +104,7 @@ export function Sparkline({
         strokeLinecap="round"
         vectorEffect="non-scaling-stroke"
       />
+      </g>)}
     </svg>
   )
 }

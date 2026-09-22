@@ -27,6 +27,42 @@ serves a smaller subset on its own port — see `docs/edge-deploy.md`.
 
 ---
 
+## Document versions and concurrent edits
+
+`GET /api/pous/{path}`, `/api/hmi/{path}`, `/api/devices/{name}`,
+`/api/edges/{name}`, `/api/iomap`, `/api/tasks`, `/api/alarms`, and
+`/api/northbound` return a quoted strong `ETag`, derived from backing-file
+bytes (including whether an optional config file exists). Keep that version
+with the document you read. On the corresponding whole-document `PUT`, send
+`If-Match: "<version>"`. If another writer has changed the file, the server
+returns **412 Precondition Failed** without writing; re-read the document
+and reapply the edit. Weak `If-Match` tags never authorize a write.
+`If-None-Match: *` allows creation only when the backing file is absent.
+
+The comparison and write hold the same project lock, so concurrent API
+writers cannot both replace one version. Hashes survive restarts and detect
+edits made outside the server. Direct filesystem writers do not take this
+lock and can still race during the final check/write interval; use the API
+when co-editing. This is conflict detection, not automatic merging.
+
+Successful whole-document PUTs return the resulting document version in
+`X-IA2-Version`; named-document creation POSTs return `ETag`. The separate
+PUT header respects RFC 9110 §9.3.4 because JSON writes can be normalized
+into TOML; it is usable as the next `If-Match` without a racy follow-up GET.
+JSON response bodies are unchanged. Legacy raw HTTP
+and `cs api` calls without precondition headers retain their unconditional
+behavior. `cs set` is deliberately stricter: replacements require the
+original `--if-match <ETag|@FILE>` or explicit `--force`. `cs get --etag-file
+FILE` preserves stdout and saves that read's version separately. Named
+resources created by `cs set` need neither flag; the CLI uses the creation
+response's version for its initial write. Single-document configs always
+have a GET representation (defaults when absent), so read their version
+before setting them. HTTP 412 remains CLI exit **2**.
+
+Clients must associate versions with individual edit buffers, not a global
+latest-version cache: another agent/tab's new GET must never validate an
+older buffer. A conflict must preserve the local edits and stop Save/Run.
+
 ## Health & lifecycle
 
 | Method | Path | Purpose | Notes |
@@ -94,7 +130,7 @@ read-only device-template catalog used to pre-fill devices from a bus scan.
 | `GET` | `/api/hmi` | List the project's HMI screens: `HmiListEntry[] { path, title, level }`. |
 | `POST` | `/api/hmi` | Create an empty screen. Body `{ path, title? }`; returns the fresh `HmiDoc`. Emits SSE `hmi` mutation. |
 | `GET` | `/api/hmi/{path}` | Read one screen as `HmiDoc` (slug percent-encoded into one segment, like `/api/pous/{path}`). |
-| `PUT` | `/api/hmi/{path}` | Replace the whole document (`cs set hmi/…`). A blind overwrite: anything another writer added after the caller read the document is gone — which is why the IDE canvas, drags included, edits through `/ops` instead. Rejects structural errors; returns remaining warnings as `HmiIssue[]`. Emits SSE `hmi` mutation with empty `touched`. |
+| `PUT` | `/api/hmi/{path}` | Replace the whole document (`cs set hmi/…`), with optional `If-Match` / `If-None-Match` preconditions described above. No header means a blind overwrite; the IDE canvas, drags included, uses incremental `/ops` instead. Rejects structural errors; returns remaining warnings as `HmiIssue[]`. Emits SSE `hmi` mutation with empty `touched`. |
 | `DELETE` | `/api/hmi/{path}` | Delete the screen. Emits SSE `hmi` mutation (`hmi_deleted`). |
 | `POST` | `/api/hmi/{path}/ops` | THE incremental authoring surface: body `{ ops: HmiOp[] }` (`add_node` / `update_node` / `remove_node` / `set_meta`), applied atomically. Returns `{ touched, issues }`; the SSE `hmi` mutation carries the same `touched` node ids so every open canvas spawn-animates exactly the elements this batch placed. |
 | `GET` | `/api/hmi/{path}/check` | Structural validation plus variable-existence warnings against the project's POUs. Returns `HmiIssue[]`. |
@@ -208,6 +244,29 @@ the *deployed* edge runtime, proxy the same ops through
 | `POST` | `/api/runtime/inject-scan-stall` | Fault injection (test primitive): stall the next `scans` scans by `stall_ms` each so the scan watchdog trips through its real overrun path. Body: `{ stall_ms, scans? }` (`scans` defaults to threshold + 1). Backs the scenario DSL's `inject` step; on a live plant this deliberately drives the runtime into latched failsafe — only a program restart recovers. 409 if stopped. |
 
 ## Runtime history & alarms
+
+Snapshots include `device_health: [{ name, healthy }]` and, on each mapped
+input variable, `input: { device, channel, stale }`. An unavailable device,
+failed input read, or mapping awaiting its first successful read makes that
+input stale. `value`/`bits` remain the VM's last value, **not a fresh field
+measurement**. Recovery clears `stale` only after a successful input read;
+recovering a link while paused is insufficient. Internal and output variables
+have no `input` field; this is not transitive provenance through PLC logic.
+Transport health does not claim a per-channel acquisition timestamp.
+
+Every configured device gets a built-in high-severity alarm
+`__device/<device-name>` after 1 s of continuously observed unhealthy state,
+including failed startup connections. No `alarms.toml` entry is required.
+Recovery returns it, but an unacknowledged occurrence remains standing until
+acknowledged. URL-encode the entire id for the existing ack route (including
+the slash). The `__device/` prefix is reserved. These alarms share the existing
+state/journal/ack machinery on server and edge; they do not change PLC logic
+or output safety policy. Process alarms watching stale inputs neither raise
+nor clear, and their pending debounce resets until valid input returns.
+
+History points add optional `stale: true` when any sample in the bucket was
+stale. Consumers must show a gap/unknown interval, not a fresh flat line;
+the edge's persisted history retains this flag across restarts.
 
 Served by the shared monitor layer (`ironplc_bridge::monitor`): an
 in-memory 1 Hz historian (~2 h window; the edge runtime persists the

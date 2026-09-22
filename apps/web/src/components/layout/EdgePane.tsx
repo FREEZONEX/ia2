@@ -33,6 +33,7 @@ import {
   discoverEdge,
   edgeRuntimeOp,
   fetchEdgeLogs,
+  fetchEdge,
   fetchEdgeStatus,
   fetchEdgeSystem,
   probeEdge,
@@ -41,6 +42,7 @@ import {
   type EdgeSystem,
 } from "@/lib/api"
 import { useRuntime } from "@/state/runtime"
+import { DocumentReloadButton, useDocumentDraft } from "@/lib/use-document-draft"
 import type { DeployReport } from "@/types/generated/DeployReport"
 import type { Edge } from "@/types/generated/Edge"
 import type { EdgeProbe } from "@/types/generated/EdgeProbe"
@@ -92,7 +94,7 @@ function Editor({
   onAttach: () => Promise<void>
   onDetach: () => Promise<void>
 }) {
-  const [draft, setDraft] = useState<Edge>(edge)
+  const { draft, setDraft, dirty, conflict, reload } = useDocumentDraft(edge, edge.name)
   const [tab, setTab] = useState<EdgeTab>("config")
   const [probe, setProbe] = useState<EdgeProbe | null>(null)
   const [probing, setProbing] = useState(false)
@@ -103,7 +105,6 @@ function Editor({
   const [deployError, setDeployError] = useState<string | null>(null)
 
   useEffect(() => {
-    setDraft(edge)
     setProbe(null)
     setDeployLog(null)
     setDeployError(null)
@@ -133,7 +134,6 @@ function Editor({
     }
   }, [probeName])
 
-  const dirty = JSON.stringify(draft) !== JSON.stringify(edge)
   const update = (patch: Partial<Edge>) => setDraft({ ...draft, ...patch })
 
   const probeNow = async () => {
@@ -195,11 +195,13 @@ function Editor({
         title={<span title={edge.name}>{edge.name}</span>}
         description={<span className="font-mono" title={edge.host}>{edge.host}</span>}
         meta={<><ReachBadge probe={probe} probing={probing} />{dirty && <span className="text-warn">Unsaved changes</span>}</>}
-        actions={<Button size="sm" disabled={!dirty || saving} aria-busy={saving} onClick={async () => {
+        actions={<>
+          <DocumentReloadButton reload={() => reload(() => fetchEdge(edge.name))} conflict={conflict} />
+          <Button size="sm" disabled={!dirty || saving} aria-busy={saving} onClick={async () => {
           if (saving) return
           setSaving(true)
-          try { await onSave(draft) } finally { setSaving(false) }
-        }}><Save className="size-4" />{saving ? "Saving…" : "Save changes"}</Button>}
+          try { await onSave(draft) } catch { /* provider displays the error */ } finally { setSaving(false) }
+        }}><Save className="size-4" />{saving ? "Saving…" : "Save changes"}</Button></>}
       />
 
       <EdgeTabs tab={tab} setTab={setTab} />

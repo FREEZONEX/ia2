@@ -272,7 +272,8 @@ struct WorkerShared {
     /// demotion (RTSO-HOLD-0731 fix). The cycle watchdog reports a
     /// paused counter as "re-walking", not as a stall.
     reinitializing: Arc<AtomicBool>,
-    /// Count of bus re-walks started since connect (0 = never demoted).
+    /// Count of recovery attempts since connect, including attempts
+    /// deferred by the read-only census (0 = never demoted).
     reinits: Arc<AtomicU64>,
     /// In-cycle gear engines (one per configured [[gear]] axis), owned by
     /// the cyclic worker and ticked between the mirror copy and tx_rx.
@@ -827,6 +828,32 @@ fn reinit_backoff(attempt: u64) -> Duration {
     }
 }
 
+/// A partial bus cannot pass the topology check after a full re-walk.
+/// Probe it with the same read-only BRD(Type) census EtherCrab uses at
+/// init, before resetting/configuring any surviving slaves. This avoids
+/// repeated expensive failed walks while part of the bus is powered off.
+/// A matching count is only permission to try the full walk; its identity
+/// and OP checks remain mandatory. It does not establish bus health.
+async fn probe_rewalk_topology(
+    maindevice: &MainDevice<'_>,
+    expected_subdevices: usize,
+) -> Result<(), String> {
+    let started = Instant::now();
+    let result = ethercrab::Command::brd(ethercrab::RegisterAddress::Type.into())
+        .with_wkc(expected_subdevices as u16)
+        .receive::<u8>(maindevice)
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("re-walk census (expected {expected_subdevices} subdevices): {e:?}"));
+    tracing::debug!(
+        expected_subdevices,
+        elapsed_us = started.elapsed().as_micros() as u64,
+        complete = result.is_ok(),
+        "ethercat re-walk census"
+    );
+    result
+}
+
 /// RTSO-HOLD-0731 fix: shared failure handling for every step of the bus
 /// walk. First-init failures abort connect exactly as before (caller must
 /// `return`); re-walk failures log and retry (caller must `continue`).
@@ -1022,6 +1049,17 @@ fn smol_main(
                         continue 'supervise;
                     }
                 }
+            }
+
+            // Read-only census first: do not reset surviving slaves when
+            // the known topology is absent. Backoff/shutdown handling is
+            // identical to a failed walk, and health stays unhealthy.
+            if let Some(expected) = expected_subdevices {
+                if let Err(msg) = probe_rewalk_topology(&maindevice, expected).await {
+                    walk_fail(false, &init_tx, &mut reinit_attempt, msg);
+                    continue 'supervise;
+                }
+                tracing::info!("ethercat complete topology observed; starting full re-walk");
             }
 
             // Walk the bus and assign each SubDevice an auto-increment address.
@@ -1576,6 +1614,85 @@ fn smol_main(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Respond through EtherCrab's actual PDU storage/parser, with no NIC
+    /// or privilege. The only request must be BRD(Type), never a write to
+    /// reset or configure the surviving slaves.
+    fn census_reply(working_counter: u16) -> Result<(), String> {
+        use std::task::Poll;
+        let storage = Storage::new();
+        let (mut tx, mut rx, pdu_loop) = storage.try_split().unwrap();
+        let maindevice =
+            MainDevice::new(pdu_loop, Timeouts::default(), MainDeviceConfig::default());
+        smol::block_on(async {
+            let response = std::future::poll_fn(|cx| {
+                tx.replace_waker(cx.waker());
+                let Some(frame) = tx.next_sendable_frame() else {
+                    return Poll::Pending;
+                };
+                let mut reply = Vec::new();
+                frame
+                    .send_blocking(|request| {
+                        // Ethernet(14), EtherCAT(2), datagram header(10),
+                        // one Type byte, WKC(2).
+                        assert_eq!(request[16], 0x07, "BRD, not a reset/write");
+                        assert_eq!(&request[20..22], &[0, 0], "ESC Type register");
+                        assert_eq!(u16::from_le_bytes([request[22], request[23]]) & 0x7ff, 1);
+                        reply = request.to_vec();
+                        Ok(request.len())
+                    })
+                    .unwrap();
+                reply[6] ^= 0x02; // Returned frame, not our outgoing MAC.
+                reply[27..29].copy_from_slice(&working_counter.to_le_bytes());
+                rx.receive_frame(&reply).unwrap();
+                Poll::Ready(())
+            });
+            let (result, ()) =
+                smol::future::zip(probe_rewalk_topology(&maindevice, 4), response).await;
+            assert!(tx.next_sendable_frame().is_none());
+            result
+        })
+    }
+
+    #[test]
+    fn incomplete_or_changed_bus_is_rejected_by_one_read_only_census() {
+        for count in [0, 1, 3, 5] {
+            let error = census_reply(count).expect_err("do not reconfigure a changed bus");
+            assert!(error.contains("expected 4 subdevices"), "{error}");
+            assert!(error.contains("WorkingCounter"), "{error}");
+        }
+    }
+
+    #[test]
+    fn complete_count_allows_full_rewalk_without_claiming_identity_or_health() {
+        census_reply(4).unwrap();
+        // The probe only returns permission to walk. Identity validation
+        // and the transition to OP still occur in the supervisor below it.
+    }
+
+    #[test]
+    fn absent_census_response_times_out_cooperatively() {
+        use std::future::Future;
+        let storage = Storage::new();
+        let (_tx, _rx, pdu_loop) = storage.try_split().unwrap();
+        let maindevice =
+            MainDevice::new(pdu_loop, Timeouts::default(), MainDeviceConfig::default());
+        // No response path at all: exercise EtherCrab's real PDU timeout,
+        // not a mocked sleep. Counting polls distinguishes timer wakeups
+        // from spinning; this does not claim hardware scan-jitter coverage.
+        let mut polls = 0;
+        let result = smol::block_on(async {
+            let mut probe = std::pin::pin!(probe_rewalk_topology(&maindevice, 4));
+            std::future::poll_fn(|cx| {
+                polls += 1;
+                probe.as_mut().poll(cx)
+            })
+            .await
+        });
+        let error = result.unwrap_err();
+        assert!(error.contains("Timeout(Pdu)"), "{error}");
+        assert!(polls < 100, "PDU wait should park, not busy-poll: {polls}");
+    }
 
     // The bus-side paths need a real NIC + CAP_NET_RAW, so these exercise
     // the bounded-join logic in isolation — that's the part that has to

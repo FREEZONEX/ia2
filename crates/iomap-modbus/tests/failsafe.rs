@@ -9,11 +9,12 @@
 
 use std::time::Duration;
 
-use iocore::{ChannelValue, IoDevice};
+use iocore::{ChannelValue, IoDevice, IoError};
 use iomap_modbus::{run_demo_slave, DemoSlave, ModbusDevice};
 use project::{
     ModbusAccess, ModbusChannel, ModbusChannelKind, ModbusConfig, ModbusTcpParams, ModbusTransport,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 /// Bind the demo slave to `127.0.0.1:0` (kernel-assigned port), spawn the
@@ -198,4 +199,112 @@ async fn write_to_access_read_channel_is_rejected() {
         777,
         "write to an access=read channel must never reach the wire"
     );
+}
+
+#[derive(Clone, Copy)]
+enum WriteReply {
+    Accept,
+    Reject,
+    Disconnect,
+}
+
+/// A loopback-only Modbus peer: all reads succeed, but each register's
+/// write can be accepted, rejected by an exception PDU, or lose the link.
+/// Inspect the received requests, not just the returned error strings.
+async fn faulting_slave(
+    replies: [WriteReply; 3],
+) -> (
+    ModbusDevice,
+    std::sync::Arc<std::sync::Mutex<Vec<(u16, u16)>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = writes.clone();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        loop {
+            let mut mbap = [0u8; 7];
+            if stream.read_exact(&mut mbap).await.is_err() {
+                break;
+            }
+            let mut pdu = vec![0; u16::from_be_bytes([mbap[4], mbap[5]]) as usize - 1];
+            stream.read_exact(&mut pdu).await.unwrap();
+            let response = match pdu[0] {
+                3 => {
+                    let count = u16::from_be_bytes([pdu[3], pdu[4]]) as usize;
+                    let mut data = vec![0; count * 2 + 2];
+                    data[0] = 3;
+                    data[1] = (count * 2) as u8;
+                    data
+                }
+                6 => {
+                    let address = u16::from_be_bytes([pdu[1], pdu[2]]);
+                    let value = u16::from_be_bytes([pdu[3], pdu[4]]);
+                    observed.lock().unwrap().push((address, value));
+                    match replies[address as usize] {
+                        WriteReply::Accept => pdu,
+                        WriteReply::Reject => vec![0x86, 2], // Illegal data address
+                        WriteReply::Disconnect => break,
+                    }
+                }
+                function => panic!("unexpected Modbus function {function}"),
+            };
+            mbap[4..6].copy_from_slice(&((response.len() + 1) as u16).to_be_bytes());
+            stream.write_all(&mbap).await.unwrap();
+            stream.write_all(&response).await.unwrap();
+        }
+    });
+    let mut cfg = config_with_mixed_channels(port);
+    cfg.timeout_ms = Some(200);
+    cfg.channels = (0..3)
+        .map(|address| ModbusChannel {
+            name: format!("output_{address}"),
+            kind: ModbusChannelKind::HoldingRegister,
+            address,
+            data_type: Default::default(),
+            word_order: Default::default(),
+            access: ModbusAccess::Write,
+        })
+        .collect();
+    let device = ModbusDevice::connect("fault-injection".into(), &cfg)
+        .await
+        .unwrap();
+    (device, writes, peer)
+}
+
+#[tokio::test]
+async fn protocol_rejection_preserves_error_class_and_attempts_remaining_outputs() {
+    use WriteReply::*;
+    let (mut device, writes, peer) = faulting_slave([Reject, Accept, Accept]).await;
+    let err = device.enter_failsafe().await.unwrap_err();
+    assert!(matches!(err, IoError::Protocol(_)), "{err:?}");
+    assert!(err.to_string().starts_with("protocol: modbus exception:"));
+    assert_eq!(*writes.lock().unwrap(), vec![(0, 0), (1, 0), (2, 0)]);
+    assert!(device.is_healthy(), "a rejection is not a disconnected bus");
+    device.shutdown().await.unwrap();
+    peer.await.unwrap();
+}
+
+#[tokio::test]
+async fn transport_failure_aborts_remaining_failsafe_writes() {
+    use WriteReply::*;
+    let (mut device, writes, peer) = faulting_slave([Disconnect, Accept, Accept]).await;
+    let err = device.enter_failsafe().await.unwrap_err();
+    assert!(matches!(err, IoError::Transport(_)), "{err:?}");
+    assert_eq!(*writes.lock().unwrap(), vec![(0, 0)]);
+    device.shutdown().await.unwrap();
+    peer.await.unwrap();
+}
+
+#[tokio::test]
+async fn later_transport_failure_takes_precedence_over_earlier_protocol_rejection() {
+    use WriteReply::*;
+    let (mut device, writes, peer) = faulting_slave([Reject, Disconnect, Accept]).await;
+    let err = device.enter_failsafe().await.unwrap_err();
+    assert!(matches!(err, IoError::Transport(_)), "{err:?}");
+    assert_eq!(*writes.lock().unwrap(), vec![(0, 0), (1, 0)]);
+    device.shutdown().await.unwrap();
+    peer.await.unwrap();
 }

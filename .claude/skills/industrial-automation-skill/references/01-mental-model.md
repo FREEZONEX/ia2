@@ -123,7 +123,7 @@ Every `MutationEvent` carries a `project: String` field. Web clients filter SSE 
 | List open projects | `GET /api/projects/open-list` | `cs ls projects` |
 | Open a project | `POST /api/projects/open {path}` | `cs project open PATH` |
 | Project tree | `GET /api/project` (with header) | `cs get project` (online) · `cs project info PATH` (offline dir) |
-| Save POU source | `PUT /api/pous/{path}` | `cs set pous/NAME.st --from -` |
+| Save POU source | `PUT /api/pous/{path}` | `cs set pous/NAME.st --from - --if-match @version` |
 | Validate full project | `POST /api/project/validate` | `cs project check PATH` |
 | Start running | `POST /api/run` | `cs run [--program X]` |
 | Pause / step / resume | `POST /api/runtime/{action}` | `cs runtime pause/step/resume` |
@@ -133,7 +133,7 @@ Every `MutationEvent` carries a `project: String` field. Web clients filter SSE 
 | Mode + forces only | `GET /api/runtime/status` | `cs runtime status` |
 | Historian (1 Hz, ~2 h) | `GET /api/runtime/history` | `cs get runtime/history --query vars=a,b` |
 | Alarms — live / ack | `GET /api/runtime/alarms` · `POST /api/runtime/alarms/{id}/ack` | `cs get runtime/alarms` · `cs runtime ack ID` |
-| IoMap / Tasks / Northbound / Alarm defs | `GET·PUT /api/iomap` (etc.) | `cs get iomap` · `cs set iomap --from -` (same for `tasks` / `northbound` / `alarms`) |
+| IoMap / Tasks / Northbound / Alarm defs | `GET·PUT /api/iomap` (etc.) | `cs get iomap --etag-file version` · `cs set iomap --from - --if-match @version` (same for `tasks` / `northbound` / `alarms`) |
 | Edge introspection | `GET /api/edges/{name}/{logs,scan,system,status,probe}` | `cs get edges/NAME/{logs,scan,system,status}` · `cs probe NAME` |
 | Drive an edge runtime | `POST /api/edges/{name}/runtime/{op}` | `cs runtime <op> --edge NAME` |
 | SSE event stream | `GET /api/events` | (SSE — see `02-cli-reference.md`) |

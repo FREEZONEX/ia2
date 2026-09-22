@@ -24,6 +24,8 @@ use project::{AlarmCondition, AlarmDef, AlarmSeverity};
 /// Bounded journal length — oldest entries drop first. Enough for a
 /// shift's worth of events on a busy line without unbounded memory.
 const JOURNAL_CAP: usize = 1000;
+/// Suppress short reconnect blips, but report sustained loss without setup.
+const DEVICE_LOSS_DELAY_MS: u32 = 1000;
 
 /// Live state of one alarm definition, as served by GET /alarms.
 #[derive(Debug, Clone, Serialize, TS)]
@@ -83,6 +85,7 @@ struct AlarmRuntime {
 #[derive(Debug, Default)]
 pub struct AlarmEngine {
     defs: Vec<AlarmDef>,
+    device_defs: HashMap<String, AlarmDef>,
     states: HashMap<String, AlarmRuntime>,
     journal: VecDeque<AlarmJournalEntry>,
 }
@@ -95,13 +98,14 @@ impl AlarmEngine {
             .collect();
         Self {
             defs,
+            device_defs: HashMap::new(),
             states,
             journal: VecDeque::new(),
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.defs.is_empty()
+        self.defs.is_empty() && self.device_defs.is_empty()
     }
 
     /// Evaluate every definition against a sampled snapshot. Returns
@@ -116,19 +120,51 @@ impl AlarmEngine {
     pub fn note_snapshot(&mut self, snap: &VarSnapshot, wall_now_us: u64) -> bool {
         let now_us = snap.timestamp_us;
         let mut changed = false;
-        for def in &self.defs {
-            let Some(var) = snap.vars.iter().find(|v| v.name == def.variable) else {
-                continue; // variable not in this program — skip quietly
-            };
-            let value = typed_value(&var.type_name, var.bits, &var.value)
-                .as_f64()
-                .or_else(|| {
-                    typed_value(&var.type_name, var.bits, &var.value)
-                        .as_bool()
-                        .map(|b| if b { 1.0 } else { 0.0 })
-                });
-            let Some(value) = value else { continue };
+        let device_health = snap.device_health.as_deref().unwrap_or_default();
+        for health in device_health {
+            self.device_defs.entry(health.name.clone()).or_insert_with(|| AlarmDef {
+                id: format!("{}{}", project::DEVICE_ALARM_PREFIX, health.name),
+                variable: format!("device:{}", health.name),
+                condition: AlarmCondition::IsFalse,
+                limit: None, deadband: 0.0, delay_ms: DEVICE_LOSS_DELAY_MS,
+                severity: AlarmSeverity::High,
+                message: format!("Device '{}' is unavailable — check its power and fieldbus connection; input values are stale", health.name),
+            });
+        }
+        let values = self
+            .defs
+            .iter()
+            .map(|def| {
+                let value = snap
+                    .vars
+                    .iter()
+                    .find(|v| v.name == def.variable)
+                    .filter(|v| !v.input.as_ref().is_some_and(|q| q.stale))
+                    .and_then(|v| {
+                        let value = typed_value(&v.type_name, v.bits, &v.value);
+                        value
+                            .as_f64()
+                            .or_else(|| value.as_bool().map(|b| u8::from(b) as f64))
+                    });
+                (def, value)
+            })
+            .chain(self.device_defs.iter().map(|(name, def)| {
+                (
+                    def,
+                    device_health
+                        .iter()
+                        .find(|h| h.name == *name)
+                        .map(|h| u8::from(h.healthy) as f64),
+                )
+            }));
+        for (def, value) in values {
             let st = self.states.entry(def.id.clone()).or_default();
+            let Some(value) = value else {
+                // Unknown input cannot raise OR clear a process alarm. A
+                // missing interval also cannot count toward its debounce.
+                st.pending_since_us = None;
+                continue;
+            };
 
             let raw = eval_condition(def, value, st.active);
             if raw {
@@ -172,8 +208,9 @@ impl AlarmEngine {
         let def = self
             .defs
             .iter()
+            .chain(self.device_defs.values())
             .find(|d| d.id == id)
-            .ok_or_else(|| format!("no alarm '{id}' in alarms.toml"))?
+            .ok_or_else(|| format!("no alarm '{id}'"))?
             .clone();
         let st = self.states.entry(def.id.clone()).or_default();
         if !st.acked || st.cleared_unacked {
@@ -190,6 +227,7 @@ impl AlarmEngine {
         let mut out: Vec<AlarmState> = self
             .defs
             .iter()
+            .chain(self.device_defs.values())
             .map(|d| state_of(d, self.states.get(&d.id).unwrap_or(&DEFAULT_RT)))
             .collect();
         out.sort_by(|a, b| {
@@ -306,11 +344,13 @@ mod tests {
         VarSnapshot {
             timestamp_us: t_us,
             scan_count: t_us,
+            device_health: None,
             vars: vec![VarValue {
                 name: "level".into(),
                 type_name: "REAL".into(),
                 value: format!("{level}"),
                 bits: level.to_bits() as u64,
+                input: None,
             }],
         }
     }
@@ -396,6 +436,73 @@ mod tests {
         assert!(eng.ack("nope", 0).is_err());
     }
 
+    fn bus_snap(t_us: u64, healthy: bool) -> VarSnapshot {
+        let mut snap = snap(t_us, 0.0);
+        snap.device_health = Some(vec![crate::DeviceHealth {
+            name: "bus0".into(),
+            healthy,
+        }]);
+        snap
+    }
+
+    #[test]
+    fn device_loss_raises_without_config_and_recovery_still_needs_ack() {
+        let mut eng = AlarmEngine::default();
+        assert!(!eng.note_snapshot(&bus_snap(0, false), 1));
+        assert!(!eng.note_snapshot(&bus_snap(999_999, false), 2));
+        assert!(eng.note_snapshot(&bus_snap(1_000_000, false), 123_456));
+        let state = &eng.states()[0];
+        assert_eq!(state.id, "__device/bus0");
+        assert_eq!(state.severity, AlarmSeverity::High);
+        assert_eq!(state.raised_at_us, 123_456, "journal uses wall clock");
+        assert!(state.active && !state.acked);
+        assert!(eng.note_snapshot(&bus_snap(2_000_000, true), 234_567));
+        assert!(!eng.states()[0].active && eng.states()[0].standing());
+        eng.ack("__device/bus0", 345_678).unwrap();
+        assert!(!eng.states()[0].standing());
+        let events: Vec<_> = eng.journal(10).into_iter().map(|j| j.event).collect();
+        assert_eq!(events, ["acked", "returned", "raised"]);
+    }
+
+    #[test]
+    fn short_device_blip_does_not_accumulate_across_recovery() {
+        let mut eng = AlarmEngine::default();
+        for (t, healthy) in [
+            (0, false),
+            (900_000, true),
+            (1_000_000, false),
+            (1_900_000, false),
+            (2_000_000, true),
+        ] {
+            assert!(!eng.note_snapshot(&bus_snap(t, healthy), t));
+        }
+        assert!(eng.journal(10).is_empty());
+        assert!(!eng.states()[0].standing());
+    }
+
+    #[test]
+    fn stale_process_value_neither_raises_nor_clears_and_breaks_debounce() {
+        let mut eng = high_alarm(0.0, 500);
+        let stale = |t, value| {
+            let mut snap = snap(t, value);
+            snap.vars[0].input = Some(crate::InputQuality {
+                device: "bus0".into(),
+                channel: "level".into(),
+                stale: true,
+            });
+            snap
+        };
+        assert!(!eng.note_snapshot(&snap(0, 95.0), 0));
+        assert!(!eng.note_snapshot(&stale(600_000, 95.0), 1));
+        assert!(!eng.note_snapshot(&snap(700_000, 95.0), 2));
+        assert!(!eng.note_snapshot(&snap(1_199_999, 95.0), 3));
+        assert!(eng.note_snapshot(&snap(1_200_000, 95.0), 4));
+        assert!(!eng.note_snapshot(&stale(2_000_000, 0.0), 5));
+        assert!(eng.states()[0].active, "unknown cannot confirm a return");
+        assert!(eng.note_snapshot(&snap(3_000_000, 0.0), 6));
+        assert!(!eng.states()[0].active);
+    }
+
     #[test]
     fn bool_alarm_via_is_true() {
         let mut eng = AlarmEngine::new(vec![AlarmDef {
@@ -411,11 +518,13 @@ mod tests {
         let snap = VarSnapshot {
             timestamp_us: 1,
             scan_count: 1,
+            device_health: None,
             vars: vec![VarValue {
                 name: "estop_hit".into(),
                 type_name: "BOOL".into(),
                 value: "TRUE".into(),
                 bits: 1,
+                input: None,
             }],
         };
         assert!(eng.note_snapshot(&snap, 1));

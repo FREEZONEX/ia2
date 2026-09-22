@@ -121,6 +121,10 @@ pub enum IoError {
     Connect(String),
     #[error("transport: {0}")]
     Transport(String),
+    /// The peer replied but rejected the operation. This is not evidence
+    /// that the connection is lost, or that other channels were skipped.
+    #[error("protocol: {0}")]
+    Protocol(String),
 }
 
 /// A fieldbus device — read/write a logical channel by name. Implementations
@@ -160,9 +164,11 @@ pub trait IoDevice: Send {
     /// software. Implementations should:
     ///   - Write a zero/safe value to every output channel they know
     ///     about. Read-only channels are skipped.
-    ///   - Best-effort: a transport error on one channel should not
-    ///     stop the loop from trying the rest. Return the first error
-    ///     so the caller can log.
+    ///   - Best-effort: continue past per-channel protocol rejections.
+    ///     An unusable transport may abort the remaining writes to keep
+    ///     shutdown bounded. Return an error if any output was not
+    ///     confirmed, preserving protocol vs transport classification.
+    ///     Success is an adapter acknowledgement, not physical readback.
     ///
     /// Default impl is a no-op so devices that genuinely have no
     /// writable surface (e.g. a read-only sensor adapter) need no

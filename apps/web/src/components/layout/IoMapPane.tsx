@@ -12,11 +12,11 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { fetchPouVariables, fetchDemoSlaveSnapshot } from "@/lib/api"
+import { fetchPouVariables, fetchDemoSlaveSnapshot, fetchIomap } from "@/lib/api"
+import { DocumentReloadButton, useDocumentDraft } from "@/lib/use-document-draft"
 import { useRuntime } from "@/state/runtime"
 import type { DemoSlaveSnapshot } from "@/types/generated/DemoSlaveSnapshot"
 import type { Direction } from "@/types/generated/Direction"
-import type { IoMap } from "@/types/generated/IoMap"
 import type { Mapping } from "@/types/generated/Mapping"
 import type { VariableInfo } from "@/types/generated/VariableInfo"
 
@@ -24,12 +24,10 @@ const SLAVE_POLL_MS = 500
 
 export function IoMapPane() {
   const { project, iomap, isRunning, saveIomap } = useRuntime()
-  const [draft, setDraft] = useState<IoMap>(iomap)
+  const { draft, setDraft, dirty, conflict, reload } = useDocumentDraft(iomap, project?.name ?? "")
   const [saving, setSaving] = useState(false)
   const [vars, setVars] = useState<Record<string, VariableInfo[]>>({})
   const [slave, setSlave] = useState<DemoSlaveSnapshot | null>(null)
-
-  useEffect(() => setDraft(iomap), [iomap])
 
   // Pre-fetch variables for every POU so the variable column has datalist
   // suggestions ready without per-row latency.
@@ -72,17 +70,16 @@ export function IoMapPane() {
     }
   }, [isRunning])
 
-  const dirty = JSON.stringify(draft) !== JSON.stringify(iomap)
-
   const set = (idx: number, patch: Partial<Mapping>) => {
     const next = draft.mappings.map((m, i) =>
       i === idx ? { ...m, ...patch } : m,
     )
-    setDraft({ mappings: next })
+    setDraft({ ...draft, mappings: next })
   }
 
   const add = () => {
     setDraft({
+      ...draft,
       mappings: [
         ...draft.mappings,
         {
@@ -97,7 +94,7 @@ export function IoMapPane() {
   }
 
   const remove = (idx: number) => {
-    setDraft({ mappings: draft.mappings.filter((_, i) => i !== idx) })
+    setDraft({ ...draft, mappings: draft.mappings.filter((_, i) => i !== idx) })
   }
 
   return (
@@ -108,13 +105,14 @@ export function IoMapPane() {
         meta={dirty ? <span className="text-warn">Unsaved changes</span> : `${draft.mappings.length} mappings`}
         actions={
           <>
+            <DocumentReloadButton reload={() => reload(fetchIomap)} conflict={conflict} />
             <Button size="sm" variant="outline" onClick={add}>
               <Plus className="size-4" /> Add mapping
             </Button>
             <Button size="sm" disabled={!dirty || saving} aria-busy={saving} onClick={async () => {
               if (saving) return
               setSaving(true)
-              try { await saveIomap(draft) } finally { setSaving(false) }
+              try { await saveIomap(draft) } catch { /* provider displays the error */ } finally { setSaving(false) }
             }}>
               <Save className="size-4" /> {saving ? "Saving…" : "Save changes"}
             </Button>

@@ -249,6 +249,91 @@ fn sim_run_proves_and_refutes_against_a_real_server() {
         .stderr(predicates::str::contains("scenario FAILED"));
 }
 
+#[test]
+fn stale_agent_cannot_remove_another_writers_alarm_or_program_edit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("sim_smoke");
+    copy_dir(&repo_root().join("examples/sim_smoke"), &proj);
+    let server = spawn_server(tmp.path());
+    server.open_project(&proj);
+
+    cs(&server.base)
+        .args(["set", "pous/fresh.st", "--from", "-"])
+        .write_stdin("PROGRAM fresh\nEND_PROGRAM\n")
+        .assert()
+        .success();
+    cs(&server.base)
+        .args(["get", "pous/fresh.st"])
+        .assert()
+        .success()
+        .stdout("PROGRAM fresh\nEND_PROGRAM\n");
+
+    for resource in ["alarms", "pous/main.st"] {
+        let version = tmp
+            .path()
+            .join(format!("{}.etag", resource.replace('/', "-")));
+        let old = cs(&server.base)
+            .args(["get", resource, "--etag-file"])
+            .arg(&version)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let other = if resource == "alarms" {
+            let mut doc: serde_json::Value = serde_json::from_slice(&old).unwrap();
+            doc["alarms"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "id":"overflow_trip", "variable":"overflow", "condition":"is_true",
+                    "severity":"critical", "message":"Overflow trip"
+                }));
+            doc.to_string()
+        } else {
+            format!(
+                "{}\n(* another writer's interlock edit *)\n",
+                String::from_utf8(old.clone()).unwrap()
+            )
+        };
+        cs(&server.base)
+            .args(["set", resource, "--from", "-", "--if-match"])
+            .arg(format!("@{}", version.display()))
+            .write_stdin(other.clone())
+            .assert()
+            .success();
+        // A second agent/IDE read must NOT replace the first writer's version.
+        cs(&server.base).args(["get", resource]).assert().success();
+        cs(&server.base)
+            .args(["set", resource, "--from", "-", "--if-match"])
+            .arg(format!("@{}", version.display()))
+            .write_stdin(old)
+            .assert()
+            .code(2)
+            .stderr(predicates::str::contains("HTTP 412"))
+            .stderr(predicates::str::contains("re-read"));
+        let saved = cs(&server.base)
+            .args(["get", resource])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        if resource == "alarms" {
+            let saved: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+            assert!(saved["alarms"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|alarm| alarm["id"] == "overflow_trip"));
+        } else {
+            assert!(String::from_utf8(saved)
+                .unwrap()
+                .contains("another writer's interlock edit"));
+        }
+    }
+}
+
 /// A resource name with non-ASCII characters must survive the trip through
 /// the CLI's URL encoder and the server's router.
 ///
@@ -302,4 +387,91 @@ fn copy_dir(src: &PathBuf, dst: &PathBuf) {
             std::fs::copy(entry.path(), &to).unwrap();
         }
     }
+}
+
+#[test]
+fn unavailable_device_has_stale_inputs_and_an_acknowledgeable_default_alarm() {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("device_health");
+    copy_dir(&repo_root().join("examples/device_health"), &proj);
+    // Own the port for the whole test but never answer a Modbus request.
+    // This is deterministic communication loss on loopback, not a bench probe.
+    let unavailable = TcpListener::bind("127.0.0.1:0").unwrap();
+    let device = proj.join("devices/bus0.toml");
+    let config = std::fs::read_to_string(&device).unwrap().replace(
+        "port = 65534",
+        &format!("port = {}", unavailable.local_addr().unwrap().port()),
+    );
+    std::fs::write(&device, config).unwrap();
+    assert!(!proj.join("alarms.toml").exists(), "zero-config regression");
+    let server = spawn_server(tmp.path());
+    server.open_project(&proj);
+    cs(&server.base)
+        .args(["api", "POST", "/api/run"])
+        .assert()
+        .success();
+    cs(&server.base)
+        .args(["sim", "run", "--no-run"])
+        .arg(proj.join("scenarios/unavailable.toml"))
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("scenario passed"));
+    let output = cs(&server.base)
+        .args(["api", "GET", "/api/runtime/snapshot"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let snapshot: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let vars = snapshot["vars"].as_array().unwrap();
+    let input = vars.iter().find(|v| v["name"] == "input_value").unwrap();
+    assert_eq!(input["input"]["stale"], true);
+    assert_eq!(input["input"]["device"], "bus0");
+    assert_eq!(input["input"]["channel"], "input");
+    // The IDE receives SSE, not the one-shot route: prove the wire event
+    // preserves quality as well, including snapshots forwarded by the server.
+    use std::io::BufRead;
+    let stream = ureq::get(&format!("{}/api/events", server.base))
+        .timeout(std::time::Duration::from_secs(3))
+        .call()
+        .unwrap();
+    let event = std::io::BufReader::new(stream.into_reader())
+        .lines()
+        .take(30)
+        .find_map(|line| {
+            let line = line.unwrap();
+            let data = line.strip_prefix("data:")?;
+            let event: serde_json::Value = serde_json::from_str(data.trim()).unwrap();
+            (event["type"] == "snapshot").then_some(event)
+        })
+        .expect("SSE must emit a snapshot");
+    let streamed = event["data"]["vars"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["name"] == "input_value")
+        .unwrap();
+    assert_eq!(streamed["input"], input["input"]);
+    assert_eq!(event["data"]["device_health"][0]["healthy"], false);
+    assert!(vars
+        .iter()
+        .find(|v| v["name"] == "ticks")
+        .unwrap()
+        .get("input")
+        .is_none());
+    let output = cs(&server.base)
+        .args(["api", "POST", "/api/runtime/alarms/__device%2Fbus0/ack"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let alarm: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(alarm["active"], true);
+    assert_eq!(alarm["acked"], true);
+    cs(&server.base)
+        .args(["api", "POST", "/api/stop"])
+        .assert()
+        .success();
 }

@@ -13,6 +13,14 @@ state valid.
 
 ## The workflow
 
+For live data, inspect `VarValue.input.stale` as well as feed liveness. Mapped
+inputs identify their `device` and `channel`; stale inputs are last-known, not
+fresh measurements. HMI bindings/interlocks treat them as unknown, affected
+nodes show a quality warning, and trends leave a gap. Unrelated healthy values
+remain usable. This is direct input provenance, not dependency tracking through
+PLC calculations. Device loss also raises `__device/<name>` automatically after
+1 s; see [alarms and history](09-sim-alarms.md).
+
 Start from project truth, not from a blank page. `cs hmi generate overview`
 builds a deterministic first pass — alarm bar on top, one section per POU
 file, BOOLs as indicators, numerics as value readouts, `*_sp`-named

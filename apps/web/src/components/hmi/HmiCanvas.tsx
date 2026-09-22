@@ -31,6 +31,8 @@ import {
   cssColor,
   displayBinding,
   lookupVar,
+  snapshotVariable,
+  toNumber,
   resolveBinding,
   resolveOn,
 } from "@/lib/hmi-binding"
@@ -212,10 +214,8 @@ export function HmiCanvas({
     const t = Number(snapshot.timestamp_us) / 1e6
     for (const [name, windowS] of trendWindows(doc)) {
       const found = lookupVar(snapshot, name)
-      if (!found) continue
-      const n = Number.isNaN(Number(found.raw))
-        ? (/^true$/i.test(found.raw.trim()) ? 1 : 0)
-        : Number(found.raw)
+      const parsed = found ? toNumber(found.raw) : NaN
+      const n = Number.isFinite(parsed) ? parsed : null
       let buf = historyRef.current.get(name)
       if (!buf) {
         buf = []
@@ -642,6 +642,12 @@ function CanvasNode({
   if (hidden && mode === "operate") return null
 
   const body = renderKind(node, snapshot, historyRef, onAction, host, mode)
+  const boundNames = Object.values(node.bind).flatMap(b => b === undefined ? [] : [bindingVariable(b)])
+  if (node.type === "trend") boundNames.push(...node.series.map(s => s.variable))
+  const staleInputs = [...new Set(boundNames.flatMap(name => {
+    const input = snapshotVariable(snapshot, name)?.input
+    return input?.stale ? [`${input.device}/${input.channel}`] : []
+  }))]
 
   // In Operate mode a tap-actionable node IS a control: give it a real
   // role and a keyboard path (Enter/Space through the same gated
@@ -660,6 +666,7 @@ function CanvasNode({
     <div
       data-hmi-id={node.id}
       data-hmi-type={node.type}
+      data-stale-input={staleInputs.length > 0 ? "true" : undefined}
       role={keyboardActionable ? "button" : undefined}
       tabIndex={keyboardActionable ? 0 : undefined}
       onKeyDown={
@@ -703,6 +710,8 @@ function CanvasNode({
       }}
     >
       {body}
+      {staleInputs.length > 0 && <span className="pointer-events-none absolute left-0 top-full z-10 max-w-full truncate rounded bg-warn/15 px-1 text-[10px] text-warn"
+        title={`Last-known input, not live feedback: ${staleInputs.join(", ")}`}>Stale · {staleInputs.join(", ")}</span>}
       {node.type === "group" &&
         node.children.map((c) => (
           <CanvasNode

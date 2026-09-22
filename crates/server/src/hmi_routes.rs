@@ -7,6 +7,8 @@
 //! animate exactly the elements an agent just placed, Pencil-style,
 //! instead of re-rendering blind.
 
+use crate::conditional::{self, Versioned};
+use axum::http::HeaderMap;
 use std::collections::BTreeMap;
 
 use axum::extract::{Path as AxumPath, State};
@@ -67,11 +69,12 @@ pub async fn create_hmi(
     State(state): State<AppState>,
     project: ProjectName,
     Json(req): Json<CreateHmiRequest>,
-) -> Result<Json<HmiDoc>, ApiError> {
+) -> Result<Versioned<HmiDoc>, ApiError> {
     let (doc, project_name) = with_project(&state, &project, |store| {
         let title = req.title.clone().unwrap_or_else(|| req.path.clone());
+        let doc = store.create_hmi(&req.path, &title)?;
         Ok((
-            store.create_hmi(&req.path, &title)?,
+            conditional::reply(&conditional::file(store, "hmi", &req.path)?, doc)?,
             store.name().to_string(),
         ))
     })?;
@@ -83,15 +86,18 @@ pub async fn create_hmi(
             touched: vec![],
         },
     );
-    Ok(Json(doc))
+    Ok(doc)
 }
 
 pub async fn get_hmi(
     State(state): State<AppState>,
     project: ProjectName,
     AxumPath(path): AxumPath<String>,
-) -> Result<Json<HmiDoc>, ApiError> {
-    with_project(&state, &project, |store| Ok(store.read_hmi(&path)?)).map(Json)
+) -> Result<Versioned<HmiDoc>, ApiError> {
+    with_project(&state, &project, |store| {
+        let file = conditional::file(store, "hmi", &path)?;
+        conditional::read(&file, || Ok(store.read_hmi(&path)?))
+    })
 }
 
 /// The one persistence gate: error-severity findings block a write.
@@ -109,16 +115,22 @@ fn structural_errors(issues: &[HmiIssue]) -> Option<String> {
 pub async fn put_hmi(
     State(state): State<AppState>,
     project: ProjectName,
+    headers: HeaderMap,
     AxumPath(path): AxumPath<String>,
     Json(doc): Json<HmiDoc>,
-) -> Result<Json<Vec<HmiIssue>>, ApiError> {
+) -> Result<Versioned<Vec<HmiIssue>>, ApiError> {
     let issues = validate_hmi(&doc);
     if let Some(msg) = structural_errors(&issues) {
         return Err(ApiError::BadRequest(msg));
     }
-    let project_name = with_project(&state, &project, |store| {
+    let (project_name, response) = with_project(&state, &project, |store| {
+        let file = conditional::file(store, "hmi", &path)?;
+        conditional::check(&file, &headers)?;
         store.write_hmi(&path, &doc)?;
-        Ok(store.name().to_string())
+        Ok((
+            store.name().to_string(),
+            conditional::written(&file, issues)?,
+        ))
     })?;
     // Whole-document save: no per-node touched list (the canvas refreshes
     // without spawn animation — saves are edits, not generation).
@@ -130,7 +142,7 @@ pub async fn put_hmi(
             touched: vec![],
         },
     );
-    Ok(Json(issues))
+    Ok(response)
 }
 
 pub async fn delete_hmi(

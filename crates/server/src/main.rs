@@ -1,4 +1,7 @@
 mod catalog;
+mod conditional;
+#[cfg(test)]
+mod conditional_tests;
 mod edges;
 mod error;
 mod events;

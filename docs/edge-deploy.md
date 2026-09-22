@@ -182,6 +182,23 @@ rollback is just "point `current` at an older version and restart".
   If you find a legitimate access blocked, loosen carefully — these are
   there to limit what a misbehaving runtime can touch.
 
+## Shutdown and failsafe evidence
+
+A completed bridge drain means the failsafe and teardown **attempts**
+finished, not that every physical output was confirmed safe. The scan
+loop's final log includes `failsafe_failed` and `shutdown_failed` device
+counts; inspect the preceding device/channel errors whenever either is
+nonzero. Even zero counts do not replace physical readback or a hardware
+safety circuit.
+
+For Modbus, `protocol: modbus exception: …` means the slave replied but
+rejected that write; the failsafe sweep continues to the remaining
+writable channels and reports that some outputs are unconfirmed.
+`transport: …` means the link failed (or timed out), so the sweep aborts
+the remaining writes to keep shutdown bounded. A later transport failure
+takes precedence over an earlier protocol rejection. Neither case is
+reported as “outputs in failsafe”.
+
 ## EtherCAT mode selection
 
 `iomap-ethercat` picks between two implementations based on the device
@@ -197,6 +214,16 @@ For real-mode channels, you must fill in `pdi_byte_offset` (and
 this PDO entry within the SubDevice's input or output PDI region. The
 device editor surfaces these alongside the CoE `pdo_index` / `sub_index`
 fields. They default to 0 for back-compat with sim-only configs.
+
+On link loss, recovery first counts responding slaves with one read-only
+BRD(Type). If that count differs from the last successful walk, it keeps
+the existing capped backoff without resetting/configuring the surviving
+slaves. A matching count still requires the full walk, configured identity
+checks, and OP transition; it does not mark the bus healthy by itself.
+The `reinits` heartbeat field counts recovery attempts, including census
+deferrals, not just full bus walks. See
+[reconnect cadence acceptance](bench/ethercat-reconnect-cadence.md) for
+the offline evidence and the remaining hardware timing check.
 
 ### Dedicate the NIC to EtherCAT
 
@@ -232,6 +259,18 @@ with `ethtool -k enp2s0`.) Use a **separate NIC** for EtherCAT from the
 one carrying your SSH / management traffic.
 
 ## Caveats
+
+- Field-input quality travels with each snapshot: mapped input variables carry
+  `input: { device, channel, stale }`, and the snapshot carries `device_health`.
+  Keep last-known values distinct from fresh measurements. MQTT snapshots keep
+  the existing `values` object and add `inputs` (variable-name → the same quality
+  object) and `device_health`; consumers must inspect quality before using a value.
+  This does not trace dependencies through PLC calculations.
+- Sustained device loss automatically raises `__device/<name>` after 1 s,
+  even with no `alarms.toml`. Recovery returns the alarm; acknowledgement is
+  still required for an unacknowledged occurrence. The existing `/alarms`,
+  `/alarms-journal`, and encoded-id ack endpoint expose it. Process alarms do
+  not evaluate stale field inputs, and persisted history marks stale buckets.
 
 - **No EtherCAT hardware on the dev machine**: leave `nic = "_sim"`. The
   IDE will let you configure PDOs and the bridge will respond in sim

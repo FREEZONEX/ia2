@@ -14,8 +14,8 @@ SRV="'"$SRV"'"
 # 1. create (becomes the active project)
 cs project create tank_ctrl --server "$SRV"
 
-# 2. main PROGRAM (ST). VAR RETAIN values survive restart.
-cs --project tank_ctrl set pous/main.st --server "$SRV" --from - <<"ST"
+# 2. Deliberately replace the just-created template main PROGRAM.
+cs --project tank_ctrl set pous/main.st --force --server "$SRV" --from - <<"ST"
 PROGRAM main
   VAR level : INT := 0; setpoint : INT := 800; valve_open, pump_on : BOOL; END_VAR
   VAR RETAIN cycle_count : DINT := 0; END_VAR
@@ -41,14 +41,14 @@ Then tell the user: "Monitor pane should now show `level` oscillating around 800
 
 ## B. Add a device + wire it to program variables
 
-Devices and iomap are JSON: `cs get devices/<n>` → edit → `cs set devices/<n> --from -`. The device body is the full `Device` (top-level `name` + `protocol`), exactly what `cs get devices/<n>` prints — so it round-trips. `cs set` is upsert: a body that already carries `protocol` creates the device outright, no separate create step. (Full shapes: `06-devices-iomap-tasks.md`.)
+Devices and iomap are JSON: `cs get devices/<n> --etag-file device.etag` → edit → `cs set devices/<n> --from - --if-match @device.etag`. The device body is the full `Device` (top-level `name` + `protocol`), exactly what `cs get devices/<n>` prints — so it round-trips. `cs set` is upsert: a body that already carries `protocol` creates the device outright, no separate create step. (Full shapes: `06-devices-iomap-tasks.md`.)
 
 ```bash
 cs agent run --label "Wire HMI to tank_ctrl" --server "$SRV" -- bash -c '
 set -e
 SRV="'"$SRV"'"
 
-# device — upsert the whole config (the "protocol" in the body creates it)
+# NEW device — the "protocol" in the body creates it; existing names require an original-read ETag
 cs --project tank_ctrl set devices/hmi --server "$SRV" --from - <<"JSON"
 { "name": "hmi", "protocol": "modbus",
   "transport": { "kind": "tcp", "host": "127.0.0.1", "port": 5502 },
@@ -59,8 +59,9 @@ cs --project tank_ctrl set devices/hmi --server "$SRV" --from - <<"JSON"
     { "name": "level",  "kind": "holding_register", "address": 0 } ] }
 JSON
 
-# iomap — note the mandatory "application" field (the POU name)
-cs --project tank_ctrl set iomap --server "$SRV" --from - <<"JSON"
+# iomap — read the original version before editing; preserve any existing mappings
+cs --project tank_ctrl get iomap --etag-file iomap.etag --server "$SRV"
+cs --project tank_ctrl set iomap --if-match @iomap.etag --server "$SRV" --from - <<"JSON"
 { "mappings": [
   { "application": "main", "variable": "valve_open", "device": "hmi", "channel": "valve", "direction": "output" },
   { "application": "main", "variable": "level",      "device": "hmi", "channel": "level", "direction": "output" } ] }
@@ -77,7 +78,8 @@ cs project check ~/Documents/IA2/tank_ctrl
 `cs run` (no `--program`) runs the whole tasks.toml — every scheduled PROGRAM, each in its own container, round-robin on one scan thread. The only rejected shape is 2+ PROGRAMs that *also* share a `VAR_GLOBAL` (globals aren't shared across instances). See `01-mental-model.md` fact 2.
 
 ```bash
-cs --project tank_ctrl set tasks --server "$SRV" --from - <<'JSON'
+cs --project tank_ctrl get tasks --etag-file tasks.etag --server "$SRV"
+cs --project tank_ctrl set tasks --if-match @tasks.etag --server "$SRV" --from - <<'JSON'
 { "tasks":    [ { "name": "fast", "interval_ms": 50, "priority": 1 } ],
   "programs": [ { "instance": "main_inst", "program": "main", "task": "fast" } ] }
 JSON
@@ -116,7 +118,8 @@ Always `unforce` what you `force`. A leftover force is invisible until someone w
 Switch a Modbus device to RTU by setting its transport. macOS device paths look like `/dev/cu.usbserial-XXXX`; Linux `/dev/ttyUSB0`; Windows `COM3`.
 
 ```bash
-cs --project tank_ctrl set devices/hmi --server "$SRV" --from - <<'JSON'
+cs --project tank_ctrl get devices/hmi --etag-file hmi.etag --server "$SRV"
+cs --project tank_ctrl set devices/hmi --if-match @hmi.etag --server "$SRV" --from - <<'JSON'
 { "name": "hmi", "protocol": "modbus",
   "transport": { "kind": "rtu", "serial_device": "/dev/cu.usbserial-A1B2",
                  "baud_rate": 9600, "data_bits": "eight", "stop_bits": "one", "parity": "none" },
@@ -173,8 +176,10 @@ When more than one project is open, **every** command needs `--project`. Check f
 
 ```bash
 cs ls projects --server "$SRV"           # see what's open, which is active (*)
-cs --project bottling set pous/main.st --from - ...
-cs --project mixer    set pous/main.st --from - ...   # different window, different project, no cross-talk
+cs --project bottling get pous/main.st --etag-file bottling.etag
+cs --project bottling set pous/main.st --from - --if-match @bottling.etag ...
+cs --project mixer get pous/main.st --etag-file mixer.etag
+cs --project mixer set pous/main.st --from - --if-match @mixer.etag ...   # different window, different project, no cross-talk
 ```
 
 Only one program runs at a time across the whole server. If `bottling` is running and you `cs --project mixer run`, the bottling program stops. Tell the user before doing that.
