@@ -215,6 +215,16 @@ this PDO entry within the SubDevice's input or output PDI region. The
 device editor surfaces these alongside the CoE `pdo_index` / `sub_index`
 fields. They default to 0 for back-compat with sim-only configs.
 
+On link loss, recovery first counts responding slaves with one read-only
+BRD(Type). If that count differs from the last successful walk, it keeps
+the existing capped backoff without resetting/configuring the surviving
+slaves. A matching count still requires the full walk, configured identity
+checks, and OP transition; it does not mark the bus healthy by itself.
+The `reinits` heartbeat field counts recovery attempts, including census
+deferrals, not just full bus walks. See
+[reconnect cadence acceptance](bench/ethercat-reconnect-cadence.md) for
+the offline evidence and the remaining hardware timing check.
+
 ### Dedicate the NIC to EtherCAT
 
 EtherCAT is raw Layer-2 with no IP. The interface must be left alone by
