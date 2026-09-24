@@ -803,6 +803,14 @@ fn check_pou_source_with_context(
                 Ok(p) => p,
                 Err(e) => return vec![synthetic_parse_diag("LD-PARSE", "LD", &e)],
             };
+            // Checked ahead of the transpile only to keep its location:
+            // the editor highlights the clashing placement's rung.
+            if let Some(clash) = ld_transpile::instance_name_clash(&prog) {
+                return vec![CheckDiagnostic {
+                    ld_location: Some(clash.location.clone()),
+                    ..synthetic_transpile_diag("LD-TRANSPILE", &clash.into())
+                }];
+            }
             let (st, map) = match ld_transpile::transpile_to_st_with_map(&prog) {
                 Ok(pair) => pair,
                 Err(e) => return vec![synthetic_transpile_diag("LD-TRANSPILE", &e)],
@@ -814,6 +822,13 @@ fn check_pou_source_with_context(
                 Ok(p) => p,
                 Err(e) => return vec![synthetic_parse_diag("FBD-PARSE", "FBD", &e)],
             };
+            // As for LD: keep the clashing block's location.
+            if let Some(clash) = fbd_transpile::instance_name_clash(&prog) {
+                return vec![CheckDiagnostic {
+                    fbd_location: Some(clash.location.clone()),
+                    ..synthetic_transpile_diag("FBD-TRANSPILE", &clash.into())
+                }];
+            }
             let (st, map) = match fbd_transpile::transpile_to_st_with_map(&prog) {
                 Ok(pair) => pair,
                 Err(e) => return vec![synthetic_transpile_diag("FBD-TRANSPILE", &e)],

@@ -20,7 +20,7 @@
 //! source-map plumbing lands in a follow-up; the rung `id` field on
 //! `LdRung` is the anchor.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
 
 use project::{
@@ -30,7 +30,7 @@ use project::{
 use serde::Serialize;
 use ts_rs::TS;
 
-use crate::errors::BridgeError;
+use crate::errors::{BridgeError, NameClash};
 
 /// `(instance_name, fb_type)`. Stable across iterations because we
 /// build it from a deterministic walk of the program.
@@ -141,18 +141,27 @@ pub fn transpile_to_st_with_map(prog: &LdProgram) -> Result<(String, LdSourceMap
         LdPouType::FunctionBlock => ("FUNCTION_BLOCK", "END_FUNCTION_BLOCK"),
     };
 
+    // Pre-scan: collect every FB instance referenced from any rung's
+    // logic tree. Each instance becomes a `name : fb_type;` line in
+    // the internal VAR block. Conflicts error early — a name clash with
+    // another declaration, or one instance with two FB types — since
+    // silently picking one would lead to a very confusing ironplc
+    // diagnostic later, or none and a VM that never starts.
+    if let Some(clash) = instance_name_clash(prog) {
+        return Err(clash.into());
+    }
+    let fb_instances = collect_fb_instances(&prog.rungs)?;
+
     // Pre-scan: which rungs evaluate their network into a BOOL temporary.
     // ironplc requires every identifier to be declared in a VAR block
     // before use, so the names are fixed up-front and emitted as internal
     // variables. See `needs_temp` for which rungs, and why.
-    let rung_temps = rung_temporaries(&prog.rungs);
-
-    // Pre-scan: collect every FB instance referenced from any rung's
-    // logic tree. Each instance becomes a `name : fb_type;` line in
-    // the internal VAR block. Conflicts (same instance name, different
-    // FB types) error early — silently picking one would lead to a
-    // very confusing ironplc diagnostic later.
-    let fb_instances = collect_fb_instances(&prog.rungs)?;
+    let reserved = prog
+        .variables
+        .iter()
+        .map(|v| v.name.as_str())
+        .chain(fb_instances.keys().map(String::as_str));
+    let rung_temps = rung_temporaries(&prog.rungs, reserved);
 
     em.line(None, format_args!("{} {}", head, prog.name));
     let declared_temps: Vec<String> = rung_temps.iter().flatten().cloned().collect();
@@ -186,10 +195,16 @@ fn needs_temp(rung: &LdRung) -> bool {
 }
 
 /// One slot per rung: the temporary's name, or `None`. Names derive from
-/// the rung id; two ids that sanitise alike get the rung index appended so
-/// the declarations never collide.
-fn rung_temporaries(rungs: &[LdRung]) -> Vec<Option<String>> {
-    let mut taken = std::collections::HashSet::new();
+/// the rung id and must be unique the way IEC compares names — ignoring
+/// case — among themselves and against `reserved` (the POU's variables
+/// and FB instances). They are the transpiler's own names, so a clash is
+/// renamed, not refused: two ids that sanitise alike, or differ only in
+/// case (`Fill` / `fill`), get the rung index appended, then a counter.
+fn rung_temporaries<'a>(
+    rungs: &[LdRung],
+    reserved: impl IntoIterator<Item = &'a str>,
+) -> Vec<Option<String>> {
+    let mut taken: HashSet<String> = reserved.into_iter().map(str::to_lowercase).collect();
     rungs
         .iter()
         .enumerate()
@@ -197,14 +212,83 @@ fn rung_temporaries(rungs: &[LdRung]) -> Vec<Option<String>> {
             if !needs_temp(rung) {
                 return None;
             }
-            let mut name = format!("__rung_{}", sanitise_ident(&rung.id));
-            if !taken.insert(name.clone()) {
-                name = format!("{name}_{idx}");
-                taken.insert(name.clone());
+            let base = format!("__rung_{}", sanitise_ident(&rung.id));
+            let mut name = base.clone();
+            let mut attempt = 0;
+            while !taken.insert(name.to_lowercase()) {
+                attempt += 1;
+                name = match attempt {
+                    1 => format!("{base}_{idx}"),
+                    n => format!("{base}_{idx}_{n}"),
+                };
             }
             Some(name)
         })
         .collect()
+}
+
+/// The first FB placement whose instance name clashes with another
+/// declaration once IEC 61131-3's case-insensitive name rules apply, or
+/// `None`. Both clashes are refused rather than guessed at:
+///
+///   * a placement whose name differs only in case from an earlier one
+///     (`T1` / `t1`). An exact repeat shares one instance across rungs;
+///     a case-only difference is ambiguous — one instance or two?
+///   * a placement named like a variable the POU declares. The diagram
+///     declares its FB instances itself, so both would be declared.
+///
+/// Located at the clashing placement so the editor can point at its
+/// rung. Empty names are left to `collect_fb_instances`.
+pub fn instance_name_clash(prog: &LdProgram) -> Option<NameClash<LdLocation>> {
+    let variables: HashMap<String, &str> = prog
+        .variables
+        .iter()
+        .map(|v| (v.name.to_lowercase(), v.name.as_str()))
+        .collect();
+    // lower-cased name → (first spelling, its rung id)
+    let mut seen: HashMap<String, (String, &str)> = HashMap::new();
+    for rung in &prog.rungs {
+        let mut placed = Vec::new();
+        let _ = walk_in_order(&rung.logic, &mut |node| {
+            if let LdNode::FbCall { instance, .. } = node {
+                placed.push(instance.clone());
+            }
+            Ok(())
+        });
+        for instance in placed.into_iter().filter(|i| !i.is_empty()) {
+            let key = instance.to_lowercase();
+            let message = if let Some(var) = variables.get(&key) {
+                format!(
+                    "FB instance '{instance}' in rung '{}' has the same name as the variable \
+                     '{var}' (IEC 61131-3 names are case-insensitive). The diagram declares its \
+                     FB instances itself — rename the instance, or remove or rename the variable",
+                    rung.id
+                )
+            } else if let Some((first, first_rung)) = seen.get(&key) {
+                if *first == instance {
+                    continue;
+                }
+                format!(
+                    "FB instance '{instance}' in rung '{}' differs only in case from instance \
+                     '{first}' in rung '{first_rung}'. IEC 61131-3 names are case-insensitive, so \
+                     both would declare the same name — use the same spelling to share one \
+                     instance, or a different name for a separate one",
+                    rung.id
+                )
+            } else {
+                seen.insert(key, (instance, rung.id.as_str()));
+                continue;
+            };
+            return Some(NameClash {
+                message,
+                location: LdLocation::FbCall {
+                    rung_id: rung.id.clone(),
+                    instance,
+                },
+            });
+        }
+    }
+    None
 }
 
 /// Walk all rung logic trees, gathering every `FbCall` instance. Errors
@@ -1285,12 +1369,6 @@ mod tests {
                     section: LdVarSection::Output,
                     init: None,
                 },
-                LdVariable {
-                    name: "__rung_multi".into(),
-                    type_name: "BOOL".into(),
-                    section: LdVarSection::Internal,
-                    init: None,
-                },
             ],
             rungs: vec![LdRung {
                 id: "multi".into(),
@@ -2107,5 +2185,123 @@ mod tests {
             ],
         );
         assert_compiles_clean(&prog);
+    }
+
+    fn ton(instance: &str, input: &str) -> LdNode {
+        fb(
+            instance,
+            "TON",
+            &[("IN", lit(input)), ("PT", lit("T#200ms"))],
+            "Q",
+        )
+    }
+
+    /// The single diagnostic the editor gets for `prog`, which must be a
+    /// located transpile error.
+    fn transpile_diagnostic(prog: &LdProgram) -> crate::CheckDiagnostic {
+        let source = serde_json::to_string(prog).unwrap();
+        let diags = crate::check_pou_source(&source, project::PouLanguage::Ld);
+        assert_eq!(diags.len(), 1, "{diags:#?}");
+        assert_eq!(diags[0].code, "LD-TRANSPILE", "{diags:#?}");
+        diags[0].clone()
+    }
+
+    /// IEC names are case-insensitive, so `T1` and `t1` are one name. The
+    /// transpiler used to key instances by exact string and declare both;
+    /// the program checked clean and its VM never started. Refused now,
+    /// pointing at the later placement and naming both.
+    #[test]
+    fn instances_differing_only_in_case_are_refused_at_the_later_rung() {
+        let prog = program(
+            vec![bool_var("a", None), bool_var("b", None)],
+            vec![
+                rung("r0", ton("T1", "TRUE"), "a", LdCoilKind::Standard),
+                rung("r1", ton("t1", "FALSE"), "b", LdCoilKind::Standard),
+            ],
+        );
+        let err = transpile_to_st(&prog).unwrap_err().to_string();
+        assert!(
+            err.contains("'t1'")
+                && err.contains("'T1'")
+                && err.contains("'r1'")
+                && err.contains("'r0'")
+                && err.contains("case"),
+            "{err}"
+        );
+
+        let d = transpile_diagnostic(&prog);
+        assert!(
+            matches!(
+                d.ld_location,
+                Some(LdLocation::FbCall { ref rung_id, ref instance })
+                    if rung_id == "r1" && instance == "t1"
+            ),
+            "{d:#?}"
+        );
+    }
+
+    /// An FB instance the diagram declares must not also be a variable
+    /// the POU declares — in any spelling.
+    #[test]
+    fn an_instance_named_like_a_variable_is_refused() {
+        let prog = program(
+            vec![
+                bool_var("a", None),
+                LdVariable {
+                    name: "Timer1".into(),
+                    type_name: "TON".into(),
+                    section: LdVarSection::Internal,
+                    init: None,
+                },
+            ],
+            vec![rung("r0", ton("timer1", "TRUE"), "a", LdCoilKind::Standard)],
+        );
+        let err = transpile_to_st(&prog).unwrap_err().to_string();
+        assert!(
+            err.contains("'timer1'") && err.contains("'Timer1'") && err.contains("variable"),
+            "{err}"
+        );
+
+        let d = transpile_diagnostic(&prog);
+        assert!(
+            matches!(
+                d.ld_location,
+                Some(LdLocation::FbCall { ref rung_id, ref instance })
+                    if rung_id == "r0" && instance == "timer1"
+            ),
+            "{d:#?}"
+        );
+    }
+
+    /// Rung temporaries are the transpiler's own names, so a clash is
+    /// renamed rather than refused — case-insensitively, and away from
+    /// the POU's variables. `Fill`/`fill` used to declare `__rung_Fill`
+    /// and `__rung_fill`, one name twice, and the VM never started.
+    #[test]
+    fn rung_temporaries_are_distinct_ignoring_case_and_user_variables() {
+        let prog = program(
+            vec![
+                bool_var("a", Some("TRUE")),
+                bool_var("p", None),
+                bool_var("q", None),
+                bool_var("r", None),
+                bool_var("__rung_x", None),
+            ],
+            vec![
+                rung("Fill", contact("a"), "p", LdCoilKind::Set),
+                rung(
+                    "fill",
+                    LdNode::Not {
+                        arg: Box::new(contact("a")),
+                    },
+                    "q",
+                    LdCoilKind::Set,
+                ),
+                rung("x", contact("a"), "r", LdCoilKind::Set),
+            ],
+        );
+        let st = transpile_to_st(&prog).unwrap();
+        let v = crate::test_vm::run_st(&st, 2);
+        assert_eq!((v["p"], v["q"], v["r"]), (1, 0, 1), "{st}");
     }
 }

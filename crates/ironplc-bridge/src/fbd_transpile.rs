@@ -28,7 +28,7 @@ use project::{
 use serde::Serialize;
 use ts_rs::TS;
 
-use crate::errors::BridgeError;
+use crate::errors::{BridgeError, NameClash};
 
 // =================================================================
 //   Source map (parallel to ld_transpile::LdLocation)
@@ -121,8 +121,8 @@ pub fn transpile_to_st_with_map(prog: &FbdProgram) -> Result<(String, FbdSourceM
             )));
         }
     }
-    // 2. Instance names unique (two blocks can't share an FB instance).
-    let mut instances: HashMap<&str, &str> = HashMap::new();
+    // 2. Instance names unique (two blocks can't share an FB instance)
+    //    and clear of the POU's variables, ignoring case.
     for b in &prog.blocks {
         if b.instance.is_empty() {
             return Err(BridgeError::Parse(format!(
@@ -136,12 +136,9 @@ pub fn transpile_to_st_with_map(prog: &FbdProgram) -> Result<(String, FbdSourceM
                 b.id
             )));
         }
-        if let Some(prev_id) = instances.insert(b.instance.as_str(), b.id.as_str()) {
-            return Err(BridgeError::Parse(format!(
-                "FB instance '{}' used by both block '{}' and block '{}'",
-                b.instance, prev_id, b.id
-            )));
-        }
+    }
+    if let Some(clash) = instance_name_clash(prog) {
+        return Err(clash.into());
     }
     // 3. Wire endpoints reference existing blocks.
     let id_to_idx: HashMap<&str, usize> = prog
@@ -176,15 +173,16 @@ pub fn transpile_to_st_with_map(prog: &FbdProgram) -> Result<(String, FbdSourceM
             )));
         }
     }
-    // 4. Each VAR_OUTPUT is driven by at most one binding.
-    let mut driven: HashMap<&str, &str> = HashMap::new();
+    // 4. Each VAR_OUTPUT is driven by at most one binding, in any
+    //    spelling — `Out` and `out` are one variable.
+    let mut driven: HashMap<String, &str> = HashMap::new();
     for out in &prog.outputs {
         if out.variable.is_empty() {
             return Err(BridgeError::Parse(
                 "FBD output binding has empty variable".into(),
             ));
         }
-        if let Some(prev) = driven.insert(out.variable.as_str(), out.from_block.as_str()) {
+        if let Some(prev) = driven.insert(out.variable.to_lowercase(), out.from_block.as_str()) {
             return Err(BridgeError::Parse(format!(
                 "Output variable '{}' driven by two blocks ({} and {})",
                 out.variable, prev, out.from_block
@@ -241,6 +239,57 @@ pub fn transpile_to_st_with_map(prog: &FbdProgram) -> Result<(String, FbdSourceM
 // =================================================================
 //   Helpers
 // =================================================================
+
+/// The first block whose FB instance name clashes with another
+/// declaration once IEC 61131-3's case-insensitive name rules apply, or
+/// `None`: another block's instance in any spelling (two blocks cannot
+/// share an instance), or a variable the POU declares (the diagram
+/// declares its FB instances itself, so both would be declared). Located
+/// at the later block so the editor can point at it. Empty names are
+/// left to the transpiler's own checks.
+pub fn instance_name_clash(prog: &FbdProgram) -> Option<NameClash<FbdLocation>> {
+    let variables: HashMap<String, &str> = prog
+        .variables
+        .iter()
+        .map(|v| (v.name.to_lowercase(), v.name.as_str()))
+        .collect();
+    let mut seen: HashMap<String, &FbdBlock> = HashMap::new();
+    for b in prog.blocks.iter().filter(|b| !b.instance.is_empty()) {
+        let key = b.instance.to_lowercase();
+        let message = if let Some(var) = variables.get(&key) {
+            format!(
+                "FB instance '{}' of block '{}' has the same name as the variable '{var}' \
+                 (IEC 61131-3 names are case-insensitive). The diagram declares its FB \
+                 instances itself — rename the instance, or remove or rename the variable",
+                b.instance, b.id
+            )
+        } else if let Some(prev) = seen.get(&key) {
+            if prev.instance == b.instance {
+                format!(
+                    "FB instance '{}' used by both block '{}' and block '{}'",
+                    b.instance, prev.id, b.id
+                )
+            } else {
+                format!(
+                    "FB instance '{}' of block '{}' differs only in case from instance '{}' of \
+                     block '{}'. IEC 61131-3 names are case-insensitive, so both blocks would \
+                     declare the same name — rename one of them",
+                    b.instance, b.id, prev.instance, prev.id
+                )
+            }
+        } else {
+            seen.insert(key, b);
+            continue;
+        };
+        return Some(NameClash {
+            message,
+            location: FbdLocation::Block {
+                block_id: b.id.clone(),
+            },
+        });
+    }
+    None
+}
 
 fn write_variable_blocks(
     em: &mut StEmitter,
@@ -837,5 +886,133 @@ mod tests {
         if let Err(e) = crate::compile(&st) {
             panic!("ironplc cannot generate code for our ST:\n{st}\n{e}");
         }
+    }
+
+    fn bool_var(name: &str, section: LdVarSection) -> LdVariable {
+        LdVariable {
+            name: name.into(),
+            type_name: "BOOL".into(),
+            section,
+            init: None,
+        }
+    }
+
+    fn ton_block(id: &str, instance: &str) -> FbdBlock {
+        FbdBlock {
+            id: id.into(),
+            fb_type: "TON".into(),
+            instance: instance.into(),
+            inputs: vec![
+                FbdInputBinding {
+                    pin: "IN".into(),
+                    value: FbdInputSource::Literal {
+                        value: "TRUE".into(),
+                    },
+                },
+                FbdInputBinding {
+                    pin: "PT".into(),
+                    value: FbdInputSource::Literal {
+                        value: "T#200ms".into(),
+                    },
+                },
+            ],
+            position: None,
+        }
+    }
+
+    fn output(variable: &str, from_block: &str) -> FbdOutputBinding {
+        FbdOutputBinding {
+            variable: variable.into(),
+            from_block: from_block.into(),
+            from_pin: "Q".into(),
+        }
+    }
+
+    /// Two TON blocks `b1` / `b2` with the given instance names, each
+    /// driving its own output.
+    fn two_timers(first: &str, second: &str) -> FbdProgram {
+        FbdProgram {
+            name: "p".into(),
+            pou_type: LdPouType::Program,
+            variables: vec![
+                bool_var("a", LdVarSection::Output),
+                bool_var("b", LdVarSection::Output),
+            ],
+            blocks: vec![ton_block("b1", first), ton_block("b2", second)],
+            outputs: vec![output("a", "b1"), output("b", "b2")],
+        }
+    }
+
+    /// The single diagnostic the editor gets for `prog`, which must be a
+    /// transpile error located on `block_id`.
+    fn assert_located_at_block(prog: &FbdProgram, block_id: &str) {
+        let source = serde_json::to_string(prog).unwrap();
+        let diags = crate::check_pou_source(&source, project::PouLanguage::Fbd);
+        assert_eq!(diags.len(), 1, "{diags:#?}");
+        assert_eq!(diags[0].code, "FBD-TRANSPILE", "{diags:#?}");
+        assert!(
+            matches!(
+                diags[0].fbd_location,
+                Some(FbdLocation::Block { block_id: ref id }) if id == block_id
+            ),
+            "{diags:#?}"
+        );
+    }
+
+    /// IEC names are case-insensitive: `T1` and `t1` would be one instance
+    /// declared twice. The exact-duplicate check missed this, the program
+    /// checked clean, and its VM never started.
+    #[test]
+    fn instances_differing_only_in_case_are_refused_at_the_later_block() {
+        let prog = two_timers("T1", "t1");
+        let err = transpile_to_st(&prog).unwrap_err().to_string();
+        assert!(
+            err.contains("'t1'")
+                && err.contains("'T1'")
+                && err.contains("'b1'")
+                && err.contains("'b2'")
+                && err.contains("case"),
+            "{err}"
+        );
+        assert_located_at_block(&prog, "b2");
+    }
+
+    #[test]
+    fn an_exact_duplicate_instance_is_located_at_the_later_block() {
+        let prog = two_timers("T1", "T1");
+        let err = transpile_to_st(&prog).unwrap_err().to_string();
+        assert!(
+            err.contains("FB instance 'T1' used by both block 'b1' and block 'b2'"),
+            "{err}"
+        );
+        assert_located_at_block(&prog, "b2");
+    }
+
+    #[test]
+    fn an_instance_named_like_a_variable_is_refused() {
+        let mut prog = two_timers("T1", "timer1");
+        prog.variables.push(LdVariable {
+            name: "Timer1".into(),
+            type_name: "TON".into(),
+            section: LdVarSection::Internal,
+            init: None,
+        });
+        let err = transpile_to_st(&prog).unwrap_err().to_string();
+        assert!(
+            err.contains("'timer1'") && err.contains("'Timer1'") && err.contains("variable"),
+            "{err}"
+        );
+        assert_located_at_block(&prog, "b2");
+    }
+
+    /// `Out` and `out` are one variable, so binding both drives it twice
+    /// and the later assignment silently wins.
+    #[test]
+    fn outputs_differing_only_in_case_are_double_driven() {
+        let mut prog = two_timers("T1", "T2");
+        prog.variables = vec![bool_var("Out", LdVarSection::Output)];
+        prog.outputs = vec![output("Out", "b1"), output("out", "b2")];
+        let err = transpile_to_st(&prog).unwrap_err().to_string();
+        assert!(err.contains("driven by two blocks"), "{err}");
     }
 }
