@@ -2346,9 +2346,10 @@ pub async fn run(
                     // Ad-hoc isolated run: the named file's PROGRAM plus a
                     // single-PROGRAM CONFIGURATION. Sibling files that
                     // declare no PROGRAM ride along as type context, so
-                    // library FUNCTION_BLOCKs resolve — while the debug
-                    // section (and therefore Monitor) still shows exactly
-                    // the variables of the file the user is looking at.
+                    // library FUNCTION_BLOCKs, TYPEs and globals resolve —
+                    // while the debug section (and therefore Monitor)
+                    // shows the variables of the file the user is looking
+                    // at plus any project globals, never another PROGRAM's.
                     let tasks = single_program_tasks(name);
                     let (container, metadata) =
                         ironplc_bridge::compile_isolated_in_project_full(store, file_path, &tasks)?;
