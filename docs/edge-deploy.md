@@ -116,18 +116,26 @@ prompts — the IDE runs `ssh -o BatchMode=yes`).
      the old process. File rollback does not prove that it is running;
    - a missing `VERSION=` line from the remote script fails the deploy
      (script drift = state unknown);
-   - a restart systemd accepted is not a running program: after the
-     restart the deploy reads the runtime's `/status` until the program has
-     scanned and a second read shows no fault. A fault (a VM trap, a VM
-     that failed to start), a latched watchdog, or no scan within 30 s fails
-     the deploy (`ok: false`, `health` says why). The new version stays
-     installed and current — nothing is rolled back automatically; the log
-     names the previous version for the manual rollback below. A device
-     still down at the check is a `warning`, not a failure. When nothing was
-     restarted (the unit is not enabled), `health` says it was not checked;
-   - a `[governance]` table that is invalid (unknown key, `min > max`,
-     non-finite bound) is one such refusal — governance is validated on
-     load, never silently ignored;
+   - a restart systemd accepted is not a running program: the check requires
+     continuous mode and advancing positive scan counts in consecutive `/status`
+     reads. Counter/uptime resets and changed `runtime_id` restart the observation;
+     unchanged counts are waited for, since long-cycle tasks may not advance each
+     second. New runtimes provide a per-process `runtime_id`; older ones fall back
+     to counter/uptime evidence, which cannot exclude every fast restart;
+   - the entire check, including SSH reads and poll sleeps, has a 30 s deadline.
+     A fault/watchdog is `faulted`, paused/single-step mode is `not_running`, and
+     failure to confirm progress before the deadline is `unknown`. All fail the
+     deploy (`ok:false`). **Unknown does not prove stopped or physically safe.**
+     A task with a period longer than the observation window may remain unknown;
+   - the new version stays installed and current. No automatic rollback or
+     restart of the previous program occurs after a failed health check. Inspect
+     runtime and plant state before choosing manual recovery; the log names the
+     previous version. A down device on a running program remains a warning.
+     If nothing was restarted or the install directory differs from the service,
+     `not_checked` retains installation success (`ok:true`), while the IDE shows
+     program state unconfirmed, never green live;
+   - invalid `[governance]` (unknown keys, `min > max`, non-finite bounds)
+     is refused during snapshot preflight, before upload;
    - install_dir vs systemd-unit drift stays a deploy-level `warning`
      field in the report (structured, plus a WARNING line in the log) —
      the files land, but the service will not see them until you

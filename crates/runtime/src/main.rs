@@ -766,8 +766,24 @@ mod build_stamp_tests {
     }
 }
 
+/// Per-process identity, stable across requests and different after restart.
+fn runtime_instance_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock precedes Unix epoch")
+                .as_nanos()
+        )
+    })
+}
+
 #[derive(Serialize)]
 struct Status {
+    runtime_id: &'static str,
     version: &'static str,
     /// What built this binary: the source commit (suffixed `-dirty` when the
     /// tree had uncommitted changes) and the compiler version, stamped in at
@@ -849,6 +865,7 @@ async fn status(State(state): State<AppState>) -> Json<Status> {
         .filter(|a| a.standing())
         .count();
     Json(Status {
+        runtime_id: runtime_instance_id(),
         version: env!("CARGO_PKG_VERSION"),
         build_commit: env!("IA2_BUILD_COMMIT"),
         build_rustc: env!("IA2_BUILD_RUSTC"),

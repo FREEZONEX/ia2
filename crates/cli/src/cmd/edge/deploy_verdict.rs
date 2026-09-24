@@ -30,11 +30,16 @@ pub(super) fn deploy_verdict(name: &str, value: &serde_json::Value) -> Vec<Strin
             }
         }
         (false, Some(v)) if health.is_some() => {
+            let outcome = if matches!(state, Some("faulted" | "not_running")) {
+                "its program is not running"
+            } else {
+                "program state is unconfirmed"
+            };
             lines.push(format!(
-                "✗ deployed version {v} to '{name}', but its program is not running: {detail}"
+                "✗ deployed version {v} to '{name}', but {outcome}: {detail}"
             ));
             lines.push(
-                "  the new version is current — fix the program and deploy again, or roll \
+                "  the new version is current — inspect runtime and plant state before restarting or rolling \
                  back (the log names the previous version)"
                     .into(),
             );
@@ -114,5 +119,16 @@ mod tests {
             lines[1],
             "  program state not checked: nothing was restarted"
         );
+    }
+    #[test]
+    fn an_unknown_state_is_not_reported_as_stopped() {
+        let lines = deploy_verdict(
+            "pi",
+            &report(json!({"ok": false,
+            "health": {"state": "unknown", "detail": "status read timed out"}})),
+        );
+        assert!(lines[0].contains("state is unconfirmed"), "{lines:?}");
+        assert!(!lines[0].contains("not running"), "{lines:?}");
+        assert!(lines[1].contains("inspect runtime and plant state"));
     }
 }

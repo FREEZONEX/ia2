@@ -864,11 +864,20 @@ function DeployVerdict({ report }: { report: DeployReport }) {
             {outcome.detail && <span className="text-muted-foreground"> — {outcome.detail}</span>}
           </span>
         </div>
+      ) : outcome.kind === "unconfirmed" ? (
+        <div className="inline-flex items-center gap-1.5 text-warn">
+          <AlertCircle className="size-3.5" />
+          <span>
+            Version <span className="font-mono">{outcome.version}</span> installed;
+            program state unconfirmed: {outcome.detail}. Check runtime and plant state
+            before restarting or rolling back.
+          </span>
+        </div>
       ) : outcome.kind === "not_running" ? (
         <ErrorBox className="max-w-full whitespace-pre-wrap break-words p-2 text-xs">
           Version <span className="font-mono">{outcome.version}</span> is installed and
-          current, but its program is not running: {outcome.detail}. Fix the program and
-          deploy again, or roll back — the log names the previous version.
+          current, but continuous operation failed: {outcome.detail}. Inspect runtime and
+          plant state before restarting or rolling back — the log names the previous version.
         </ErrorBox>
       ) : (
         <ErrorBox className="max-w-full whitespace-pre-wrap p-2 text-xs">

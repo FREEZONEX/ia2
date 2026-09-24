@@ -55,15 +55,25 @@ describe("deployOutcome", () => {
     expect(deployOutcome(report({ ok: false, version: "" })).kind).toBe("failed")
   })
 
-  it("keeps a deploy with nothing restarted live, saying nothing was checked", () => {
+  it("shows an unchecked deployment as unconfirmed", () => {
     const outcome = deployOutcome(
       report({
         health: { state: "not_checked", detail: "nothing was restarted", unhealthy_devices: [] },
       }),
     )
     expect(outcome).toMatchObject({
-      kind: "live",
-      detail: "Program state not checked: nothing was restarted",
+      kind: "unconfirmed",
+      detail: "nothing was restarted",
     })
   })
+  it("does not mistake a communication timeout for a stopped program", () => {
+    expect(deployOutcome(report({ ok: false, health: {
+      state: "unknown", detail: "status read timed out", unhealthy_devices: [],
+    } }))).toMatchObject({ kind: "unconfirmed", detail: "status read timed out" })
+  })
+
+  it("does not infer running from a legacy successful report", () => {
+    expect(deployOutcome(report()).kind).toBe("unconfirmed")
+  })
+
 })
