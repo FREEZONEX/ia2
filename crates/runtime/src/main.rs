@@ -841,10 +841,11 @@ struct Status {
     mode: RuntimeMode,
     /// Currently-forced variables (name → pinned value).
     forces: Vec<ForceEntry>,
-    /// Why the scan loop died, if it died: the VM-trap or panic message.
-    /// `null` while running or after a clean stop. Agents watching an
-    /// edge poll this to tell "still scanning" from "faulted and halted"
-    /// — without it a trapped program looks like a frozen snapshot.
+    /// Why the scan loop died, if it died: a VM trap, a VM that failed to
+    /// start, or a panic. `null` while running or after a requested stop.
+    /// Agents watching an edge poll this to tell "still scanning" from
+    /// "faulted and halted" — without it a trapped program looks like a
+    /// frozen snapshot.
     fault: Option<String>,
     /// Alarms needing operator attention (active or cleared-unacked).
     /// The full list is one GET /alarms away; the count rides on
