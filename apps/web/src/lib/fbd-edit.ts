@@ -58,8 +58,7 @@ export function addBlock(
   position?: FbdPosition,
 ): { prog: FbdProgram; blockId: string; instance: string } {
   const blockId = nextBlockId(prog)
-  const usedInstances = new Set(prog.blocks.map((b) => b.instance))
-  const instance = suggestInstanceName(fbType, usedInstances)
+  const instance = suggestInstanceName(fbType, declaredNames(prog))
   const def = fbByType(fbType)
   const inputs: FbdInputBinding[] = def
     ? def.pins
@@ -115,19 +114,29 @@ export function setBlockPosition(
   return updateBlock(prog, blockId, (b) => ({ ...b, position }))
 }
 
-/** Rename a block's FB instance variable. Rejects duplicates against
- *  other blocks (callers should validate before calling — defensive
- *  no-op rather than throwing).  */
+/** Rename a block's FB instance variable. Rejects a name another block's
+ *  instance or a variable already has, compared case-insensitively as
+ *  IEC 61131-3 does — the transpiler would declare it twice (callers
+ *  should validate before calling — defensive no-op rather than
+ *  throwing).  */
 export function setBlockInstance(
   prog: FbdProgram,
   blockId: string,
   instance: string,
 ): FbdProgram {
-  const taken = prog.blocks.some(
-    (b) => b.id !== blockId && b.instance === instance,
-  )
-  if (taken || !instance.trim()) return prog
-  return updateBlock(prog, blockId, (b) => ({ ...b, instance: instance.trim() }))
+  const name = instance.trim()
+  const others = declaredNames({
+    ...prog,
+    blocks: prog.blocks.filter((b) => b.id !== blockId),
+  })
+  const taken = others.some((n) => n.toLowerCase() === name.toLowerCase())
+  if (taken || !name) return prog
+  return updateBlock(prog, blockId, (b) => ({ ...b, instance: name }))
+}
+
+/** Every name the POU declares: block FB instances and variables. */
+function declaredNames(prog: FbdProgram): string[] {
+  return [...prog.blocks.map((b) => b.instance), ...prog.variables.map((v) => v.name)]
 }
 
 /**
