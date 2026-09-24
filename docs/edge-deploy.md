@@ -91,6 +91,11 @@ prompts — the IDE runs `ssh -o BatchMode=yes`).
    - Streams the remote script's output back into the pane
 
    Deploy REFUSES to lie about the outcome:
+   - deploy first copies regular project files into a private temporary snapshot.
+     The shared runtime pre-check and upload both consume that same copy, so
+     edits after the check cannot alter the upload. The snapshot is cleaned up
+     after success, failure or cancellation. Symlinks and special files are
+     refused before upload; replace them with regular project files;
    - a project the edge runtime would refuse at startup is refused before
      upload, and nothing on the edge changes: deploy first runs the
      runtime's own start path on it (open the project, which validates

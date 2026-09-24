@@ -31,5 +31,4 @@ iomap-modbus = { path = "../iomap-modbus" }
 iomap-opcua = { path = "../iomap-opcua" }
 toml.workspace = true
 
-[dev-dependencies]
 tempfile = "3"

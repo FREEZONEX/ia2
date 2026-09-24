@@ -1578,32 +1578,31 @@ pub async fn deploy_edge_route(
         let edge = store.read_edge(&name).map_err(crate::error::project_err)?;
         Ok((edge, store.root().to_path_buf()))
     })?;
-    // Refuse, before anything touches the edge, a project the edge runtime
-    // would exit on at startup: the check is the runtime's own start path.
-    // It compiles with this server's compiler, which is the edge's too
-    // when the deploy ships a runtime binary built from the same tree.
-    let check_dir = project_dir.clone();
+    // Freeze before preflight; upload can only consume a checked snapshot.
     let precheck = tokio::task::spawn_blocking(move || {
-        ironplc_bridge::load_edge_project(&check_dir).map(|_| ())
+        crate::deploy_snapshot::DeploySnapshot::prepare(&project_dir)
     })
     .await
     .map_err(|e| ApiError::Internal(format!("deploy pre-check task failed: {e}")))?;
-    if let Err(reason) = precheck {
-        return Ok(Json(DeployReport {
-            ok: false,
-            version: String::new(),
-            log: format!(
-                "Refused before upload — nothing on the edge changed. The edge runtime would \
-                 not start this project:\n{reason}\n"
-            ),
-            warning: None,
-            health: None,
-        }));
-    }
+    let snapshot = match precheck {
+        Ok(snapshot) => snapshot,
+        Err(reason) => {
+            return Ok(Json(DeployReport {
+                ok: false,
+                version: String::new(),
+                log: format!(
+                    "Refused before upload — nothing on the edge changed. \
+                 Project snapshot preparation or runtime pre-check failed:\n{reason}\n"
+                ),
+                warning: None,
+                health: None,
+            }))
+        }
+    };
     let runtime_binary = find_runtime_binary();
     match deploy_to_edge(
         &edge,
-        &project_dir,
+        &snapshot,
         runtime_binary.as_deref(),
         state.web_dist.as_deref(),
     )
