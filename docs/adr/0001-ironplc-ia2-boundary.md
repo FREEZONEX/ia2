@@ -164,11 +164,11 @@ tasks" with no change to the layers above.
    [ironplc #1553](https://github.com/ironplc/ironplc/issues/1553).
    Until supported, hoist those instances into the PROGRAM.
 
-IA2-side follow-up from the v0.246.0 upgrade: the LD/FBD transpilers
-de-duplicate generated instance and temporary names case-sensitively and
-do not check them against the POU's own variables. IEC names are
-case-insensitive, so such a clash now surfaces as P4014 on generated ST
-rather than as a pointed error on the diagram element.
+IA2-side follow-up from the v0.246.0 upgrade, since done (#72): the LD/FBD
+transpilers compare generated instance and temporary names
+case-insensitively and against the POU's own variables, as IEC names
+require. A clash is a pointed error on the diagram element rather than
+P4014 on generated ST.
 
 Offline compile, VM, pause/step/resume and simulation tests are upgrade
 evidence, not real fieldbus or timing acceptance. Rebuild and test hardware

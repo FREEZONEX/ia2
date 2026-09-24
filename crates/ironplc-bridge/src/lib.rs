@@ -1526,24 +1526,28 @@ mod project_units_tests {
     /// `CONFIGURATION config` once ironplc began reporting a configuration
     /// and a type of the same name as a duplicate (P4013) — Run failed on
     /// a declaration the user never wrote. Both compile paths synthesize
-    /// it. The type sits in the program's own file: an isolated run skips
-    /// sibling files that declare no POU.
+    /// it. The type sits in a types-only file, so the isolated run meets it
+    /// as sibling context next to its own synthesized configuration.
     fn store_with_a_type_named_config(dir: &std::path::Path) -> (ProjectStore, Tasks) {
         let store = fixture_store(dir);
-        store
-            .create_pou_file("configured", PouType::Program, PouLanguage::St)
-            .unwrap();
-        store
-            .write_pou_source(
-                "configured",
-                "TYPE Config : STRUCT gain : INT; END_STRUCT; END_TYPE\n\
-                 PROGRAM configured\n\
-                     VAR c : Config; y : INT; END_VAR\n\
-                     c.gain := 3;\n\
-                     y := c.gain;\n\
-                 END_PROGRAM",
-            )
-            .unwrap();
+        let write = |path: &str, source: &str| {
+            store
+                .create_pou_file(path, PouType::Program, PouLanguage::St)
+                .unwrap();
+            store.write_pou_source(path, source).unwrap();
+        };
+        write(
+            "config_types",
+            "TYPE Config : STRUCT gain : INT; END_STRUCT; END_TYPE",
+        );
+        write(
+            "configured",
+            "PROGRAM configured\n\
+                 VAR c : Config; y : INT; END_VAR\n\
+                 c.gain := 3;\n\
+                 y := c.gain;\n\
+             END_PROGRAM",
+        );
         let tasks = Tasks {
             tasks: vec![Task {
                 name: "t".into(),
