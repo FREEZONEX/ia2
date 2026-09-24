@@ -101,6 +101,15 @@ prompts — the IDE runs `ssh -o BatchMode=yes`).
      the old process. File rollback does not prove that it is running;
    - a missing `VERSION=` line from the remote script fails the deploy
      (script drift = state unknown);
+   - a restart systemd accepted is not a running program: after the
+     restart the deploy reads the runtime's `/status` until the program has
+     scanned and a second read shows no fault. A fault (a VM trap, a VM
+     that failed to start), a latched watchdog, or no scan within 30 s fails
+     the deploy (`ok: false`, `health` says why). The new version stays
+     installed and current — nothing is rolled back automatically; the log
+     names the previous version for the manual rollback below. A device
+     still down at the check is a `warning`, not a failure. When nothing was
+     restarted (the unit is not enabled), `health` says it was not checked;
    - a project whose `[governance]` table is invalid (unknown key,
      `min > max`, non-finite bound) fails at edge runtime start with a
      loud load error — governance is validated on load, never silently

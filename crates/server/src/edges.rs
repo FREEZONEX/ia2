@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::io;
 use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use ironplc_bridge::DeviceHealth;
 use project::Edge;
@@ -455,11 +456,63 @@ pub struct DeployReport {
     /// Tail of stdout/stderr from the remote script — useful for
     /// surfacing the "what just happened" to the user.
     pub log: String,
-    /// Structured caveat on an otherwise-successful deploy — today the
-    /// install_dir/systemd drift warning. `None` = nothing to flag.
+    /// Structured caveat on an otherwise-successful deploy: the
+    /// install_dir/systemd drift warning, or a fieldbus device still down
+    /// when the health check passed. `None` = nothing to flag.
     /// Machine-readable so clients don't have to grep the log.
     pub warning: Option<String>,
+    /// What the restarted runtime reported: whether the deployed program
+    /// is actually running. `ok` is `false` when it is not, although the
+    /// new version is installed and current. `None` when the deploy failed
+    /// before anything was restarted.
+    pub health: Option<DeployHealth>,
 }
+
+/// The deployed program's state after the restart, read from the edge
+/// runtime's `/status`.
+#[derive(Debug, Clone, PartialEq, Serialize, TS)]
+#[ts(export)]
+pub struct DeployHealth {
+    pub state: DeployHealthState,
+    /// What the check saw: the scan count, the fault, what never happened,
+    /// or why nothing was checked.
+    pub detail: String,
+    /// Devices down at the last read. The program runs, but inputs from
+    /// these are frozen; right after a restart a device may still be
+    /// connecting.
+    pub unhealthy_devices: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum DeployHealthState {
+    /// The program scanned, and a read one poll later still showed no fault.
+    Running,
+    /// The runtime answers, but its program stopped (the fault is in
+    /// `detail`) or its scan watchdog latched the outputs off.
+    Faulted,
+    /// No scan within the window: the runtime never answered, or answered
+    /// without ever scanning.
+    NotRunning,
+    /// Nothing to check: no restart happened, or the service runs from
+    /// another install_dir (see `warning`).
+    NotChecked,
+}
+
+impl DeployHealthState {
+    /// Whether the deploy achieved what it is for: the new program running.
+    fn deploy_ok(self) -> bool {
+        matches!(self, Self::Running | Self::NotChecked)
+    }
+}
+
+/// How long deploy waits after a restart for the new program's first scan.
+/// Devices connect before the first scan (an EtherCAT walk, a slow Modbus
+/// connect), so this is generous; a healthy program answers in seconds.
+const HEALTH_WINDOW: Duration = Duration::from_secs(30);
+/// Between two reads of the edge's `/status`.
+const HEALTH_POLL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum DeployError {
@@ -642,6 +695,7 @@ pub async fn deploy_to_edge(
     // log, so agents don't have to grep prose.
     let mut combined = combined;
     let mut warning = None;
+    let restarted = combined.lines().any(|l| l.starts_with("RESTARTED="));
     let svc = query_service(edge).await;
     if let Some(svc_root) = svc
         .project_dir
@@ -660,12 +714,169 @@ pub async fn deploy_to_edge(
         }
     }
 
+    // A restart that succeeded says nothing about the program: it may
+    // fault on its first scan, or its VM may never start, while systemd
+    // reports the unit active. Ask the runtime itself.
+    let health = if warning.is_some() {
+        DeployHealth {
+            state: DeployHealthState::NotChecked,
+            detail: "the service runs from another install_dir, so its state says nothing \
+                     about this deploy"
+                .into(),
+            unhealthy_devices: Vec::new(),
+        }
+    } else if !restarted {
+        DeployHealth {
+            state: DeployHealthState::NotChecked,
+            detail: format!(
+                "nothing was restarted ({EDGE_UNIT}.service is not enabled or systemd is absent)"
+            ),
+            unhealthy_devices: Vec::new(),
+        }
+    } else {
+        watch_restarted_program(
+            || fetch_edge_json(edge, "/status"),
+            HEALTH_WINDOW,
+            HEALTH_POLL,
+        )
+        .await
+    };
+    let ok = health.state.deploy_ok();
+    combined = format!("{combined}\nHEALTH={:?}: {}\n", health.state, health.detail);
+    if !ok {
+        let prev = combined
+            .lines()
+            .find_map(|l| l.strip_prefix("PREV="))
+            .filter(|p| !p.is_empty());
+        combined.push_str(&format!(
+            "Version {version} is installed and current, but its program is not running. \
+             Fix the program and deploy again, or roll back{} (docs/edge-deploy.md, Rollback).\n",
+            prev.map(|p| format!(" to {p}")).unwrap_or_default()
+        ));
+    } else if health.state == DeployHealthState::Running && !health.unhealthy_devices.is_empty() {
+        warning = Some(format!(
+            "the program runs, but {} {} down at the check (it may still be connecting): {}",
+            health.unhealthy_devices.len(),
+            if health.unhealthy_devices.len() == 1 {
+                "device was"
+            } else {
+                "devices were"
+            },
+            health.unhealthy_devices.join(", ")
+        ));
+    }
+
     Ok(DeployReport {
-        ok: true,
+        ok,
         version,
         log: combined,
         warning,
+        health: Some(health),
     })
+}
+
+/// One read of the edge runtime's `/status`, reduced to what the deploy
+/// health check needs. Missing fields (an older edge build) read as
+/// absent, not as a failure.
+#[derive(Debug, Default)]
+struct StatusReading {
+    scan_count: u64,
+    fault: Option<String>,
+    watchdog_tripped: bool,
+    unhealthy_devices: Vec<String>,
+}
+
+fn status_reading(v: &serde_json::Value) -> StatusReading {
+    StatusReading {
+        scan_count: v.get("scan_count").and_then(|n| n.as_u64()).unwrap_or(0),
+        fault: v.get("fault").and_then(|f| f.as_str()).map(String::from),
+        watchdog_tripped: v
+            .get("watchdog_tripped")
+            .and_then(|w| w.as_bool())
+            .unwrap_or(false),
+        unhealthy_devices: v
+            .get("device_health")
+            .and_then(|d| d.as_array())
+            .into_iter()
+            .flatten()
+            .filter(|d| d.get("healthy").and_then(|h| h.as_bool()) == Some(false))
+            .filter_map(|d| d.get("name").and_then(|n| n.as_str()).map(String::from))
+            .collect(),
+    }
+}
+
+/// Read the restarted runtime's `/status` until its program is known to
+/// run or known not to, within `window`. Running means a scan happened
+/// and a read one poll later still shows no fault — which also catches a
+/// trap on the first scans, and a VM that never started (no scan ever) on
+/// an edge build that did not yet record that as a fault. `read` is the
+/// fetch, a parameter so the loop is testable without ssh.
+async fn watch_restarted_program<F, Fut>(
+    mut read: F,
+    window: Duration,
+    poll: Duration,
+) -> DeployHealth
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<serde_json::Value, String>>,
+{
+    let verdict = |state, detail: String, unhealthy_devices| DeployHealth {
+        state,
+        detail,
+        unhealthy_devices,
+    };
+    let deadline = tokio::time::Instant::now() + window;
+    let mut scanned = false;
+    let mut last_error: Option<String>;
+    loop {
+        match read().await {
+            Ok(v) => {
+                let r = status_reading(&v);
+                last_error = None;
+                if let Some(fault) = r.fault {
+                    return verdict(
+                        DeployHealthState::Faulted,
+                        format!("the program stopped: {fault}"),
+                        r.unhealthy_devices,
+                    );
+                }
+                if r.watchdog_tripped {
+                    return verdict(
+                        DeployHealthState::Faulted,
+                        "the scan watchdog latched: every output is zeroed and held off".into(),
+                        r.unhealthy_devices,
+                    );
+                }
+                if r.scan_count > 0 {
+                    if scanned {
+                        return verdict(
+                            DeployHealthState::Running,
+                            format!("the program is running ({} scans)", r.scan_count),
+                            r.unhealthy_devices,
+                        );
+                    }
+                    scanned = true;
+                } else {
+                    // Back to zero: the process started over (a crash
+                    // loop under systemd, say) — wait for a fresh scan.
+                    scanned = false;
+                }
+            }
+            Err(e) => last_error = Some(e),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let secs = window.as_secs();
+            let detail = match (scanned, last_error) {
+                (true, Some(e)) => {
+                    format!("the program scanned, then the runtime stopped answering: {e}")
+                }
+                (false, Some(e)) => format!("the runtime did not answer within {secs} s: {e}"),
+                (_, None) => format!("the runtime answers, but ran no scan within {secs} s"),
+            };
+            return verdict(DeployHealthState::NotRunning, detail, Vec::new());
+        }
+        tokio::time::sleep(poll).await;
+    }
 }
 
 /// Metadata-suppression flags for the host `tar`, probed once per
@@ -1523,5 +1734,118 @@ mod tests {
         let junk = probe_from_health_body("<html>502 Bad Gateway</html>");
         assert!(!junk.reachable);
         assert!(junk.error.unwrap().contains("unexpected body"));
+    }
+
+    /// Run the post-restart check against scripted `/status` reads (the
+    /// last one repeats), in a short window so a check that never settles
+    /// ends quickly.
+    async fn watch(reads: Vec<Result<serde_json::Value, String>>) -> DeployHealth {
+        let mut queue = std::collections::VecDeque::from(reads);
+        watch_restarted_program(
+            move || {
+                let read = if queue.len() > 1 {
+                    queue.pop_front()
+                } else {
+                    queue.front().cloned()
+                }
+                .expect("at least one scripted read");
+                async move { read }
+            },
+            Duration::from_millis(200),
+            Duration::from_millis(5),
+        )
+        .await
+    }
+
+    fn status(scan_count: u64, fault: Option<&str>) -> Result<serde_json::Value, String> {
+        Ok(serde_json::json!({
+            "scan_count": scan_count,
+            "fault": fault,
+            "watchdog_tripped": false,
+            "device_health": [],
+        }))
+    }
+
+    #[tokio::test]
+    async fn a_restarted_program_that_scans_is_running() {
+        let health = watch(vec![status(0, None), status(3, None), status(9, None)]).await;
+        assert_eq!(health.state, DeployHealthState::Running, "{health:?}");
+        assert!(health.detail.contains("9 scans"), "{health:?}");
+        assert!(health.state.deploy_ok());
+    }
+
+    /// systemd reported the restart fine; the program trapped on its first
+    /// scan. Deploy used to report success.
+    #[tokio::test]
+    async fn a_restarted_program_that_traps_is_faulted() {
+        let trap = "VM trap in main_inst: DivideByZero";
+        let health = watch(vec![status(0, None), status(0, Some(trap))]).await;
+        assert_eq!(health.state, DeployHealthState::Faulted, "{health:?}");
+        assert!(health.detail.contains(trap), "{health:?}");
+        assert!(!health.state.deploy_ok());
+    }
+
+    /// One read showing scans is not enough: the confirming read a poll
+    /// later catches a trap right after the first scans.
+    #[tokio::test]
+    async fn a_trap_after_the_first_scans_is_caught_by_the_confirming_read() {
+        let trap = "VM trap in main_inst: DivideByZero";
+        let health = watch(vec![status(2, None), status(2, Some(trap))]).await;
+        assert_eq!(health.state, DeployHealthState::Faulted, "{health:?}");
+    }
+
+    /// A VM that never starts records no fault on an older edge build; it
+    /// just never scans. That must not pass either.
+    #[tokio::test]
+    async fn a_restarted_program_that_never_scans_is_not_running() {
+        let health = watch(vec![status(0, None)]).await;
+        assert_eq!(health.state, DeployHealthState::NotRunning, "{health:?}");
+        assert!(health.detail.contains("ran no scan"), "{health:?}");
+        assert!(!health.state.deploy_ok());
+    }
+
+    #[tokio::test]
+    async fn a_runtime_that_never_answers_is_not_running() {
+        let health = watch(vec![Err("curl: connection refused".into())]).await;
+        assert_eq!(health.state, DeployHealthState::NotRunning, "{health:?}");
+        assert!(health.detail.contains("connection refused"), "{health:?}");
+    }
+
+    #[tokio::test]
+    async fn a_runtime_that_answers_late_is_waited_for() {
+        let health = watch(vec![
+            Err("curl: connection refused".into()),
+            Err("curl: connection refused".into()),
+            status(1, None),
+            status(4, None),
+        ])
+        .await;
+        assert_eq!(health.state, DeployHealthState::Running, "{health:?}");
+    }
+
+    #[tokio::test]
+    async fn a_latched_watchdog_is_faulted() {
+        let latched = Ok(serde_json::json!({
+            "scan_count": 40, "fault": null, "watchdog_tripped": true, "device_health": [],
+        }));
+        let health = watch(vec![latched]).await;
+        assert_eq!(health.state, DeployHealthState::Faulted, "{health:?}");
+        assert!(health.detail.contains("watchdog"), "{health:?}");
+    }
+
+    /// A device still down runs the program all the same; it is reported,
+    /// not failed.
+    #[tokio::test]
+    async fn a_down_device_is_reported_on_a_running_program() {
+        let degraded = |n: u64| {
+            Ok(serde_json::json!({
+                "scan_count": n, "fault": null, "watchdog_tripped": false,
+                "device_health": [{"name": "coupler", "healthy": false},
+                                  {"name": "servo", "healthy": true}],
+            }))
+        };
+        let health = watch(vec![degraded(1), degraded(5)]).await;
+        assert_eq!(health.state, DeployHealthState::Running, "{health:?}");
+        assert_eq!(health.unhealthy_devices, vec!["coupler".to_string()]);
     }
 }

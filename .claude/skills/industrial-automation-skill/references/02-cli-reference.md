@@ -207,7 +207,13 @@ count keeps climbing, while it drives nothing. `probe` prints
 `WATCHDOG LATCHED` for it; only a restart clears it.
 
 Deploy REFUSES to lie: a failed restart, broken tar stream, or missing
-version stamp fails the deploy (`ok:false` + log). install_dir/systemd
+version stamp fails the deploy (`ok:false` + log). So does a restarted
+program that does not run: after the restart deploy reads the edge's
+`/status` until the program has scanned without a fault, and a fault, a
+latched watchdog, or no scan within 30 s is `ok:false` with `health.state`
+`faulted` / `not_running` and the reason in `health.detail` (exit 1). The
+new version stays current — no automatic rollback; the log's `PREV=` line
+names the version to roll back to. install_dir/systemd
 drift surfaces as a structured `warning` field. Attach/detach live
 streaming: `cs api POST /api/edges/<n>/attach` / `detach`.
 

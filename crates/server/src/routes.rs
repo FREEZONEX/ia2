@@ -1597,6 +1597,7 @@ pub async fn deploy_edge_route(
             version: String::new(),
             log: format!("remote deploy script exited with status {code}\n{log}"),
             warning: None,
+            health: None,
         })),
         Err(e) => Err(ApiError::Internal(e.to_string())),
     }
