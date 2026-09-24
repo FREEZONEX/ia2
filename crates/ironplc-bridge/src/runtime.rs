@@ -578,8 +578,10 @@ impl ProgramHandle {
         self.watchdog_tripped.load(Ordering::Relaxed)
     }
 
-    /// Why the scan loop died, if it died: `Some(message)` after a VM trap
-    /// or a scan-thread panic, `None` while running or after a clean stop.
+    /// Why the scan loop died, if it died: `Some(message)` after a VM trap,
+    /// a VM that failed to start, a scan-thread panic, or any other end of
+    /// the scan thread nobody requested; `None` while running or after a
+    /// requested stop.
     /// Callers watching the snapshot stream use this at stream close to
     /// tell fault from stop.
     pub fn fault(&self) -> Option<String> {
@@ -739,6 +741,7 @@ fn spawn_units_inner(
 
     let stop_clone = stop.clone();
     let stop_reconnect = stop.clone();
+    let stop_exit = stop.clone();
     let snapshot_tx_clone = snapshot_tx.clone();
     let mode_clone = mode.clone();
     let forces_clone = forces.clone();
@@ -750,6 +753,13 @@ fn spawn_units_inner(
     let device_reports_reconnect = device_reports.clone();
 
     let join_handle = std::thread::spawn(move || {
+        // Owns the fault sender for the whole thread, so however the
+        // thread ends, a run nobody asked to stop reads as a fault.
+        let exit = ExitGuard {
+            stop: stop_exit,
+            fault: fault_tx,
+        };
+        let fault_tx = &exit.fault;
         // Southbound adapters get their own I/O runtime, and devices are
         // connected HERE — at the top of the thread, before the scan
         // runtime exists — so every background task an adapter spawns
@@ -770,6 +780,7 @@ fn spawn_units_inner(
             Ok(rt) => rt,
             Err(e) => {
                 tracing::error!(%e, "failed to create io runtime");
+                record_fault(fault_tx, format!("failed to create io runtime: {e}"));
                 return;
             }
         };
@@ -786,6 +797,10 @@ fn spawn_units_inner(
             Ok(rt) => rt,
             Err(e) => {
                 tracing::error!(%e, "failed to create scan-thread runtime");
+                record_fault(
+                    fault_tx,
+                    format!("failed to create scan-thread runtime: {e}"),
+                );
                 return;
             }
         };
@@ -866,7 +881,7 @@ fn spawn_units_inner(
                 watchdog_tripped_clone,
                 scan_overruns_clone,
                 consecutive_overruns_clone,
-                &fault_tx,
+                fault_tx,
                 reconnect_rx,
                 state_path,
             ))
@@ -881,14 +896,7 @@ fn spawn_units_inner(
                     .map(|s| s.to_string())
                     .or_else(|| panic.downcast_ref::<String>().cloned())
                     .unwrap_or_else(|| "scan loop panicked".into());
-                fault_tx.send_if_modified(|f| {
-                    if f.is_none() {
-                        *f = Some(format!("scan loop panicked: {msg}"));
-                        true
-                    } else {
-                        false
-                    }
-                });
+                record_fault(fault_tx, format!("scan loop panicked: {msg}"));
             }
 
             // Always-run failsafe before the thread dies. Drive every
@@ -922,14 +930,25 @@ fn spawn_units_inner(
             // holds the runtime that late-connected adapters' background
             // tasks live on, and must outlive the writes above).
             drained.store(true, Ordering::Relaxed);
-            match &result {
-                Ok(()) => tracing::info!(
+            // "Cleanly" only when nothing faulted: a VM trap or a failed
+            // start also returns normally, and its log used to read as a
+            // clean exit right after the error.
+            let recorded = fault_tx.borrow().clone();
+            match (&result, recorded) {
+                (Ok(()), None) => tracing::info!(
                     devices = dev_count,
                     failsafe_failed,
                     shutdown_failed,
                     "scan loop exited cleanly; failsafe and shutdown attempts completed"
                 ),
-                Err(_) => tracing::error!(
+                (Ok(()), Some(fault)) => tracing::error!(
+                    devices = dev_count,
+                    failsafe_failed,
+                    shutdown_failed,
+                    %fault,
+                    "scan loop ended on a fault; failsafe and shutdown attempts completed"
+                ),
+                (Err(_), _) => tracing::error!(
                     devices = dev_count,
                     failsafe_failed,
                     shutdown_failed,
@@ -1576,6 +1595,43 @@ fn warn_clamped(name: &str, requested: f64, written: f64) {
     );
 }
 
+/// Record why the run ended. The first reason wins: anything recorded
+/// later (the exit guard, say) only describes a consequence of it.
+fn record_fault(fault: &tokio::sync::watch::Sender<Option<String>>, reason: String) {
+    fault.send_if_modified(|f| {
+        if f.is_none() {
+            *f = Some(reason);
+            true
+        } else {
+            false
+        }
+    });
+}
+
+/// Owns the scan thread's fault sender and, when the thread ends without
+/// a stop request, records a fault unless one is already recorded. Every
+/// deliberate end of a run sets the stop flag (`stop` / `shutdown`) and
+/// every known failure records its own reason first, so this speaks only
+/// for an exit nothing else explained. Without it such a run reads as a
+/// clean stop to every caller that tells the two apart by this watch —
+/// the server keeps it registered as running, the edge reports no fault.
+/// Dropping the sender afterwards closes the watch, as before.
+struct ExitGuard {
+    stop: Arc<AtomicBool>,
+    fault: tokio::sync::watch::Sender<Option<String>>,
+}
+
+impl Drop for ExitGuard {
+    fn drop(&mut self) {
+        if !self.stop.load(Ordering::Relaxed) {
+            record_fault(
+                &self.fault,
+                "scan thread exited without a stop request".into(),
+            );
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_loop_async(
     mut units: Vec<ProgramUnit>,
@@ -1609,6 +1665,10 @@ async fn run_loop_async(
 ) {
     if units.is_empty() {
         tracing::error!("no program units to run — scan loop not started");
+        record_fault(
+            fault,
+            "no program units to run — scan loop not started".into(),
+        );
         return;
     }
     let n_units = units.len();
@@ -1637,6 +1697,13 @@ async fn run_loop_async(
             Ok(r) => runnings.push(r),
             Err(ctx) => {
                 tracing::error!(instance = %unit.instance, ?ctx.trap, "vm failed to start");
+                // Record WHY, as a trap during a scan does: a run that ends
+                // with no fault reads as a clean stop to every caller, so a
+                // program that never ran kept being reported as running.
+                record_fault(
+                    fault,
+                    format!("VM failed to start in {}: {:?}", unit.instance, ctx.trap),
+                );
                 return;
             }
         }
@@ -2223,14 +2290,10 @@ async fn run_loop_async(
                 // Record WHY before breaking — the watch write is what
                 // wakes the HTTP layer's forwarder, turning a silent halt
                 // into a visible fault on /status + SSE.
-                fault.send_if_modified(|f| {
-                    if f.is_none() {
-                        *f = Some(format!("VM trap in {}: {:?}", instances[i], ctx.trap));
-                        true
-                    } else {
-                        false
-                    }
-                });
+                record_fault(
+                    fault,
+                    format!("VM trap in {}: {:?}", instances[i], ctx.trap),
+                );
                 // One faulted unit stops the whole plant — consistent
                 // with pause semantics ("the plant freezes together")
                 // and the safest default; the wrapper's failsafe pass
@@ -4963,5 +5026,115 @@ mod tests {
             state.vars["a_inst.counter"], 4242,
             "the restored value round-trips back out on the final flush"
         );
+    }
+
+    fn counting_program() -> Container {
+        crate::compile(
+            "PROGRAM main\n\
+                VAR x : INT; END_VAR\n\
+                x := x + 1;\n\
+            END_PROGRAM",
+        )
+        .expect("program compiles")
+    }
+
+    /// The fault the run records, waiting (bounded) for the scan thread to
+    /// record one or to exit. `None` means it exited without one — which
+    /// every caller reads as a clean stop.
+    async fn recorded_fault(handle: &ProgramHandle) -> Option<String> {
+        let mut rx = handle.fault_watch();
+        tokio::time::timeout(Duration::from_secs(5), rx.wait_for(|f| f.is_some()))
+            .await
+            .expect("the scan thread neither faulted nor exited within 5 s")
+            .ok()
+            .and_then(|f| (*f).clone())
+    }
+
+    /// A VM whose `start()` traps never runs a scan. The run used to end
+    /// with no fault recorded, so the server kept reporting it as running
+    /// and the edge reported `fault: null`, while nothing executed.
+    #[tokio::test]
+    async fn a_vm_that_fails_to_start_records_why() {
+        let mut broken = counting_program();
+        // `start()` refuses a container that declares no call depth before
+        // any init code runs — on every compiler version, with no
+        // compiler bug needed to reach the start-failure path.
+        broken.header.max_call_depth = 0;
+        let handle = spawn_units_inner(
+            vec![
+                unit("a_inst", counting_program(), 10, 1),
+                unit("b_inst", broken, 10, 1),
+            ],
+            DeviceSource::Prebuilt(Vec::new()),
+            Vec::new(),
+            None,
+            WriteGovernance::default(),
+        );
+        let fault = recorded_fault(&handle)
+            .await
+            .expect("a VM that failed to start must be recorded as a fault");
+        assert!(
+            fault.contains("failed to start")
+                && fault.contains("b_inst")
+                && fault.contains("ZeroCallDepth"),
+            "{fault}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_with_no_units_records_why() {
+        let handle = spawn_units_inner(
+            Vec::new(),
+            DeviceSource::Prebuilt(Vec::new()),
+            Vec::new(),
+            None,
+            WriteGovernance::default(),
+        );
+        let fault = recorded_fault(&handle)
+            .await
+            .expect("a run that never started must be recorded as a fault");
+        assert!(fault.contains("no program units"), "{fault}");
+    }
+
+    /// The backstop for any exit nothing else explained: no stop request
+    /// and no recorded reason means a fault; a stop means none; an earlier
+    /// reason is kept.
+    #[test]
+    fn the_exit_guard_speaks_only_for_unexplained_exits() {
+        let ended = |stopped: bool, earlier: Option<&str>| {
+            let (tx, rx) = tokio::sync::watch::channel(earlier.map(String::from));
+            drop(ExitGuard {
+                stop: Arc::new(AtomicBool::new(stopped)),
+                fault: tx,
+            });
+            let fault = rx.borrow().clone();
+            fault
+        };
+        assert_eq!(
+            ended(false, None).as_deref(),
+            Some("scan thread exited without a stop request")
+        );
+        assert_eq!(ended(true, None), None);
+        assert_eq!(
+            ended(false, Some("VM trap in main: X")).as_deref(),
+            Some("VM trap in main: X")
+        );
+    }
+
+    /// The other side: a requested stop is not a fault.
+    #[tokio::test]
+    async fn a_stopped_run_records_no_fault() {
+        let handle = spawn_units_inner(
+            vec![single_unit(counting_program(), 10)],
+            DeviceSource::Prebuilt(Vec::new()),
+            Vec::new(),
+            None,
+            WriteGovernance::default(),
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+        assert_eq!(recorded_fault(&handle).await, None);
     }
 }
