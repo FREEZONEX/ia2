@@ -1578,6 +1578,28 @@ pub async fn deploy_edge_route(
         let edge = store.read_edge(&name).map_err(crate::error::project_err)?;
         Ok((edge, store.root().to_path_buf()))
     })?;
+    // Refuse, before anything touches the edge, a project the edge runtime
+    // would exit on at startup: the check is the runtime's own start path.
+    // It compiles with this server's compiler, which is the edge's too
+    // when the deploy ships a runtime binary built from the same tree.
+    let check_dir = project_dir.clone();
+    let precheck = tokio::task::spawn_blocking(move || {
+        ironplc_bridge::load_edge_project(&check_dir).map(|_| ())
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("deploy pre-check task failed: {e}")))?;
+    if let Err(reason) = precheck {
+        return Ok(Json(DeployReport {
+            ok: false,
+            version: String::new(),
+            log: format!(
+                "Refused before upload — nothing on the edge changed. The edge runtime would \
+                 not start this project:\n{reason}\n"
+            ),
+            warning: None,
+            health: None,
+        }));
+    }
     let runtime_binary = find_runtime_binary();
     match deploy_to_edge(
         &edge,
@@ -3622,5 +3644,70 @@ mod launch_run_tests {
         tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
             .await
             .expect("shutdown");
+    }
+}
+
+#[cfg(test)]
+mod deploy_precheck_tests {
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Request, StatusCode},
+        routing::post,
+        Router,
+    };
+    use tower::ServiceExt;
+
+    use crate::state::AppState;
+
+    /// A project the edge runtime would refuse at startup is refused before
+    /// upload. It used to be tarred, shipped and swapped in; the runtime
+    /// then exited on start and the edge ran nothing.
+    #[tokio::test]
+    async fn deploy_refuses_a_project_the_edge_runtime_would_not_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = project::ProjectStore::create(dir.path().join("p"), "p").unwrap();
+        store
+            .write_pou_source(
+                "main",
+                "PROGRAM main\n VAR x : INT; END_VAR\n x := ghost;\nEND_PROGRAM",
+            )
+            .unwrap();
+        // An edge no one can reach: had the route got as far as ssh, the
+        // report would carry an ssh or remote-script failure instead.
+        store
+            .create_edge("field", "nobody@ia2-precheck.invalid")
+            .unwrap();
+        let state = AppState::new(iomap_modbus::DemoSlave::new(), String::new(), None, None);
+        state.projects.lock().insert_and_activate(store);
+        let app = Router::new()
+            .route("/api/edges/{name}/deploy", post(super::deploy_edge_route))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::post("/api/edges/field/deploy")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a deploy outcome, not an error"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["ok"], false, "{body}");
+        assert_eq!(body["version"], "", "{body}");
+        assert!(body["health"].is_null(), "{body}");
+        let log = body["log"].as_str().unwrap();
+        assert!(
+            log.starts_with("Refused before upload — nothing on the edge changed.")
+                && log.contains("compiling project:")
+                && log.contains("ghost"),
+            "{log}"
+        );
     }
 }

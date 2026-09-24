@@ -91,6 +91,16 @@ prompts — the IDE runs `ssh -o BatchMode=yes`).
    - Streams the remote script's output back into the pane
 
    Deploy REFUSES to lie about the outcome:
+   - a project the edge runtime would refuse at startup is refused before
+     upload, and nothing on the edge changes: deploy first runs the
+     runtime's own start path on it (open the project, which validates
+     `[governance]`; require `tasks.toml`; the multi-PROGRAM `VAR_GLOBAL`
+     rule; compile every scheduled PROGRAM). The report is `ok: false`
+     with an empty `version` and the reason in `log`. It compiles with
+     this server's compiler — the edge's too when the deploy ships a
+     runtime binary built from the same tree. A deploy that ships none
+     keeps the edge's own binary, whose compiler may differ; the
+     post-restart check below stays the authority;
    - a broken tar stream or a local tar failure fails the deploy (no
      silently-truncated uploads);
    - a failed `systemctl restart` fails the deploy (`ok: false` + the
@@ -110,10 +120,9 @@ prompts — the IDE runs `ssh -o BatchMode=yes`).
      names the previous version for the manual rollback below. A device
      still down at the check is a `warning`, not a failure. When nothing was
      restarted (the unit is not enabled), `health` says it was not checked;
-   - a project whose `[governance]` table is invalid (unknown key,
-     `min > max`, non-finite bound) fails at edge runtime start with a
-     loud load error — governance is validated on load, never silently
-     ignored;
+   - a `[governance]` table that is invalid (unknown key, `min > max`,
+     non-finite bound) is one such refusal — governance is validated on
+     load, never silently ignored;
    - install_dir vs systemd-unit drift stays a deploy-level `warning`
      field in the report (structured, plus a WARNING line in the log) —
      the files land, but the service will not see them until you

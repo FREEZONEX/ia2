@@ -216,6 +216,55 @@ pub fn compile_project(store: &project::ProjectStore) -> Result<Vec<ProgramUnit>
     compile_project_units(store, &tasks)
 }
 
+/// A project directory loaded and compiled exactly the way `ia2-runtime`
+/// does at startup, with everything the runtime goes on to use.
+pub struct EdgeProject {
+    pub store: project::ProjectStore,
+    pub tasks: project::Tasks,
+    pub devices: Vec<project::Device>,
+    pub iomap: project::IoMap,
+    pub units: Vec<ProgramUnit>,
+}
+
+/// Load and compile the project at `project_dir` the way `ia2-runtime`
+/// does at startup: open it (which validates `[governance]`), require
+/// `tasks.toml`, read devices and the iomap, apply the ADR-0001
+/// shared-globals rule, compile one unit per scheduled PROGRAM. An error
+/// is what the runtime would exit with.
+///
+/// The edge runtime starts through this, and the IDE server's deploy runs
+/// it on the project BEFORE uploading, so a project the runtime would
+/// refuse is refused without touching the edge. Only the compiler differs
+/// when a deploy carries the edge's existing runtime binary forward.
+pub fn load_edge_project(project_dir: &std::path::Path) -> Result<EdgeProject, String> {
+    let store = project::ProjectStore::open(project_dir.to_path_buf())
+        .map_err(|e| format!("opening project at {}: {e}", project_dir.display()))?;
+    let tasks = store
+        .read_tasks()
+        .map_err(|e| format!("reading tasks.toml: {e}"))?
+        .ok_or_else(|| {
+            "tasks.toml missing from project — run the IDE's 'Migrate to tasks' once, or \
+             hand-author tasks.toml, then redeploy"
+                .to_string()
+        })?;
+    let devices = store
+        .list_devices()
+        .map_err(|e| format!("listing devices: {e}"))?;
+    let iomap = store
+        .read_iomap()
+        .map_err(|e| format!("reading iomap: {e}"))?;
+    reject_shared_globals(&store, &tasks).map_err(|msg| format!("{msg} Then redeploy."))?;
+    let units =
+        compile_project_units(&store, &tasks).map_err(|e| format!("compiling project: {e}"))?;
+    Ok(EdgeProject {
+        store,
+        tasks,
+        devices,
+        iomap,
+        units,
+    })
+}
+
 /// Compile one container per `tasks.toml` PROGRAM instance — the
 /// multi-PROGRAM execution model from ADR-0001 ("one Container + one VM
 /// per PROGRAM instance, round-robin scheduled on a single scan thread").
@@ -1771,5 +1820,112 @@ mod retain_tests {
         );
         let (_container, meta) = compile_with_metadata(&src).unwrap();
         assert!(meta.retain_vars.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod edge_project_tests {
+    use super::load_edge_project;
+    use project::{PouLanguage, PouType, ProgramInstance, ProjectStore, Task, Tasks};
+
+    fn project(dir: &std::path::Path) -> ProjectStore {
+        ProjectStore::create(dir.to_path_buf(), "edge").expect("create project")
+    }
+
+    #[test]
+    fn a_fresh_project_loads_with_one_unit() {
+        let dir = tempfile::tempdir().unwrap();
+        project(dir.path());
+        let loaded = load_edge_project(dir.path()).expect("the seeded project loads");
+        assert_eq!(loaded.units.len(), 1);
+        assert_eq!(loaded.tasks.programs[0].instance, "main_inst");
+    }
+
+    #[test]
+    fn a_program_that_does_not_compile_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = project(dir.path());
+        store
+            .write_pou_source(
+                "main",
+                "PROGRAM main\n VAR x : INT; END_VAR\n x := ghost;\nEND_PROGRAM",
+            )
+            .unwrap();
+        let err = load_edge_project(dir.path()).err().expect("refused");
+        assert!(
+            err.starts_with("compiling project:") && err.contains("ghost"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_project_without_tasks_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        project(dir.path());
+        std::fs::remove_file(dir.path().join("tasks.toml")).unwrap();
+        let err = load_edge_project(dir.path()).err().expect("refused");
+        assert!(err.contains("tasks.toml missing"), "{err}");
+    }
+
+    /// ADR-0001: two scheduled PROGRAMs cannot share a VAR_GLOBAL.
+    #[test]
+    fn shared_globals_across_programs_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = project(dir.path());
+        store
+            .create_pou_file("second", PouType::Program, PouLanguage::St)
+            .unwrap();
+        store
+            .write_pou_source(
+                "second",
+                "VAR_GLOBAL shared : INT; END_VAR\n\
+                 PROGRAM second\n VAR y : INT; END_VAR\n y := 1;\nEND_PROGRAM",
+            )
+            .unwrap();
+        store
+            .write_tasks(&Tasks {
+                tasks: vec![Task {
+                    name: "plc_task".into(),
+                    interval_ms: 100,
+                    priority: 1,
+                }],
+                programs: vec![
+                    ProgramInstance {
+                        instance: "main_inst".into(),
+                        program: "main".into(),
+                        task: "plc_task".into(),
+                    },
+                    ProgramInstance {
+                        instance: "second_inst".into(),
+                        program: "second".into(),
+                        task: "plc_task".into(),
+                    },
+                ],
+            })
+            .unwrap();
+        let err = load_edge_project(dir.path()).err().expect("refused");
+        assert!(
+            err.contains("VAR_GLOBAL") && err.ends_with("Then redeploy."),
+            "{err}"
+        );
+    }
+
+    /// Opening validates `[governance]`, as the runtime's start does.
+    #[test]
+    fn an_invalid_governance_table_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        project(dir.path());
+        let manifest = dir.path().join("project.toml");
+        let text = std::fs::read_to_string(&manifest).unwrap();
+        std::fs::write(
+            &manifest,
+            format!("{text}\n[[governance.rules]]\nvariable = \"x\"\nmin = 5.0\nmax = 1.0\n"),
+        )
+        .unwrap();
+        let err = load_edge_project(dir.path()).err().expect("refused");
+        assert!(
+            err.starts_with("opening project at") && err.contains("greater than max"),
+            "{err}"
+        );
     }
 }

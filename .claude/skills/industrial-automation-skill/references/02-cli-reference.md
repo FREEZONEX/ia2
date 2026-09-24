@@ -206,9 +206,14 @@ nastiest: a latched runtime is reachable AND fieldbus-healthy AND its scan
 count keeps climbing, while it drives nothing. `probe` prints
 `WATCHDOG LATCHED` for it; only a restart clears it.
 
-Deploy REFUSES to lie: a failed restart, broken tar stream, or missing
-version stamp fails the deploy (`ok:false` + log). So does a restarted
-program that does not run: after the restart deploy reads the edge's
+Deploy REFUSES to lie. A project the edge runtime would refuse at start
+(does not compile, no `tasks.toml`, invalid `[governance]`, a `VAR_GLOBAL`
+shared by two scheduled PROGRAMs) is refused before upload — `ok:false`,
+empty `version`, the reason in `log`, nothing on the edge changed; run
+`cs api POST /api/project/validate` (or `cs check pous/*.st`) for full
+diagnostics. A failed restart, broken tar stream, or missing version stamp
+fails the deploy (`ok:false` + log). So does a restarted program that does
+not run: after the restart deploy reads the edge's
 `/status` until the program has scanned without a fault, and a fault, a
 latched watchdog, or no scan within 30 s is `ok:false` with `health.state`
 `faulted` / `not_running` and the reason in `health.detail` (exit 1). The
