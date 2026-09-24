@@ -453,20 +453,22 @@ pub fn extract_project_global_vars(store: &project::ProjectStore) -> Vec<(String
 /// Compile one POU file for an ad-hoc isolated run, returning the
 /// AST-derived `ProgramMetadata` alongside the bytecode. Used by the
 /// ProgramPane's Run button so opening cascade_pid.st and clicking Run
-/// actually runs cascade_pid in isolation — ironplc's debug section only
-/// names PROGRAM variables, and no sibling PROGRAM is included, so the
-/// Monitor shows exactly the target file's variables (unlike
-/// `compile_project`, which concatenates every PROGRAM).
+/// actually runs cascade_pid in isolation — no sibling PROGRAM is
+/// included, so the Monitor never shows another PROGRAM's variables.
 ///
 /// "Isolated" scopes the *debug surface*, not the type system: every
 /// sibling file that declares no PROGRAM (imported library blocks,
-/// helper FUNCTION_BLOCKs / FUNCTIONs) is appended as type context, so
-/// an FBD program wired to FB_PID from the library runs exactly like it
-/// compiles project-wide. Sibling files that fail to read or parse are
+/// helper FUNCTION_BLOCKs / FUNCTIONs, `TYPE` declarations, top-level
+/// `VAR_GLOBAL`s) is appended as type context, so an FBD program wired
+/// to FB_PID from the library runs exactly like it compiles
+/// project-wide. Globals from such a file join this run's debug section,
+/// as they do for a single-instance scheduled run; with exactly one
+/// PROGRAM there is one copy, so ADR-0001's multi-PROGRAM globals rule
+/// does not apply. Sibling files that fail to read or parse are
 /// skipped — their absence resurfaces honestly as P2008 on the
-/// reference. Sibling files that mix a PROGRAM with FBs stay excluded
-/// (the PROGRAM would pollute the debug section); keep shared blocks in
-/// their own files.
+/// reference. Sibling files that mix a PROGRAM with other declarations
+/// stay excluded (the PROGRAM would pollute the debug section); keep
+/// shared blocks and types in their own files.
 pub fn compile_isolated_in_project_full(
     store: &project::ProjectStore,
     pou_path: &str,
@@ -488,6 +490,7 @@ pub fn compile_isolated_in_project_full(
         combined.push('\n');
     }
     if let Ok(paths) = store.list_pou_paths() {
+        let options = parser_options();
         for path in &paths {
             if path == pou_path {
                 continue;
@@ -498,14 +501,10 @@ pub fn compile_isolated_in_project_full(
             let Ok(raw) = store.read_pou_source(path) else {
                 continue;
             };
-            let decls = extract_pou_declarations(&raw, lang);
-            if decls.is_empty() || decls.iter().any(|d| d.type_ == project::PouType::Program) {
-                continue;
-            }
-            let Ok(sibling_st) = source_to_st(&raw, lang) else {
+            let Some(context) = isolated_type_context(&raw, lang, path, &options) else {
                 continue;
             };
-            combined.push_str(&strip_any_configuration(&sibling_st));
+            combined.push_str(&context);
             if !combined.ends_with('\n') {
                 combined.push('\n');
             }
@@ -513,6 +512,28 @@ pub fn compile_isolated_in_project_full(
     }
     combined.push_str(&synthesize_configuration(tasks));
     compile_with_metadata(&combined)
+}
+
+/// The ST a sibling file contributes to an isolated run, or `None` when
+/// it must stay out. Classifies the parsed library of exactly the text
+/// that would be appended rather than the file's POU declarations: a file
+/// of only `TYPE`s or only `VAR_GLOBAL`s declares no POU, yet is precisely
+/// the context a PROGRAM elsewhere needs.
+fn isolated_type_context(
+    raw: &str,
+    language: project::PouLanguage,
+    path: &str,
+    options: &CompilerOptions,
+) -> Option<String> {
+    let st = source_to_st(raw, language).ok()?;
+    let cleaned = strip_any_configuration(&st);
+    let library =
+        ironplc_parser::parse_program(&cleaned, &FileId::from_string(path), options).ok()?;
+    let declares_program = library
+        .elements
+        .iter()
+        .any(|e| matches!(e, LibraryElementKind::ProgramDeclaration(_)));
+    (!declares_program).then_some(cleaned)
 }
 
 /// Lower an arbitrary POU source into ST, ready for ironplc to parse.
@@ -782,6 +803,14 @@ fn check_pou_source_with_context(
                 Ok(p) => p,
                 Err(e) => return vec![synthetic_parse_diag("LD-PARSE", "LD", &e)],
             };
+            // Checked ahead of the transpile only to keep its location:
+            // the editor highlights the clashing placement's rung.
+            if let Some(clash) = ld_transpile::instance_name_clash(&prog) {
+                return vec![CheckDiagnostic {
+                    ld_location: Some(clash.location.clone()),
+                    ..synthetic_transpile_diag("LD-TRANSPILE", &clash.into())
+                }];
+            }
             let (st, map) = match ld_transpile::transpile_to_st_with_map(&prog) {
                 Ok(pair) => pair,
                 Err(e) => return vec![synthetic_transpile_diag("LD-TRANSPILE", &e)],
@@ -793,6 +822,13 @@ fn check_pou_source_with_context(
                 Ok(p) => p,
                 Err(e) => return vec![synthetic_parse_diag("FBD-PARSE", "FBD", &e)],
             };
+            // As for LD: keep the clashing block's location.
+            if let Some(clash) = fbd_transpile::instance_name_clash(&prog) {
+                return vec![CheckDiagnostic {
+                    fbd_location: Some(clash.location.clone()),
+                    ..synthetic_transpile_diag("FBD-TRANSPILE", &clash.into())
+                }];
+            }
             let (st, map) = match fbd_transpile::transpile_to_st_with_map(&prog) {
                 Ok(pair) => pair,
                 Err(e) => return vec![synthetic_transpile_diag("FBD-TRANSPILE", &e)],
@@ -1549,6 +1585,96 @@ mod project_units_tests {
         assert_eq!(globals.len(), 1, "{globals:?}");
         assert_eq!(globals[0].0, "globals");
         assert_eq!(globals[0].1.to_lowercase(), "shared_flag");
+    }
+
+    fn single_program_tasks(program: &str) -> Tasks {
+        Tasks {
+            tasks: vec![Task {
+                name: "adhoc".into(),
+                interval_ms: 10,
+                priority: 1,
+            }],
+            programs: vec![ProgramInstance {
+                instance: format!("{program}_inst"),
+                program: program.into(),
+                task: "adhoc".into(),
+            }],
+        }
+    }
+
+    /// A file holding only `TYPE ... END_TYPE` declares no POU at all. The
+    /// isolated run used to classify siblings by their POU declarations
+    /// and skip any file with none, so a PROGRAM whose type lives in
+    /// `types` compiled project-wide but failed from the Run button.
+    #[test]
+    fn isolated_run_resolves_types_from_a_types_only_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = fixture_store(dir.path());
+        let write = |path: &str, source: &str| {
+            store
+                .create_pou_file(path, PouType::Program, PouLanguage::St)
+                .unwrap();
+            store.write_pou_source(path, source).unwrap();
+        };
+        write(
+            "types",
+            "TYPE Recipe : STRUCT gain : INT; END_STRUCT; END_TYPE\n\
+             TYPE Mode : (idle, running); END_TYPE",
+        );
+        write(
+            "mixer",
+            "PROGRAM mixer\n\
+                 VAR r : Recipe; m : Mode; y : INT; END_VAR\n\
+                 r.gain := 3;\n\
+                 m := running;\n\
+                 y := r.gain;\n\
+             END_PROGRAM",
+        );
+        let tasks = single_program_tasks("mixer");
+
+        let units = compile_project_units(&store, &tasks).expect("scheduled unit compiles");
+        let (container, _meta) = compile_isolated_in_project_full(&store, "mixer", &tasks)
+            .expect("isolated run resolves types from a types-only sibling");
+
+        let names = debug_names(&container);
+        assert!(names.iter().any(|n| n == "y"), "{names:?}");
+        assert_eq!(names, debug_names(&units[0].container));
+    }
+
+    /// Same gap for a file holding only a top-level `VAR_GLOBAL`. An
+    /// isolated run schedules exactly one PROGRAM, so the globals get one
+    /// copy in one container — the ADR-0001 multi-PROGRAM rule does not
+    /// apply, exactly as for a single-instance scheduled run.
+    #[test]
+    fn isolated_run_resolves_globals_from_a_globals_only_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = fixture_store(dir.path());
+        let write = |path: &str, source: &str| {
+            store
+                .create_pou_file(path, PouType::Program, PouLanguage::St)
+                .unwrap();
+            store.write_pou_source(path, source).unwrap();
+        };
+        write("globals", "VAR_GLOBAL shared_count : INT; END_VAR");
+        write(
+            "counter",
+            "PROGRAM counter\n\
+                 VAR_EXTERNAL shared_count : INT; END_VAR\n\
+                 VAR seen : INT; END_VAR\n\
+                 shared_count := shared_count + 1;\n\
+                 seen := shared_count;\n\
+             END_PROGRAM",
+        );
+        let tasks = single_program_tasks("counter");
+
+        let units = compile_project_units(&store, &tasks).expect("scheduled unit compiles");
+        let (container, _meta) = compile_isolated_in_project_full(&store, "counter", &tasks)
+            .expect("isolated run resolves globals from a globals-only sibling");
+
+        let names = debug_names(&container);
+        assert!(names.iter().any(|n| n == "shared_count"), "{names:?}");
+        assert!(names.iter().any(|n| n == "seen"), "{names:?}");
+        assert_eq!(names, debug_names(&units[0].container));
     }
 }
 

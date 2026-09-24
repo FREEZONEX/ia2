@@ -2346,9 +2346,10 @@ pub async fn run(
                     // Ad-hoc isolated run: the named file's PROGRAM plus a
                     // single-PROGRAM CONFIGURATION. Sibling files that
                     // declare no PROGRAM ride along as type context, so
-                    // library FUNCTION_BLOCKs resolve — while the debug
-                    // section (and therefore Monitor) still shows exactly
-                    // the variables of the file the user is looking at.
+                    // library FUNCTION_BLOCKs, TYPEs and globals resolve —
+                    // while the debug section (and therefore Monitor)
+                    // shows the variables of the file the user is looking
+                    // at plus any project globals, never another PROGRAM's.
                     let tasks = single_program_tasks(name);
                     let (container, metadata) =
                         ironplc_bridge::compile_isolated_in_project_full(store, file_path, &tasks)?;
@@ -2406,6 +2407,49 @@ pub async fn run(
     // `state_path = None`; only the headless `ia2-runtime` edge
     // binary points it at a real disk location.
     let handle = ironplc_bridge::spawn_units(units, device_specs, mappings, None, governance);
+
+    // Record what kind of run this is so /api/runtime/status can label
+    // the Monitor pane on a fresh page load (which would otherwise have
+    // no way to know — the SSE `Started` event already fired).
+    let info = match (req.program.as_deref(), req.file_path.as_deref()) {
+        (Some(name), Some(file_path)) => Some(RunningInfo::Isolated {
+            program: name.to_string(),
+            file_path: file_path.to_string(),
+        }),
+        (Some(name), None) => Some(RunningInfo::Scheduled {
+            programs: vec![name.to_string()],
+        }),
+        (None, _) => {
+            // Whole-project schedule — pull the PROGRAM names from
+            // tasks.toml so the IDE can render them, not the instance
+            // names (instances are bookkeeping; PROGRAM names are what
+            // humans recognise from the POU tree).
+            let programs = state
+                .projects
+                .lock()
+                .get(&project_name)
+                .and_then(|s| s.read_tasks().ok().flatten())
+                .map(|t| t.programs.into_iter().map(|p| p.program).collect())
+                .unwrap_or_default();
+            Some(RunningInfo::Scheduled { programs })
+        }
+    };
+    launch_run(&state, project_name, handle, info);
+
+    Ok(Json(RunResponse { ok: true }))
+}
+
+/// Make a freshly spawned run the server's running program: clear the
+/// previous run's error, register it in the program slot with its
+/// `info`, announce `Started`, then forward its snapshots to the caches
+/// and SSE. The forwarder also surfaces the run's fault if it records
+/// one.
+fn launch_run(
+    state: &AppState,
+    project_name: String,
+    handle: ironplc_bridge::ProgramHandle,
+    info: Option<RunningInfo>,
+) {
     let mut rx = handle.subscribe();
     let event_tx = state.event_tx.clone();
     let last_snapshot_cache = state.last_snapshot.clone();
@@ -2418,13 +2462,13 @@ pub async fn run(
     let fault_state = state.clone();
     let fault_handle = handle.clone();
     let mut fault_rx = handle.fault_watch();
-    tokio::spawn(async move {
+    let forward = async move {
         // Forward snapshots until the run ends. "Ends" cannot be seen on
         // the broadcast stream alone — this task and the program slot both
         // hold ProgramHandle clones whose snapshot sender keeps the channel
-        // open — so select on the fault watch too: it fires when the scan
-        // loop records a VM trap / panic, and closes (Err) when the scan
-        // thread exits cleanly.
+        // open — so select on the fault watch too: it fires when the run
+        // records a fault (a VM trap, a VM that failed to start, a panic),
+        // and closes (Err) when the scan thread exits after a stop.
         loop {
             tokio::select! {
                 res = rx.recv() => match res {
@@ -2473,44 +2517,23 @@ pub async fn run(
             let _ = fault_state.event_tx.send(AppEvent::Error(msg));
             let _ = fault_state.event_tx.send(AppEvent::Stopped);
         }
-    });
+    };
 
     state.program.lock().replace(RunningProgram {
-        project_name: project_name.clone(),
+        project_name,
         handle,
     });
 
-    // Record what kind of run this is so /api/runtime/status can label
-    // the Monitor pane on a fresh page load (which would otherwise have
-    // no way to know — the SSE `Started` event already fired).
-    let info = match (req.program.as_deref(), req.file_path.as_deref()) {
-        (Some(name), Some(file_path)) => Some(RunningInfo::Isolated {
-            program: name.to_string(),
-            file_path: file_path.to_string(),
-        }),
-        (Some(name), None) => Some(RunningInfo::Scheduled {
-            programs: vec![name.to_string()],
-        }),
-        (None, _) => {
-            // Whole-project schedule — pull the PROGRAM names from
-            // tasks.toml so the IDE can render them, not the instance
-            // names (instances are bookkeeping; PROGRAM names are what
-            // humans recognise from the POU tree).
-            let programs = state
-                .projects
-                .lock()
-                .get(&project_name)
-                .and_then(|s| s.read_tasks().ok().flatten())
-                .map(|t| t.programs.into_iter().map(|p| p.program).collect())
-                .unwrap_or_default();
-            Some(RunningInfo::Scheduled { programs })
-        }
-    };
     *state.running_info.lock() = info;
 
     let _ = state.event_tx.send(AppEvent::Started);
 
-    Ok(Json(RunResponse { ok: true }))
+    // Spawned only now, so that however soon the run faults (a VM can
+    // fail to start before this function returns), the forwarder finds
+    // it registered and its Error + Stopped follow Started. Spawned
+    // first, it could act before the registration above and leave the
+    // dead run reported as running.
+    tokio::spawn(forward);
 }
 
 pub async fn stop(
@@ -3496,5 +3519,107 @@ mod lsp_frame_tests {
         input.extend_from_slice(b"Content-Length: 2\r\n\r\n{}");
         let got = frames(&input).await.expect("skips the bad body");
         assert_eq!(got, vec!["{}".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod launch_run_tests {
+    use super::launch_run;
+    use crate::events::AppEvent;
+    use crate::state::AppState;
+    use std::time::Duration;
+
+    fn state() -> AppState {
+        AppState::new(iomap_modbus::DemoSlave::new(), String::new(), None, None)
+    }
+
+    /// Spawn a one-unit run of a counting PROGRAM and launch it the way
+    /// `POST /api/run` does after compiling.
+    fn launch(state: &AppState, start_fails: bool) -> ironplc_bridge::ProgramHandle {
+        let mut container = ironplc_bridge::compile(
+            "PROGRAM main\n\
+                VAR x : INT; END_VAR\n\
+                x := x + 1;\n\
+            END_PROGRAM",
+        )
+        .expect("program compiles");
+        if start_fails {
+            // `start()` refuses a container that declares no call depth,
+            // before any init code runs.
+            container.header.max_call_depth = 0;
+        }
+        let unit = ironplc_bridge::ProgramUnit {
+            instance: "main_inst".into(),
+            task_name: "t".into(),
+            interval_ms: 10,
+            priority: 1,
+            container,
+            retain_vars: Vec::new(),
+        };
+        let handle = ironplc_bridge::spawn_units(
+            vec![unit],
+            Vec::new(),
+            Vec::new(),
+            None,
+            project::WriteGovernance::default(),
+        );
+        launch_run(state, "p".into(), handle.clone(), None);
+        handle
+    }
+
+    /// A run whose VM fails to start must not stay registered as running.
+    /// It did: Run answered ok, the program slot kept the dead run, and
+    /// `/api/runtime/status` said `running: true`, `scan_count: 0`,
+    /// `last_error: null` with no `Error` or `Stopped` event, for good.
+    #[tokio::test]
+    async fn a_run_whose_vm_fails_to_start_is_not_left_running() {
+        let state = state();
+        let mut events = state.event_tx.subscribe();
+        launch(&state, true);
+
+        let mut seen = Vec::new();
+        let stopped = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match events.recv().await.expect("event channel open") {
+                    AppEvent::Started => seen.push("started"),
+                    AppEvent::Error(_) => seen.push("error"),
+                    AppEvent::Stopped => {
+                        seen.push("stopped");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        assert!(stopped.is_ok(), "no Stopped event; saw {seen:?}");
+        assert_eq!(seen, ["started", "error", "stopped"]);
+        assert!(
+            state.program.lock().is_none(),
+            "the dead run holds the slot"
+        );
+        assert!(state.running_info.lock().is_none());
+        let err = state.last_error.lock().clone().expect("last_error is set");
+        assert!(
+            err.contains("failed to start") && err.contains("main_inst"),
+            "{err}"
+        );
+    }
+
+    /// The other side: a run that starts stays registered, error-free.
+    #[tokio::test]
+    async fn a_run_that_starts_stays_registered() {
+        let state = state();
+        let handle = launch(&state, false);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(state
+            .program
+            .lock()
+            .as_ref()
+            .is_some_and(|rp| rp.handle.same_run(&handle)));
+        assert!(state.last_error.lock().is_none());
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
     }
 }
