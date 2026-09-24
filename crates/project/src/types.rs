@@ -1423,6 +1423,12 @@ pub struct Edge {
     /// Free-form notes — "production line 1", "test bench", whatever.
     #[serde(default)]
     pub notes: String,
+    /// When a deploy's program does not run after the restart (it faulted,
+    /// or never scanned), point `current` back at the version that was
+    /// current before and restart it. Off by default: starting the previous
+    /// program on a plant is a choice the edge's owner makes, written here.
+    #[serde(default)]
+    pub auto_rollback: bool,
 }
 
 fn default_ssh_port() -> u16 {

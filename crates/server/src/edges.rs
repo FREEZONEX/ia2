@@ -466,6 +466,25 @@ pub struct DeployReport {
     /// new version is installed and current. `None` when the deploy failed
     /// before anything was restarted.
     pub health: Option<DeployHealth>,
+    /// The automatic rollback, when the edge sets `auto_rollback` and the
+    /// deployed program did not run; `None` otherwise. `ok` stays `false`
+    /// either way: the deploy failed even when the rollback worked.
+    pub rollback: Option<DeployRollback>,
+}
+
+/// What the automatic rollback did.
+#[derive(Debug, Clone, PartialEq, Serialize, TS)]
+#[ts(export)]
+pub struct DeployRollback {
+    /// The version directory `current` points at again. `None` when it was
+    /// not switched: a first install has no previous version, or the
+    /// rollback failed before the swap.
+    pub to: Option<String>,
+    /// What happened, in one sentence.
+    pub detail: String,
+    /// The restored version's own post-restart check; `None` when it was
+    /// not restarted.
+    pub health: Option<DeployHealth>,
 }
 
 /// The deployed program's state after the restart, read from the edge
@@ -743,16 +762,41 @@ pub async fn deploy_to_edge(
     };
     let ok = health.state.deploy_ok();
     combined = format!("{combined}\nHEALTH={:?}: {}\n", health.state, health.detail);
+    let mut rollback = None;
     if !ok {
         let prev = combined
             .lines()
             .find_map(|l| l.strip_prefix("PREV="))
-            .filter(|p| !p.is_empty());
-        combined.push_str(&format!(
-            "Version {version} is installed and current, but its program is not running. \
-             Fix the program and deploy again, or roll back{} (docs/edge-deploy.md, Rollback).\n",
-            prev.map(|p| format!(" to {p}")).unwrap_or_default()
-        ));
+            .filter(|p| !p.is_empty())
+            .map(str::to_string);
+        if edge.auto_rollback {
+            let (rolled, output) = roll_back(
+                prev.as_deref(),
+                |prev| run_rollback_script(edge, prev),
+                || {
+                    watch_restarted_program(
+                        || fetch_edge_json(edge, "/status"),
+                        HEALTH_WINDOW,
+                        HEALTH_POLL,
+                    )
+                },
+            )
+            .await;
+            combined.push_str(&output);
+            combined.push_str(&format!(
+                "Version {version}'s program did not run, so the edge rolled back \
+                 automatically: {}\n",
+                rolled.detail
+            ));
+            rollback = Some(rolled);
+        } else {
+            combined.push_str(&format!(
+                "Version {version} is installed and current, but its program is not running. \
+                 Fix the program and deploy again, or roll back{} (docs/edge-deploy.md, \
+                 Rollback). An edge with `auto_rollback = true` does that itself.\n",
+                prev.map(|p| format!(" to {p}")).unwrap_or_default()
+            ));
+        }
     } else if health.state == DeployHealthState::Running && !health.unhealthy_devices.is_empty() {
         warning = Some(format!(
             "the program runs, but {} {} down at the check (it may still be connecting): {}",
@@ -772,7 +816,140 @@ pub async fn deploy_to_edge(
         log: combined,
         warning,
         health: Some(health),
+        rollback,
     })
+}
+
+/// Roll back after a deploy whose program did not run: switch `current`
+/// back to `prev` and restart (`run`, given `prev`), then check the
+/// restored version (`watch`). Returns what happened and the output to
+/// append to the deploy log. Both steps are parameters so this is
+/// testable without ssh.
+async fn roll_back<R, RF, W, WF>(prev: Option<&str>, run: R, watch: W) -> (DeployRollback, String)
+where
+    R: FnOnce(String) -> RF,
+    RF: std::future::Future<Output = Result<String, String>>,
+    W: FnOnce() -> WF,
+    WF: std::future::Future<Output = DeployHealth>,
+{
+    let Some(prev) = prev else {
+        return (
+            DeployRollback {
+                to: None,
+                detail: "nothing to roll back to — there was no previous version (a first install)"
+                    .into(),
+                health: None,
+            },
+            String::new(),
+        );
+    };
+    let name = prev.rsplit('/').next().unwrap_or(prev).to_string();
+    match run(prev.to_string()).await {
+        Err(output) => {
+            // The script prints ROLLED_BACK= once the link is switched, so
+            // its output says whether `current` moved before it failed.
+            let switched = output.contains("ROLLED_BACK=");
+            let rolled = DeployRollback {
+                to: switched.then(|| name.clone()),
+                detail: format!(
+                    "rolling back to {name} failed{}: {}",
+                    if switched {
+                        " after current was switched back"
+                    } else {
+                        ""
+                    },
+                    output
+                        .lines()
+                        .rev()
+                        .find(|l| !l.trim().is_empty())
+                        .unwrap_or("")
+                        .trim()
+                ),
+                health: None,
+            };
+            (rolled, output)
+        }
+        Ok(output) => {
+            let health = watch().await;
+            let detail = if health.state == DeployHealthState::Running {
+                format!("rolled back to {name}: {}", health.detail)
+            } else {
+                format!(
+                    "rolled back to {name}, but its program does not run either: {}",
+                    health.detail
+                )
+            };
+            let output = format!(
+                "{output}ROLLBACK_HEALTH={:?}: {}\n",
+                health.state, health.detail
+            );
+            (
+                DeployRollback {
+                    to: Some(name),
+                    detail,
+                    health: Some(health),
+                },
+                output,
+            )
+        }
+    }
+}
+
+/// Run the rollback script on the edge. `Ok` carries its output, `Err` its
+/// output plus the exit status.
+async fn run_rollback_script(edge: &Edge, prev: String) -> Result<String, String> {
+    let out = ssh_cmd(edge)
+        .arg(remote_rollback_script(&edge.install_dir, &prev))
+        .output()
+        .await
+        .map_err(|e| format!("spawn ssh: {e}"))?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if out.status.success() {
+        Ok(text)
+    } else {
+        Err(format!(
+            "{text}rollback script exited with status {}\n",
+            out.status.code().unwrap_or(-1)
+        ))
+    }
+}
+
+/// Point `current` back at `prev` (a directory under `versions/`) and
+/// restart the unit: the automatic rollback. The same symlink swap and
+/// restart attempts as `remote_deploy_script`. The failed version's
+/// directory stays under `versions/` for inspection.
+fn remote_rollback_script(install_dir: &str, prev: &str) -> String {
+    let install_dir = sh_squote(install_dir);
+    let prev = sh_squote(prev);
+    format!(
+        r#"set -euo pipefail
+INSTALL_DIR={install_dir}
+PREV={prev}
+if [ ! -d "$PREV" ]; then
+  echo "ERROR: the previous version $PREV is gone; current was not switched" >&2
+  exit 4
+fi
+TMPLINK="$INSTALL_DIR/.current.new"
+ln -sfn "$PREV" "$TMPLINK"
+mv -Tf "$TMPLINK" "$INSTALL_DIR/current"
+echo "ROLLED_BACK=$PREV"
+RESTART_ERR=""
+USER_RESTART_ERR=""
+if RESTART_ERR=$(sudo -n systemctl restart {EDGE_UNIT} 2>&1); then
+  echo "RESTARTED={EDGE_UNIT}"
+elif USER_RESTART_ERR=$(systemctl --user restart {EDGE_UNIT} 2>&1); then
+  echo "RESTARTED={EDGE_UNIT}"
+else
+  echo "ERROR: current points at $PREV again, but restarting {EDGE_UNIT} FAILED; runtime state is unconfirmed" >&2
+  printf 'system restart: %s\nuser restart: %s\n' "$RESTART_ERR" "$USER_RESTART_ERR" >&2
+  exit 3
+fi
+"#,
+    )
 }
 
 /// One read of the edge runtime's `/status`, reduced to what the deploy
@@ -1847,5 +2024,211 @@ mod tests {
         let health = watch(vec![degraded(1), degraded(5)]).await;
         assert_eq!(health.state, DeployHealthState::Running, "{health:?}");
         assert_eq!(health.unhealthy_devices, vec!["coupler".to_string()]);
+    }
+
+    fn health_of(state: DeployHealthState, detail: &str) -> DeployHealth {
+        DeployHealth {
+            state,
+            detail: detail.into(),
+            unhealthy_devices: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn rolling_back_restores_the_previous_version_and_checks_it() {
+        let (rolled, log) = roll_back(
+            Some("/opt/ia2/versions/2026-09-24T01-00-00Z.good"),
+            |prev| async move { Ok(format!("ROLLED_BACK={prev}\nRESTARTED=ia2\n")) },
+            || async {
+                health_of(
+                    DeployHealthState::Running,
+                    "the program is running (40 scans)",
+                )
+            },
+        )
+        .await;
+        assert_eq!(rolled.to.as_deref(), Some("2026-09-24T01-00-00Z.good"));
+        assert!(
+            rolled
+                .detail
+                .starts_with("rolled back to 2026-09-24T01-00-00Z.good: the program is running"),
+            "{rolled:?}"
+        );
+        assert_eq!(rolled.health.unwrap().state, DeployHealthState::Running);
+        assert!(log.contains("ROLLBACK_HEALTH=Running"), "{log}");
+    }
+
+    /// The previous version was not running either (an earlier deploy that
+    /// failed and stayed current): say so, and do not roll back further.
+    #[tokio::test]
+    async fn a_previous_version_that_does_not_run_either_is_reported() {
+        let (rolled, _) = roll_back(
+            Some("/opt/ia2/versions/old"),
+            |_| async { Ok("ROLLED_BACK=/opt/ia2/versions/old\nRESTARTED=ia2\n".into()) },
+            || async {
+                health_of(
+                    DeployHealthState::Faulted,
+                    "the program stopped: VM trap in main_inst: X",
+                )
+            },
+        )
+        .await;
+        assert_eq!(rolled.to.as_deref(), Some("old"));
+        assert!(rolled.detail.contains("does not run either"), "{rolled:?}");
+    }
+
+    #[tokio::test]
+    async fn a_first_install_has_nothing_to_roll_back_to() {
+        let (rolled, log) = roll_back(
+            None,
+            |_| async { panic!("nothing to run") },
+            || async { panic!("nothing to check") },
+        )
+        .await;
+        assert_eq!(rolled.to, None);
+        assert!(rolled.detail.contains("no previous version"), "{rolled:?}");
+        assert!(rolled.health.is_none() && log.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_rollback_says_whether_current_moved() {
+        let gone =
+            "ERROR: the previous version /opt/ia2/versions/old is gone; current was not switched\n\
+                    rollback script exited with status 4\n";
+        let (rolled, _) = roll_back(
+            Some("/opt/ia2/versions/old"),
+            |_| async move { Err(gone.to_string()) },
+            || async { panic!("not restarted, nothing to check") },
+        )
+        .await;
+        assert_eq!(rolled.to, None, "{rolled:?}");
+        assert!(rolled.detail.contains("status 4"), "{rolled:?}");
+
+        let restart_failed = "ROLLED_BACK=/opt/ia2/versions/old\n\
+                              ERROR: current points at /opt/ia2/versions/old again, but restarting ia2 FAILED\n\
+                              rollback script exited with status 3\n";
+        let (rolled, _) = roll_back(
+            Some("/opt/ia2/versions/old"),
+            |_| async move { Err(restart_failed.to_string()) },
+            || async { panic!("not restarted, nothing to check") },
+        )
+        .await;
+        assert_eq!(rolled.to.as_deref(), Some("old"), "{rolled:?}");
+        assert!(
+            rolled.detail.contains("after current was switched back"),
+            "{rolled:?}"
+        );
+    }
+
+    /// Run `remote_rollback_script` under a local bash, with a GNU-flavoured
+    /// `mv` and stand-ins for `sudo` / `systemctl` (restart fails when the
+    /// `restart-fails` marker exists).
+    #[cfg(unix)]
+    fn run_rollback(install: &std::path::Path, prev: &std::path::Path) -> std::process::Output {
+        let shim = install.join(".rollback-shim");
+        std::fs::create_dir_all(&shim).unwrap();
+        std::fs::write(
+            shim.join("mv"),
+            "#!/bin/bash\nif [ \"$1\" = \"-Tf\" ]; then rm -rf \"$3\"; exec /bin/mv \"$2\" \"$3\"; fi\nexec /bin/mv \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            shim.join("systemctl"),
+            "#!/bin/bash\n[ -f \"$(dirname \"$0\")/restart-fails\" ] && { echo 'Job for ia2.service failed' >&2; exit 1; }\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            shim.join("sudo"),
+            "#!/bin/bash\n[ \"$1\" = \"-n\" ] && shift\nexec \"$@\"\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for f in ["mv", "systemctl", "sudo"] {
+                std::fs::set_permissions(shim.join(f), std::fs::Permissions::from_mode(0o755))
+                    .unwrap();
+            }
+        }
+        let path = format!(
+            "{}:{}",
+            shim.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        std::process::Command::new("bash")
+            .arg("-c")
+            .arg(remote_rollback_script(
+                install.to_str().unwrap(),
+                prev.to_str().unwrap(),
+            ))
+            .env("PATH", path)
+            .output()
+            .unwrap()
+    }
+
+    /// `install/versions/{good,bad}` with `current -> bad`.
+    #[cfg(unix)]
+    fn installed_with_bad_current(
+        tmp: &std::path::Path,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let install = tmp.join("ia2");
+        let good = install.join("versions/good");
+        std::fs::create_dir_all(&good).unwrap();
+        std::fs::create_dir_all(install.join("versions/bad")).unwrap();
+        std::os::unix::fs::symlink(install.join("versions/bad"), install.join("current")).unwrap();
+        (install, good)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_script_points_current_back_and_restarts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (install, good) = installed_with_bad_current(tmp.path());
+        let out = run_rollback(&install, &good);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            stdout.contains(&format!("ROLLED_BACK={}", good.display())),
+            "{stdout}"
+        );
+        assert!(stdout.contains("RESTARTED=ia2"), "{stdout}");
+        assert_eq!(std::fs::read_link(install.join("current")).unwrap(), good);
+        assert!(
+            install.join("versions/bad").is_dir(),
+            "the failed version stays for inspection"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_script_refuses_a_previous_version_that_is_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (install, good) = installed_with_bad_current(tmp.path());
+        std::fs::remove_dir(&good).unwrap();
+        let out = run_rollback(&install, &good);
+        assert_eq!(out.status.code(), Some(4));
+        assert_eq!(
+            std::fs::read_link(install.join("current")).unwrap(),
+            install.join("versions/bad"),
+            "current must not move"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_script_reports_a_failed_restart_after_switching_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (install, good) = installed_with_bad_current(tmp.path());
+        std::fs::create_dir_all(install.join(".rollback-shim")).unwrap();
+        std::fs::write(install.join(".rollback-shim/restart-fails"), "").unwrap();
+        let out = run_rollback(&install, &good);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(3), "{stderr}");
+        assert!(stderr.contains("restarting ia2 FAILED"), "{stderr}");
+        assert_eq!(std::fs::read_link(install.join("current")).unwrap(), good);
     }
 }

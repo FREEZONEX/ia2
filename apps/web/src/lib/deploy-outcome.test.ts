@@ -10,6 +10,7 @@ function report(patch: Partial<DeployReport> = {}): DeployReport {
     log: "",
     warning: null,
     health: null,
+    rollback: null,
     ...patch,
   }
 }
@@ -47,6 +48,24 @@ describe("deployOutcome", () => {
     expect(outcome.kind).toBe("not_running")
     if (outcome.kind === "not_running") {
       expect(outcome.detail).toContain("DivideByZero")
+    }
+  })
+
+  it("carries the automatic rollback of a version whose program did not run", () => {
+    const outcome = deployOutcome(
+      report({
+        ok: false,
+        health: { state: "faulted", detail: "the program stopped: X", unhealthy_devices: [] },
+        rollback: {
+          to: "2026-09-24T01-00-00Z.good",
+          detail: "rolled back to 2026-09-24T01-00-00Z.good: the program is running (40 scans)",
+          health: null,
+        },
+      }),
+    )
+    expect(outcome.kind).toBe("not_running")
+    if (outcome.kind === "not_running") {
+      expect(outcome.rollback?.to).toBe("2026-09-24T01-00-00Z.good")
     }
   })
 

@@ -253,6 +253,23 @@ function Editor({
               />
             </Field>
           </div>
+          <label className="mt-3 flex max-w-2xl items-start gap-2 text-[13px]">
+            <input
+              type="checkbox"
+              className="mt-0.5"
+              checked={draft.auto_rollback}
+              onChange={(e) => update({ auto_rollback: e.target.checked })}
+            />
+            <span>
+              Roll back automatically
+              <span className="block text-xs text-muted-foreground">
+                When a deploy's program does not run after the restart, point{" "}
+                <span className="font-mono">current</span> back at the previous version and
+                restart it. Off by default: it starts the previous program on the plant without
+                asking.
+              </span>
+            </span>
+          </label>
           <p className="mt-3 max-w-2xl text-xs text-muted-foreground">
             What runs on this edge is the project's <span className="font-mono">tasks.toml</span>{" "}
             (every PROGRAM instance declared there, on its bound task) — not a
@@ -866,9 +883,20 @@ function DeployVerdict({ report }: { report: DeployReport }) {
         </div>
       ) : outcome.kind === "not_running" ? (
         <ErrorBox className="max-w-full whitespace-pre-wrap break-words p-2 text-xs">
-          Version <span className="font-mono">{outcome.version}</span> is installed and
-          current, but its program is not running: {outcome.detail}. Fix the program and
-          deploy again, or roll back — the log names the previous version.
+          {outcome.rollback?.to ? (
+            <>
+              Version <span className="font-mono">{outcome.version}</span> did not run:{" "}
+              {outcome.detail}. The edge rolled back automatically — {outcome.rollback.detail}.
+            </>
+          ) : (
+            <>
+              Version <span className="font-mono">{outcome.version}</span> is installed and
+              current, but its program is not running: {outcome.detail}.{" "}
+              {outcome.rollback
+                ? `Automatic rollback: ${outcome.rollback.detail}. Fix the program and deploy again.`
+                : "Fix the program and deploy again, or roll back — the log names the previous version."}
+            </>
+          )}
         </ErrorBox>
       ) : (
         <ErrorBox className="max-w-full whitespace-pre-wrap p-2 text-xs">

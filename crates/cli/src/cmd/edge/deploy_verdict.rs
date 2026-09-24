@@ -17,6 +17,7 @@ pub(super) fn deploy_verdict(name: &str, value: &serde_json::Value) -> Vec<Strin
         .and_then(|h| h.get("detail"))
         .and_then(|d| d.as_str())
         .unwrap_or("");
+    let rollback = value.get("rollback").filter(|r| !r.is_null());
     let mut lines = Vec::new();
     match (ok, version) {
         (true, v) => {
@@ -33,11 +34,24 @@ pub(super) fn deploy_verdict(name: &str, value: &serde_json::Value) -> Vec<Strin
             lines.push(format!(
                 "✗ deployed version {v} to '{name}', but its program is not running: {detail}"
             ));
-            lines.push(
-                "  the new version is current — fix the program and deploy again, or roll \
-                 back (the log names the previous version)"
-                    .into(),
-            );
+            match rollback {
+                Some(r) => {
+                    let what = r.get("detail").and_then(|d| d.as_str()).unwrap_or("");
+                    lines.push(format!("  automatic rollback: {what}"));
+                    if r.get("to").is_none_or(|t| t.is_null()) {
+                        lines.push(
+                            "  the new version is still current — fix the program and deploy \
+                             again"
+                                .into(),
+                        );
+                    }
+                }
+                None => lines.push(
+                    "  the new version is current — fix the program and deploy again, or roll \
+                     back (the log names the previous version)"
+                        .into(),
+                ),
+            }
         }
         (false, _) => lines.push(format!("✗ deploy to '{name}' FAILED — read the log above")),
     }
@@ -94,6 +108,40 @@ mod tests {
             "{lines:?}"
         );
         assert!(lines[1].contains("roll"), "{lines:?}");
+    }
+
+    #[test]
+    fn a_rolled_back_deploy_says_where_the_edge_is_now() {
+        let lines = deploy_verdict(
+            "pi",
+            &report(json!({"ok": false,
+                "health": {"state": "faulted", "detail": "the program stopped: VM trap in main_inst: X",
+                    "unhealthy_devices": []},
+                "rollback": {"to": "2026-09-24T01-00-00Z.good",
+                    "detail": "rolled back to 2026-09-24T01-00-00Z.good: the program is running (40 scans)",
+                    "health": null}})),
+        );
+        assert!(lines[0].starts_with('✗'), "{lines:?}");
+        assert_eq!(
+            lines[1],
+            "  automatic rollback: rolled back to 2026-09-24T01-00-00Z.good: the program is running (40 scans)"
+        );
+        assert_eq!(lines.len(), 2, "{lines:?}");
+    }
+
+    #[test]
+    fn a_rollback_that_could_not_happen_leaves_the_new_version_current() {
+        let lines = deploy_verdict(
+            "pi",
+            &report(json!({"ok": false,
+                "health": {"state": "not_running", "detail": "ran no scan within 30 s",
+                    "unhealthy_devices": []},
+                "rollback": {"to": null,
+                    "detail": "nothing to roll back to — there was no previous version (a first install)",
+                    "health": null}})),
+        );
+        assert!(lines[1].contains("no previous version"), "{lines:?}");
+        assert!(lines[2].contains("still current"), "{lines:?}");
     }
 
     #[test]

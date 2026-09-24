@@ -1,11 +1,13 @@
 import type { DeployReport } from "@/types/generated/DeployReport"
+import type { DeployRollback } from "@/types/generated/DeployRollback"
 
 /** How the edge pane presents a finished deploy. */
 export type DeployOutcome =
   /** The new version runs; `detail` is what the health check saw. */
   | { kind: "live"; version: string; detail: string | null }
-  /** Installed and current, but its program does not run. */
-  | { kind: "not_running"; version: string; detail: string }
+  /** Its program does not run. Still current unless `rollback.to` names
+   *  the version the edge went back to (an edge with `auto_rollback`). */
+  | { kind: "not_running"; version: string; detail: string; rollback: DeployRollback | null }
   /** Failed before anything was restarted; the log has the story. */
   | { kind: "failed" }
 
@@ -28,7 +30,12 @@ export function deployOutcome(report: DeployReport): DeployOutcome {
     return { kind: "live", version: report.version, detail }
   }
   if (health != null && report.version) {
-    return { kind: "not_running", version: report.version, detail: health.detail }
+    return {
+      kind: "not_running",
+      version: report.version,
+      detail: health.detail,
+      rollback: report.rollback,
+    }
   }
   return { kind: "failed" }
 }

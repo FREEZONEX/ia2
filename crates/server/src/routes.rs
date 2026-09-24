@@ -1598,6 +1598,7 @@ pub async fn deploy_edge_route(
             ),
             warning: None,
             health: None,
+            rollback: None,
         }));
     }
     let runtime_binary = find_runtime_binary();
@@ -1620,6 +1621,7 @@ pub async fn deploy_edge_route(
             log: format!("remote deploy script exited with status {code}\n{log}"),
             warning: None,
             health: None,
+            rollback: None,
         })),
         Err(e) => Err(ApiError::Internal(e.to_string())),
     }

@@ -217,8 +217,12 @@ not run: after the restart deploy reads the edge's
 `/status` until the program has scanned without a fault, and a fault, a
 latched watchdog, or no scan within 30 s is `ok:false` with `health.state`
 `faulted` / `not_running` and the reason in `health.detail` (exit 1). The
-new version stays current — no automatic rollback; the log's `PREV=` line
-names the version to roll back to. install_dir/systemd
+new version stays current, and the log's `PREV=` line names the version to
+roll back to — unless the edge sets `auto_rollback = true` (off by default;
+edit it with `cs get`/`cs set edges/<n>`): then deploy switches back to the
+previous version, restarts and checks it, and the report's `rollback` says
+where the edge is now (`to`, plus the restored version's `health`). `ok`
+stays `false` either way. install_dir/systemd
 drift surfaces as a structured `warning` field. Attach/detach live
 streaming: `cs api POST /api/edges/<n>/attach` / `detach`.
 

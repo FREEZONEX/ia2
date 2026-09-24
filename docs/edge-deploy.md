@@ -116,8 +116,9 @@ prompts — the IDE runs `ssh -o BatchMode=yes`).
      scanned and a second read shows no fault. A fault (a VM trap, a VM
      that failed to start), a latched watchdog, or no scan within 30 s fails
      the deploy (`ok: false`, `health` says why). The new version stays
-     installed and current — nothing is rolled back automatically; the log
-     names the previous version for the manual rollback below. A device
+     installed and current unless the edge sets `auto_rollback = true`
+     (see Rollback below); otherwise the log names the previous version for
+     the manual rollback. A device
      still down at the check is a `warning`, not a failure. When nothing was
      restarted (the unit is not enabled), `health` says it was not checked;
    - a `[governance]` table that is invalid (unknown key, `min > max`,
@@ -174,7 +175,25 @@ the next deploy.
 
 ## Rollback
 
-There's no Rollback button (yet). Manually:
+**Automatic, per edge, off by default.** An edge with `auto_rollback = true`
+in its TOML rolls back by itself when a deploy's program does not run after
+the restart. Set it in the IDE with the edge's *Roll back automatically* box,
+or `cs get edges/<n>` → edit → `cs set edges/<n> --from -`.
+
+What happens:
+- It points `current` back at the version that was current before the
+  deploy, restarts, and checks that version the same way.
+- The deploy still reports `ok: false`. The report's `rollback` says where
+  the edge is now (`to`) and whether the restored program runs (`health`).
+- A first install has nothing to roll back to.
+- If the restored version does not run either, it stays current and the
+  report says so. There is no second rollback.
+- The failed version stays under `versions/` for inspection.
+
+It is off by default because it starts the previous program on the plant
+without asking; that is the edge owner's call, written in the edge's file.
+
+Manually (there is no Rollback button yet):
 ```sh
 ssh edge
 sudo ls /opt/ia2/versions/   # find the previous timestamp

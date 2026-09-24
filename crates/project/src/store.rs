@@ -694,6 +694,7 @@ impl ProjectStore {
             install_dir: "/opt/ia2".into(),
             runtime_port: 13001,
             notes: String::new(),
+            auto_rollback: false,
         };
         self.write_edge(&edge)?;
         Ok(edge)
