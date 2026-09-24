@@ -544,8 +544,9 @@ export function newFbCall(
   prog: LdProgram,
   fbType: string,
 ): { node: LdNode; instance: string } {
-  const used = new Set<string>()
-  // Collect every existing FbCall instance across the program.
+  // Every existing FbCall instance across the program, plus the
+  // variables: the transpiler declares instances next to them.
+  const used = new Set(prog.variables.map((v) => v.name))
   for (const r of prog.rungs) collectInstances(r.logic, used)
   const instance = suggestInstanceName(fbType, used)
   const def = fbByType(fbType)

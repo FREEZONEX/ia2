@@ -210,7 +210,8 @@ pub struct AppState {
     pub last_snapshot: Arc<Mutex<Option<VarSnapshot>>>,
     /// Last bridge / runtime error surfaced to /api/runtime/status, or
     /// `None` if the last run is clean. Set by the run handler's stream
-    /// forwarder when a run dies on a VM trap or scan-thread panic
+    /// forwarder when a run dies on a VM trap, a VM that failed to start,
+    /// or a scan-thread panic
     /// (alongside the SSE `Error` + `Stopped` events); cleared by the
     /// next /api/run.
     pub last_error: Arc<Mutex<Option<String>>>,

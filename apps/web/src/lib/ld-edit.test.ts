@@ -525,6 +525,14 @@ describe("FbCall editing", () => {
     }
   })
 
+  // IEC names are case-insensitive and the transpiler declares each
+  // instance next to the variables, so both kinds of name are taken.
+  it("newFbCall avoids variables and other spellings of taken names", () => {
+    const seed = seedWithFb("MYT1")
+    seed.variables.push({ name: "MyT2", type: "BOOL", section: "internal", init: null })
+    expect(newFbCall(seed, "TON").instance).toBe("myT3")
+  })
+
   it("newFbCall starts at instance suffix 1 when none in use", () => {
     const empty: LdProgram = {
       name: "p",

@@ -63,7 +63,7 @@ Each entry: the symptom you'll see, the cause, the fix.
 **Fix:** confirm the `VAR RETAIN` declaration sits in a `PROGRAM` or `VAR_GLOBAL` block — an FB-internal one is warned about at compile time and ignored (`grep` the runtime log for `VAR RETAIN inside a FUNCTION_BLOCK`). Note the flush cadence is 5 s + on clean stop — up to 5 s of change can be lost on an unclean kill. Values themselves are stored as raw 64-bit slots and do not truncate.
 
 ### The run stopped by itself — snapshots frozen, nothing obvious in the way
-**Cause:** the program faulted. A VM trap (divide by zero, bad array index, …) in any scheduled instance stops the whole plant and zeroes outputs (failsafe), by design.
+**Cause:** the program faulted. A VM trap (divide by zero, bad array index, …) in any scheduled instance stops the whole plant and zeroes outputs (failsafe), by design. A VM that fails to start never runs a scan and is reported the same way, as `VM failed to start in <instance>: <trap>`. On a binary predating that, a failed start instead shows `running: true` with `scan_count` stuck at 0 and no error anywhere but the log line `vm failed to start`.
 **Fix:** read the reason instead of re-running blind: `/api/runtime/status` reports `running: false` with `last_error` carrying the trap message (e.g. `VM trap in main_inst: DivideByZero`), and the SSE stream emitted `error` then `stopped` at the moment it died. On an edge, the runtime's own `/status` carries the same message in `fault`. Fix the arithmetic (guard divisors, clamp indices) and run again — the next `cs run` clears `last_error`.
 
 ### Ran `cs run --program X`, but the snapshot shows a different POU's variables (e.g. the template's `counter`/`blink`)

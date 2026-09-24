@@ -50,6 +50,15 @@ describe("addBlock", () => {
     expect(prog.blocks[1].fb_type).toBe("TON")
   })
 
+  // IEC names are case-insensitive and the transpiler declares each
+  // instance next to the variables, so both kinds of name are taken.
+  it("avoids variables and other spellings of taken names", () => {
+    const start = seed()
+    start.blocks[0].instance = "MYT1"
+    start.variables.push({ name: "MyT2", type: "BOOL", section: "internal", init: null })
+    expect(addBlock(start, "TON").instance).toBe("myT3")
+  })
+
   it("populates inputs with defaults from the FB metadata", () => {
     const empty: FbdProgram = {
       name: "p",
@@ -151,6 +160,16 @@ describe("setBlockInstance", () => {
   it("rejects empty / whitespace", () => {
     const next = setBlockInstance(seed(), "b0", "  ")
     expect(next.blocks[0].instance).toBe("myT1")
+  })
+
+  it("rejects another spelling of a taken instance or variable", () => {
+    const start = addBlock(seed(), "TON").prog // b1 = myT2
+    expect(setBlockInstance(start, "b0", "MYT2").blocks[0].instance).toBe("myT1")
+    expect(setBlockInstance(start, "b0", " Btn ").blocks[0].instance).toBe("myT1")
+  })
+
+  it("allows re-casing a block's own instance", () => {
+    expect(setBlockInstance(seed(), "b0", "MyT1").blocks[0].instance).toBe("MyT1")
   })
 })
 

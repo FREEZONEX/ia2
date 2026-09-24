@@ -319,18 +319,21 @@ export function fbOutputs(type: string): FbPin[] {
 }
 
 /**
- * Suggest a fresh instance name for an FB type, given the set of names
- * already in use across the POU. We always return `prefix + N` for the
- * smallest N ≥ 1 that doesn't collide.
+ * Suggest a fresh instance name for an FB type, given the names already
+ * in use across the POU — its FB instances AND its variables, since the
+ * transpiler declares every instance next to them. We always return
+ * `prefix + N` for the smallest N ≥ 1 that doesn't collide, comparing
+ * case-insensitively as IEC 61131-3 does (`MYT1` is taken by `myT1`).
  */
-export function suggestInstanceName(type: string, used: Set<string>): string {
+export function suggestInstanceName(type: string, used: Iterable<string>): string {
   const fb = fbByType(type)
   const prefix = fb?.instancePrefix ?? "myFb"
+  const taken = new Set(Array.from(used, (name) => name.toLowerCase()))
   let n = 1
   // eslint-disable-next-line no-constant-condition
   while (true) {
     const candidate = `${prefix}${n}`
-    if (!used.has(candidate)) return candidate
+    if (!taken.has(candidate.toLowerCase())) return candidate
     n += 1
   }
 }
