@@ -80,7 +80,11 @@ prompts — the IDE runs `ssh -o BatchMode=yes`).
    bus is down — hover it for the device names. That state is easy to
    misread from the outside: the scan count keeps climbing and values keep
    updating, but the down device's inputs are frozen at last-known values
-   and its outputs are dropped.
+   and its outputs are dropped. A red `faulted` badge means the runtime
+   answers but its program stopped (a VM trap, say) — hover it, or read
+   the status grid, for the reason. A red `outputs locked` badge means the
+   scan watchdog tripped: every output is zeroed and held off until the
+   program is restarted.
 
 3. **Deploy**. Click `Deploy`. The IDE:
    - `tar`s your project directory + (if found) a freshly-built

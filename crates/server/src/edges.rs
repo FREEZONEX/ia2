@@ -115,6 +115,13 @@ pub struct EdgeProbe {
     /// gates only on those two would call a dead plant healthy. `None` when
     /// unreachable, or when the edge runs a build predating the flag.
     pub watchdog_tripped: Option<bool>,
+    /// Why the edge's program stopped (a VM trap, say), when it did. Such a
+    /// runtime is reachable — it answers HTTP — while running nothing, so
+    /// like `watchdog_tripped` this must be read before calling the edge
+    /// healthy. `None` when unreachable, while the program runs, or when
+    /// the edge runs a build whose `/health` predates the field (its
+    /// `/status` still carries `fault`).
+    pub fault: Option<String>,
     /// First line of stderr / error message when unreachable. Gives the
     /// user enough hint to fix `~/.ssh/config` or `install_dir`.
     pub error: Option<String>,
@@ -273,6 +280,7 @@ fn unreachable_probe(error: String) -> EdgeProbe {
         fieldbus_healthy: None,
         unhealthy_devices: vec![],
         watchdog_tripped: None,
+        fault: None,
         error: Some(error),
     }
 }
@@ -297,6 +305,9 @@ fn probe_from_health_body(body: &str) -> EdgeProbe {
         /// edge build simply omits it, which must read as "unknown".
         #[serde(default)]
         watchdog_tripped: Option<bool>,
+        /// Absent on an older edge build, which reads as "none reported".
+        #[serde(default)]
+        fault: Option<String>,
     }
     let Ok(parsed) = serde_json::from_str::<Health>(body) else {
         return unreachable_probe(format!("unexpected body: {}", first_line(body)));
@@ -317,6 +328,7 @@ fn probe_from_health_body(body: &str) -> EdgeProbe {
             .map(|d| d.name.clone())
             .collect(),
         watchdog_tripped: parsed.watchdog_tripped,
+        fault: parsed.fault,
         error: None,
     }
 }
@@ -1414,6 +1426,24 @@ mod tests {
         assert!(probe.error.is_none());
     }
 
+    /// A runtime whose program died still answers `/health` with
+    /// `status: "ok"`. The probe must carry the fault through, or the IDE
+    /// badge and `cs probe` call a dead edge running.
+    #[test]
+    fn probe_carries_the_fault_of_a_reachable_edge() {
+        let probe = probe_from_health_body(
+            r#"{"status":"ok","uptime_secs":90,"scan_count":0,
+                "fieldbus_healthy":true,"devices":[],"watchdog_tripped":false,
+                "fault":"VM trap in main_inst: DivideByZero"}"#,
+        );
+        assert!(probe.reachable, "the runtime did answer");
+        assert_eq!(
+            probe.fault.as_deref(),
+            Some("VM trap in main_inst: DivideByZero")
+        );
+        assert!(probe.error.is_none());
+    }
+
     #[test]
     fn probe_reports_a_fully_healthy_edge_cleanly() {
         let probe = probe_from_health_body(
@@ -1435,6 +1465,7 @@ mod tests {
         assert_eq!(probe.scan_count, Some(9));
         assert_eq!(probe.fieldbus_healthy, None, "unknown, not false");
         assert!(probe.unhealthy_devices.is_empty());
+        assert_eq!(probe.fault, None);
     }
 
     /// The proxy must carry the edge's own status through — a

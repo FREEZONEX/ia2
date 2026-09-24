@@ -700,6 +700,12 @@ struct Health {
     /// probe that only checks `status: "ok"` would otherwise call a latched
     /// runtime healthy — it is still serving HTTP and still scanning.
     watchdog_tripped: bool,
+    /// Why the program stopped, if it did — the same message as `/status`'s
+    /// `fault`, `null` while it runs. `status` stays `"ok"` because it only
+    /// says the process answers, and a runtime whose program died still
+    /// does: without this field a probe of `/health` called such an edge
+    /// healthy while it ran nothing.
+    fault: Option<String>,
 }
 
 async fn health(State(state): State<AppState>) -> Json<Health> {
@@ -710,15 +716,26 @@ async fn health(State(state): State<AppState>) -> Json<Health> {
         .as_ref()
         .map(|s| s.scan_count)
         .unwrap_or(0);
-    let devices = state.handle.device_health();
-    Json(Health {
+    Json(health_of(
+        &state.handle,
+        scan_count,
+        state.start_time.elapsed().as_secs(),
+    ))
+}
+
+/// The `/health` body for the run behind `handle`. Split out of the
+/// handler so the contract is testable without a whole `AppState`.
+fn health_of(handle: &ProgramHandle, scan_count: u64, uptime_secs: u64) -> Health {
+    let devices = handle.device_health();
+    Health {
         status: "ok",
-        uptime_secs: state.start_time.elapsed().as_secs(),
+        uptime_secs,
         scan_count,
         fieldbus_healthy: devices.iter().all(|d| d.healthy),
         devices,
-        watchdog_tripped: state.handle.watchdog_tripped(),
-    })
+        watchdog_tripped: handle.watchdog_tripped(),
+        fault: handle.fault(),
+    }
 }
 
 use ironplc_bridge::monitor::{self, ForceEntry, ModeResponse};
@@ -1453,9 +1470,67 @@ async fn stop_handler(State(state): State<AppState>) -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        audit_outcome, origin_of, record_audit, sibling_web_dir, write_err, AuditLog,
+        audit_outcome, health_of, origin_of, record_audit, sibling_web_dir, write_err, AuditLog,
         RuntimeWriteError, StatusCode, AUDIT_CAP,
     };
+
+    /// Spawn a one-unit run of `body` (the statements of PROGRAM main,
+    /// which declares `x` and `z : INT`).
+    fn spawn_main(body: &str) -> ironplc_bridge::ProgramHandle {
+        let container = ironplc_bridge::compile(&format!(
+            "PROGRAM main\n VAR x : INT; z : INT; END_VAR\n {body}\nEND_PROGRAM"
+        ))
+        .expect("program compiles");
+        ironplc_bridge::spawn_units(
+            vec![ironplc_bridge::ProgramUnit {
+                instance: "main_inst".into(),
+                task_name: "t".into(),
+                interval_ms: 10,
+                priority: 1,
+                container,
+                retain_vars: Vec::new(),
+            }],
+            Vec::new(),
+            Vec::new(),
+            None,
+            project::WriteGovernance::default(),
+        )
+    }
+
+    /// `/health` said `"status": "ok"` and nothing else for a runtime whose
+    /// program had died, so `cs probe` and the IDE's edge badge reported a
+    /// dead edge as running. It now carries the fault, `status` unchanged.
+    #[tokio::test]
+    async fn health_carries_the_fault_of_a_program_that_died() {
+        let handle = spawn_main("x := 1 / z;");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle.fault_watch().wait_for(|f| f.is_some()),
+        )
+        .await
+        .expect("the division by zero traps within 5 s")
+        .expect("the trap is recorded as a fault");
+
+        let body = serde_json::to_value(health_of(&handle, 0, 1)).unwrap();
+        assert_eq!(body["status"], "ok", "the process still answers");
+        let fault = body["fault"].as_str().expect("fault is a string");
+        assert!(fault.contains("main_inst"), "{fault}");
+    }
+
+    #[tokio::test]
+    async fn health_of_a_running_program_has_a_null_fault() {
+        let handle = spawn_main("x := x + 1;");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let body = serde_json::to_value(health_of(&handle, 0, 1)).unwrap();
+        assert_eq!(body["status"], "ok");
+        assert!(
+            body.get("fault").is_some_and(|f| f.is_null()),
+            "present and null, so clients can rely on the key: {body}"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
 
     #[test]
     fn audit_ring_is_bounded_and_keeps_the_newest() {
