@@ -41,6 +41,7 @@ import {
   type EdgeStatus,
   type EdgeSystem,
 } from "@/lib/api"
+import { deployOutcome } from "@/lib/deploy-outcome"
 import { useRuntime } from "@/state/runtime"
 import { DocumentReloadButton, useDocumentDraft } from "@/lib/use-document-draft"
 import type { DeployReport } from "@/types/generated/DeployReport"
@@ -363,11 +364,7 @@ function Editor({
               <ErrorBox className="max-w-full p-3 text-xs">{deployError}</ErrorBox>
             ) : deployLog ? (
               <div>
-                <div className="mb-1 inline-flex items-center gap-1.5 text-[12px] text-highlight">
-                  <CheckCircle2 className="size-3.5" />
-                  Version{" "}
-                  <span className="font-mono">{deployLog.version}</span> live
-                </div>
+                <DeployVerdict report={deployLog} />
                 <pre className="max-h-64 max-w-full overflow-auto rounded-md border border-border bg-muted/40 p-3 text-xs text-muted-foreground">
                   {deployLog.log}
                 </pre>
@@ -849,6 +846,50 @@ function DebugPanel({ name }: { name: string }) {
           Force
         </Button>
       </div>
+    </div>
+  )
+}
+
+/** The headline of the last deploy: live, installed but not running, or
+ *  failed — see `deployOutcome` — plus the report's warning. */
+function DeployVerdict({ report }: { report: DeployReport }) {
+  const outcome = deployOutcome(report)
+  return (
+    <div className="mb-1 flex flex-col gap-1 text-[12px]">
+      {outcome.kind === "live" ? (
+        <div className="inline-flex items-center gap-1.5 text-highlight">
+          <CheckCircle2 className="size-3.5" />
+          <span>
+            Version <span className="font-mono">{outcome.version}</span> live
+            {outcome.detail && <span className="text-muted-foreground"> — {outcome.detail}</span>}
+          </span>
+        </div>
+      ) : outcome.kind === "unconfirmed" ? (
+        <div className="inline-flex items-center gap-1.5 text-warn">
+          <AlertCircle className="size-3.5" />
+          <span>
+            Version <span className="font-mono">{outcome.version}</span> installed;
+            program state unconfirmed: {outcome.detail}. Check runtime and plant state
+            before restarting or rolling back.
+          </span>
+        </div>
+      ) : outcome.kind === "not_running" ? (
+        <ErrorBox className="max-w-full whitespace-pre-wrap break-words p-2 text-xs">
+          Version <span className="font-mono">{outcome.version}</span> is installed and
+          current, but continuous operation failed: {outcome.detail}. Inspect runtime and
+          plant state before restarting or rolling back — the log names the previous version.
+        </ErrorBox>
+      ) : (
+        <ErrorBox className="max-w-full whitespace-pre-wrap p-2 text-xs">
+          Deploy failed — read the log below.
+        </ErrorBox>
+      )}
+      {report.warning && (
+        <div className="inline-flex items-center gap-1.5 text-warn">
+          <AlertCircle className="size-3.5" />
+          {report.warning}
+        </div>
+      )}
     </div>
   )
 }

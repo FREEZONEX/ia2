@@ -91,6 +91,21 @@ prompts — the IDE runs `ssh -o BatchMode=yes`).
    - Streams the remote script's output back into the pane
 
    Deploy REFUSES to lie about the outcome:
+   - deploy first copies regular project files into a private temporary snapshot.
+     The shared runtime pre-check and upload both consume that same copy, so
+     edits after the check cannot alter the upload. The snapshot is cleaned up
+     after success, failure or cancellation. Symlinks and special files are
+     refused before upload; replace them with regular project files;
+   - a project the edge runtime would refuse at startup is refused before
+     upload, and nothing on the edge changes: deploy first runs the
+     runtime's own start path on it (open the project, which validates
+     `[governance]`; require `tasks.toml`; the multi-PROGRAM `VAR_GLOBAL`
+     rule; compile every scheduled PROGRAM). The report is `ok: false`
+     with an empty `version` and the reason in `log`. It compiles with
+     this server's compiler — the edge's too when the deploy ships a
+     runtime binary built from the same tree. A deploy that ships none
+     keeps the edge's own binary, whose compiler may differ; the
+     post-restart check below stays the authority;
    - a broken tar stream or a local tar failure fails the deploy (no
      silently-truncated uploads);
    - a failed `systemctl restart` fails the deploy (`ok: false` + the
@@ -101,10 +116,26 @@ prompts — the IDE runs `ssh -o BatchMode=yes`).
      the old process. File rollback does not prove that it is running;
    - a missing `VERSION=` line from the remote script fails the deploy
      (script drift = state unknown);
-   - a project whose `[governance]` table is invalid (unknown key,
-     `min > max`, non-finite bound) fails at edge runtime start with a
-     loud load error — governance is validated on load, never silently
-     ignored;
+   - a restart systemd accepted is not a running program: the check requires
+     continuous mode and advancing positive scan counts in consecutive `/status`
+     reads. Counter/uptime resets and changed `runtime_id` restart the observation;
+     unchanged counts are waited for, since long-cycle tasks may not advance each
+     second. New runtimes provide a per-process `runtime_id`; older ones fall back
+     to counter/uptime evidence, which cannot exclude every fast restart;
+   - the entire check, including SSH reads and poll sleeps, has a 30 s deadline.
+     A fault/watchdog is `faulted`, paused/single-step mode is `not_running`, and
+     failure to confirm progress before the deadline is `unknown`. All fail the
+     deploy (`ok:false`). **Unknown does not prove stopped or physically safe.**
+     A task with a period longer than the observation window may remain unknown;
+   - the new version stays installed and current. No automatic rollback or
+     restart of the previous program occurs after a failed health check. Inspect
+     runtime and plant state before choosing manual recovery; the log names the
+     previous version. A down device on a running program remains a warning.
+     If nothing was restarted or the install directory differs from the service,
+     `not_checked` retains installation success (`ok:true`), while the IDE shows
+     program state unconfirmed, never green live;
+   - invalid `[governance]` (unknown keys, `min > max`, non-finite bounds)
+     is refused during snapshot preflight, before upload;
    - install_dir vs systemd-unit drift stays a deploy-level `warning`
      field in the report (structured, plus a WARNING line in the log) —
      the files land, but the service will not see them until you
