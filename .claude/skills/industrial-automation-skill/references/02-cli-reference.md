@@ -207,15 +207,21 @@ count keeps climbing, while it drives nothing. `probe` prints
 `WATCHDOG LATCHED` for it; only a restart clears it.
 
 Deploy REFUSES to lie: a failed restart, broken tar stream, or missing
-version stamp fails the deploy (`ok:false` + log). So does a restarted
-program that does not run: after the restart deploy reads the edge's
-`/status` until the program has scanned without a fault, and a fault, a
-latched watchdog, or no scan within 30 s is `ok:false` with `health.state`
-`faulted` / `not_running` and the reason in `health.detail` (exit 1). The
-new version stays current — no automatic rollback; the log's `PREV=` line
-names the version to roll back to. install_dir/systemd
-drift surfaces as a structured `warning` field. Attach/detach live
-streaming: `cs api POST /api/edges/<n>/attach` / `detach`.
+version stamp fails (`ok:false` + log). After restart the server requires
+continuous mode and advancing positive scans in consecutive `/status` reads.
+A changed `runtime_id` or reset counter/uptime restarts that observation; older
+runtimes without an identity use the weaker counter/uptime evidence. Equal
+counts are waited for (long-cycle tasks). The entire check, including SSH
+reads and sleeps, is bounded to 30 s. `health.state` is `faulted` for a fault
+or watchdog, `not_running` for paused/step, or `unknown` when progress cannot
+be confirmed by the deadline; all are `ok:false` (exit 1). **Unknown does not
+prove stopped or safe.** A task longer than the window can remain unknown.
+The new version stays current; inspect runtime and plant state before manual
+rollback/restart. There is no automatic restart of the old program. The log's
+`PREV=` names the previous version. `not_checked` (no restart / install_dir
+drift) keeps `ok:true` for installation only; the IDE marks operation
+unconfirmed. Drift also has a structured `warning`.
+Attach/detach streaming: `cs api POST /api/edges/<n>/attach` / `detach`.
 
 ### HMI authoring actions
 
