@@ -192,7 +192,7 @@ physical timing, PDO layout, or machine safety; those remain bench gates.
 }
 ```
 
-- `tasks[].interval_ms` → `TASK fast(INTERVAL := T#50ms, PRIORITY := 1)` in the synthesized CONFIGURATION. Periodic only, and **the real scan-cadence knob** (the bridge throttles there; the vendored ironplc doesn't populate the VM task table from CONFIGURATION).
+- `tasks[].interval_ms` → `TASK fast(INTERVAL := T#50ms, PRIORITY := 1)` in the synthesized CONFIGURATION. Periodic only, and **the real scan-cadence knob** (the bridge throttles there; ironplc's own task timer is neutralized at load so it can never skip a scan the bridge counted).
 - `programs[].program` is a **PROGRAM**-kind POU; `instance` names it; `task` references a `tasks[].name`. Several instances run round-robin (`cs run` runs them all); the one rejected shape is 2+ PROGRAMs sharing a `VAR_GLOBAL` (see `01-mental-model.md` fact 2).
 
 ---

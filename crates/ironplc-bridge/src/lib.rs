@@ -561,13 +561,19 @@ fn source_to_st(source: &str, language: project::PouLanguage) -> Result<String, 
     }
 }
 
+/// Name of the synthesized CONFIGURATION. ironplc reports a configuration
+/// and a type or POU with the same name as a duplicate declaration, so a
+/// plain name like `config` would reject a user's `TYPE Config`. The
+/// `__ia2_` prefix keeps it out of any name a project would choose.
+const SYNTHESIZED_CONFIGURATION: &str = "__ia2_configuration";
+
 /// Build a single CONFIGURATION block from the project's task / program
 /// bindings. Currently emits one fixed RESOURCE — multi-RESOURCE projects
 /// aren't supported yet (the IEC standard allows them; not a frequent need
 /// for single-edge deployments).
 fn synthesize_configuration(tasks: &project::Tasks) -> String {
     let mut s = String::new();
-    s.push_str("CONFIGURATION config\n");
+    s.push_str(&format!("CONFIGURATION {SYNTHESIZED_CONFIGURATION}\n"));
     s.push_str("    RESOURCE plc_res ON PLC\n");
     for t in &tasks.tasks {
         s.push_str(&format!(
@@ -1514,6 +1520,62 @@ mod project_units_tests {
             "sibling PROGRAM vars must not bleed into the isolated debug \
              section: {names:?}"
         );
+    }
+
+    /// A project's own `TYPE Config` used to collide with the synthesized
+    /// `CONFIGURATION config` once ironplc began reporting a configuration
+    /// and a type of the same name as a duplicate (P4013) — Run failed on
+    /// a declaration the user never wrote. Both compile paths synthesize
+    /// it. The type sits in a types-only file, so the isolated run meets it
+    /// as sibling context next to its own synthesized configuration.
+    fn store_with_a_type_named_config(dir: &std::path::Path) -> (ProjectStore, Tasks) {
+        let store = fixture_store(dir);
+        let write = |path: &str, source: &str| {
+            store
+                .create_pou_file(path, PouType::Program, PouLanguage::St)
+                .unwrap();
+            store.write_pou_source(path, source).unwrap();
+        };
+        write(
+            "config_types",
+            "TYPE Config : STRUCT gain : INT; END_STRUCT; END_TYPE",
+        );
+        write(
+            "configured",
+            "PROGRAM configured\n\
+                 VAR c : Config; y : INT; END_VAR\n\
+                 c.gain := 3;\n\
+                 y := c.gain;\n\
+             END_PROGRAM",
+        );
+        let tasks = Tasks {
+            tasks: vec![Task {
+                name: "t".into(),
+                interval_ms: 20,
+                priority: 1,
+            }],
+            programs: vec![ProgramInstance {
+                instance: "configured_inst".into(),
+                program: "configured".into(),
+                task: "t".into(),
+            }],
+        };
+        (store, tasks)
+    }
+
+    #[test]
+    fn a_scheduled_program_may_declare_a_type_named_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, tasks) = store_with_a_type_named_config(dir.path());
+        compile_project_units(&store, &tasks).expect("scheduled units compile");
+    }
+
+    #[test]
+    fn an_isolated_run_may_declare_a_type_named_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, tasks) = store_with_a_type_named_config(dir.path());
+        compile_isolated_in_project_full(&store, "configured", &tasks)
+            .expect("isolated run compiles");
     }
 
     /// ironplc's codegen compiles the FIRST ProgramDeclaration it sees.

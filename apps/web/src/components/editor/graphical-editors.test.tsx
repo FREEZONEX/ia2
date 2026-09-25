@@ -178,29 +178,47 @@ describe("FBD online mode", () => {
 })
 
 describe("SFC online mode", () => {
-  const sfc = (active: string) =>
+  const sfc = (active: string, initial = "空闲") =>
     JSON.stringify({
       name: "batch",
       pou_type: "program",
       variables: [],
-      initial_step: "空闲",
+      initial_step: initial,
       steps: [
-        { name: "空闲", actions: [] },
+        { name: initial, actions: [] },
         { name: active, actions: [] },
       ],
-      transitions: [{ from: "空闲", to: active, condition: "TRUE" }],
+      transitions: [{ from: initial, to: active, condition: "TRUE" }],
     })
 
   it("finds the active step by the value the runtime stores for its name", () => {
     runningScheduled([["batch_inst", "batch"], ["other_inst", "other"]])
+    // A chart with non-Latin-1 step names runs its state as WSTRING; the
+    // snapshot types and values are the ones a live server reports.
     live.snapshot = snapshot([
-      ["batch_inst.__sfc_step", "STRING", runtimeStringLiteral("加料")],
+      ["batch_inst.__sfc_step", "WSTRING", "\"$52A0$6599\""],
       ["other_inst.__sfc_step", "STRING", "'idle'"],
     ])
     const { container } = render(<SFCEditor value={sfc("加料")} onChange={() => {}} path="batch" />)
     // The header badge; transition labels also read "→ 加料".
     const badge = container.querySelector('[class*="bg-highlight/15"]')
     expect(badge?.textContent).toBe("→ 加料")
+  })
+
+  it("matches a Latin-1 chart's STRING state, and never across types", () => {
+    runningScheduled([["batch_inst", "batch"]])
+    // Every step name is Latin-1, so this chart keeps STRING.
+    live.snapshot = snapshot([["batch_inst.__sfc_step", "STRING", "'caf$E9'"]])
+    const { container, unmount } = render(
+      <SFCEditor value={sfc("café", "idle")} onChange={() => {}} path="batch" />,
+    )
+    expect(container.querySelector('[class*="bg-highlight/15"]')?.textContent).toBe("→ café")
+    unmount()
+
+    // The narrow form of 加料 under a WSTRING type is not a match.
+    live.snapshot = snapshot([["batch_inst.__sfc_step", "WSTRING", runtimeStringLiteral("加料")]])
+    const again = render(<SFCEditor value={sfc("加料")} onChange={() => {}} path="batch" />)
+    expect(again.container.querySelector('[class*="bg-highlight/15"]')).toBeNull()
   })
 })
 
