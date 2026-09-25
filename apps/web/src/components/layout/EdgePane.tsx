@@ -46,6 +46,7 @@ import { DocumentReloadButton, useDocumentDraft } from "@/lib/use-document-draft
 import type { DeployReport } from "@/types/generated/DeployReport"
 import type { Edge } from "@/types/generated/Edge"
 import type { EdgeProbe } from "@/types/generated/EdgeProbe"
+import { edgeReach } from "@/lib/edge-reach"
 
 type EdgeTab = "config" | "logs" | "discover" | "system" | "debug"
 
@@ -149,6 +150,7 @@ function Editor({
         fieldbus_healthy: null,
         unhealthy_devices: [],
         watchdog_tripped: null,
+        fault: null,
         error: String(e),
       })
     } finally {
@@ -875,41 +877,32 @@ function ReachBadge({
       </StatusBadge>
     )
   }
-  if (probe.reachable) {
-    // Reachable is not the same as working: the runtime answers /health
-    // and keeps scanning while a fieldbus is down. Say so, rather than
-    // showing the same green as a fully healthy edge.
-    const down = probe.unhealthy_devices
-    if (down.length > 0) {
+  const reach = edgeReach(probe)
+  switch (reach.kind) {
+    case "running":
       return (
-        <StatusBadge
-          className="bg-warn/15 text-warn"
-          title={`Runtime is up, but ${down.length === 1 ? "this device is" : "these devices are"} down (inputs frozen, outputs dropped): ${down.join(", ")}`}
-        >
+        <StatusBadge className="bg-highlight/15 text-highlight" title={reach.detail}>
+          <CheckCircle2 className="size-3" />
+          running
+        </StatusBadge>
+      )
+    case "degraded":
+      return (
+        <StatusBadge className="bg-warn/15 text-warn" title={reach.detail}>
           <AlertCircle className="size-3" />
           degraded
         </StatusBadge>
       )
-    }
-    return (
-      <StatusBadge
-        className="bg-highlight/15 text-highlight"
-        title="Edge runtime is responding"
-      >
-        <CheckCircle2 className="size-3" />
-        running
-      </StatusBadge>
-    )
+    case "faulted":
+    case "locked":
+    case "unreachable":
+      return (
+        <StatusBadge className="bg-destructive/15 text-destructive" title={reach.detail}>
+          <AlertCircle className="size-3" />
+          {reach.kind === "locked" ? "outputs locked" : reach.kind}
+        </StatusBadge>
+      )
   }
-  return (
-    <StatusBadge
-      className="bg-destructive/15 text-destructive"
-      title={probe.error ?? ""}
-    >
-      <AlertCircle className="size-3" />
-      unreachable
-    </StatusBadge>
-  )
 }
 
 function StatusGrid({ probe }: { probe: EdgeProbe }) {
@@ -933,6 +926,11 @@ function StatusGrid({ probe }: { probe: EdgeProbe }) {
       {!probe.reachable && probe.error && (
         <div className="col-span-full">
           <ErrorBox>{probe.error}</ErrorBox>
+        </div>
+      )}
+      {probe.reachable && probe.fault && (
+        <div className="col-span-full">
+          <ErrorBox>Program stopped: {probe.fault}</ErrorBox>
         </div>
       )}
     </dl>

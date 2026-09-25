@@ -138,7 +138,7 @@ RTU is slow — keep `poll_interval_ms` ≥ 200 at 9600 baud. A missing serial d
 cs --project tank_ctrl set edges/field_pi --host pi@plc.local --server "$SRV"  # create (or put "host" in a --from body)
 cs --project tank_ctrl get edges/field_pi --server "$SRV"     # check install_dir / runtime_port
 cs deploy field_pi --server "$SRV"                            # tar → ssh → versioned swap → restart
-cs probe  field_pi --server "$SRV"                            # confirm the edge runtime came up
+cs probe  field_pi --server "$SRV"                            # confirm the runtime came up and runs (✓, not ⚠)
 ```
 
 Deploy ships the project **and** the `ia2-runtime` binary — but only if a **Linux ELF** for the edge's arch is present in `target/` (the deploy guards against shipping a wrong-arch/host binary, e.g. a macOS build); otherwise it carries forward the runtime already on the box. So cross-compile `ia2-runtime` for the edge's arch yourself before a binary-bearing deploy — there's no CI building artifacts. The edge runs headless; RETAIN state lives in `<install_dir>/state/retain.json` on the box.

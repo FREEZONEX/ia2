@@ -51,54 +51,8 @@ pub(crate) fn cmd_probe(client: &Client, name: &str, json: bool) -> Result<i32> 
     if json {
         println!("{}", serde_json::to_string_pretty(&value)?);
     } else if reachable {
-        let scans = value
-            .get("scan_count")
-            .and_then(|v| v.as_u64())
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "?".into());
-        let uptime = value
-            .get("uptime_secs")
-            .and_then(|v| v.as_u64())
-            .map(|n| format!("{n}s"))
-            .unwrap_or_else(|| "?".into());
-        let version = value
-            .get("runtime_version")
-            .and_then(|v| v.as_str())
-            .unwrap_or("?");
-        // "Reachable" only means the runtime answered. A live scan loop on
-        // top of a dead fieldbus must not print the same ✓ as a healthy
-        // edge — that is the reading that sends people hunting the wrong
-        // fault. Exit code stays 0 (it IS reachable); the text tells the
-        // truth about the buses.
-        let down: Vec<&str> = value
-            .get("unhealthy_devices")
-            .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|d| d.as_str()).collect())
-            .unwrap_or_default();
-        // A latched watchdog is the harsher version of the same trap: the
-        // runtime answers, every bus is healthy, the scan count climbs —
-        // and not one output is being driven. It must never print ✓.
-        let latched = value
-            .get("watchdog_tripped")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        if down.is_empty() && !latched {
-            println!("✓ {name} reachable · v{version} · {scans} scans · up {uptime}");
-        } else {
-            println!("⚠ {name} reachable · v{version} · {scans} scans · up {uptime}");
-            if latched {
-                println!(
-                    "  WATCHDOG LATCHED — scan deadline lost; outputs zeroed and \
-                     held off until the program is restarted"
-                );
-            }
-            if !down.is_empty() {
-                println!(
-                    "  fieldbus DEGRADED — {} down (inputs frozen, outputs dropped): {}",
-                    down.len(),
-                    down.join(", ")
-                );
-            }
+        for line in reachable_report(name, &value) {
+            println!("{line}");
         }
     } else {
         let err = value
@@ -108,4 +62,117 @@ pub(crate) fn cmd_probe(client: &Client, name: &str, json: bool) -> Result<i32> 
         eprintln!("✗ {name}: {err}");
     }
     Ok(if reachable { 0 } else { 1 })
+}
+
+/// What `cs probe` prints for a reachable edge. "Reachable" only means the
+/// runtime answered: a live scan loop on top of a dead fieldbus, a latched
+/// watchdog, or a program that died must not print the same ✓ as a healthy
+/// edge — that is the reading that sends people hunting the wrong fault.
+/// The exit code stays 0 (it IS reachable); the text tells the truth.
+fn reachable_report(name: &str, value: &serde_json::Value) -> Vec<String> {
+    let scans = value
+        .get("scan_count")
+        .and_then(|v| v.as_u64())
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "?".into());
+    let uptime = value
+        .get("uptime_secs")
+        .and_then(|v| v.as_u64())
+        .map(|n| format!("{n}s"))
+        .unwrap_or_else(|| "?".into());
+    let version = value
+        .get("runtime_version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let down: Vec<&str> = value
+        .get("unhealthy_devices")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|d| d.as_str()).collect())
+        .unwrap_or_default();
+    // A latched watchdog is the harsher version of the same trap: the
+    // runtime answers, every bus is healthy, the scan count climbs —
+    // and not one output is being driven.
+    let latched = value
+        .get("watchdog_tripped")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    // Harsher still: the program itself is gone, and only the reason says so.
+    let fault = value.get("fault").and_then(|v| v.as_str());
+    let summary = format!("{name} reachable · v{version} · {scans} scans · up {uptime}");
+    if down.is_empty() && !latched && fault.is_none() {
+        return vec![format!("✓ {summary}")];
+    }
+    let mut lines = vec![format!("⚠ {summary}")];
+    if let Some(fault) = fault {
+        lines.push(format!(
+            "  PROGRAM FAULTED — {fault}; the runtime answers but runs nothing"
+        ));
+    }
+    if latched {
+        lines.push(
+            "  WATCHDOG LATCHED — scan deadline lost; outputs zeroed and \
+             held off until the program is restarted"
+                .into(),
+        );
+    }
+    if !down.is_empty() {
+        lines.push(format!(
+            "  fieldbus DEGRADED — {} down (inputs frozen, outputs dropped): {}",
+            down.len(),
+            down.join(", ")
+        ));
+    }
+    lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reachable_report;
+    use serde_json::json;
+
+    fn probe(extra: serde_json::Value) -> serde_json::Value {
+        let mut v = json!({
+            "reachable": true, "scan_count": 12, "uptime_secs": 30,
+            "runtime_version": null, "fieldbus_healthy": true,
+            "unhealthy_devices": [], "watchdog_tripped": false,
+            "fault": null, "error": null,
+        });
+        v.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        v
+    }
+
+    #[test]
+    fn a_healthy_edge_prints_one_check_line() {
+        assert_eq!(
+            reachable_report("pi", &probe(json!({}))),
+            ["✓ pi reachable · v? · 12 scans · up 30s"]
+        );
+    }
+
+    /// A runtime whose program died answers every probe; it printed ✓.
+    #[test]
+    fn a_faulted_edge_prints_the_fault() {
+        let lines = reachable_report(
+            "pi",
+            &probe(json!({"fault": "VM trap in main_inst: DivideByZero"})),
+        );
+        assert!(lines[0].starts_with('⚠'), "{lines:?}");
+        assert!(
+            lines[1].contains("PROGRAM FAULTED — VM trap in main_inst: DivideByZero"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_latched_or_degraded_edge_still_warns() {
+        let lines = reachable_report(
+            "pi",
+            &probe(json!({"watchdog_tripped": true, "unhealthy_devices": ["coupler"]})),
+        );
+        assert!(lines[0].starts_with('⚠'), "{lines:?}");
+        assert!(lines[1].contains("WATCHDOG LATCHED"), "{lines:?}");
+        assert!(lines[2].contains("fieldbus DEGRADED — 1 down"), "{lines:?}");
+    }
 }
