@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::io;
 use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use ironplc_bridge::DeviceHealth;
 use project::Edge;
@@ -467,11 +468,66 @@ pub struct DeployReport {
     /// Tail of stdout/stderr from the remote script — useful for
     /// surfacing the "what just happened" to the user.
     pub log: String,
-    /// Structured caveat on an otherwise-successful deploy — today the
-    /// install_dir/systemd drift warning. `None` = nothing to flag.
+    /// Structured caveat on an otherwise-successful deploy: the
+    /// install_dir/systemd drift warning, or a fieldbus device still down
+    /// when the health check passed. `None` = nothing to flag.
     /// Machine-readable so clients don't have to grep the log.
     pub warning: Option<String>,
+    /// What the restarted runtime reported: whether the deployed program
+    /// is actually running. `ok` is `false` when continuous operation is
+    /// not confirmed after a restart, although the
+    /// new version is installed and current. `None` when the deploy failed
+    /// before anything was restarted.
+    pub health: Option<DeployHealth>,
 }
+
+/// The deployed program's state after the restart, read from the edge
+/// runtime's `/status`.
+#[derive(Debug, Clone, PartialEq, Serialize, TS)]
+#[ts(export)]
+pub struct DeployHealth {
+    pub state: DeployHealthState,
+    /// What the check saw: the scan count, the fault, what never happened,
+    /// or why nothing was checked.
+    pub detail: String,
+    /// Devices down at the last read. The program runs, but inputs from
+    /// these are frozen; right after a restart a device may still be
+    /// connecting.
+    pub unhealthy_devices: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum DeployHealthState {
+    /// Consecutive reads show continuous mode and advancing scans without a fault.
+    Running,
+    /// The runtime answers, but its program stopped (the fault is in
+    /// `detail`) or its scan watchdog latched the outputs off.
+    Faulted,
+    /// The runtime explicitly reports paused or single-step mode.
+    NotRunning,
+    /// The check could not confirm progress within its deadline. This is
+    /// not evidence that the program or the physical equipment stopped.
+    Unknown,
+    /// Nothing to check: no restart happened, or the service runs from
+    /// another install_dir (see `warning`).
+    NotChecked,
+}
+
+impl DeployHealthState {
+    /// Whether the deploy achieved what it is for: the new program running.
+    fn deploy_ok(self) -> bool {
+        matches!(self, Self::Running | Self::NotChecked)
+    }
+}
+
+/// How long deploy waits after a restart for the new program's first scan.
+/// Devices connect before the first scan (an EtherCAT walk, a slow Modbus
+/// connect), so this is generous; a healthy program answers in seconds.
+const HEALTH_WINDOW: Duration = Duration::from_secs(30);
+/// Between two reads of the edge's `/status`.
+const HEALTH_POLL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum DeployError {
@@ -654,6 +710,7 @@ pub async fn deploy_to_edge(
     // log, so agents don't have to grep prose.
     let mut combined = combined;
     let mut warning = None;
+    let restarted = combined.lines().any(|l| l.starts_with("RESTARTED="));
     let svc = query_service(edge).await;
     if let Some(svc_root) = svc
         .project_dir
@@ -672,12 +729,215 @@ pub async fn deploy_to_edge(
         }
     }
 
+    // A restart that succeeded says nothing about the program: it may
+    // fault on its first scan, or its VM may never start, while systemd
+    // reports the unit active. Ask the runtime itself.
+    let health = if warning.is_some() {
+        DeployHealth {
+            state: DeployHealthState::NotChecked,
+            detail: "the service runs from another install_dir, so its state says nothing \
+                     about this deploy"
+                .into(),
+            unhealthy_devices: Vec::new(),
+        }
+    } else if !restarted {
+        DeployHealth {
+            state: DeployHealthState::NotChecked,
+            detail: format!(
+                "nothing was restarted ({EDGE_UNIT}.service is not enabled or systemd is absent)"
+            ),
+            unhealthy_devices: Vec::new(),
+        }
+    } else {
+        watch_restarted_program(
+            || fetch_edge_json(edge, "/status"),
+            HEALTH_WINDOW,
+            HEALTH_POLL,
+        )
+        .await
+    };
+    let ok = health.state.deploy_ok();
+    combined = format!("{combined}\nHEALTH={:?}: {}\n", health.state, health.detail);
+    if !ok {
+        let prev = combined
+            .lines()
+            .find_map(|l| l.strip_prefix("PREV="))
+            .filter(|p| !p.is_empty());
+        combined.push_str(&format!(
+            "Version {version} is installed and current, but continuous operation was not confirmed. \
+             Inspect runtime and plant state before redeploying or rolling back{} \
+             (docs/edge-deploy.md, Rollback).\n",
+            prev.map(|p| format!(" to {p}")).unwrap_or_default()
+        ));
+    } else if health.state == DeployHealthState::Running && !health.unhealthy_devices.is_empty() {
+        warning = Some(format!(
+            "the program runs, but {} {} down at the check (it may still be connecting): {}",
+            health.unhealthy_devices.len(),
+            if health.unhealthy_devices.len() == 1 {
+                "device was"
+            } else {
+                "devices were"
+            },
+            health.unhealthy_devices.join(", ")
+        ));
+    }
+
     Ok(DeployReport {
-        ok: true,
+        ok,
         version,
         log: combined,
         warning,
+        health: Some(health),
     })
+}
+
+/// One read of `/status`. Missing fields remain unknown, never healthy defaults.
+#[derive(Debug, Default)]
+struct StatusReading {
+    scan_count: Option<u64>,
+    uptime_secs: Option<u64>,
+    runtime_id: Option<String>,
+    mode: Option<String>,
+    fault: Option<String>,
+    watchdog_tripped: bool,
+    unhealthy_devices: Vec<String>,
+}
+
+fn status_reading(v: &serde_json::Value) -> StatusReading {
+    StatusReading {
+        scan_count: v.get("scan_count").and_then(|n| n.as_u64()),
+        uptime_secs: v.get("uptime_secs").and_then(|n| n.as_u64()),
+        runtime_id: v
+            .get("runtime_id")
+            .and_then(|n| n.as_str())
+            .map(String::from),
+        mode: v
+            .pointer("/mode/kind")
+            .and_then(|n| n.as_str())
+            .map(String::from),
+        fault: v.get("fault").and_then(|f| f.as_str()).map(String::from),
+        watchdog_tripped: v
+            .get("watchdog_tripped")
+            .and_then(|w| w.as_bool())
+            .unwrap_or(false),
+        unhealthy_devices: v
+            .get("device_health")
+            .and_then(|d| d.as_array())
+            .into_iter()
+            .flatten()
+            .filter(|d| d.get("healthy").and_then(|h| h.as_bool()) == Some(false))
+            .filter_map(|d| d.get("name").and_then(|n| n.as_str()).map(String::from))
+            .collect(),
+    }
+}
+
+impl StatusReading {
+    fn advances_from(&self, previous: &Self) -> bool {
+        let counters_advance = matches!((previous.scan_count, self.scan_count),
+            (Some(before), Some(after)) if before > 0 && after > before);
+        let uptime_continues = matches!((previous.uptime_secs, self.uptime_secs),
+            (Some(before), Some(after)) if after >= before);
+        // New runtimes supply a process identity. Older runtimes can only
+        // offer the weaker evidence of a counter and uptime that did not reset.
+        let same_process = match (&previous.runtime_id, &self.runtime_id) {
+            (Some(before), Some(after)) => before == after,
+            (None, None) => uptime_continues,
+            _ => false,
+        };
+        counters_advance && uptime_continues && same_process
+    }
+}
+
+/// Observe advancing scans in continuous mode. Equal counters are inconclusive:
+/// a valid long-period task may not advance every poll. The entire check,
+/// including SSH reads and sleeps, shares one hard deadline.
+async fn watch_restarted_program<F, Fut>(
+    mut read: F,
+    window: Duration,
+    poll: Duration,
+) -> DeployHealth
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<serde_json::Value, String>>,
+{
+    let verdict = |state, detail: String, unhealthy_devices| DeployHealth {
+        state,
+        detail,
+        unhealthy_devices,
+    };
+    let deadline = tokio::time::Instant::now() + window;
+    let mut previous: Option<StatusReading> = None;
+    let mut detail = "no status observation".to_string();
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        match tokio::time::timeout_at(deadline, read()).await {
+            Ok(Ok(v)) => {
+                let r = status_reading(&v);
+                if let Some(fault) = r.fault {
+                    return verdict(
+                        DeployHealthState::Faulted,
+                        format!("the program stopped: {fault}"),
+                        r.unhealthy_devices,
+                    );
+                }
+                if r.watchdog_tripped {
+                    return verdict(
+                        DeployHealthState::Faulted,
+                        "the scan watchdog latched the runtime's output phase off".into(),
+                        r.unhealthy_devices,
+                    );
+                }
+                match r.mode.as_deref() {
+                    Some("paused" | "step") => {
+                        return verdict(
+                            DeployHealthState::NotRunning,
+                            "the program is paused or single-stepping, not running continuously"
+                                .into(),
+                            r.unhealthy_devices,
+                        )
+                    }
+                    Some("running") => {
+                        if previous.as_ref().is_some_and(|p| r.advances_from(p)) {
+                            return verdict(
+                                DeployHealthState::Running,
+                                format!("the program is running ({} scans)", r.scan_count.unwrap()),
+                                r.unhealthy_devices,
+                            );
+                        }
+                        detail = format!(
+                            "runtime answered, but continuous scan progress was not confirmed \
+                            (scan_count={:?}, uptime_secs={:?})",
+                            r.scan_count, r.uptime_secs
+                        );
+                        previous = Some(r);
+                    }
+                    _ => {
+                        detail = "runtime did not report a recognized execution mode".into();
+                        previous = None;
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                detail = e;
+                previous = None;
+            }
+            Err(_) => {
+                detail = "status read did not complete before the deadline".into();
+                break;
+            }
+        }
+        tokio::time::sleep_until((tokio::time::Instant::now() + poll).min(deadline)).await;
+    }
+    verdict(
+        DeployHealthState::Unknown,
+        format!(
+            "program state unknown after {} s: {detail}; stopped state is not confirmed",
+            window.as_secs()
+        ),
+        Vec::new(),
+    )
 }
 
 /// Metadata-suppression flags for the host `tar`, probed once per
@@ -957,6 +1217,8 @@ pub async fn attach_edge(
 /// through that door.
 pub fn ssh_cmd(edge: &Edge) -> Command {
     let mut c = Command::new("ssh");
+    // A cancelled health check must not leave an SSH child waiting forever.
+    c.kill_on_drop(true);
     c.arg("-p")
         .arg(edge.ssh_port.to_string())
         .arg("-o")
@@ -1554,5 +1816,256 @@ mod tests {
         let junk = probe_from_health_body("<html>502 Bad Gateway</html>");
         assert!(!junk.reachable);
         assert!(junk.error.unwrap().contains("unexpected body"));
+    }
+
+    /// Run the post-restart check against scripted `/status` reads (the
+    /// last one repeats), in a short window so a check that never settles
+    /// ends quickly.
+    async fn watch(reads: Vec<Result<serde_json::Value, String>>) -> DeployHealth {
+        let mut queue = std::collections::VecDeque::from(reads);
+        watch_restarted_program(
+            move || {
+                let read = if queue.len() > 1 {
+                    queue.pop_front()
+                } else {
+                    queue.front().cloned()
+                }
+                .expect("at least one scripted read");
+                async move { read }
+            },
+            Duration::from_millis(200),
+            Duration::from_millis(5),
+        )
+        .await
+    }
+
+    fn status(scan_count: u64, fault: Option<&str>) -> Result<serde_json::Value, String> {
+        Ok(serde_json::json!({
+            "scan_count": scan_count,
+            "uptime_secs": 10,
+            "runtime_id": "test-process",
+            "mode": {"kind": "running"},
+            "fault": fault,
+            "watchdog_tripped": false,
+            "device_health": [],
+        }))
+    }
+
+    #[tokio::test]
+    async fn a_restarted_program_that_scans_is_running() {
+        let health = watch(vec![status(0, None), status(3, None), status(9, None)]).await;
+        assert_eq!(health.state, DeployHealthState::Running, "{health:?}");
+        assert!(health.detail.contains("9 scans"), "{health:?}");
+        assert!(health.state.deploy_ok());
+    }
+
+    /// systemd reported the restart fine; the program trapped on its first
+    /// scan. Deploy used to report success.
+    #[tokio::test]
+    async fn a_restarted_program_that_traps_is_faulted() {
+        let trap = "VM trap in main_inst: DivideByZero";
+        let health = watch(vec![status(0, None), status(0, Some(trap))]).await;
+        assert_eq!(health.state, DeployHealthState::Faulted, "{health:?}");
+        assert!(health.detail.contains(trap), "{health:?}");
+        assert!(!health.state.deploy_ok());
+    }
+
+    /// One read showing scans is not enough: the confirming read a poll
+    /// later catches a trap right after the first scans.
+    #[tokio::test]
+    async fn a_trap_after_the_first_scans_is_caught_by_the_confirming_read() {
+        let trap = "VM trap in main_inst: DivideByZero";
+        let health = watch(vec![status(2, None), status(2, Some(trap))]).await;
+        assert_eq!(health.state, DeployHealthState::Faulted, "{health:?}");
+    }
+
+    /// A VM that never starts records no fault on an older edge build; it
+    /// just never scans. That must not pass either.
+    #[tokio::test]
+    async fn a_restarted_program_that_never_scans_is_unconfirmed() {
+        let health = watch(vec![status(0, None)]).await;
+        assert_eq!(health.state, DeployHealthState::Unknown, "{health:?}");
+        assert!(
+            health.detail.contains("progress was not confirmed"),
+            "{health:?}"
+        );
+        assert!(!health.state.deploy_ok());
+    }
+
+    #[tokio::test]
+    async fn a_runtime_that_never_answers_is_unknown() {
+        let health = watch(vec![Err("curl: connection refused".into())]).await;
+        assert_eq!(health.state, DeployHealthState::Unknown, "{health:?}");
+        assert!(health.detail.contains("connection refused"), "{health:?}");
+    }
+
+    #[tokio::test]
+    async fn a_runtime_that_answers_late_is_waited_for() {
+        let health = watch(vec![
+            Err("curl: connection refused".into()),
+            Err("curl: connection refused".into()),
+            status(1, None),
+            status(4, None),
+        ])
+        .await;
+        assert_eq!(health.state, DeployHealthState::Running, "{health:?}");
+    }
+
+    #[tokio::test]
+    async fn a_latched_watchdog_is_faulted() {
+        let latched = Ok(serde_json::json!({
+            "scan_count": 40, "fault": null, "watchdog_tripped": true, "device_health": [],
+        }));
+        let health = watch(vec![latched]).await;
+        assert_eq!(health.state, DeployHealthState::Faulted, "{health:?}");
+        assert!(health.detail.contains("watchdog"), "{health:?}");
+    }
+
+    /// A device still down runs the program all the same; it is reported,
+    /// not failed.
+    #[tokio::test]
+    async fn a_down_device_is_reported_on_a_running_program() {
+        let degraded = |n: u64| {
+            Ok(serde_json::json!({
+                "scan_count": n, "uptime_secs": 10, "runtime_id": "test-process",
+                "mode": {"kind": "running"}, "fault": null, "watchdog_tripped": false,
+                "device_health": [{"name": "coupler", "healthy": false},
+                                  {"name": "servo", "healthy": true}],
+            }))
+        };
+        let health = watch(vec![degraded(1), degraded(5)]).await;
+        assert_eq!(health.state, DeployHealthState::Running, "{health:?}");
+        assert_eq!(health.unhealthy_devices, vec!["coupler".to_string()]);
+    }
+    fn reading(n: u64, uptime: u64, id: &str, mode: &str) -> Result<serde_json::Value, String> {
+        let mut v = status(n, None).unwrap();
+        v["uptime_secs"] = uptime.into();
+        v["runtime_id"] = id.into();
+        v["mode"]["kind"] = mode.into();
+        Ok(v)
+    }
+
+    #[tokio::test]
+    async fn paused_and_single_step_programs_do_not_pass() {
+        for mode in ["paused", "step"] {
+            let h = watch(vec![reading(3, 10, "a", mode)]).await;
+            assert_eq!(h.state, DeployHealthState::NotRunning, "{h:?}");
+            assert!(!h.state.deploy_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_frozen_positive_counter_is_unknown_not_running() {
+        let h = watch(vec![status(3, None)]).await;
+        assert_eq!(h.state, DeployHealthState::Unknown, "{h:?}");
+        assert!(!h.state.deploy_ok());
+    }
+
+    #[tokio::test]
+    async fn restart_must_begin_a_fresh_observation() {
+        // A restarted process may already have a greater count by the next poll.
+        for (count, uptime, id) in [(2, 0, "a"), (900, 0, "a"), (900, 10, "b")] {
+            let h = watch(vec![
+                reading(800, 10, "a", "running"),
+                reading(count, uptime, id, "running"),
+            ])
+            .await;
+            assert_eq!(h.state, DeployHealthState::Unknown, "{h:?}");
+        }
+        let h = watch(vec![
+            reading(800, 10, "a", "running"),
+            reading(2, 0, "b", "running"),
+            reading(5, 1, "b", "running"),
+        ])
+        .await;
+        assert_eq!(h.state, DeployHealthState::Running, "{h:?}");
+    }
+
+    #[tokio::test]
+    async fn equal_counts_between_long_period_scans_are_waited_for() {
+        let mut reads = vec![status(3, None); 6];
+        for v in reads.iter_mut().flatten() {
+            v["scan_period_ms"] = 5000.into();
+        }
+        reads.push(status(4, None));
+        assert_eq!(watch(reads).await.state, DeployHealthState::Running);
+    }
+
+    #[tokio::test]
+    async fn missing_status_fields_are_not_assumed_healthy() {
+        let h = watch(vec![Ok(serde_json::json!({"scan_count": 10}))]).await;
+        assert_eq!(h.state, DeployHealthState::Unknown);
+        // Older builds without the new identity remain compatible using uptime.
+        let mut a = status(3, None).unwrap();
+        let mut b = status(4, None).unwrap();
+        a.as_object_mut().unwrap().remove("runtime_id");
+        b.as_object_mut().unwrap().remove("runtime_id");
+        assert_eq!(
+            watch(vec![Ok(a), Ok(b)]).await.state,
+            DeployHealthState::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_error_breaks_the_progress_observation() {
+        let h = watch(vec![
+            status(3, None),
+            Err("connection lost".into()),
+            status(4, None),
+        ])
+        .await;
+        assert_eq!(h.state, DeployHealthState::Unknown);
+    }
+
+    #[tokio::test]
+    async fn deadline_cancels_a_hanging_read() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let h = tokio::time::timeout(
+            Duration::from_millis(500),
+            watch_restarted_program(
+                || {
+                    let guard = Dropped(dropped.clone());
+                    async move {
+                        let _guard = guard;
+                        std::future::pending::<Result<serde_json::Value, String>>().await
+                    }
+                },
+                Duration::from_millis(10),
+                Duration::from_millis(1),
+            ),
+        )
+        .await
+        .expect("the health deadline must bound the read");
+        assert_eq!(h.state, DeployHealthState::Unknown);
+        assert!(h.detail.contains("deadline"));
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "pending read must be cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn deadline_also_bounds_the_poll_sleep() {
+        let h = tokio::time::timeout(
+            Duration::from_millis(500),
+            watch_restarted_program(
+                || async { status(0, None) },
+                Duration::from_millis(10),
+                Duration::from_secs(60),
+            ),
+        )
+        .await
+        .expect("poll sleep must not extend the deadline");
+        assert_eq!(h.state, DeployHealthState::Unknown);
     }
 }

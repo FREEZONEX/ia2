@@ -7,6 +7,9 @@ use anyhow::Result;
 
 use crate::http::{url_encode, Body, Client};
 
+mod deploy_verdict;
+use deploy_verdict::deploy_verdict;
+
 pub(crate) fn cmd_deploy(client: &Client, name: &str, json: bool) -> Result<i32> {
     // The server's /api/edges/{name}/deploy route owns the SSH+tar
     // dance. Bigger timeout than the default (30 s) because the
@@ -22,22 +25,16 @@ pub(crate) fn cmd_deploy(client: &Client, name: &str, json: bool) -> Result<i32>
         println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
         // Human-readable: the streamed deploy log, then the verdict.
-        let version = value.get("version").and_then(|v| v.as_str()).unwrap_or("?");
         let log = value.get("log").and_then(|v| v.as_str()).unwrap_or("");
         if !log.is_empty() {
             eprintln!("{log}");
         }
-        let ok = value.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
-        if ok {
-            eprintln!("✓ deployed to '{name}' as version {version}");
-        } else {
-            eprintln!("✗ deploy to '{name}' FAILED — read the log above");
-        }
-        if let Some(w) = value.get("warning").and_then(|v| v.as_str()) {
-            eprintln!("⚠ {w}");
+        for line in deploy_verdict(name, &value) {
+            eprintln!("{line}");
         }
     }
-    // ok=false means the script ran but exited non-zero (remote failure).
+    // ok=false: the remote script failed, or the new version is installed
+    // but its program is not running.
     let ok = value.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
     Ok(if ok { 0 } else { 1 })
 }
