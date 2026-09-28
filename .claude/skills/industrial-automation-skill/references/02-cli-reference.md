@@ -212,6 +212,16 @@ runtime answers while running nothing. `probe` prints `PROGRAM FAULTED —
 predating the field reports `fault: null` here even when faulted, so check
 `cs get edges/<n>/status` on an old edge.
 
+Deploy first freezes regular project files into a private temporary snapshot.
+Preflight and upload use the same copy; later saves cannot alter the upload.
+Symlinks and special files are refused before upload; replace them with regular
+files. The snapshot is removed after completion or cancellation. The shared
+runtime loader validates governance, tasks, devices/iomap, the multi-PROGRAM
+shared-globals rule and compilation. Refusal is `ok:false`, empty `version`,
+`health:null` and the reason in `log`; nothing on the edge changes. This uses
+the server compiler; a carried-forward edge binary may differ. Runtime faults
+remain the responsibility of the post-restart check.
+
 Deploy REFUSES to lie: a failed restart, broken tar stream, or missing
 version stamp fails (`ok:false` + log). After restart the server requires
 continuous mode and advancing positive scans in consecutive `/status` reads.

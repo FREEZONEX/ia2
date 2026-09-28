@@ -2,6 +2,7 @@ mod catalog;
 mod conditional;
 #[cfg(test)]
 mod conditional_tests;
+mod deploy_snapshot;
 mod edges;
 mod error;
 mod events;

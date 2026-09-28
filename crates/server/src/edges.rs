@@ -541,7 +541,7 @@ pub enum DeployError {
 
 /// Deploy a project directory + optional runtime binary to one edge.
 ///
-/// `project_dir`     filesystem path of the project on the dev machine.
+/// `snapshot`        private project copy that passed the runtime preflight.
 /// `runtime_binary`  path to a built `ia2-runtime` binary
 ///                   for the edge's architecture. Optional — when None,
 ///                   the deploy reuses whatever binary is already under
@@ -554,13 +554,14 @@ pub enum DeployError {
 ///                   forward (same rule as the binary).
 pub async fn deploy_to_edge(
     edge: &Edge,
-    project_dir: &std::path::Path,
+    snapshot: &crate::deploy_snapshot::DeploySnapshot,
     runtime_binary: Option<&std::path::Path>,
     web_dist: Option<&std::path::Path>,
 ) -> Result<DeployReport, DeployError> {
-    // ---- Pack project (+ optional binary) into a tar stream ----
-    // We `tar -cf -` locally and pipe to ssh's stdin so we never need a
-    // temp file on either side. The script on the edge extracts to a
+    let project_dir = snapshot.project_dir();
+    // ---- Pack the checked project (+ optional binary) into a tar stream ----
+    // Stream the checked copy with `tar -cf -` into SSH; no additional
+    // archive file is needed. The script on the edge extracts to a
     // timestamped dir and atomically flips the symlink.
     let mut tar = Command::new("tar");
     tar.arg("-cf").arg("-");

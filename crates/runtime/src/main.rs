@@ -318,22 +318,18 @@ async fn main() -> Result<()> {
     );
 
     // ---- Load + compile the whole project ----
-    let store = ProjectStore::open(args.project_dir.clone())
-        .with_context(|| format!("opening project at {}", args.project_dir.display()))?;
+    // The same function the IDE server's deploy runs on the project before
+    // uploading it, so whatever it refuses here was refused there first.
+    let ironplc_bridge::EdgeProject {
+        store,
+        tasks,
+        devices,
+        iomap,
+        units,
+    } = ironplc_bridge::load_edge_project(&args.project_dir).map_err(|e| anyhow!(e))?;
     let project_name = store.name().to_string();
-    let tasks = store
-        .read_tasks()
-        .context("reading tasks.toml")?
-        .ok_or_else(|| {
-            anyhow!(
-                "tasks.toml missing from project — run the IDE's 'Migrate to tasks' \
-                 once, or hand-author tasks.toml, then redeploy"
-            )
-        })?;
     let program_instances: Vec<String> =
         tasks.programs.iter().map(|p| p.instance.clone()).collect();
-    let devices = store.list_devices().context("listing devices")?;
-    let iomap = store.read_iomap().context("reading iomap")?;
     let device_names = devices.iter().map(|d| d.name.clone()).collect::<Vec<_>>();
     let device_specs: Vec<DeviceSpec> = devices
         .into_iter()
@@ -362,18 +358,6 @@ async fn main() -> Result<()> {
             }
         }
     }
-
-    // ADR-0001 gate — the same bridge implementation the IDE server
-    // enforces, so the rule and its message can't drift between the
-    // desktop and edge surfaces.
-    if let Err(msg) = ironplc_bridge::reject_shared_globals(&store, &tasks) {
-        anyhow::bail!("{msg} Then redeploy.");
-    }
-
-    // One container + VM per scheduled PROGRAM instance; the bridge's
-    // single scan thread rotates them at their own task intervals.
-    let units =
-        ironplc_bridge::compile_project_units(&store, &tasks).context("compiling project")?;
     let retain_var_count: usize = units.iter().map(|u| u.retain_vars.len()).sum();
     tracing::info!(
         devices = device_specs.len(),
