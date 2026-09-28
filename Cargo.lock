@@ -1004,7 +1004,7 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "container_derive"
-version = "0.244.0"
+version = "0.246.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1322,7 +1322,7 @@ dependencies = [
 
 [[package]]
 name = "dsl_macro_derive"
-version = "0.244.0"
+version = "0.246.0"
 dependencies = [
  "convert_case 0.12.0",
  "proc-macro2",
@@ -2358,7 +2358,7 @@ dependencies = [
 
 [[package]]
 name = "ironplc-analyzer"
-version = "0.244.0"
+version = "0.246.0"
 dependencies = [
  "ctor",
  "env_logger",
@@ -2407,7 +2407,7 @@ dependencies = [
 
 [[package]]
 name = "ironplc-cli"
-version = "0.244.0"
+version = "0.246.0"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -2439,7 +2439,7 @@ dependencies = [
 
 [[package]]
 name = "ironplc-cli-support"
-version = "0.244.0"
+version = "0.246.0"
 dependencies = [
  "env_logger",
  "log",
@@ -2449,7 +2449,7 @@ dependencies = [
 
 [[package]]
 name = "ironplc-codegen"
-version = "0.244.0"
+version = "0.246.0"
 dependencies = [
  "blake3",
  "ironplc-analyzer",
@@ -2468,7 +2468,7 @@ dependencies = [
 
 [[package]]
 name = "ironplc-container"
-version = "0.244.0"
+version = "0.246.0"
 dependencies = [
  "blake3",
  "container_derive",
@@ -2479,7 +2479,7 @@ dependencies = [
 
 [[package]]
 name = "ironplc-dsl"
-version = "0.244.0"
+version = "0.246.0"
 dependencies = [
  "dsl_macro_derive",
  "ironplc-problems",
@@ -2493,7 +2493,7 @@ dependencies = [
 
 [[package]]
 name = "ironplc-parser"
-version = "0.244.0"
+version = "0.246.0"
 dependencies = [
  "ironplc-container",
  "ironplc-dsl",
@@ -2510,7 +2510,7 @@ dependencies = [
 
 [[package]]
 name = "ironplc-plc2plc"
-version = "0.244.0"
+version = "0.246.0"
 dependencies = [
  "dsl_macro_derive",
  "ironplc-dsl",
@@ -2524,14 +2524,14 @@ dependencies = [
 
 [[package]]
 name = "ironplc-problems"
-version = "0.244.0"
+version = "0.246.0"
 dependencies = [
  "csv",
 ]
 
 [[package]]
 name = "ironplc-project"
-version = "0.244.0"
+version = "0.246.0"
 dependencies = [
  "ctor",
  "env_logger",
@@ -2550,7 +2550,7 @@ dependencies = [
 
 [[package]]
 name = "ironplc-sources"
-version = "0.244.0"
+version = "0.246.0"
 dependencies = [
  "ctor",
  "encoding_rs",
@@ -2570,15 +2570,15 @@ dependencies = [
 
 [[package]]
 name = "ironplc-spec-requirements-gen"
-version = "0.244.0"
+version = "0.246.0"
 
 [[package]]
 name = "ironplc-test"
-version = "0.244.0"
+version = "0.246.0"
 
 [[package]]
 name = "ironplc-vm"
-version = "0.244.0"
+version = "0.246.0"
 dependencies = [
  "csv",
  "ironplc-container",
@@ -4523,7 +4523,7 @@ dependencies = [
 
 [[package]]
 name = "spec_test_macro"
-version = "0.244.0"
+version = "0.246.0"
 dependencies = [
  "proc-macro2",
  "quote",

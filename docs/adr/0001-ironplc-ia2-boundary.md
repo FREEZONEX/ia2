@@ -3,6 +3,7 @@
 Status: Accepted (2026-06-13)
 
 Updated: 2026-09-23 — unpatched upstream v0.244.0, single IA2 scheduler.
+Updated: 2026-09-23 — released upstream v0.246.0; SFC state follows step-name encoding.
 
 ## Context
 
@@ -62,11 +63,34 @@ concepts into the vendor, and don't reimplement the language in IA2.**
 ## Decision: vendor strategy (released upstream pin, no active patches)
 
 The submodule points directly at `https://github.com/ironplc/ironplc.git`,
-tag [v0.244.0](https://github.com/ironplc/ironplc/releases/tag/v0.244.0),
-commit `fe039d8f9bf927995b42a018f6f29b7ef551c327`. This is an upstream
-**pre-release**, selected as the bounded upgrade surveyed in IA2 #61,
-not a claim that it is the newest or a stable release. There are no
-IA2 source patches in the submodule.
+tag [v0.246.0](https://github.com/ironplc/ironplc/releases/tag/v0.246.0),
+commit `6f4a796736576b29cde5d163e75c311639028e15` — an upstream **release**
+(not a pre-release). There are no IA2 source patches in the submodule.
+
+v0.246.0 over the v0.244.0 pre-release that IA2 #61 surveyed:
+
+- A `STRING` literal holding a character outside Latin-1 is rejected
+  (P4052, ironplc [#1733](https://github.com/ironplc/ironplc/issues/1733))
+  instead of silently keeping each character's low byte. The SFC
+  transpiler therefore lowers a chart whose step names are not all
+  Latin-1 to `WSTRING` state and literals; Latin-1 charts keep the
+  historical `STRING` lowering unchanged.
+- New analysis errors, some for programs that used to compile into
+  silently wrong code: a name declared twice in one scope, including
+  names that differ only in case (P4014); the same function block or type
+  declared in two POU files, where the last one used to win (P4013,
+  P2007); a `FUNCTION` holding a function block instance (P4054); a
+  `CASE` selector that is not an integer or enumeration, bit strings
+  included (P4053); an inverted `CASE` range (P4051). Every project under
+  `examples/` and the process-control library validate with identical
+  diagnostics on both versions.
+- A configuration and a type of the same name are now a duplicate
+  declaration, so the synthesized CONFIGURATION is named
+  `__ia2_configuration` (it was `config`, which rejected a project's own
+  `TYPE Config`).
+- P9999 diagnostics carry the source span of the construct
+  (ironplc [#1734](https://github.com/ironplc/ironplc/issues/1734)).
+- No bridge API change.
 
 Historical fork patches (the old fork/ref is not rewritten, so prior IA2
 commits remain reproducible):
@@ -139,6 +163,12 @@ tasks" with no change to the layers above.
 3. Nested FB instances inside FUNCTION_BLOCK bodies:
    [ironplc #1553](https://github.com/ironplc/ironplc/issues/1553).
    Until supported, hoist those instances into the PROGRAM.
+
+IA2-side follow-up from the v0.246.0 upgrade, since done (#72): the LD/FBD
+transpilers compare generated instance and temporary names
+case-insensitively and against the POU's own variables, as IEC names
+require. A clash is a pointed error on the diagram element rather than
+P4014 on generated ST.
 
 Offline compile, VM, pause/step/resume and simulation tests are upgrade
 evidence, not real fieldbus or timing acceptance. Rebuild and test hardware

@@ -206,6 +206,12 @@ nastiest: a latched runtime is reachable AND fieldbus-healthy AND its scan
 count keeps climbing, while it drives nothing. `probe` prints
 `WATCHDOG LATCHED` for it; only a restart clears it.
 
+`fault` is the fourth: the edge's program stopped (a VM trap, say), and the
+runtime answers while running nothing. `probe` prints `PROGRAM FAULTED —
+<reason>`; the edge's `/status` carries the same `fault`. An edge build
+predating the field reports `fault: null` here even when faulted, so check
+`cs get edges/<n>/status` on an old edge.
+
 Deploy first freezes regular project files into a private temporary snapshot.
 Preflight and upload use the same copy; later saves cannot alter the upload.
 Symlinks and special files are refused before upload; replace them with regular

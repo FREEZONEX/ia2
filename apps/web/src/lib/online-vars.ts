@@ -97,22 +97,32 @@ export function onlineNumber(vars: OnlineVars, name: string): number | null {
   return Number.isFinite(n) ? n : null
 }
 
-/** How the snapshot shows the STRING the runtime stores for `text`.
- *  ironplc keeps each character's low byte (Latin-1, `encode_string_literal`)
- *  and the bridge prints the bytes as an IEC literal
- *  (ironplc's `VariableRenderer`) — so `等待` arrives as `'I$85'`. */
-export function runtimeStringLiteral(text: string): string {
-  let out = "'"
-  for (const ch of text) {
-    const b = (ch.codePointAt(0) ?? 0) & 0xff
-    if (b === 0x24) out += "$$"
-    else if (b === 0x27) out += "$'"
-    else if (b === 0x09) out += "$T"
-    else if (b === 0x0a) out += "$L"
-    else if (b === 0x0c) out += "$P"
-    else if (b === 0x0d) out += "$R"
-    else if (b >= 0x20 && b <= 0x7e) out += String.fromCharCode(b)
-    else out += `$${b.toString(16).toUpperCase().padStart(2, "0")}`
+/** How the snapshot shows the value the runtime stores for `text` in a
+ *  variable of type `typeName`, as ironplc's `VariableRenderer` prints it:
+ *  a STRING is single-quoted Latin-1 bytes, a WSTRING double-quoted UTF-16
+ *  code units; printable ASCII passes through and everything else is
+ *  `$`-escaped. So `café` in a STRING arrives as `'caf$E9'` and `加料` in a
+ *  WSTRING as `"$52A0$6599"`. A STRING keeps each character's low byte —
+ *  how older runtimes stored non-Latin-1 text (`等待` as `'I$85'`); current
+ *  ones refuse such a literal. */
+export function runtimeStringLiteral(text: string, typeName = "STRING"): string {
+  const wide = /^\s*WSTRING\b/i.test(typeName)
+  const quote = wide ? '"' : "'"
+  let out = quote
+  // A WSTRING is escaped per UTF-16 code unit (so a surrogate pair is two
+  // escapes); a STRING per character, of which it keeps the low byte.
+  const units = wide
+    ? Array.from({ length: text.length }, (_, i) => text.charCodeAt(i))
+    : Array.from(text, (ch) => (ch.codePointAt(0) ?? 0) & 0xff)
+  for (const u of units) {
+    if (u === 0x24) out += "$$"
+    else if (u === quote.charCodeAt(0)) out += `$${quote}`
+    else if (u === 0x09) out += "$T"
+    else if (u === 0x0a) out += "$L"
+    else if (u === 0x0c) out += "$P"
+    else if (u === 0x0d) out += "$R"
+    else if (u >= 0x20 && u <= 0x7e) out += String.fromCharCode(u)
+    else out += `$${u.toString(16).toUpperCase().padStart(wide ? 4 : 2, "0")}`
   }
-  return `${out}'`
+  return `${out}${quote}`
 }

@@ -3,8 +3,8 @@
 //! On disk as `pous/<slug>.sfc.json`. Loaded by the store, transpiled
 //! to ST by `crates/ironplc-bridge/src/sfc_transpile.rs`, then compiled
 //! by ironplc. ironplc does NOT have a native SFC codegen path; we
-//! lower SFC to a plain ST `IF __step = '<name>' THEN …` dispatch (no
-//! `CASE OF STRING` because ironplc's analyser is shaky on it).
+//! lower SFC to a plain ST `IF __sfc_step = '<name>' THEN …` dispatch
+//! (not `CASE`: ironplc rejects a string selector, P4053).
 //!
 //! Design notes (see also MEMORY/graphical-languages.md § SFC):
 //!
@@ -12,10 +12,11 @@
 //!   `from → to` arrows with a boolean ST expression guarding them,
 //!   **actions** are ST statements attached to steps with a
 //!   "qualifier" controlling when they fire.
-//! - Step names are STRING values stored in an internal `__sfc_step`
-//!   variable. STRING was chosen over an enum/DINT mainly for
+//! - Step names are string values stored in an internal `__sfc_step`
+//!   variable — STRING, or WSTRING when a step name is not Latin-1.
+//!   A string was chosen over an enum/DINT mainly for
 //!   debuggability — operators see the actual step name in Monitor
-//!   rather than `4`. If profiling ever shows STRING comparison as a
+//!   rather than `4`. If profiling ever shows string comparison as a
 //!   hot path we'll change it.
 //! - Qualifier MVP: `N` (while active), `S` (set on entry), `R`
 //!   (reset on entry). P / P0 / P1 / time-qualified come later —
@@ -54,14 +55,16 @@ pub struct SfcProgram {
 #[ts(export)]
 pub struct SfcStep {
     /// Unique within the POU. Used both as the on-the-wire identifier
-    /// and as the source-map key. At runtime it is a STRING literal, so the
-    /// transpiler refuses names containing `'` or `$`, names longer than
-    /// 254 characters, and pairs of names the runtime would store as the
-    /// same value (it keeps only the low byte of non-Latin-1 characters).
+    /// and as the source-map key. At runtime it is a string literal —
+    /// STRING when every step name in the chart is Latin-1, WSTRING
+    /// otherwise — so the transpiler refuses names containing `'` or `$`,
+    /// names longer than 254 characters, and, in a WSTRING chart, names
+    /// containing `"` or a character outside the Basic Multilingual Plane.
     pub name: String,
     /// Statements that fire while this step is active, on entry, etc.
     /// Order is preserved; the transpiler emits them in author order
-    /// inside the step's `IF __sfc_step = 'name' THEN …` block.
+    /// inside the step's `IF __sfc_step = 'name' THEN …` block
+    /// (`"name"` when the chart's state is WSTRING).
     /// Always serialized; see `FbdProgram::outputs` for why we don't
     /// `skip_serializing_if = "Vec::is_empty"` here.
     #[serde(default)]
