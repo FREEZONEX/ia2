@@ -3023,10 +3023,31 @@ mod tests {
         }
     }
 
+    /// Join `thread` if it ends within `limit`; otherwise hand the un-joined
+    /// handle back. It polls `is_finished` and joins only once that is true,
+    /// so the join returns at once and a thread that never exits cannot hang
+    /// the runtime. (`spawn_blocking(thread.join())` under a timeout does not
+    /// have that property: the timeout abandons the future but not the blocking
+    /// task, and dropping the runtime then waits for it forever.)
+    async fn join_within(
+        thread: std::thread::JoinHandle<()>,
+        limit: Duration,
+    ) -> Result<std::thread::Result<()>, std::thread::JoinHandle<()>> {
+        let deadline = Instant::now() + limit;
+        while !thread.is_finished() {
+            if Instant::now() >= deadline {
+                return Err(thread);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Ok(thread.join())
+    }
+
     /// Join the scan thread itself. `ProgramHandle::shutdown` swallows the
     /// join error (it only logs it), so a test that waits on `shutdown` alone
     /// cannot tell a thread that finished its pass from one that unwound out
-    /// of it — nor that it finished at all, if the result is dropped.
+    /// of it — nor that it finished at all, if the result is dropped. A thread
+    /// that does not exit within 5 s fails the test instead of hanging it.
     async fn join_scan_thread(handle: &ProgramHandle) -> std::thread::Result<()> {
         let thread = handle
             .thread
@@ -3034,13 +3055,52 @@ mod tests {
             .unwrap()
             .take()
             .expect("the scan thread handle is still held");
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            tokio::task::spawn_blocking(move || thread.join()),
-        )
-        .await
-        .expect("the scan thread must exit within 5s")
-        .expect("join task")
+        match join_within(thread, Duration::from_secs(5)).await {
+            Ok(joined) => joined,
+            Err(_still_running) => panic!("the scan thread must exit within 5s"),
+        }
+    }
+
+    #[tokio::test]
+    async fn join_within_returns_the_result_of_a_thread_that_ends() {
+        let quick = std::thread::spawn(|| std::thread::sleep(Duration::from_millis(30)));
+        let joined = join_within(quick, Duration::from_secs(5))
+            .await
+            .expect("a thread that ends in time is joined");
+        assert!(joined.is_ok());
+
+        let panicking = std::thread::Builder::new()
+            .spawn(|| panic!("injected thread panic"))
+            .unwrap();
+        let joined = join_within(panicking, Duration::from_secs(5))
+            .await
+            .expect("a thread that panics is still joined");
+        assert_eq!(
+            panic_message(joined.expect_err("it panicked").as_ref()),
+            "injected thread panic"
+        );
+    }
+
+    /// The point of the helper: a thread that never exits gives up at the
+    /// limit and returns the handle, rather than waiting on it.
+    #[tokio::test]
+    async fn join_within_gives_up_on_a_thread_that_never_exits() {
+        let (release, parked) = std::sync::mpsc::channel::<()>();
+        let stuck = std::thread::spawn(move || {
+            let _ = parked.recv();
+        });
+        let started = Instant::now();
+        let stuck = join_within(stuck, Duration::from_millis(150))
+            .await
+            .expect_err("a parked thread is not joined");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "gave up promptly, took {:?}",
+            started.elapsed()
+        );
+
+        release.send(()).unwrap();
+        stuck.join().expect("the parked thread ends once released");
     }
 
     /// The post-panic failsafe pass runs OUTSIDE the loop's `catch_unwind`,
