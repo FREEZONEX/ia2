@@ -950,25 +950,38 @@ fn spawn_units_inner(
             // holds the runtime that late-connected adapters' background
             // tasks live on, and must outlive the writes above).
             drained.store(true, Ordering::Relaxed);
-            // "Cleanly" only when nothing faulted: a VM trap or a failed
-            // start also returns normally, and its log used to read as a
-            // clean exit right after the error.
+            // "Cleanly" only when nothing faulted AND no device's failsafe or
+            // shutdown call failed: a VM trap or a failed start also returns
+            // normally, and a panicking or erroring adapter used to leave this
+            // line reading as a clean exit with the failure only in a field.
             let recorded = fault_tx.borrow().clone();
-            match (&result, recorded) {
-                (Ok(()), None) => tracing::info!(
+            match classify_scan_end(
+                result.is_err(),
+                recorded.is_some(),
+                failsafe_failed,
+                shutdown_failed,
+            ) {
+                ScanEnd::Clean => tracing::info!(
                     devices = dev_count,
                     failsafe_failed,
                     shutdown_failed,
                     "scan loop exited cleanly; failsafe and shutdown attempts completed"
                 ),
-                (Ok(()), Some(fault)) => tracing::error!(
+                ScanEnd::StoppedButDevicesFailed => tracing::error!(
                     devices = dev_count,
                     failsafe_failed,
                     shutdown_failed,
-                    %fault,
+                    "scan loop stopped, but failsafe or shutdown calls FAILED on some devices; \
+                     their outputs are not confirmed safe"
+                ),
+                ScanEnd::Fault => tracing::error!(
+                    devices = dev_count,
+                    failsafe_failed,
+                    shutdown_failed,
+                    fault = %recorded.as_deref().unwrap_or_default(),
                     "scan loop ended on a fault; failsafe and shutdown attempts completed"
                 ),
-                (Err(_), _) => tracing::error!(
+                ScanEnd::Panicked => tracing::error!(
                     devices = dev_count,
                     failsafe_failed,
                     shutdown_failed,
@@ -997,6 +1010,41 @@ fn spawn_units_inner(
         watchdog_tripped,
         fault: fault_rx,
         thread: Arc::new(std::sync::Mutex::new(Some(join_handle))),
+    }
+}
+
+/// How the scan thread ended, for its closing log line. A pure classification
+/// so the wording is testable without capturing another thread's log output.
+#[derive(Debug, PartialEq, Eq)]
+enum ScanEnd {
+    /// Stopped as asked (or ended on its own) with every failsafe and shutdown
+    /// call delivered.
+    Clean,
+    /// Ended without a fault, but at least one device's failsafe or shutdown
+    /// call returned an error or panicked.
+    StoppedButDevicesFailed,
+    /// A VM trap or a failed start recorded a fault.
+    Fault,
+    /// The scan loop itself panicked.
+    Panicked,
+}
+
+/// A panic outranks a fault, which outranks failed device calls, which
+/// outrank "clean".
+fn classify_scan_end(
+    panicked: bool,
+    faulted: bool,
+    failsafe_failed: usize,
+    shutdown_failed: usize,
+) -> ScanEnd {
+    if panicked {
+        ScanEnd::Panicked
+    } else if faulted {
+        ScanEnd::Fault
+    } else if failsafe_failed > 0 || shutdown_failed > 0 {
+        ScanEnd::StoppedButDevicesFailed
+    } else {
+        ScanEnd::Clean
     }
 }
 
@@ -3019,6 +3067,26 @@ mod tests {
             assert!(
                 flag.load(Ordering::Relaxed),
                 "{what} must run after a panic"
+            );
+        }
+    }
+
+    #[test]
+    fn the_closing_log_line_is_clean_only_when_nothing_failed() {
+        use ScanEnd::*;
+        for (panicked, faulted, fs, sd, want) in [
+            (false, false, 0, 0, Clean),
+            (false, false, 1, 0, StoppedButDevicesFailed),
+            (false, false, 0, 2, StoppedButDevicesFailed),
+            (false, true, 0, 0, Fault),
+            (false, true, 3, 3, Fault),
+            (true, false, 0, 0, Panicked),
+            (true, true, 5, 5, Panicked),
+        ] {
+            assert_eq!(
+                classify_scan_end(panicked, faulted, fs, sd),
+                want,
+                "panicked={panicked} faulted={faulted} failsafe_failed={fs} shutdown_failed={sd}"
             );
         }
     }
