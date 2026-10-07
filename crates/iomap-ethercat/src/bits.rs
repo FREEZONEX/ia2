@@ -75,6 +75,21 @@ fn gather_le(bytes: &[u8], bit_length: u8) -> u32 {
     raw
 }
 
+/// `bit_offset` is the position inside the byte at `byte_offset`. At 8 or
+/// more the bounds check below still passes (that bit exists in the next
+/// byte) while the access would shift the wrong byte: a debug build panics
+/// under the PDI lock, a release build silently reads/writes bit
+/// `bit_offset % 8` of `byte_offset`. Refuse it here so the accessors never
+/// depend on connect-time validation having run.
+fn check_bit_offset(bit_offset: u8) -> Result<(), IoError> {
+    if bit_offset >= 8 {
+        return Err(IoError::Transport(format!(
+            "bit_offset={bit_offset} is outside the byte (valid 0..=7)"
+        )));
+    }
+    Ok(())
+}
+
 /// Read `bit_length` bits starting at `(byte_offset, bit_offset)` from
 /// `pdi` and decode according to `data_type`. Returns an `IoError` if
 /// the range falls outside the PDI buffer.
@@ -88,6 +103,7 @@ pub fn read_value(
     if bit_length == 0 {
         return Err(IoError::Transport("bit_length must be > 0".into()));
     }
+    check_bit_offset(bit_offset)?;
     let total_bits = bit_length as usize;
     let start_bit = (byte_offset * 8) + bit_offset as usize;
     let end_bit = start_bit + total_bits;
@@ -165,6 +181,7 @@ pub fn write_value(
     if bit_length == 0 {
         return Err(IoError::Transport("bit_length must be > 0".into()));
     }
+    check_bit_offset(bit_offset)?;
     let start_bit = (byte_offset * 8) + bit_offset as usize;
     let end_bit = start_bit + bit_length as usize;
     if end_bit > pdi.len() * 8 {
@@ -621,5 +638,119 @@ mod tests {
             let got = read_value(&pdi, 1, 0, bits, ty).expect("read");
             assert_eq!(got, want, "{ty:?} @ {bits} bits");
         }
+    }
+}
+
+/// `read_channel`/`write_channel` run these two functions while holding the
+/// PDI mutex, so a panic here poisons it and takes the failsafe path down
+/// with it. Sweep every (type, offset, bit offset, bit length) a config can
+/// express against small buffers: each must return a value or an `IoError`,
+/// never panic — in a debug build, which is where overflow checks live.
+#[cfg(test)]
+mod no_panic_sweep {
+    use super::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    const TYPES: [EthercatDataType; 8] = [
+        EthercatDataType::Bool,
+        EthercatDataType::U8,
+        EthercatDataType::I8,
+        EthercatDataType::U16,
+        EthercatDataType::I16,
+        EthercatDataType::U32,
+        EthercatDataType::I32,
+        EthercatDataType::Real,
+    ];
+
+    #[test]
+    fn read_and_write_value_never_panic_on_any_expressible_channel_geometry() {
+        let mut panics: Vec<String> = Vec::new();
+        for buf_len in [1usize, 2, 4, 5, 8] {
+            for ty in TYPES {
+                for byte_offset in [0usize, 1, 3, 4, 7, 8, 100] {
+                    for bit_offset in 0u8..=9 {
+                        for bit_length in 0u8..=255 {
+                            let tag = format!(
+                                "{ty:?} buf={buf_len} byte={byte_offset} bit={bit_offset} len={bit_length}"
+                            );
+                            let mut buf = vec![0xA5u8; buf_len];
+                            if catch_unwind(AssertUnwindSafe(|| {
+                                let _ = read_value(&buf, byte_offset, bit_offset, bit_length, ty);
+                            }))
+                            .is_err()
+                            {
+                                panics.push(format!("read  {tag}"));
+                            }
+                            for v in [
+                                ChannelValue::Bool(true),
+                                ChannelValue::U16(0xFFFF),
+                                ChannelValue::I32(i32::MIN),
+                                ChannelValue::Real(f32::NAN),
+                                ChannelValue::F64(1e300),
+                            ] {
+                                if catch_unwind(AssertUnwindSafe(|| {
+                                    let _ = write_value(
+                                        &mut buf,
+                                        byte_offset,
+                                        bit_offset,
+                                        bit_length,
+                                        ty,
+                                        v,
+                                    );
+                                }))
+                                .is_err()
+                                {
+                                    panics.push(format!("write {tag} value={v:?}"));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            panics.is_empty(),
+            "{} panicking calls, first: {:?}",
+            panics.len(),
+            &panics[..panics.len().min(5)]
+        );
+    }
+
+    /// A bit offset of 8 is the first bit of the NEXT byte only in the
+    /// caller's head. Both profiles must refuse it and leave the buffer
+    /// alone: release used to answer `Ok` from bit 0 of the wrong byte.
+    #[test]
+    fn a_bit_offset_outside_the_byte_is_refused_not_misaddressed() {
+        let pdi = [0x00u8, 0x01u8];
+        assert!(read_value(&pdi, 0, 8, 1, EthercatDataType::Bool).is_err());
+
+        let mut out = [0x00u8, 0x00u8];
+        assert!(write_value(
+            &mut out,
+            0,
+            8,
+            1,
+            EthercatDataType::Bool,
+            ChannelValue::Bool(true)
+        )
+        .is_err());
+        assert_eq!(
+            out,
+            [0x00, 0x00],
+            "a refused write must not touch the image"
+        );
+
+        // The last valid bit of the byte still works.
+        let mut out = [0x00u8];
+        write_value(
+            &mut out,
+            0,
+            7,
+            1,
+            EthercatDataType::Bool,
+            ChannelValue::Bool(true),
+        )
+        .unwrap();
+        assert_eq!(out, [0x80]);
     }
 }
