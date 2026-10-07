@@ -34,7 +34,10 @@ mod store;
 mod types;
 
 pub use alarm_check::{validate_alarms, AlarmIssue, DEVICE_ALARM_PREFIX};
-pub use device_check::{duplicate_channel_names, validate_devices, DeviceIssue};
+pub use device_check::{
+    duplicate_channel_names, pdi_bit_offset_problem, validate_devices, DeviceIssue,
+    MAX_PDI_BIT_OFFSET,
+};
 pub use errors::StoreError;
 pub use fbd::{
     FbdBlock, FbdInputBinding, FbdInputSource, FbdOutputBinding, FbdPosition, FbdProgram,
@@ -58,14 +61,14 @@ pub use paths::{
 pub use sfc::{SfcAction, SfcProgram, SfcQualifier, SfcStep, SfcTransition};
 pub use store::{is_library_slug, MigrationReport, ProjectStore, LIBRARY_SLUG_PREFIX};
 pub use types::{
-    AlarmCondition, AlarmConfig, AlarmDef, AlarmSeverity, CanopenAccess, CanopenChannel,
-    CanopenConfig, CanopenDataType, CanopenTransport, Device, Direction, Edge, EthercatBringup,
-    EthercatChannel, EthercatConfig, EthercatDataType, EthercatDcSync, EthercatGear,
-    EthercatPdoDirection, EthercatSdoInit, EthercatSlave, GearMaster, IoMap, Mapping, ModbusAccess,
-    ModbusChannel, ModbusChannelKind, ModbusConfig, ModbusDataBits, ModbusDataType, ModbusParity,
-    ModbusRs485, ModbusRtuParams, ModbusStopBits, ModbusTcpParams, ModbusTransport,
+    is_ethercat_sim_nic, AlarmCondition, AlarmConfig, AlarmDef, AlarmSeverity, CanopenAccess,
+    CanopenChannel, CanopenConfig, CanopenDataType, CanopenTransport, Device, Direction, Edge,
+    EthercatBringup, EthercatChannel, EthercatConfig, EthercatDataType, EthercatDcSync,
+    EthercatGear, EthercatPdoDirection, EthercatSdoInit, EthercatSlave, GearMaster, IoMap, Mapping,
+    ModbusAccess, ModbusChannel, ModbusChannelKind, ModbusConfig, ModbusDataBits, ModbusDataType,
+    ModbusParity, ModbusRs485, ModbusRtuParams, ModbusStopBits, ModbusTcpParams, ModbusTransport,
     ModbusWordOrder, MqttNorthbound, NorthboundConfig, OpcuaAccess, OpcuaAuth, OpcuaChannel,
     OpcuaConfig, OpcuaDataType, Pou, PouDecl, PouFile, PouFileSource, PouLanguage, PouType,
     ProgramInstance, ProjectListing, ProjectManifest, ProjectTree, ProjectTreeSkeleton, Protocol,
-    ProtocolConfig, Task, Tasks, WriteGovernance, WriteMode, WriteRule,
+    ProtocolConfig, Task, Tasks, WriteGovernance, WriteMode, WriteRule, ETHERCAT_SIM_NIC,
 };

@@ -82,12 +82,10 @@ fn gather_le(bytes: &[u8], bit_length: u8) -> u32 {
 /// `bit_offset % 8` of `byte_offset`. Refuse it here so the accessors never
 /// depend on connect-time validation having run.
 fn check_bit_offset(bit_offset: u8) -> Result<(), IoError> {
-    if bit_offset >= 8 {
-        return Err(IoError::Transport(format!(
-            "bit_offset={bit_offset} is outside the byte (valid 0..=7)"
-        )));
+    match project::pdi_bit_offset_problem(bit_offset) {
+        Some(problem) => Err(IoError::Transport(problem)),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// Read `bit_length` bits starting at `(byte_offset, bit_offset)` from

@@ -23,12 +23,22 @@
 //! is dropped without a word. That is a safety value the author believes is
 //! configured and which cannot ever be applied.
 //!
-//! Every finding is an error. Neither is a style question: one silently
-//! discards a channel, the other silently discards a safe state.
+//! **A PDI bit offset outside its byte.** `EthercatChannel::pdi_bit_offset` is
+//! the position INSIDE the byte at `pdi_byte_offset` (0 = LSB). A value of 8 or
+//! more is not "the next byte": the PDI range check still passes it (that bit
+//! exists in a long enough image), and a real-bus accessor then addresses the
+//! wrong byte. The adapter refuses it at connect, but a device that fails its
+//! connect does not stop the program: it retries in the background, so the
+//! author would otherwise learn of it from a device that never comes up. Only
+//! devices on a real NIC are checked - the simulator ignores PDI offsets - so
+//! this reports exactly what a real-bus connect would refuse.
+//!
+//! Every finding is an error. None is a style question: one silently discards
+//! a channel, one silently discards a safe state, one addresses the wrong bit.
 
 use std::collections::HashMap;
 
-use crate::types::{CanopenAccess, Device, OpcuaAccess, ProtocolConfig};
+use crate::types::{is_ethercat_sim_nic, CanopenAccess, Device, OpcuaAccess, ProtocolConfig};
 
 /// One finding, naming the device and the channel it concerns.
 #[derive(Debug, Clone, PartialEq)]
@@ -63,6 +73,23 @@ where
         .collect()
 }
 
+/// Largest valid `EthercatChannel::pdi_bit_offset`: a bit position inside one
+/// byte. Whole bytes belong in `pdi_byte_offset`.
+pub const MAX_PDI_BIT_OFFSET: u8 = 7;
+
+/// What is wrong with a channel's `pdi_bit_offset`, if anything.
+///
+/// Shared with `iomap-ethercat`, which applies it at connect and again in the
+/// PDI bit accessors: one rule, one wording, wherever it is enforced.
+pub fn pdi_bit_offset_problem(bit_offset: u8) -> Option<String> {
+    (bit_offset > MAX_PDI_BIT_OFFSET).then(|| {
+        format!(
+            "pdi_bit_offset={bit_offset} is outside the byte (valid 0..={MAX_PDI_BIT_OFFSET}); \
+             put whole bytes in pdi_byte_offset"
+        )
+    })
+}
+
 /// Check every device document. Returns all findings; an empty Vec means the
 /// documents are internally consistent.
 pub fn validate_devices(devices: &[Device]) -> Vec<DeviceIssue> {
@@ -91,6 +118,22 @@ pub fn validate_devices(devices: &[Device]) -> Vec<DeviceIssue> {
                      never be applied"
                 ),
             });
+        }
+        if let ProtocolConfig::Ethercat(cfg) = &device.config {
+            if !is_ethercat_sim_nic(&cfg.nic) {
+                for ch in &cfg.channels {
+                    if let Some(problem) = pdi_bit_offset_problem(ch.pdi_bit_offset) {
+                        issues.push(DeviceIssue {
+                            device: device.name.clone(),
+                            channel: ch.name.clone(),
+                            message: format!(
+                                "channel '{}': {problem} - a real-bus connect refuses this channel",
+                                ch.name
+                            ),
+                        });
+                    }
+                }
+            }
         }
     }
     issues
@@ -121,9 +164,11 @@ fn unwritable_failsafes(config: &ProtocolConfig) -> Vec<(String, &'static str)> 
 mod tests {
     use super::*;
     use crate::types::{
-        CanopenChannel, CanopenConfig, CanopenDataType, CanopenTransport, ModbusAccess,
-        ModbusChannel, ModbusChannelKind, ModbusConfig, ModbusDataType, ModbusTcpParams,
-        ModbusTransport, ModbusWordOrder, OpcuaChannel, OpcuaConfig, OpcuaDataType,
+        CanopenChannel, CanopenConfig, CanopenDataType, CanopenTransport, EthercatBringup,
+        EthercatChannel, EthercatConfig, EthercatDataType, EthercatDcSync, EthercatPdoDirection,
+        ModbusAccess, ModbusChannel, ModbusChannelKind, ModbusConfig, ModbusDataType,
+        ModbusTcpParams, ModbusTransport, ModbusWordOrder, OpcuaChannel, OpcuaConfig,
+        OpcuaDataType,
     };
 
     fn modbus_device(name: &str, channels: Vec<ModbusChannel>) -> Device {
@@ -152,6 +197,83 @@ mod tests {
             word_order: ModbusWordOrder::HiLo,
             access: ModbusAccess::Read,
         }
+    }
+
+    fn ethercat_device(name: &str, nic: &str, channels: Vec<EthercatChannel>) -> Device {
+        Device {
+            name: name.into(),
+            config: ProtocolConfig::Ethercat(EthercatConfig {
+                nic: nic.into(),
+                bringup: EthercatBringup::Auto,
+                cycle_us: 1_000,
+                dc_sync: EthercatDcSync::Off,
+                dc_static_sync_iterations: 0,
+                slaves: Vec::new(),
+                channels,
+                gear: Vec::new(),
+            }),
+        }
+    }
+
+    fn ec_bit(name: &str, bit_offset: u8) -> EthercatChannel {
+        EthercatChannel {
+            name: name.into(),
+            slave_index: 0,
+            direction: EthercatPdoDirection::RxPdo,
+            pdo_index: 0x7000,
+            sub_index: 1,
+            bit_length: 1,
+            data_type: EthercatDataType::Bool,
+            pdi_byte_offset: 0,
+            pdi_bit_offset: bit_offset,
+        }
+    }
+
+    #[test]
+    fn a_pdi_bit_offset_outside_its_byte_is_reported_on_a_real_nic() {
+        let d = ethercat_device(
+            "io",
+            "eth0",
+            vec![
+                ec_bit("ok0", 0),
+                ec_bit("ok7", 7),
+                ec_bit("bad8", 8),
+                ec_bit("bad255", 255),
+            ],
+        );
+        let issues = validate_devices(&[d]);
+        let channels: Vec<&str> = issues.iter().map(|i| i.channel.as_str()).collect();
+        assert_eq!(channels, ["bad8", "bad255"], "{issues:?}");
+        assert!(issues.iter().all(|i| i.device == "io"));
+        let first = &issues[0].message;
+        assert!(
+            first.contains("pdi_bit_offset=8") && first.contains("0..=7"),
+            "{first}"
+        );
+        assert!(
+            first.contains("pdi_byte_offset"),
+            "names where whole bytes go: {first}"
+        );
+    }
+
+    /// The simulator ignores PDI offsets and its connect only WARNs about
+    /// channel shapes the real bus refuses, so the lint stays quiet there:
+    /// it reports what a real-bus connect would refuse, not more.
+    #[test]
+    fn the_simulator_is_not_held_to_the_real_bus_rule() {
+        for nic in ["_sim", ""] {
+            let d = ethercat_device("io", nic, vec![ec_bit("bad8", 8)]);
+            assert!(validate_devices(&[d]).is_empty(), "nic {nic:?}");
+        }
+    }
+
+    #[test]
+    fn the_pdi_bit_offset_rule_has_one_definition() {
+        assert_eq!(pdi_bit_offset_problem(0), None);
+        assert_eq!(pdi_bit_offset_problem(MAX_PDI_BIT_OFFSET), None);
+        let problem = pdi_bit_offset_problem(MAX_PDI_BIT_OFFSET + 1).expect("8 is outside");
+        assert!(problem.contains("pdi_bit_offset=8"), "{problem}");
+        assert!(!is_ethercat_sim_nic("eth0") && is_ethercat_sim_nic("_sim"));
     }
 
     #[test]

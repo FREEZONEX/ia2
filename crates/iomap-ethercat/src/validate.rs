@@ -208,18 +208,12 @@ pub(crate) fn validate_channel_shapes(channels: &[EthercatChannel]) -> Result<()
             ));
             continue;
         }
-        // `pdi_bit_offset` is the position INSIDE the byte at `pdi_byte_offset`
-        // (0 = LSB). 8 or more is not "the next byte": the bounds check would
-        // pass it (that bit does exist in a long enough PDI) while the
-        // accessors address the wrong byte, so whole bytes belong in
-        // `pdi_byte_offset`.
-        if ch.pdi_bit_offset >= 8 {
-            problems.push(format!(
-                "channel '{name}': pdi_bit_offset={off} is outside the byte (valid 0..=7); \
-                 put whole bytes in pdi_byte_offset",
-                name = ch.name,
-                off = ch.pdi_bit_offset
-            ));
+        // 8 or more is not "the next byte": the range check below passes it
+        // (that bit exists in a long enough PDI) while the accessors address
+        // the wrong byte. The rule is `project`'s, shared with the author-time
+        // lint, so both say the same thing.
+        if let Some(problem) = project::pdi_bit_offset_problem(ch.pdi_bit_offset) {
+            problems.push(format!("channel '{name}': {problem}", name = ch.name));
         }
         if ch.bit_length > 1 && ch.pdi_bit_offset != 0 {
             problems.push(format!(

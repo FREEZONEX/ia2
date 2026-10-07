@@ -844,6 +844,16 @@ pub enum EthercatBringup {
     },
 }
 
+/// The `nic` value that selects the in-memory simulator instead of a real bus.
+pub const ETHERCAT_SIM_NIC: &str = "_sim";
+
+/// Whether `nic` selects the simulator: the sentinel, or empty. Owned here so
+/// the author-time lint and the adapter agree on which devices a rule about
+/// the real bus applies to; `iomap-ethercat` delegates to it.
+pub fn is_ethercat_sim_nic(nic: &str) -> bool {
+    nic == ETHERCAT_SIM_NIC || nic.is_empty()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct EthercatConfig {
