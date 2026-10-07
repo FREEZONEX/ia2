@@ -891,12 +891,10 @@ fn spawn_units_inner(
             // surface WHY the run died, not just that snapshots stopped.
             // (The failsafe + teardown below still run either way.)
             if let Err(panic) = &result {
-                let msg = panic
-                    .downcast_ref::<&str>()
-                    .map(|s| s.to_string())
-                    .or_else(|| panic.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "scan loop panicked".into());
-                record_fault(fault_tx, format!("scan loop panicked: {msg}"));
+                record_fault(
+                    fault_tx,
+                    format!("scan loop panicked: {}", panic_message(panic.as_ref())),
+                );
             }
 
             // Always-run failsafe before the thread dies. Drive every
@@ -905,9 +903,20 @@ fn spawn_units_inner(
             let dev_count = devices.len();
             let mut failsafe_failed = 0usize;
             for dev in devices.iter_mut() {
-                if let Err(e) = dev.enter_failsafe().await {
-                    failsafe_failed += 1;
-                    tracing::warn!(device = %dev.name(), %e, "failsafe call failed");
+                match isolate_device_call(dev.enter_failsafe()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        failsafe_failed += 1;
+                        tracing::warn!(device = %dev.name(), %e, "failsafe call failed");
+                    }
+                    Err(panic) => {
+                        failsafe_failed += 1;
+                        tracing::error!(
+                            device = %dev.name(),
+                            %panic,
+                            "failsafe call PANICKED; continuing with the remaining devices"
+                        );
+                    }
                 }
             }
             // Give an async-flush device (real EtherCAT) a cycle or two to
@@ -921,9 +930,20 @@ fn spawn_units_inner(
             // Runs on both the clean and panicked paths (before re-panic).
             let mut shutdown_failed = 0usize;
             for dev in devices.iter_mut() {
-                if let Err(e) = dev.shutdown().await {
-                    shutdown_failed += 1;
-                    tracing::warn!(device = %dev.name(), %e, "device shutdown failed");
+                match isolate_device_call(dev.shutdown()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        shutdown_failed += 1;
+                        tracing::warn!(device = %dev.name(), %e, "device shutdown failed");
+                    }
+                    Err(panic) => {
+                        shutdown_failed += 1;
+                        tracing::error!(
+                            device = %dev.name(),
+                            %panic,
+                            "device shutdown PANICKED; continuing with the remaining devices"
+                        );
+                    }
                 }
             }
             // Failsafe + teardown done: release the reconnect worker (it
@@ -978,6 +998,31 @@ fn spawn_units_inner(
         fault: fault_rx,
         thread: Arc::new(std::sync::Mutex::new(Some(join_handle))),
     }
+}
+
+/// The text of a panic payload, for logs and the recorded fault.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".into())
+}
+
+/// Run one device's failsafe/shutdown call so that a panic in it fails THAT
+/// device only. These calls run after the scan loop has ended, outside its
+/// `catch_unwind`: unguarded, one adapter's panic (say an `.expect` on a
+/// poisoned lock) unwound the whole pass, and every device after it was
+/// never driven safe or shut down.
+async fn isolate_device_call<F>(call: F) -> Result<Result<(), iocore::IoError>, String>
+where
+    F: std::future::Future<Output = Result<(), iocore::IoError>>,
+{
+    use futures_util::FutureExt;
+    std::panic::AssertUnwindSafe(call)
+        .catch_unwind()
+        .await
+        .map_err(|panic| panic_message(panic.as_ref()))
 }
 
 /// Connect every `DeviceSpec` into a live `IoDevice` adapter. A
@@ -2848,6 +2893,245 @@ mod tests {
         assert!(
             order_ok.load(Ordering::Relaxed),
             "failsafe must precede device shutdown so zeroed outputs flush before the join"
+        );
+    }
+
+    /// Repro device for the scan-thread panic path. `is_healthy` runs every
+    /// round inside the `catch_unwind`ed loop, so arming `loop_panic` is a
+    /// scan-loop panic; `failsafe_panics` models an adapter whose failsafe
+    /// itself panics (e.g. an `.expect` on a poisoned lock).
+    struct PanicDevice {
+        name: String,
+        loop_panic: Arc<AtomicBool>,
+        failsafe_panics: bool,
+        shutdown_panics: bool,
+        failsafe_called: Arc<AtomicBool>,
+        shutdown_called: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl IoDevice for PanicDevice {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        async fn read_channel(&mut self, _channel: &str) -> Result<ChannelValue, IoError> {
+            Ok(ChannelValue::I32(0))
+        }
+        async fn write_channel(
+            &mut self,
+            _channel: &str,
+            _value: ChannelValue,
+        ) -> Result<(), IoError> {
+            Ok(())
+        }
+        async fn enter_failsafe(&mut self) -> Result<(), IoError> {
+            self.failsafe_called.store(true, Ordering::Relaxed);
+            if self.failsafe_panics {
+                panic!("injected failsafe panic");
+            }
+            Ok(())
+        }
+        async fn shutdown(&mut self) -> Result<(), IoError> {
+            self.shutdown_called.store(true, Ordering::Relaxed);
+            if self.shutdown_panics {
+                panic!("injected shutdown panic");
+            }
+            Ok(())
+        }
+        fn is_healthy(&self) -> bool {
+            if self.loop_panic.load(Ordering::Relaxed) {
+                panic!("injected scan-loop panic");
+            }
+            true
+        }
+    }
+
+    fn panic_device(
+        name: &str,
+        loop_panic: &Arc<AtomicBool>,
+        failsafe_panics: bool,
+    ) -> (PanicDevice, Arc<AtomicBool>, Arc<AtomicBool>) {
+        let failsafe_called = Arc::new(AtomicBool::new(false));
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+        (
+            PanicDevice {
+                name: name.into(),
+                loop_panic: loop_panic.clone(),
+                failsafe_panics,
+                shutdown_panics: false,
+                failsafe_called: failsafe_called.clone(),
+                shutdown_called: shutdown_called.clone(),
+            },
+            failsafe_called,
+            shutdown_called,
+        )
+    }
+
+    /// Run `devices` until `armed` flips, then wait for the fault the panic
+    /// must leave behind. Returns the handle (still joinable).
+    async fn run_until_loop_panic(
+        devices: Vec<Box<dyn IoDevice>>,
+        armed: &Arc<AtomicBool>,
+    ) -> (ProgramHandle, Option<String>) {
+        let handle = spawn_units_inner(
+            vec![single_unit(trivial_container(), 5)],
+            DeviceSource::Prebuilt(devices),
+            Vec::new(),
+            None,
+            WriteGovernance::default(),
+        );
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        armed.store(true, Ordering::Relaxed);
+        let fault = tokio::time::timeout(
+            Duration::from_secs(3),
+            handle.fault_watch().wait_for(|f| f.is_some()),
+        )
+        .await
+        .ok()
+        .and_then(|r| r.ok().and_then(|f| f.clone()));
+        (handle, fault)
+    }
+
+    /// COVERAGE GAP 1: nothing in the suite ever panics the scan loop, so
+    /// "a panic still fails every device safe and is reported as a fault"
+    /// was only ever read off the code. This runs it.
+    #[tokio::test]
+    async fn a_scan_loop_panic_still_fails_every_device_safe_and_records_the_fault() {
+        let armed = Arc::new(AtomicBool::new(false));
+        let (a, a_fs, a_sd) = panic_device("a", &armed, false);
+        let (b, b_fs, b_sd) = panic_device("b", &Arc::new(AtomicBool::new(false)), false);
+        let (handle, fault) = run_until_loop_panic(vec![Box::new(a), Box::new(b)], &armed).await;
+
+        let fault = fault.expect("a scan-loop panic must be recorded as a fault");
+        assert!(
+            fault.contains("scan loop panicked") && fault.contains("injected scan-loop panic"),
+            "{fault}"
+        );
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("joined");
+        for (what, flag) in [
+            ("a failsafe", &a_fs),
+            ("a shutdown", &a_sd),
+            ("b failsafe", &b_fs),
+            ("b shutdown", &b_sd),
+        ] {
+            assert!(
+                flag.load(Ordering::Relaxed),
+                "{what} must run after a panic"
+            );
+        }
+    }
+
+    /// Join the scan thread itself. `ProgramHandle::shutdown` swallows the
+    /// join error (it only logs it), so a test that waits on `shutdown` alone
+    /// cannot tell a thread that finished its pass from one that unwound out
+    /// of it — nor that it finished at all, if the result is dropped.
+    async fn join_scan_thread(handle: &ProgramHandle) -> std::thread::Result<()> {
+        let thread = handle
+            .thread
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the scan thread handle is still held");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || thread.join()),
+        )
+        .await
+        .expect("the scan thread must exit within 5s")
+        .expect("join task")
+    }
+
+    /// The post-panic failsafe pass runs OUTSIDE the loop's `catch_unwind`,
+    /// so each device's call is isolated: one adapter whose failsafe panics
+    /// must not stop the devices after it from getting `enter_failsafe` and
+    /// `shutdown`. The thread still ends by re-raising the ORIGINAL scan-loop
+    /// panic — by design, so it dies with a backtrace — and not the failsafe's.
+    #[tokio::test]
+    async fn one_devices_panicking_failsafe_must_not_skip_the_others() {
+        let armed = Arc::new(AtomicBool::new(false));
+        let (a, _a_fs, _a_sd) = panic_device("a", &armed, true); // panics in failsafe
+        let (b, b_fs, b_sd) = panic_device("b", &Arc::new(AtomicBool::new(false)), false);
+        let (handle, _fault) = run_until_loop_panic(vec![Box::new(a), Box::new(b)], &armed).await;
+        let joined = join_scan_thread(&handle).await;
+        let (fs, sd) = (b_fs.load(Ordering::Relaxed), b_sd.load(Ordering::Relaxed));
+        assert!(
+            fs && sd,
+            "a's failsafe panic skipped device b: failsafe_ran={fs} shutdown_ran={sd}"
+        );
+        let payload = joined.expect_err("the original scan-loop panic is re-raised");
+        assert_eq!(
+            panic_message(payload.as_ref()),
+            "injected scan-loop panic",
+            "the thread must die of the scan loop's panic, not a failsafe's"
+        );
+    }
+
+    /// Same isolation for the teardown pass: a device whose `shutdown`
+    /// panics must not stop the next device being shut down. As above, the
+    /// thread ends with the original scan-loop panic (re-raised on purpose),
+    /// not a clean exit.
+    #[tokio::test]
+    async fn one_devices_panicking_shutdown_must_not_skip_the_others() {
+        let armed = Arc::new(AtomicBool::new(false));
+        let (mut a, a_fs, _a_sd) = panic_device("a", &armed, false);
+        a.shutdown_panics = true;
+        let (b, b_fs, b_sd) = panic_device("b", &Arc::new(AtomicBool::new(false)), false);
+        let (handle, _fault) = run_until_loop_panic(vec![Box::new(a), Box::new(b)], &armed).await;
+        let joined = join_scan_thread(&handle).await;
+        assert!(a_fs.load(Ordering::Relaxed), "a was driven safe first");
+        assert!(
+            b_fs.load(Ordering::Relaxed) && b_sd.load(Ordering::Relaxed),
+            "a's shutdown panic skipped device b: failsafe_ran={} shutdown_ran={}",
+            b_fs.load(Ordering::Relaxed),
+            b_sd.load(Ordering::Relaxed)
+        );
+        let payload = joined.expect_err("the original scan-loop panic is re-raised");
+        assert_eq!(
+            panic_message(payload.as_ref()),
+            "injected scan-loop panic",
+            "the thread must die of the scan loop's panic, not a shutdown's"
+        );
+    }
+
+    /// The path the first two do not cover: nothing is wrong with the scan
+    /// loop, the operator just asks it to stop, and an adapter's failsafe AND
+    /// shutdown both panic. Unisolated, that unwound the scan thread out of an
+    /// otherwise clean stop; isolated, the later device is still handled and
+    /// the thread exits CLEANLY, with no fault recorded.
+    #[tokio::test]
+    async fn a_requested_stop_survives_devices_that_panic_while_stopping() {
+        let (mut a, a_fs, a_sd) = panic_device("a", &Arc::new(AtomicBool::new(false)), true);
+        a.shutdown_panics = true;
+        let (b, b_fs, b_sd) = panic_device("b", &Arc::new(AtomicBool::new(false)), false);
+        let handle = spawn_units_inner(
+            vec![single_unit(trivial_container(), 5)],
+            DeviceSource::Prebuilt(vec![Box::new(a), Box::new(b)]),
+            Vec::new(),
+            None,
+            WriteGovernance::default(),
+        );
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(handle.fault(), None, "precondition: the loop is healthy");
+
+        handle.stop();
+        join_scan_thread(&handle)
+            .await
+            .expect("a clean stop must end in a clean thread exit");
+
+        for (what, flag) in [
+            ("a failsafe attempted", &a_fs),
+            ("a shutdown attempted", &a_sd),
+            ("b failsafe", &b_fs),
+            ("b shutdown", &b_sd),
+        ] {
+            assert!(flag.load(Ordering::Relaxed), "{what}");
+        }
+        assert_eq!(
+            handle.fault(),
+            None,
+            "a stop the operator asked for is not a fault"
         );
     }
 
