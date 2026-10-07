@@ -252,6 +252,15 @@ impl GearEngine {
     /// are stale — the engine then freezes (no master advance, target held)
     /// and recovery applies no accumulated step. Returns the target_position
     /// to write into the follower's output PDI.
+    /// Drop this axis's engage request from the worker's own side, for the
+    /// cases where waiting for the slow plane's failsafe is not an option
+    /// (a poisoned PDI mirror: see `lock_pdi_for_cycle`). Same effect as
+    /// `GearRouting::disengage_all` for one engine: the next `tick` falls
+    /// back to position hold / shadow.
+    pub(crate) fn disengage(&self) {
+        self.shared.disengage();
+    }
+
     pub fn tick(
         &mut self,
         follower_sw: u16,
