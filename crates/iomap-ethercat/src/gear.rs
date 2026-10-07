@@ -257,6 +257,12 @@ impl GearEngine {
     /// (a poisoned PDI mirror: see `lock_pdi_for_cycle`). Same effect as
     /// `GearRouting::disengage_all` for one engine: the next `tick` falls
     /// back to position hold / shadow.
+    ///
+    /// The request is consumed by a tick that has fresh inputs. A tick whose
+    /// previous exchange failed (`bus_ok == false`) returns early, holding the
+    /// target without reading the request, and republishes the PREVIOUS
+    /// `engaged` feedback; the feedback therefore lags until the next good
+    /// cycle, while the target stays held either way.
     pub(crate) fn disengage(&self) {
         self.shared.disengage();
     }
