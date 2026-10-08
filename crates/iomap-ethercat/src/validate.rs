@@ -208,6 +208,19 @@ pub(crate) fn validate_channel_shapes(channels: &[EthercatChannel]) -> Result<()
             ));
             continue;
         }
+        // `pdi_bit_offset` is the position INSIDE the byte at `pdi_byte_offset`
+        // (0 = LSB). 8 or more is not "the next byte": the bounds check would
+        // pass it (that bit does exist in a long enough PDI) while the
+        // accessors address the wrong byte, so whole bytes belong in
+        // `pdi_byte_offset`.
+        if ch.pdi_bit_offset >= 8 {
+            problems.push(format!(
+                "channel '{name}': pdi_bit_offset={off} is outside the byte (valid 0..=7); \
+                 put whole bytes in pdi_byte_offset",
+                name = ch.name,
+                off = ch.pdi_bit_offset
+            ));
+        }
         if ch.bit_length > 1 && ch.pdi_bit_offset != 0 {
             problems.push(format!(
                 "channel '{name}': non-byte-aligned multi-bit entries are not supported \
@@ -686,5 +699,49 @@ mod tests {
         assert!(validate_init_sdo(&[slave_with_sdo(256, 8)]).is_err());
         assert!(validate_init_sdo(&[slave_with_sdo(-129, 8)]).is_err());
         assert!(validate_init_sdo(&[slave_with_sdo(0x1_0000_0000, 32)]).is_err());
+    }
+}
+
+/// A 1-bit channel declared at `pdi_bit_offset = 8` must not connect:
+/// `bits.rs` cannot serve it, and before the gate existed a release build
+/// read/wrote bit 0 of the WRONG byte and reported `Ok`.
+#[cfg(test)]
+mod bit_offset_gate {
+    use super::*;
+    use project::EthercatDataType;
+
+    #[test]
+    fn a_pdi_bit_offset_of_8_or_more_is_rejected_at_connect() {
+        let ch = EthercatChannel {
+            name: "do_bit8".into(),
+            slave_index: 0,
+            direction: EthercatPdoDirection::RxPdo,
+            pdo_index: 0x7000,
+            sub_index: 1,
+            bit_length: 1,
+            data_type: EthercatDataType::Bool,
+            pdi_byte_offset: 0,
+            pdi_bit_offset: 8,
+        };
+        let bus = [SlaveDiscovery {
+            index: 0,
+            name: "dio16".into(),
+            input_bytes: 0,
+            output_bytes: 2, // bit 8 of a 2-byte output PDI is physically there
+            vendor_id: 0,
+            product_id: 0,
+        }];
+        // The range check alone cannot catch it (the bit is in range); the
+        // shape check must.
+        assert!(validate_pdi_ranges(std::slice::from_ref(&ch), &bus).is_ok());
+        let err = validate_channel_shapes(std::slice::from_ref(&ch)).unwrap_err();
+        assert!(err.contains("do_bit8") && err.contains("0..=7"), "{err}");
+
+        // 7 is the last valid bit of the byte.
+        let ok = EthercatChannel {
+            pdi_bit_offset: 7,
+            ..ch
+        };
+        assert!(validate_channel_shapes(std::slice::from_ref(&ok)).is_ok());
     }
 }

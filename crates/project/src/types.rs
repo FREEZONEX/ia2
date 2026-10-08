@@ -1093,9 +1093,11 @@ pub struct EthercatChannel {
     /// 0 for back-compat with existing sim-only configs (those ignore it).
     #[serde(default)]
     pub pdi_byte_offset: u16,
-    /// Bit offset *within* the byte at `pdi_byte_offset`. 0 is the LSB.
-    /// Only meaningful for `bit_length < 8` channels (e.g. digital I/O
-    /// where 8 channels share one byte). Defaults to 0.
+    /// Bit offset *within* the byte at `pdi_byte_offset`. 0 is the LSB;
+    /// valid values are 0..=7 (whole bytes go in `pdi_byte_offset`, and
+    /// real-mode connect rejects anything else). Only meaningful for
+    /// `bit_length < 8` channels (e.g. digital I/O where 8 channels share
+    /// one byte). Defaults to 0.
     #[serde(default)]
     pub pdi_bit_offset: u8,
 }

@@ -780,6 +780,29 @@ fn note_poll_failure(device: &str, health: &mut HealthTracker, error: &str) {
     }
 }
 
+/// Marks the device unhealthy when `poll_task` exits by ANY path, panic
+/// included. The flag is written only by this task's `HealthTracker`, so a
+/// task that dies freezes it at its last value — a device whose refresh loop
+/// is gone kept reporting healthy while serving a mirror nothing would ever
+/// update again. (`RealEthercat` closes the same hole with its `DoneGuard`.)
+struct PollTaskGuard {
+    device: String,
+    healthy: Arc<AtomicBool>,
+}
+
+impl Drop for PollTaskGuard {
+    fn drop(&mut self) {
+        self.healthy.store(false, Ordering::Relaxed);
+        if std::thread::panicking() {
+            tracing::error!(
+                device = %self.device,
+                "modbus poll task PANICKED — device marked unhealthy; its inputs stay \
+                 frozen at the last values and its outputs are dropped"
+            );
+        }
+    }
+}
+
 /// The connection-owning task: periodic mirror refresh, interleaved
 /// with write/failsafe commands. Single owner = no concurrent use of
 /// the transport (mandatory for RTU, polite for TCP slaves).
@@ -806,6 +829,12 @@ async fn poll_task(
     healthy: Arc<AtomicBool>,
     last_written: Arc<Mutex<HashMap<String, ChannelValue>>>,
 ) {
+    // Declared before anything that can panic, so it drops (and flips the
+    // flag) on every way out of this function.
+    let _alive = PollTaskGuard {
+        device: device.clone(),
+        healthy: healthy.clone(),
+    };
     let interval = Duration::from_millis(config.poll_interval_ms.max(20) as u64);
     let timeout = request_timeout(&config);
     let mut health = HealthTracker::with_flag(UNHEALTHY_AFTER_FAILURES, healthy);
@@ -1390,6 +1419,79 @@ mod tests {
         assert!(
             dev.last_written.lock().unwrap().is_empty(),
             "nothing may be cached"
+        );
+    }
+}
+
+/// The real `poll_task` dies by panic (here: the shared mirror lock is
+/// poisoned, so its next refresh hits `.expect("mirror poisoned")`). The
+/// device must then report unhealthy: `is_healthy` only reads an
+/// `AtomicBool` that the dead task alone used to write.
+#[cfg(test)]
+mod poll_task_death {
+    use super::*;
+    use crate::{run_demo_slave, DemoSlave};
+    use project::ModbusTcpParams;
+
+    #[tokio::test]
+    async fn a_dead_poll_task_must_not_leave_the_device_reporting_healthy() {
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let slave = DemoSlave::new();
+        tokio::spawn(async move {
+            let _ = run_demo_slave(format!("127.0.0.1:{port}").parse().unwrap(), slave).await;
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let cfg = ModbusConfig {
+            transport: ModbusTransport::Tcp(ModbusTcpParams {
+                host: "127.0.0.1".into(),
+                port,
+            }),
+            slave_id: 1,
+            poll_interval_ms: 20,
+            timeout_ms: None,
+            reconnect_backoff_ms: None,
+            channels: vec![ModbusChannel {
+                name: "pump".into(),
+                kind: ModbusChannelKind::Coil,
+                address: 0,
+                data_type: Default::default(),
+                word_order: Default::default(),
+                access: Default::default(),
+            }],
+        };
+        let mut dev = ModbusDevice::connect("m".into(), &cfg).await.unwrap();
+        assert!(dev.is_healthy(), "precondition: healthy after connect");
+
+        // Kill the REAL poll task through its own code path.
+        let mirror = dev.mirror.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = mirror.write().unwrap();
+            panic!("poison the mirror");
+        })
+        .join();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !dev.task.as_ref().unwrap().is_finished() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            dev.task.as_ref().unwrap().is_finished(),
+            "precondition: the real poll task must have died"
+        );
+        // Give a (hypothetical) health mechanism several poll periods.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let write = dev.write_channel("pump", ChannelValue::Bool(true)).await;
+        let failsafe = dev.enter_failsafe().await;
+        eprintln!(
+            "poll task dead. is_healthy={} | write -> {write:?} | enter_failsafe -> {failsafe:?}",
+            dev.is_healthy()
+        );
+        assert!(
+            !dev.is_healthy(),
+            "the poll task is dead (write: {write:?}, failsafe: {failsafe:?}) yet is_healthy() is still true"
         );
     }
 }

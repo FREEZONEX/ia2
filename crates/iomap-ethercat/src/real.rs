@@ -36,7 +36,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -83,10 +83,10 @@ type Storage = PduStorage<MAX_FRAMES, MAX_PDU_DATA>;
 /// Walk the OP group, size the PDI mirror, log + return the discovered
 /// SubDevices.
 macro_rules! capture_discovery {
-    ($group:expr, $maindevice:expr, $pdi:expr) => {{
+    ($group:expr, $maindevice:expr, $pdi:expr, $latch:expr) => {{
         let mut discovered: Vec<SlaveDiscovery> = Vec::new();
         {
-            let mut mirror = $pdi.lock().expect("pdi mirror poisoned");
+            let mut mirror = lock_pdi_for_cycle(&$pdi, &$latch);
             // Insert-only maps would keep stale keys across a re-walk of
             // a shrunken bus, silently serving frozen inputs for vanished
             // positions. Clear + re-insert under the one lock: a vanished
@@ -128,8 +128,8 @@ macro_rules! capture_discovery {
 
 /// Pre-cycle: copy our owned output bytes onto the bus surface.
 macro_rules! copy_outputs_to_bus {
-    ($group:expr, $maindevice:expr, $pdi:expr) => {{
-        let mirror = $pdi.lock().expect("pdi mirror poisoned");
+    ($group:expr, $maindevice:expr, $pdi:expr, $latch:expr) => {{
+        let mirror = lock_pdi_for_cycle(&$pdi, &$latch);
         for (offset_idx, sd) in $group.iter(&$maindevice).enumerate() {
             let idx = offset_idx as u16;
             if let Some(src) = mirror.outputs.get(&idx) {
@@ -148,7 +148,16 @@ macro_rules! copy_outputs_to_bus {
 /// `copy_outputs_to_bus!` so the engine — not the PLC mirror — owns those
 /// bytes on the wire.
 macro_rules! gear_tick {
-    ($group:expr, $maindevice:expr, $engines:expr, $bus_ok:expr) => {{
+    ($group:expr, $maindevice:expr, $engines:expr, $bus_ok:expr, $latch:expr) => {{
+        // A poisoned PDI mirror latched safe state this cycle or an earlier
+        // one: keep every engine disengaged EVERY tick, not just on the
+        // transition, so a stale engage request that lands afterwards
+        // cannot restart the follower's target.
+        if $latch.load(Ordering::Relaxed) {
+            for eng in $engines.iter() {
+                eng.disengage();
+            }
+        }
         for eng in $engines.iter_mut() {
             let mut master_actual: Option<i32> = None;
             if let crate::gear::MasterSrc::Axis {
@@ -184,8 +193,8 @@ macro_rules! gear_tick {
 
 /// Post-cycle: snapshot inputs back into our mirror.
 macro_rules! copy_inputs_from_bus {
-    ($group:expr, $maindevice:expr, $pdi:expr, $changes:expr) => {{
-        let mut mirror = $pdi.lock().expect("pdi mirror poisoned");
+    ($group:expr, $maindevice:expr, $pdi:expr, $latch:expr, $changes:expr) => {{
+        let mut mirror = lock_pdi_for_cycle(&$pdi, &$latch);
         let mut changed = false;
         for (offset_idx, sd) in $group.iter(&$maindevice).enumerate() {
             let idx = offset_idx as u16;
@@ -218,6 +227,58 @@ macro_rules! copy_inputs_from_bus {
 struct PdiMirror {
     inputs: HashMap<u16, Vec<u8>>,
     outputs: HashMap<u16, Vec<u8>>,
+}
+
+/// Lock the PDI mirror, riding through poison. Only the failsafe path and
+/// `lock_pdi_for_cycle` call this: both must keep working exactly when
+/// something else has panicked. A failsafe that `expect`s on a poisoned lock
+/// panics outside the bridge's `catch_unwind` and costs every later device
+/// its own failsafe.
+///
+/// This hands back the mirror AS IT WAS LEFT — possibly half-written by the
+/// panicking writer — so a caller that is about to TRANSMIT must not use it
+/// as is: the cyclic worker goes through `lock_pdi_for_cycle`, which zeroes
+/// the outputs first. (The mirror is plain byte buffers whose sizes no
+/// panicking writer changes, so reading or overwriting it is memory-safe; it
+/// is only the VALUES that cannot be trusted.) The scan-thread accessors
+/// (`read_channel`/`write_channel`) keep failing fast.
+fn lock_pdi(pdi: &Mutex<PdiMirror>) -> MutexGuard<'_, PdiMirror> {
+    pdi.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Lock the PDI mirror for one cyclic-worker step, and make a poisoned mirror
+/// SAFE rather than merely survivable.
+///
+/// Riding through poison alone (`lock_pdi`) left the worker preparing the
+/// half-written, non-zero output image for transmission every cycle — and the
+/// gear engines, whose engage requests are still standing, advancing their
+/// targets over it — for as long as the bridge took to reach this device's
+/// `enter_failsafe` (it fails devices one after another, awaiting each). So
+/// the first time the worker sees poison it latches `latch` (logging once),
+/// and from then on, on every lock: all outputs are forced to zero BEFORE the
+/// caller copies them anywhere, and `gear_tick!` keeps the engines
+/// disengaged. That is the same state `enter_failsafe` produces, reached
+/// without waiting for it. The latch is never cleared: a poisoned mirror
+/// means the scan thread died mid-write, and leaving that state takes a
+/// restart.
+fn lock_pdi_for_cycle<'a>(
+    pdi: &'a Mutex<PdiMirror>,
+    latch: &AtomicBool,
+) -> MutexGuard<'a, PdiMirror> {
+    let mut mirror = lock_pdi(pdi);
+    if pdi.is_poisoned() && !latch.swap(true, Ordering::Relaxed) {
+        tracing::error!(
+            "ethercat PDI mirror is poisoned (a thread panicked while writing it): \
+             latching SAFE state — outputs are forced to zero every cycle and the gear \
+             engines are disengaged until the runtime is restarted"
+        );
+    }
+    if latch.load(Ordering::Relaxed) {
+        for buf in mirror.outputs.values_mut() {
+            buf.fill(0);
+        }
+    }
+    mirror
 }
 
 /// Bounded wait for the cyclic worker thread to stop on graceful
@@ -260,6 +321,11 @@ struct WorkerShared {
     shutdown: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
     healthy: Arc<AtomicBool>,
+    /// Latched `true` by the worker the first time it meets a poisoned PDI
+    /// mirror: from then on every cycle forces the outputs to zero and keeps
+    /// the gear engines disengaged (see `lock_pdi_for_cycle`). Never cleared —
+    /// a poisoned mirror needs a restart, not an automatic recovery.
+    pdi_poisoned: Arc<AtomicBool>,
     /// RTSO-HOLD-0731 instrumentation: bumped once per cyclic loop
     /// iteration (Ok or Err). A parked or dead worker stops advancing
     /// this; the watchdog thread turns that into a journal line.
@@ -375,6 +441,7 @@ impl RealEthercat {
         let shutdown = Arc::new(AtomicBool::new(false));
         let stopped = Arc::new(AtomicBool::new(false));
         let healthy = Arc::new(AtomicBool::new(true));
+        let pdi_poisoned = Arc::new(AtomicBool::new(false));
         let cycles = Arc::new(AtomicU64::new(0));
         let input_changes = Arc::new(AtomicU64::new(0));
         let reinitializing = Arc::new(AtomicBool::new(false));
@@ -391,6 +458,7 @@ impl RealEthercat {
             shutdown: shutdown.clone(),
             stopped: stopped.clone(),
             healthy: healthy.clone(),
+            pdi_poisoned,
             cycles: cycles.clone(),
             input_changes: input_changes.clone(),
             reinitializing: reinitializing.clone(),
@@ -524,7 +592,12 @@ impl IoDevice for RealEthercat {
         // value forever — only `record_failure` could clear it, and a dead
         // thread never calls it. Reported observable only; nothing gates
         // control flow on this.
-        self.healthy.load(Ordering::Relaxed) && !self.stopped.load(Ordering::Relaxed)
+        self.healthy.load(Ordering::Relaxed)
+            && !self.stopped.load(Ordering::Relaxed)
+            // A poisoned mirror means the scan thread died mid-write; the
+            // worker is holding the outputs at zero (`lock_pdi_for_cycle`),
+            // so the device is not under control of the program.
+            && !self.pdi.is_poisoned()
     }
 
     async fn read_channel(&mut self, channel: &str) -> Result<ChannelValue, IoError> {
@@ -608,7 +681,14 @@ impl IoDevice for RealEthercat {
         // zeroed mirror below.
         self.gear_routing.disengage_all();
         {
-            let mut pdi = self.pdi.lock().expect("pdi mirror poisoned");
+            if self.pdi.is_poisoned() {
+                tracing::error!(
+                    device = %self.name,
+                    "ethercat PDI mirror was poisoned by an earlier panic; \
+                     zeroing the outputs through it anyway"
+                );
+            }
+            let mut pdi = lock_pdi(&self.pdi);
             for buf in pdi.outputs.values_mut() {
                 buf.fill(0);
             }
@@ -956,6 +1036,7 @@ fn smol_main(
         shutdown,
         stopped,
         healthy,
+        pdi_poisoned,
         cycles,
         input_changes,
         reinitializing,
@@ -1325,7 +1406,7 @@ fn smol_main(
 
                     // Capture discovery before confirming OP so the topology is
                     // visible even if OP never settles.
-                    let discovered = capture_discovery!(group, maindevice, pdi);
+                    let discovered = capture_discovery!(group, maindevice, pdi, pdi_poisoned);
 
                     // Pump tx_rx_dc until every SubDevice reaches OP (zero
                     // outputs / controlword 0 — nothing moves). Bounded.
@@ -1391,8 +1472,8 @@ fn smol_main(
                     while !shutdown.load(Ordering::Relaxed) {
                         cycles.fetch_add(1, Ordering::Relaxed);
                         let cycle_start = std::time::Instant::now();
-                        copy_outputs_to_bus!(group, maindevice, pdi);
-                        gear_tick!(group, maindevice, engines, bus_ok);
+                        copy_outputs_to_bus!(group, maindevice, pdi, pdi_poisoned);
+                        gear_tick!(group, maindevice, engines, bus_ok, pdi_poisoned);
                         let next_wait = match group.tx_rx_dc(&maindevice).await {
                             Ok(resp) => {
                                 let edge = note_bus_shape(
@@ -1452,7 +1533,13 @@ fn smol_main(
                                 }
                                 // Capture the last valid inputs first —
                                 // SAFE-OP still serves them — then decide.
-                                copy_inputs_from_bus!(group, maindevice, pdi, input_changes);
+                                copy_inputs_from_bus!(
+                                    group,
+                                    maindevice,
+                                    pdi,
+                                    pdi_poisoned,
+                                    input_changes
+                                );
                                 if resp
                                     .subdevice_states
                                     .iter()
@@ -1501,7 +1588,7 @@ fn smol_main(
                         // controlword = 0 (Disable Voltage) before the thread stops,
                         // instead of de-energizing only via its own SyncManager
                         // watchdog once the master goes away.
-                        copy_outputs_to_bus!(group, maindevice, pdi);
+                        copy_outputs_to_bus!(group, maindevice, pdi, pdi_poisoned);
                         let _ = group.tx_rx_dc(&maindevice).await;
                         tracing::info!("ethercat cyclic loop exiting (shutdown signalled)");
                     }
@@ -1526,7 +1613,7 @@ fn smol_main(
                         }
                     };
 
-                    let discovered = capture_discovery!(group, maindevice, pdi);
+                    let discovered = capture_discovery!(group, maindevice, pdi, pdi_poisoned);
                     if first_init {
                         let _ = init_tx.send(InitResult::Ok { discovered });
                         first_init = false;
@@ -1550,8 +1637,8 @@ fn smol_main(
                     let mut shape_edges: u64 = 0;
                     while !shutdown.load(Ordering::Relaxed) {
                         cycles.fetch_add(1, Ordering::Relaxed);
-                        copy_outputs_to_bus!(group, maindevice, pdi);
-                        gear_tick!(group, maindevice, engines, bus_ok);
+                        copy_outputs_to_bus!(group, maindevice, pdi, pdi_poisoned);
+                        gear_tick!(group, maindevice, engines, bus_ok, pdi_poisoned);
                         match group.tx_rx(&maindevice).await {
                             Ok(resp) => {
                                 note_bus_shape(
@@ -1586,7 +1673,7 @@ fn smol_main(
                                 bus_ok = false;
                             }
                         }
-                        copy_inputs_from_bus!(group, maindevice, pdi, input_changes);
+                        copy_inputs_from_bus!(group, maindevice, pdi, pdi_poisoned, input_changes);
                         if demoted {
                             break;
                         }
@@ -1601,7 +1688,7 @@ fn smol_main(
                         // Final flush before teardown: failsafe has zeroed the
                         // output mirror; push it out once more so the SubDevices
                         // latch their safe (zero) outputs before the thread stops.
-                        copy_outputs_to_bus!(group, maindevice, pdi);
+                        copy_outputs_to_bus!(group, maindevice, pdi, pdi_poisoned);
                         let _ = group.tx_rx(&maindevice).await;
                         tracing::info!("ethercat cyclic loop exiting (shutdown signalled)");
                     }
@@ -1698,7 +1785,7 @@ mod tests {
     // the bounded-join logic in isolation — that's the part that has to
     // hold the line on shutdown latency regardless of bus health.
 
-    fn device_with_outputs(stopped_flag: bool) -> RealEthercat {
+    pub(super) fn device_with_outputs(stopped_flag: bool) -> RealEthercat {
         let mut outputs = HashMap::new();
         outputs.insert(0u16, vec![0xffu8; 4]);
         RealEthercat {
@@ -1732,6 +1819,54 @@ mod tests {
             vec![0u8; 4],
             "the output image must be zeroed regardless"
         );
+    }
+
+    /// A panic under the PDI lock poisons it. The failsafe must still zero
+    /// the outputs and return normally rather than panic itself — the
+    /// bridge runs it OUTSIDE its `catch_unwind`, so a panic here costs the
+    /// remaining devices their own failsafe.
+    #[test]
+    fn failsafe_survives_a_poisoned_pdi_lock() {
+        let mut dev = device_with_outputs(false);
+        let pdi = dev.pdi.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = pdi.lock().unwrap();
+            panic!("poison the PDI mirror");
+        })
+        .join();
+        assert!(dev.pdi.is_poisoned(), "precondition: lock is poisoned");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rt.block_on(dev.enter_failsafe())
+        }));
+        let result = outcome.expect("enter_failsafe panicked on a poisoned PDI lock");
+        result.expect("worker alive => the zeroed mirror is the failsafe, so Ok");
+        let mirror = lock_pdi(&dev.pdi);
+        assert_eq!(
+            mirror.outputs[&0],
+            vec![0u8; 4],
+            "outputs must still be zeroed"
+        );
+    }
+
+    /// The cyclic worker locks through `lock_pdi` too (`copy_outputs_to_bus!`
+    /// and friends). It needs a NIC to run, so pin the helper they share: a
+    /// poisoned mirror must hand back its contents, not panic.
+    #[test]
+    fn lock_pdi_returns_the_mirror_even_when_poisoned() {
+        let dev = device_with_outputs(false);
+        let pdi = dev.pdi.clone();
+        let _ = std::thread::spawn(move || {
+            let mut held = pdi.lock().unwrap();
+            held.outputs.get_mut(&0).unwrap()[0] = 0x55;
+            panic!("poison the PDI mirror mid-write");
+        })
+        .join();
+        assert!(dev.pdi.is_poisoned());
+        assert_eq!(lock_pdi(&dev.pdi).outputs[&0], vec![0x55, 0xff, 0xff, 0xff]);
     }
 
     /// With the worker stopped no frame will ever carry those zeros. The
@@ -1892,5 +2027,311 @@ mod tests {
             start.elapsed() < Duration::from_millis(300),
             "must return shortly after the timeout, not wait out the worker"
         );
+    }
+}
+
+/// What the cyclic worker does when it meets a poisoned PDI mirror.
+///
+/// The worker's real macros (`copy_outputs_to_bus!`, `gear_tick!`,
+/// `copy_inputs_from_bus!`) are run against an in-memory bus surface — no
+/// NIC, no runtime — so these exercise the production code, not a copy. The
+/// DC and free-run loops call the same macros, and the macros' arity makes it
+/// a compile error for either loop (or a final shutdown flush) to omit the
+/// latch. What cannot run offline is the loops themselves and a frame
+/// actually reaching a drive; that needs the bench.
+///
+/// The bridge fails devices one after another and awaits each, so the worker
+/// can run any number of cycles before `enter_failsafe` reaches this device.
+/// Every test here models exactly that: it never calls `enter_failsafe`, so
+/// the safe state has to come from the worker itself, from the first cycle.
+#[cfg(test)]
+mod worker_poison_latch {
+    use super::*;
+    use std::cell::{RefCell, RefMut};
+
+    struct FakeSlave {
+        inputs: Vec<u8>,
+        outputs: RefCell<Vec<u8>>,
+    }
+
+    impl FakeSlave {
+        fn outputs_raw_mut(&self) -> RefMut<'_, Vec<u8>> {
+            self.outputs.borrow_mut()
+        }
+
+        fn inputs_raw(&self) -> &[u8] {
+            &self.inputs
+        }
+    }
+
+    struct FakeGroup(Vec<FakeSlave>);
+
+    impl FakeGroup {
+        fn iter(&self, _maindevice: &()) -> std::slice::Iter<'_, FakeSlave> {
+            self.0.iter()
+        }
+
+        /// What this slave's output surface holds, i.e. what the next
+        /// `tx_rx` would put on the wire.
+        fn wire(&self) -> Vec<u8> {
+            self.0[0].outputs.borrow().clone()
+        }
+    }
+
+    fn group(outputs_len: usize, inputs: Vec<u8>) -> FakeGroup {
+        FakeGroup(vec![FakeSlave {
+            inputs,
+            // Not zero: a cycle that forgets to overwrite the surface shows.
+            outputs: RefCell::new(vec![0xEE; outputs_len]),
+        }])
+    }
+
+    /// The scan thread dying while holding the lock, after a partial write.
+    fn poison_after_partial_write(pdi: &Mutex<PdiMirror>, offset: usize) {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut held = pdi.lock().unwrap();
+            held.outputs.get_mut(&0).unwrap()[offset] = 0x55;
+            panic!("test injection: scan thread panicked mid-write of its output image");
+        }));
+        assert!(outcome.is_err());
+        assert!(pdi.is_poisoned(), "precondition: the mirror is poisoned");
+    }
+
+    fn mirror(outputs: Vec<u8>) -> Mutex<PdiMirror> {
+        Mutex::new(PdiMirror {
+            inputs: HashMap::new(),
+            outputs: HashMap::from([(0, outputs)]),
+        })
+    }
+
+    /// One follower axis: controlword at output byte 0, i32 target at byte 2;
+    /// statusword at input byte 2, i32 actual at input byte 4. The gear is
+    /// engaged with a non-zero master velocity, so every healthy tick advances
+    /// the target.
+    fn engaged_gear() -> (Vec<crate::gear::GearEngine>, crate::gear::GearRouting) {
+        let config = project::EthercatGear {
+            slave_index: 0,
+            target_pos_offset: 2,
+            actual_pos_offset: 4,
+            status_word_offset: 2,
+            master: project::GearMaster::Virtual,
+            engage_channel: "gear_engage".into(),
+            ratio_num_channel: "ratio_num".into(),
+            ratio_den_channel: "ratio_den".into(),
+            ratio_step_channel: "ratio_step".into(),
+            phase_channel: "phase_ofs".into(),
+            master_vel_channel: "master_vel".into(),
+            max_travel_channel: "gear_max_travel".into(),
+            engaged_channel: "gear_engaged".into(),
+            trip_channel: "gear_trip".into(),
+            ratio_apply_channel: "gear_ratio_apply".into(),
+            ratio_ack_channel: "gear_ratio_ack".into(),
+        };
+        let (engines, routing) = crate::gear::build(&[config]);
+        for (channel, value) in [
+            ("ratio_num", 1.0),
+            ("ratio_den", 1.0),
+            ("ratio_step", 1.0),
+            ("master_vel", 100.0),
+            ("gear_max_travel", 1e9),
+        ] {
+            routing
+                .write(channel, &ChannelValue::F64(value))
+                .unwrap()
+                .unwrap();
+        }
+        engage(&routing);
+        (engines, routing)
+    }
+
+    fn engage(routing: &crate::gear::GearRouting) {
+        routing
+            .write("gear_engage", &ChannelValue::Bool(true))
+            .unwrap()
+            .unwrap();
+    }
+
+    /// CiA402 Operation Enabled (statusword 0x1637), actual position zero.
+    fn enabled_drive_inputs() -> Vec<u8> {
+        vec![0, 0, 0x37, 0x16, 0, 0, 0, 0]
+    }
+
+    fn target(group: &FakeGroup) -> i32 {
+        crate::gear::read_i32(&group.0[0].outputs.borrow(), 2).unwrap()
+    }
+
+    fn engaged_feedback(routing: &crate::gear::GearRouting) -> ChannelValue {
+        routing.read("gear_engaged").unwrap()
+    }
+
+    #[test]
+    fn a_poisoned_mirror_is_never_transmitted_not_even_once() {
+        let pdi = mirror(vec![0xff; 4]);
+        let g = group(4, Vec::new());
+        let md = ();
+        let latch = AtomicBool::new(false);
+        let mut engines: Vec<crate::gear::GearEngine> = Vec::new();
+        poison_after_partial_write(&pdi, 0);
+
+        // No catch_unwind: a worker that panics here fails the test. Staying
+        // alive and sending safe outputs is the contract, not stopping.
+        for cycle in 0..4 {
+            copy_outputs_to_bus!(g, md, pdi, latch);
+            gear_tick!(g, md, engines, true, latch);
+            assert_eq!(
+                g.wire(),
+                vec![0; 4],
+                "cycle {cycle}: the half-written image reached the output surface"
+            );
+        }
+        assert!(latch.load(Ordering::Relaxed), "the safe state is latched");
+    }
+
+    #[test]
+    fn a_poisoned_mirror_drops_the_enable_and_the_gear_every_cycle() {
+        let pdi = mirror(vec![0x0f, 0, 0, 0, 0, 0]);
+        let g = group(6, enabled_drive_inputs());
+        let md = ();
+        let latch = AtomicBool::new(false);
+        let (mut engines, routing) = engaged_gear();
+
+        // Healthy cycles first: enabled and advancing.
+        let mut last = 0;
+        for _ in 0..2 {
+            copy_outputs_to_bus!(g, md, pdi, latch);
+            gear_tick!(g, md, engines, true, latch);
+            assert_eq!(&g.wire()[..2], &[0x0f, 0], "precondition: drive enabled");
+            assert!(target(&g) > last, "precondition: the gear is advancing");
+            last = target(&g);
+        }
+        assert_eq!(engaged_feedback(&routing), ChannelValue::Bool(true));
+        let held = last;
+        poison_after_partial_write(&pdi, 2);
+
+        // The assertions sit AFTER gear_tick!, i.e. on what the exchange
+        // would actually carry — the ordering both cyclic loops use.
+        for cycle in 0..3 {
+            copy_outputs_to_bus!(g, md, pdi, latch);
+            gear_tick!(g, md, engines, true, latch);
+            let wire = g.wire();
+            assert_eq!(
+                &wire[..2],
+                &[0, 0],
+                "cycle {cycle}: the enable (controlword) must be dropped"
+            );
+            assert_eq!(
+                target(&g),
+                held,
+                "cycle {cycle}: the gear target must be held, not advanced"
+            );
+            assert_eq!(
+                engaged_feedback(&routing),
+                ChannelValue::Bool(false),
+                "cycle {cycle}: the engine must report disengaged"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stale_engage_request_after_the_latch_cannot_restart_the_gear() {
+        let pdi = mirror(vec![0x0f, 0, 0, 0, 0, 0]);
+        let g = group(6, enabled_drive_inputs());
+        let md = ();
+        let latch = AtomicBool::new(false);
+        let (mut engines, routing) = engaged_gear();
+        copy_outputs_to_bus!(g, md, pdi, latch);
+        gear_tick!(g, md, engines, true, latch);
+        let held = target(&g);
+        poison_after_partial_write(&pdi, 2);
+        copy_outputs_to_bus!(g, md, pdi, latch);
+        gear_tick!(g, md, engines, true, latch);
+
+        // The slow plane (or a still-running scan thread) raises engage again.
+        engage(&routing);
+        for cycle in 0..3 {
+            copy_outputs_to_bus!(g, md, pdi, latch);
+            gear_tick!(g, md, engines, true, latch);
+            assert_eq!(
+                &g.wire()[..2],
+                &[0, 0],
+                "cycle {cycle}: enable stays dropped"
+            );
+            assert_eq!(target(&g), held, "cycle {cycle}: the gear stays held");
+            assert_eq!(engaged_feedback(&routing), ChannelValue::Bool(false));
+        }
+    }
+
+    #[test]
+    fn the_latch_outlives_input_copies_and_later_writers() {
+        let pdi = Mutex::new(PdiMirror {
+            inputs: HashMap::from([(0, vec![0; 4])]),
+            outputs: HashMap::from([(0, vec![0xff; 4])]),
+        });
+        let g = group(4, vec![1, 2, 3, 4]);
+        let md = ();
+        let latch = AtomicBool::new(false);
+        let changes = AtomicU64::new(0);
+        poison_after_partial_write(&pdi, 1);
+
+        for cycle in 0..3 {
+            // Something writes a fresh non-zero image into the (still
+            // poisoned) mirror between cycles.
+            lock_pdi(&pdi).outputs.get_mut(&0).unwrap().fill(0xAA);
+            copy_outputs_to_bus!(g, md, pdi, latch);
+            assert_eq!(
+                g.wire(),
+                vec![0; 4],
+                "cycle {cycle}: later writer got through"
+            );
+            // The post-cycle input copy runs through the same lock and must
+            // neither panic nor release the latch.
+            copy_inputs_from_bus!(g, md, pdi, latch, changes);
+            assert_eq!(
+                lock_pdi(&pdi).inputs[&0],
+                vec![1, 2, 3, 4],
+                "inputs still flow"
+            );
+            assert!(latch.load(Ordering::Relaxed));
+        }
+    }
+
+    /// Control: the safe state must not trigger without poison, or the whole
+    /// thing is a switch that zeroes healthy plants.
+    #[test]
+    fn a_healthy_mirror_passes_through_untouched_and_never_latches() {
+        let pdi = mirror(vec![0x0f, 0, 0, 0, 0, 0]);
+        let g = group(6, enabled_drive_inputs());
+        let md = ();
+        let latch = AtomicBool::new(false);
+        let (mut engines, routing) = engaged_gear();
+
+        let mut last = 0;
+        for cycle in 0..3 {
+            copy_outputs_to_bus!(g, md, pdi, latch);
+            gear_tick!(g, md, engines, true, latch);
+            assert_eq!(
+                &g.wire()[..2],
+                &[0x0f, 0],
+                "cycle {cycle}: enable delivered"
+            );
+            assert!(target(&g) > last, "cycle {cycle}: gear advancing");
+            last = target(&g);
+        }
+        assert_eq!(engaged_feedback(&routing), ChannelValue::Bool(true));
+        assert!(!latch.load(Ordering::Relaxed), "nothing latched");
+        assert!(!pdi.is_poisoned());
+    }
+
+    #[test]
+    fn a_device_with_a_poisoned_mirror_is_not_healthy() {
+        let dev = tests::device_with_outputs(false);
+        assert!(dev.is_healthy(), "precondition");
+        let pdi = dev.pdi.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = pdi.lock().unwrap();
+            panic!("poison the PDI mirror");
+        })
+        .join();
+        assert!(!dev.is_healthy(), "a torn mirror is not a healthy device");
     }
 }
