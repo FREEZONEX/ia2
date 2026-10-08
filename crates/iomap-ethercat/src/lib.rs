@@ -35,8 +35,9 @@ use project::EthercatConfig;
 pub use esi_map::assemble_channels;
 
 /// Sentinel NIC name that selects the in-memory sim path. Anything else
-/// is treated as a real network interface name.
-pub const SIM_NIC: &str = "_sim";
+/// is treated as a real network interface name. Defined by `project`, which
+/// needs the same distinction for its author-time lint.
+pub const SIM_NIC: &str = project::ETHERCAT_SIM_NIC;
 
 /// One subdevice as seen on the bus (real mode, walked at connect) or as
 /// configured (sim mode). Plain data — the bridge maps this into its own
@@ -92,7 +93,7 @@ impl EthercatDevice {
 }
 
 fn is_sim_nic(nic: &str) -> bool {
-    nic == SIM_NIC || nic.is_empty()
+    project::is_ethercat_sim_nic(nic)
 }
 
 #[async_trait]

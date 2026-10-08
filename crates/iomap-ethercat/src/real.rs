@@ -152,7 +152,9 @@ macro_rules! gear_tick {
         // A poisoned PDI mirror latched safe state this cycle or an earlier
         // one: keep every engine disengaged EVERY tick, not just on the
         // transition, so a stale engage request that lands afterwards
-        // cannot restart the follower's target.
+        // cannot restart the follower's target. (A tick whose previous
+        // exchange failed returns early and republishes the old `engaged`
+        // feedback; the target is held and the controlword is zero either way.)
         if $latch.load(Ordering::Relaxed) {
             for eng in $engines.iter() {
                 eng.disengage();
@@ -2333,5 +2335,132 @@ mod worker_poison_latch {
         })
         .join();
         assert!(!dev.is_healthy(), "a torn mirror is not a healthy device");
+    }
+    /// The first lock that meets the poison need not be an output copy: the
+    /// post-cycle input copy can be the one. It must latch and zero on its own,
+    /// not leave that to a later output copy, and still deliver the inputs.
+    #[test]
+    fn an_input_copy_alone_latches_and_zeroes_the_poison() {
+        let pdi = Mutex::new(PdiMirror {
+            inputs: HashMap::from([(0, vec![0; 4])]),
+            outputs: HashMap::from([(0, vec![0xff; 4])]),
+        });
+        let g = group(4, vec![1, 2, 3, 4]);
+        let md = ();
+        let latch = AtomicBool::new(false);
+        let changes = AtomicU64::new(0);
+        poison_after_partial_write(&pdi, 1);
+
+        copy_inputs_from_bus!(g, md, pdi, latch, changes);
+
+        assert!(latch.load(Ordering::Relaxed), "the input copy latched");
+        let image = lock_pdi(&pdi);
+        assert_eq!(image.outputs[&0], vec![0; 4], "and zeroed the outputs");
+        assert_eq!(
+            image.inputs[&0],
+            vec![1, 2, 3, 4],
+            "and still copied the inputs"
+        );
+    }
+
+    /// The latch is what keeps the outputs safe, not the mutex flag: if the
+    /// poison is ever cleared (nothing does today), the next writer's image
+    /// must still not get through.
+    #[test]
+    fn the_latch_outlives_clearing_the_mutex_poison() {
+        let pdi = mirror(vec![0xff; 4]);
+        let g = group(4, vec![]);
+        let md = ();
+        let latch = AtomicBool::new(false);
+        poison_after_partial_write(&pdi, 1);
+        copy_outputs_to_bus!(g, md, pdi, latch);
+        assert!(latch.load(Ordering::Relaxed));
+
+        pdi.clear_poison();
+        assert!(
+            !pdi.is_poisoned(),
+            "precondition: the mutex no longer says poisoned"
+        );
+        for cycle in 0..3 {
+            lock_pdi(&pdi).outputs.get_mut(&0).unwrap().fill(0xaa);
+            copy_outputs_to_bus!(g, md, pdi, latch);
+            assert_eq!(
+                g.wire(),
+                vec![0; 4],
+                "cycle {cycle}: a later image got through"
+            );
+            assert!(latch.load(Ordering::Relaxed));
+        }
+    }
+
+    /// Held target is for a drive that is still enabled. A drive that is no
+    /// longer in Operation Enabled makes the engine shadow its actual
+    /// position instead, so a later enable cannot jump to a stale target.
+    #[test]
+    fn a_latched_gear_shadows_the_actual_position_when_the_drive_is_disabled() {
+        let pdi = mirror(vec![0x0f, 0, 0, 0, 0, 0]);
+        let mut g = group(6, enabled_drive_inputs());
+        let md = ();
+        let latch = AtomicBool::new(false);
+        let (mut engines, routing) = engaged_gear();
+        copy_outputs_to_bus!(g, md, pdi, latch);
+        gear_tick!(g, md, engines, true, latch);
+        assert!(
+            target(&g) > 0,
+            "precondition: the gear was driving a target"
+        );
+        poison_after_partial_write(&pdi, 2);
+
+        // statusword 0x0040 is Switch On Disabled; actual position 1234.
+        g.0[0].inputs[2..4].copy_from_slice(&0x0040u16.to_le_bytes());
+        g.0[0].inputs[4..8].copy_from_slice(&1234i32.to_le_bytes());
+        copy_outputs_to_bus!(g, md, pdi, latch);
+        gear_tick!(g, md, engines, true, latch);
+
+        assert_eq!(&g.wire()[..2], &[0, 0]);
+        assert_eq!(target(&g), 1234, "the target follows the actual position");
+        assert_eq!(engaged_feedback(&routing), ChannelValue::Bool(false));
+    }
+
+    /// A cycle whose previous exchange failed gives the engine stale inputs
+    /// and `GearEngine::tick` returns early. The outputs must be safe on every
+    /// such cycle; the `engaged` feedback is NOT asserted there because tick
+    /// republishes the previous value (see `GearEngine::disengage`). The next
+    /// good cycle must report disengaged and keep the target held.
+    #[test]
+    fn outputs_stay_safe_across_failed_exchanges_and_the_next_good_cycle_reports_disengaged() {
+        let pdi = mirror(vec![0x0f, 0, 0, 0, 0, 0]);
+        let g = group(6, enabled_drive_inputs());
+        let md = ();
+        let latch = AtomicBool::new(false);
+        let (mut engines, routing) = engaged_gear();
+
+        let mut last = 0;
+        for _ in 0..2 {
+            copy_outputs_to_bus!(g, md, pdi, latch);
+            gear_tick!(g, md, engines, true, latch);
+            assert!(target(&g) > last, "precondition: the gear advances");
+            last = target(&g);
+        }
+        let held = last;
+        poison_after_partial_write(&pdi, 2);
+
+        for cycle in 0..3 {
+            copy_outputs_to_bus!(g, md, pdi, latch);
+            gear_tick!(g, md, engines, false, latch);
+            assert!(latch.load(Ordering::Relaxed));
+            assert_eq!(&g.wire()[..2], &[0, 0], "cycle {cycle}: controlword zero");
+            assert_eq!(target(&g), held, "cycle {cycle}: target held");
+        }
+
+        copy_outputs_to_bus!(g, md, pdi, latch);
+        gear_tick!(g, md, engines, true, latch);
+        assert_eq!(&g.wire()[..2], &[0, 0]);
+        assert_eq!(target(&g), held);
+        assert_eq!(
+            engaged_feedback(&routing),
+            ChannelValue::Bool(false),
+            "the first good cycle reports disengaged"
+        );
     }
 }

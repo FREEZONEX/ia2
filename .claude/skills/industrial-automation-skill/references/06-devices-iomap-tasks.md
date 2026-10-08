@@ -109,7 +109,7 @@ The adapter merges channels into contiguous **read spans** per function code and
 - `dc_static_sync_iterations` (def `0`): init-time drift compensation (FRMW burst). `0` is right for short buses; on a non-RT host one lost frame aborts init with `Timeout(Pdu)`. Raise to `1000`–`10000` on long DC buses.
 - `slaves[].init_sdo`: CoE writes applied in **PRE-OP on every connect**, in order, before PDO mapping — how non-persisting drives get set each power-up (SV660N needs `0x6060 = 8`; PDO remap goes here too). Each entry `{ index, sub_index, value, bits (8|16|32) }`, decimal (`24672` = `0x6060`). A failed write aborts init.
 - `direction`: `tx_pdo` (slave→master = **input**) | `rx_pdo` (master→slave = **output**). `data_type`: `bool` `u8` `i8` `u16` `i16` `u32` `i32` `real`.
-- `pdi_byte_offset`/`pdi_bit_offset`: the entry's spot in the process image — **required for real hardware** (from the ESI/datasheet; sim ignores them; `bit_length < 8` uses the bit offset, which must be 0–7 — whole bytes go in `pdi_byte_offset`). `pdo_index`/`sub_index` are documentation-only.
+- `pdi_byte_offset`/`pdi_bit_offset`: the entry's spot in the process image — **required for real hardware** (from the ESI/datasheet; sim ignores them; `bit_length < 8` uses the bit offset, which must be 0–7 — whole bytes go in `pdi_byte_offset`; `POST /api/project/validate` flags a larger value on a real NIC; a `_sim` NIC is not checked). `pdo_index`/`sub_index` are documentation-only.
 - **Capacity**: up to **128 subdevices / 4 KiB image** per device (a 1000-point project ≈ 660 B). One device = one NIC = one bus.
 
 ### Bring-up mode (`bringup`)

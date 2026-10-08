@@ -102,6 +102,16 @@ the failsafe sweep skips, so a configured safe state can never be applied. The
 duplicate-name half is also refused by the adapters themselves at connect,
 because the edge runtime runs no project validation at all.
 
+A third finding applies to EtherCAT devices on a real NIC only (the simulator
+ignores PDI offsets, so a `_sim` or empty `nic` is not checked): a channel whose
+`pdi_bit_offset` is 8 or more. The field is the bit position *inside* the byte
+at `pdi_byte_offset` (valid `0..=7`); the PDI range check passes a larger value
+because that bit exists in a long enough image, and a real-bus accessor then
+addresses the wrong byte. The adapter refuses it at connect too, but a device
+that fails its connect only retries in the background while the program runs,
+so without this the author learns of it from a device that never comes up.
+Deploy preflight does not run this lint.
+
 ## POUs
 
 A POU is one IEC declaration (PROGRAM / FUNCTION_BLOCK / FUNCTION). A

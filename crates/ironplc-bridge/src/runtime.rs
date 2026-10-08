@@ -950,25 +950,38 @@ fn spawn_units_inner(
             // holds the runtime that late-connected adapters' background
             // tasks live on, and must outlive the writes above).
             drained.store(true, Ordering::Relaxed);
-            // "Cleanly" only when nothing faulted: a VM trap or a failed
-            // start also returns normally, and its log used to read as a
-            // clean exit right after the error.
+            // "Cleanly" only when nothing faulted AND no device's failsafe or
+            // shutdown call failed: a VM trap or a failed start also returns
+            // normally, and a panicking or erroring adapter used to leave this
+            // line reading as a clean exit with the failure only in a field.
             let recorded = fault_tx.borrow().clone();
-            match (&result, recorded) {
-                (Ok(()), None) => tracing::info!(
+            match classify_scan_end(
+                result.is_err(),
+                recorded.is_some(),
+                failsafe_failed,
+                shutdown_failed,
+            ) {
+                ScanEnd::Clean => tracing::info!(
                     devices = dev_count,
                     failsafe_failed,
                     shutdown_failed,
                     "scan loop exited cleanly; failsafe and shutdown attempts completed"
                 ),
-                (Ok(()), Some(fault)) => tracing::error!(
+                ScanEnd::StoppedButDevicesFailed => tracing::error!(
                     devices = dev_count,
                     failsafe_failed,
                     shutdown_failed,
-                    %fault,
+                    "scan loop stopped, but failsafe or shutdown calls FAILED on some devices; \
+                     their outputs are not confirmed safe"
+                ),
+                ScanEnd::Fault => tracing::error!(
+                    devices = dev_count,
+                    failsafe_failed,
+                    shutdown_failed,
+                    fault = %recorded.as_deref().unwrap_or_default(),
                     "scan loop ended on a fault; failsafe and shutdown attempts completed"
                 ),
-                (Err(_), _) => tracing::error!(
+                ScanEnd::Panicked => tracing::error!(
                     devices = dev_count,
                     failsafe_failed,
                     shutdown_failed,
@@ -997,6 +1010,41 @@ fn spawn_units_inner(
         watchdog_tripped,
         fault: fault_rx,
         thread: Arc::new(std::sync::Mutex::new(Some(join_handle))),
+    }
+}
+
+/// How the scan thread ended, for its closing log line. A pure classification
+/// so the wording is testable without capturing another thread's log output.
+#[derive(Debug, PartialEq, Eq)]
+enum ScanEnd {
+    /// Stopped as asked (or ended on its own) with every failsafe and shutdown
+    /// call delivered.
+    Clean,
+    /// Ended without a fault, but at least one device's failsafe or shutdown
+    /// call returned an error or panicked.
+    StoppedButDevicesFailed,
+    /// A VM trap or a failed start recorded a fault.
+    Fault,
+    /// The scan loop itself panicked.
+    Panicked,
+}
+
+/// A panic outranks a fault, which outranks failed device calls, which
+/// outrank "clean".
+fn classify_scan_end(
+    panicked: bool,
+    faulted: bool,
+    failsafe_failed: usize,
+    shutdown_failed: usize,
+) -> ScanEnd {
+    if panicked {
+        ScanEnd::Panicked
+    } else if faulted {
+        ScanEnd::Fault
+    } else if failsafe_failed > 0 || shutdown_failed > 0 {
+        ScanEnd::StoppedButDevicesFailed
+    } else {
+        ScanEnd::Clean
     }
 }
 
@@ -3023,10 +3071,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_closing_log_line_is_clean_only_when_nothing_failed() {
+        use ScanEnd::*;
+        for (panicked, faulted, fs, sd, want) in [
+            (false, false, 0, 0, Clean),
+            (false, false, 1, 0, StoppedButDevicesFailed),
+            (false, false, 0, 2, StoppedButDevicesFailed),
+            (false, true, 0, 0, Fault),
+            (false, true, 3, 3, Fault),
+            (true, false, 0, 0, Panicked),
+            (true, true, 5, 5, Panicked),
+        ] {
+            assert_eq!(
+                classify_scan_end(panicked, faulted, fs, sd),
+                want,
+                "panicked={panicked} faulted={faulted} failsafe_failed={fs} shutdown_failed={sd}"
+            );
+        }
+    }
+
+    /// Join `thread` if it ends within `limit`; otherwise hand the un-joined
+    /// handle back. It polls `is_finished` and joins only once that is true,
+    /// so the join returns at once and a thread that never exits cannot hang
+    /// the runtime. (`spawn_blocking(thread.join())` under a timeout does not
+    /// have that property: the timeout abandons the future but not the blocking
+    /// task, and dropping the runtime then waits for it forever.)
+    async fn join_within(
+        thread: std::thread::JoinHandle<()>,
+        limit: Duration,
+    ) -> Result<std::thread::Result<()>, std::thread::JoinHandle<()>> {
+        let deadline = Instant::now() + limit;
+        while !thread.is_finished() {
+            if Instant::now() >= deadline {
+                return Err(thread);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Ok(thread.join())
+    }
+
     /// Join the scan thread itself. `ProgramHandle::shutdown` swallows the
     /// join error (it only logs it), so a test that waits on `shutdown` alone
     /// cannot tell a thread that finished its pass from one that unwound out
-    /// of it — nor that it finished at all, if the result is dropped.
+    /// of it — nor that it finished at all, if the result is dropped. A thread
+    /// that does not exit within 5 s fails the test instead of hanging it.
     async fn join_scan_thread(handle: &ProgramHandle) -> std::thread::Result<()> {
         let thread = handle
             .thread
@@ -3034,13 +3123,52 @@ mod tests {
             .unwrap()
             .take()
             .expect("the scan thread handle is still held");
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            tokio::task::spawn_blocking(move || thread.join()),
-        )
-        .await
-        .expect("the scan thread must exit within 5s")
-        .expect("join task")
+        match join_within(thread, Duration::from_secs(5)).await {
+            Ok(joined) => joined,
+            Err(_still_running) => panic!("the scan thread must exit within 5s"),
+        }
+    }
+
+    #[tokio::test]
+    async fn join_within_returns_the_result_of_a_thread_that_ends() {
+        let quick = std::thread::spawn(|| std::thread::sleep(Duration::from_millis(30)));
+        let joined = join_within(quick, Duration::from_secs(5))
+            .await
+            .expect("a thread that ends in time is joined");
+        assert!(joined.is_ok());
+
+        let panicking = std::thread::Builder::new()
+            .spawn(|| panic!("injected thread panic"))
+            .unwrap();
+        let joined = join_within(panicking, Duration::from_secs(5))
+            .await
+            .expect("a thread that panics is still joined");
+        assert_eq!(
+            panic_message(joined.expect_err("it panicked").as_ref()),
+            "injected thread panic"
+        );
+    }
+
+    /// The point of the helper: a thread that never exits gives up at the
+    /// limit and returns the handle, rather than waiting on it.
+    #[tokio::test]
+    async fn join_within_gives_up_on_a_thread_that_never_exits() {
+        let (release, parked) = std::sync::mpsc::channel::<()>();
+        let stuck = std::thread::spawn(move || {
+            let _ = parked.recv();
+        });
+        let started = Instant::now();
+        let stuck = join_within(stuck, Duration::from_millis(150))
+            .await
+            .expect_err("a parked thread is not joined");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "gave up promptly, took {:?}",
+            started.elapsed()
+        );
+
+        release.send(()).unwrap();
+        stuck.join().expect("the parked thread ends once released");
     }
 
     /// The post-panic failsafe pass runs OUTSIDE the loop's `catch_unwind`,
