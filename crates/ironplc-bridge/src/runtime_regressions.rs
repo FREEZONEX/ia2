@@ -464,6 +464,16 @@ async fn delayed_connect_spec(
         accepted.clone(),
     ));
     tokio::time::sleep(Duration::from_millis(100)).await; // demo slave is up
+    (
+        coil_spec(front, timeout_ms),
+        accepted,
+        [slave.abort_handle(), proxy.abort_handle()],
+    )
+}
+
+/// A retry spec with one writable coil, so the connect-time seed read has
+/// something to ask for and failsafe something to zero.
+fn coil_spec(front: std::net::SocketAddr, timeout_ms: u32) -> DeviceSpec {
     let mut spec = retry_spec(front);
     let ProtocolConfig::Modbus(config) = &mut spec.config else {
         unreachable!("retry_spec builds a Modbus device");
@@ -477,7 +487,7 @@ async fn delayed_connect_spec(
         word_order: Default::default(),
         access: Default::default(),
     }];
-    (spec, accepted, [slave.abort_handle(), proxy.abort_handle()])
+    spec
 }
 
 async fn wait_until(flag: &AtomicBool, limit: Duration) {
@@ -529,6 +539,7 @@ async fn stop_during_an_inflight_reconnect_connect_does_not_hold_shutdown_for_th
         Duration::from_millis(300),
     );
     wait_until(&accepted, Duration::from_secs(5)).await;
+    let id = scan_thread_id(&handle);
     let stopped_at = Instant::now();
     handle.stop();
     handle.shutdown().await;
@@ -537,7 +548,314 @@ async fn stop_during_an_inflight_reconnect_connect_does_not_hold_shutdown_for_th
         "shutdown() waited {:?} for an in-flight connect",
         stopped_at.elapsed()
     );
+    // A worker still connecting after the grace is not a clean exit.
+    assert_eq!(scan_end_of(id), ScanEnd::ReconnectUnconfirmed);
     for task in tasks {
         task.abort();
     }
+}
+
+// --- scan-loop and teardown behaviors that had no test of their own --------
+
+fn snapshot_dint(snap: &VarSnapshot, name: &str) -> i64 {
+    snap.vars
+        .iter()
+        .find(|v| v.name == name)
+        .unwrap_or_else(|| panic!("no variable {name}"))
+        .value
+        .parse()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_disabled_task_does_not_run_its_program_body() {
+    // Same PROGRAM twice: enabled, its counter advances; with the task's enable
+    // flag cleared the unit's clock still runs and snapshots still flow, but the
+    // body never executes.
+    for (enabled, label) in [(true, "enabled"), (false, "disabled")] {
+        let mut c =
+            crate::compile("PROGRAM main VAR x : DINT; END_VAR x := x + 1; END_PROGRAM").unwrap();
+        if !enabled {
+            for task in &mut c.task_table.tasks {
+                task.flags &= !1;
+            }
+        }
+        let handle = spawn_units_inner(
+            vec![single_unit(c, 5)],
+            DeviceSource::Prebuilt(Vec::new()),
+            Vec::new(),
+            None,
+            WriteGovernance::default(),
+        );
+        let mut rx = handle.subscribe();
+        let snap = last_snapshot_within(&mut rx, Duration::from_millis(400)).await;
+        let x = snapshot_dint(&snap, "x");
+        handle.shutdown().await;
+        if enabled {
+            assert!(x > 0, "{label}: the counter never advanced");
+        } else {
+            assert_eq!(x, 0, "{label}: the body ran");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_container_with_two_program_instances_is_refused_and_driven_safe() {
+    // The interruptible driver runs instance 0 only, so a container that holds
+    // more is refused instead of silently running one of them.
+    let mut c = trivial_container();
+    let second = c.task_table.programs[0].clone();
+    c.task_table.programs.push(second);
+    let (d, fs, sd) = panic_device("probe", &Arc::new(AtomicBool::new(false)), false);
+    let handle = spawn_units_inner(
+        vec![single_unit(c, 5)],
+        DeviceSource::Prebuilt(vec![Box::new(d)]),
+        Vec::new(),
+        None,
+        WriteGovernance::default(),
+    );
+    join_scan_thread(&handle).await.unwrap();
+    let fault = handle.fault().expect("a refused container is a fault");
+    assert!(
+        fault.contains("exactly one program instance in main"),
+        "{fault}"
+    );
+    assert!(fs.load(Ordering::Relaxed) && sd.load(Ordering::Relaxed));
+}
+
+/// An adapter that connected late, with each teardown call set to succeed,
+/// fail, or panic.
+#[derive(Clone, Copy, Debug)]
+enum Call {
+    Ok,
+    Err,
+    Panic,
+}
+
+struct LateAdapter {
+    failsafe: Call,
+    shutdown: Call,
+    shutdown_called: Arc<AtomicBool>,
+}
+
+fn run_call(mode: Call) -> Result<(), IoError> {
+    match mode {
+        Call::Ok => Ok(()),
+        Call::Err => Err(IoError::Transport("injected".into())),
+        Call::Panic => panic!("injected adapter panic"),
+    }
+}
+
+#[async_trait::async_trait]
+impl IoDevice for LateAdapter {
+    fn name(&self) -> &str {
+        "late"
+    }
+    async fn read_channel(&mut self, _: &str) -> Result<ChannelValue, IoError> {
+        Ok(ChannelValue::I32(0))
+    }
+    async fn write_channel(&mut self, _: &str, _: ChannelValue) -> Result<(), IoError> {
+        Ok(())
+    }
+    async fn enter_failsafe(&mut self) -> Result<(), IoError> {
+        run_call(self.failsafe)
+    }
+    async fn shutdown(&mut self) -> Result<(), IoError> {
+        self.shutdown_called.store(true, Ordering::Relaxed);
+        run_call(self.shutdown)
+    }
+}
+
+#[tokio::test]
+async fn late_adapter_cleanup_counts_each_failed_call_and_never_skips_the_second() {
+    for (failsafe, shutdown, want_failsafe, want_shutdown) in [
+        (Call::Ok, Call::Ok, 0, 0),
+        (Call::Err, Call::Ok, 1, 0),
+        (Call::Ok, Call::Err, 0, 1),
+        (Call::Err, Call::Err, 1, 1),
+        (Call::Panic, Call::Ok, 1, 0),
+        (Call::Ok, Call::Panic, 0, 1),
+        (Call::Panic, Call::Panic, 1, 1),
+    ] {
+        let called = Arc::new(AtomicBool::new(false));
+        let adapter = LateAdapter {
+            failsafe,
+            shutdown,
+            shutdown_called: called.clone(),
+        };
+        let mut outcome = ReconnectOutcome::default();
+        clean_up_late_adapter("late", Box::new(adapter), &mut outcome).await;
+        assert_eq!(
+            (outcome.late_failsafe_failed, outcome.late_shutdown_failed),
+            (want_failsafe, want_shutdown),
+            "failsafe {failsafe:?}, shutdown {shutdown:?}"
+        );
+        assert!(
+            called.load(Ordering::Relaxed),
+            "shutdown was skipped after failsafe {failsafe:?}"
+        );
+    }
+}
+
+/// How the scan thread of `handle` concluded, once it has ended.
+fn scan_end_of(thread: std::thread::ThreadId) -> ScanEnd {
+    SCAN_ENDS
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|(id, _)| *id == thread)
+        .map(|(_, end)| *end)
+        .expect("the scan thread classified its exit")
+}
+
+fn scan_thread_id(handle: &ProgramHandle) -> std::thread::ThreadId {
+    handle
+        .thread
+        .lock()
+        .unwrap()
+        .as_ref()
+        .expect("the scan thread handle is still held")
+        .thread()
+        .id()
+}
+
+#[tokio::test]
+async fn a_plain_stop_is_classified_clean() {
+    let (device, _) = MockDevice::named("probe");
+    let handle = spawn_units_inner(
+        vec![single_unit(trivial_container(), 5)],
+        DeviceSource::Prebuilt(vec![Box::new(device)]),
+        Vec::new(),
+        None,
+        WriteGovernance::default(),
+    );
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let id = scan_thread_id(&handle);
+    handle.stop();
+    handle.shutdown().await;
+    assert_eq!(scan_end_of(id), ScanEnd::Clean);
+}
+
+#[tokio::test]
+async fn a_late_adapter_that_cannot_be_driven_safe_makes_the_scan_end_report_a_device_failure() {
+    // The worker is inside its connect when Stop arrives; the adapter then
+    // arrives late and its failsafe fails. The scan thread, which waits for the
+    // worker, has to conclude that a device failed, not that it exited cleanly.
+    let (spec, accepted, tasks) = delayed_connect_spec(Duration::from_millis(600), 5_000).await;
+    let handle = spawn_units_with_grace(
+        vec![single_unit(trivial_container(), 5)],
+        DeviceSource::PrebuiltWithRetries(Vec::new(), vec![spec]),
+        Vec::new(),
+        None,
+        WriteGovernance::default(),
+        Duration::from_secs(5),
+    );
+    wait_until(&accepted, Duration::from_secs(5)).await;
+    let id = scan_thread_id(&handle);
+    handle.stop();
+    handle.shutdown().await;
+    assert_eq!(scan_end_of(id), ScanEnd::StoppedButDevicesFailed);
+    for task in tasks {
+        task.abort();
+    }
+}
+
+/// Accepts connections, raises `accepted`, holds each one for `delay`, then
+/// connects it straight through to `backend` for good.
+async fn delayed_transparent_proxy(
+    listener: tokio::net::TcpListener,
+    backend: std::net::SocketAddr,
+    delay: Duration,
+    accepted: Arc<AtomicBool>,
+) {
+    loop {
+        let Ok((mut client, _)) = listener.accept().await else {
+            return;
+        };
+        accepted.store(true, Ordering::Relaxed);
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let Ok(mut upstream) = tokio::net::TcpStream::connect(backend).await else {
+                return;
+            };
+            let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+        });
+    }
+}
+
+/// A device whose failsafe takes a while.
+struct SlowSafe(Duration);
+
+#[async_trait::async_trait]
+impl IoDevice for SlowSafe {
+    fn name(&self) -> &str {
+        "slow"
+    }
+    async fn read_channel(&mut self, _: &str) -> Result<ChannelValue, IoError> {
+        Ok(ChannelValue::I32(0))
+    }
+    async fn write_channel(&mut self, _: &str, _: ChannelValue) -> Result<(), IoError> {
+        Ok(())
+    }
+    async fn enter_failsafe(&mut self) -> Result<(), IoError> {
+        tokio::time::sleep(self.0).await;
+        Ok(())
+    }
+    async fn shutdown(&mut self) -> Result<(), IoError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn an_adapter_still_queued_when_the_scan_ends_is_driven_safe_while_its_runtime_lives() {
+    // A real Modbus adapter reaches a demo slave through a proxy that holds the
+    // connect for 400 ms, with coil 0 already ON. The scan loop is parked inside
+    // one tick (a stall) while the adapter arrives, and Stop comes before the loop
+    // is back at the top, where adapters are adopted: it is still QUEUED when the
+    // scan ends. Another device's slow failsafe runs ahead of it, so the adapter's
+    // own failsafe comes later than the worker's 200 ms release poll: it only
+    // reaches the slave if the worker's runtime was kept alive until the whole
+    // pass had finished. Coil 0 going OFF proves both that the queued adapter was
+    // driven safe and that its runtime outlived the pass.
+    let backend_probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let backend = backend_probe.local_addr().unwrap();
+    drop(backend_probe);
+    let slave_state = iomap_modbus::DemoSlave::new();
+    slave_state.coils().lock().unwrap()[0] = true;
+    let slave = tokio::spawn(iomap_modbus::run_demo_slave(backend, slave_state.clone()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let front = listener.local_addr().unwrap();
+    let accepted = Arc::new(AtomicBool::new(false));
+    let proxy = tokio::spawn(delayed_transparent_proxy(
+        listener,
+        backend,
+        Duration::from_millis(400),
+        accepted.clone(),
+    ));
+    tokio::time::sleep(Duration::from_millis(100)).await; // demo slave is up
+
+    let handle = spawn_units_inner(
+        vec![single_unit(trivial_container(), 5)],
+        DeviceSource::PrebuiltWithRetries(
+            vec![Box::new(SlowSafe(Duration::from_millis(600)))],
+            vec![coil_spec(front, 5_000)],
+        ),
+        Vec::new(),
+        None,
+        WriteGovernance::default(),
+    );
+    wait_until(&accepted, Duration::from_secs(5)).await; // the worker is inside its connect
+    handle.inject_scan_stall(1_000, 1).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(650)).await; // the adapter arrived at ~400 ms
+    handle.stop();
+    join_scan_thread(&handle).await.unwrap();
+
+    assert_eq!(handle.fault(), None);
+    assert!(
+        !slave_state.coils().lock().unwrap()[0],
+        "the queued adapter was not driven safe before its runtime went away"
+    );
+    proxy.abort();
+    slave.abort();
 }

@@ -1015,13 +1015,16 @@ fn spawn_units_with_grace(
             let recorded = fault_tx.borrow().clone();
             let reconnect_failed = reconnect_end.failed;
             let reconnect_unconfirmed = reconnect_end.unconfirmed;
-            match classify_scan_end(
+            let scan_end = classify_scan_end(
                 result.is_err(),
                 recorded.is_some(),
                 failsafe_failed,
                 shutdown_failed,
                 &reconnect_end,
-            ) {
+            );
+            #[cfg(test)]
+            record_scan_end(scan_end);
+            match scan_end {
                 ScanEnd::Clean => tracing::info!(
                     devices = dev_count,
                     failsafe_failed,
@@ -1092,7 +1095,7 @@ fn spawn_units_with_grace(
 
 /// How the scan thread ended, for its closing log line. A pure classification
 /// so the wording is testable without capturing another thread's log output.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScanEnd {
     /// Stopped as asked (or ended on its own) with every failsafe and shutdown
     /// call delivered.
@@ -1109,6 +1112,21 @@ enum ScanEnd {
     Fault,
     /// The scan loop itself panicked.
     Panicked,
+}
+
+/// Test builds only: how each scan thread's closing line was classified, by
+/// thread, so a test can check what the scan thread concluded instead of
+/// capturing log output. A real thread's id is never reused while it is alive.
+#[cfg(test)]
+static SCAN_ENDS: std::sync::Mutex<Vec<(std::thread::ThreadId, ScanEnd)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn record_scan_end(end: ScanEnd) {
+    SCAN_ENDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((std::thread::current().id(), end));
 }
 
 /// A panic outranks a fault, which outranks failed device calls (including the
