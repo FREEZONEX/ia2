@@ -34,12 +34,34 @@ struct ScanGuard<'a> {
     deadline: Instant,
     stop_seen: Option<Instant>,
     stop_grace: Duration,
+    /// Opcodes executed before the current window began.
     instructions: u64,
+    /// Opcodes the current window admits, and how many of them are left. The
+    /// per-opcode work is one decrement; the clock, Stop and the instruction
+    /// ceiling are looked at when a window runs out.
+    window_len: u64,
+    window_left: u64,
     limit: u64,
     outcome: ScanOutcome,
 }
 
-impl ScanGuard<'_> {
+impl<'a> ScanGuard<'a> {
+    fn new(stop: &'a AtomicBool, deadline: Instant, stop_grace: Duration, limit: u64) -> Self {
+        Self {
+            stop,
+            deadline,
+            stop_seen: None,
+            stop_grace,
+            instructions: 0,
+            // An empty first window: the first opcode is a checkpoint, so
+            // Stop and the clock are looked at before anything executes.
+            window_len: 0,
+            window_left: 0,
+            limit,
+            outcome: ScanOutcome::Completed,
+        }
+    }
+
     fn check_clock_and_stop(&mut self) {
         if self.stop.load(Ordering::Relaxed) && self.stop_grace_expired() {
             self.outcome = ScanOutcome::Stopped;
@@ -58,14 +80,14 @@ impl ScanGuard<'_> {
             self.outcome = ScanOutcome::BudgetExceeded("time limit");
         }
     }
-}
 
-impl DebugHook for ScanGuard<'_> {
-    #[inline]
-    fn before_instruction(&mut self, _function: FunctionId, _pc: usize, _op: u8) -> HookAction {
-        if self.instructions.is_multiple_of(CHECK_INTERVAL) {
-            self.check_clock_and_stop();
-        }
+    /// The window just ran out, i.e. every opcode it admitted has executed.
+    /// Account for them, look at Stop, the clock and the instruction ceiling,
+    /// and open the next window, or end the scan.
+    #[inline(never)]
+    fn checkpoint(&mut self) -> HookAction {
+        self.instructions += self.window_len;
+        self.check_clock_and_stop();
         if self.outcome == ScanOutcome::Completed && self.instructions >= self.limit {
             self.outcome = ScanOutcome::BudgetExceeded("instruction limit");
         }
@@ -74,8 +96,22 @@ impl DebugHook for ScanGuard<'_> {
             // treats it as terminal; it is never a user-visible debug step.
             return HookAction::Pause(PauseReason::Step);
         }
-        self.instructions += 1;
+        // This call's opcode opens the next window: CHECK_INTERVAL opcodes,
+        // fewer when the ceiling falls inside it, so the ceiling is exact.
+        self.window_len = (self.limit - self.instructions).min(CHECK_INTERVAL);
+        self.window_left = self.window_len - 1;
         HookAction::Continue
+    }
+}
+
+impl DebugHook for ScanGuard<'_> {
+    #[inline]
+    fn before_instruction(&mut self, _function: FunctionId, _pc: usize, _op: u8) -> HookAction {
+        if self.window_left > 0 {
+            self.window_left -= 1;
+            return HookAction::Continue;
+        }
+        self.checkpoint()
     }
 }
 
@@ -90,15 +126,12 @@ pub(crate) fn run_scan(
     } else {
         Duration::from_micros(watchdog_us).min(MAX_SCAN_TIME)
     };
-    let mut guard = ScanGuard {
+    let mut guard = ScanGuard::new(
         stop,
-        deadline: Instant::now() + time_limit,
-        stop_seen: None,
-        stop_grace: STOP_GRACE,
-        instructions: 0,
-        limit: MAX_SCAN_INSTRUCTIONS,
-        outcome: ScanOutcome::Completed,
-    };
+        Instant::now() + time_limit,
+        STOP_GRACE,
+        MAX_SCAN_INSTRUCTIONS,
+    );
     let result = vm.run_round_debug(uptime_us, &mut guard)?;
     if matches!(result, RoundOutcome::Completed) {
         // Also cover a slow final opcode / a scan shorter than the sampling
@@ -126,15 +159,12 @@ mod tests {
         let mut bufs = VmBuffers::from_container(&c);
         let mut vm = Vm::new().load(&c, &mut bufs).unwrap().start().unwrap();
         let stop = AtomicBool::new(false);
-        let mut guard = ScanGuard {
-            stop: &stop,
-            deadline: Instant::now() + Duration::from_secs(5),
-            stop_seen: None,
-            stop_grace: Duration::ZERO,
-            instructions: 0,
-            limit: 1000,
-            outcome: ScanOutcome::Completed,
-        };
+        let mut guard = ScanGuard::new(
+            &stop,
+            Instant::now() + Duration::from_secs(5),
+            Duration::ZERO,
+            1000,
+        );
         assert!(matches!(
             vm.run_round_debug(0, &mut guard).unwrap(),
             RoundOutcome::Paused(_)
@@ -150,15 +180,12 @@ mod tests {
     #[test]
     fn stop_is_observed_inside_an_in_flight_scan() {
         let stop = AtomicBool::new(false);
-        let mut guard = ScanGuard {
-            stop: &stop,
-            deadline: Instant::now() + Duration::from_secs(5),
-            stop_seen: None,
-            stop_grace: Duration::ZERO,
-            instructions: 0,
-            limit: MAX_SCAN_INSTRUCTIONS,
-            outcome: ScanOutcome::Completed,
-        };
+        let mut guard = ScanGuard::new(
+            &stop,
+            Instant::now() + Duration::from_secs(5),
+            Duration::ZERO,
+            MAX_SCAN_INSTRUCTIONS,
+        );
         assert_eq!(
             guard.before_instruction(FunctionId::SCAN, 0, 0),
             HookAction::Continue
@@ -179,15 +206,8 @@ mod tests {
     #[test]
     fn expired_time_budget_stops_before_executing_an_instruction() {
         let stop = AtomicBool::new(false);
-        let mut guard = ScanGuard {
-            stop: &stop,
-            deadline: Instant::now(),
-            stop_seen: None,
-            stop_grace: Duration::ZERO,
-            instructions: 0,
-            limit: MAX_SCAN_INSTRUCTIONS,
-            outcome: ScanOutcome::Completed,
-        };
+        let mut guard =
+            ScanGuard::new(&stop, Instant::now(), Duration::ZERO, MAX_SCAN_INSTRUCTIONS);
         assert!(matches!(
             guard.before_instruction(FunctionId::SCAN, 0, 0),
             HookAction::Pause(_)
@@ -200,15 +220,12 @@ mod tests {
     fn stop_is_deferred_until_its_grace_has_elapsed() {
         let stop = AtomicBool::new(true);
         let grace = Duration::from_millis(40);
-        let mut guard = ScanGuard {
-            stop: &stop,
-            deadline: Instant::now() + Duration::from_secs(30),
-            stop_seen: None,
-            stop_grace: grace,
-            instructions: 0,
-            limit: MAX_SCAN_INSTRUCTIONS,
-            outcome: ScanOutcome::Completed,
-        };
+        let mut guard = ScanGuard::new(
+            &stop,
+            Instant::now() + Duration::from_secs(30),
+            grace,
+            MAX_SCAN_INSTRUCTIONS,
+        );
         // The first sample sees Stop but a healthy scan still gets its grace.
         assert_eq!(
             guard.before_instruction(FunctionId::SCAN, 0, 0),
@@ -241,5 +258,76 @@ mod tests {
             ScanOutcome::Completed,
             "the caller honours Stop at the boundary; the finished scan is consistent"
         );
+    }
+
+    /// Counts opcodes and never pauses.
+    struct CountOpcodes(u64);
+
+    impl DebugHook for CountOpcodes {
+        fn before_instruction(&mut self, _: FunctionId, _: usize, _: u8) -> HookAction {
+            self.0 += 1;
+            HookAction::Continue
+        }
+    }
+
+    /// One scan of `source` under a guard with the given opcode ceiling and
+    /// no time or Stop pressure: how the round ended, the guard's verdict,
+    /// and how many opcodes it had counted.
+    fn guarded_scan(source: &str, limit: u64) -> (RoundOutcome, ScanOutcome, u64) {
+        let c = crate::compile(source).unwrap();
+        let mut bufs = VmBuffers::from_container(&c);
+        let mut vm = Vm::new().load(&c, &mut bufs).unwrap().start().unwrap();
+        let stop = AtomicBool::new(false);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut guard = ScanGuard::new(&stop, deadline, Duration::ZERO, limit);
+        let round = vm.run_round_debug(0, &mut guard).unwrap();
+        (round, guard.outcome, guard.instructions)
+    }
+
+    const SPIN: &str =
+        "PROGRAM main VAR x : DINT; END_VAR WHILE TRUE DO x := x + 1; END_WHILE; END_PROGRAM";
+
+    #[test]
+    fn the_instruction_ceiling_admits_exactly_that_many_opcodes() {
+        let source = "PROGRAM main VAR i : DINT; a : DINT; END_VAR
+                      FOR i := 1 TO 300 DO a := a + i; END_FOR; END_PROGRAM";
+        let c = crate::compile(source).unwrap();
+        let mut bufs = VmBuffers::from_container(&c);
+        let mut vm = Vm::new().load(&c, &mut bufs).unwrap().start().unwrap();
+        let mut count = CountOpcodes(0);
+        vm.run_round_debug(0, &mut count).unwrap();
+        let total = count.0;
+        assert!(
+            total > 3 * CHECK_INTERVAL && !total.is_multiple_of(CHECK_INTERVAL),
+            "the scan ({total} opcodes) must end strictly inside a window"
+        );
+
+        for limit in [total, total + 1, total + CHECK_INTERVAL] {
+            let (round, outcome, _) = guarded_scan(source, limit);
+            assert_eq!(round, RoundOutcome::Completed, "limit {limit}");
+            assert_eq!(outcome, ScanOutcome::Completed, "limit {limit}");
+        }
+        let (round, outcome, executed) = guarded_scan(source, total - 1);
+        assert!(matches!(round, RoundOutcome::Paused(_)));
+        assert_eq!(outcome, ScanOutcome::BudgetExceeded("instruction limit"));
+        assert_eq!(
+            executed,
+            total - 1,
+            "stopped before the opcode over the line"
+        );
+    }
+
+    #[test]
+    fn the_instruction_ceiling_is_exact_at_window_edges() {
+        for limit in [0, 1, 2, 255, 256, 257, 511, 512, 513, 1000] {
+            let (round, outcome, executed) = guarded_scan(SPIN, limit);
+            assert!(matches!(round, RoundOutcome::Paused(_)), "limit {limit}");
+            assert_eq!(
+                outcome,
+                ScanOutcome::BudgetExceeded("instruction limit"),
+                "limit {limit}"
+            );
+            assert_eq!(executed, limit, "limit {limit}");
+        }
     }
 }
