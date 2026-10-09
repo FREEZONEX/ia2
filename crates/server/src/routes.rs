@@ -4049,6 +4049,49 @@ mod run_handover_tests {
         silent.abort();
     }
 
+    /// Several `POST /api/run` at once must leave exactly one run behind. Each
+    /// later start retires the one before it; if two starts overlapped, one
+    /// run would be displaced from the slot without being stopped and would
+    /// keep publishing snapshots for good.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn simultaneous_starts_leave_exactly_one_run() {
+        const STARTS: usize = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let store = project::ProjectStore::create(dir.path().join("p"), "p").unwrap();
+        store.write_pou_source("main", IDLE).unwrap();
+        let state = AppState::new(iomap_modbus::DemoSlave::new(), String::new(), None, None);
+        state.projects.lock().insert_and_activate(store);
+        let app = Router::new()
+            .route("/api/run", post(super::run))
+            .route("/api/stop", post(super::stop))
+            .with_state(state.clone());
+
+        let mut starts = tokio::task::JoinSet::new();
+        for _ in 0..STARTS {
+            let app = app.clone();
+            starts.spawn(async move { post_run(&app).await.0 });
+        }
+        while let Some(status) = starts.join_next().await {
+            assert_eq!(status.unwrap(), StatusCode::OK);
+        }
+        assert!(state.program.lock().is_some());
+
+        post_stop(&app).await;
+        state
+            .wait_until_drained(Duration::from_secs(10))
+            .await
+            .expect("teardown ends");
+        // Everything is stopped and drained: no snapshot may still arrive.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let before = state.last_snapshot.lock().as_ref().map(|s| s.timestamp_us);
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        let after = state.last_snapshot.lock().as_ref().map(|s| s.timestamp_us);
+        assert_eq!(
+            before, after,
+            "a run is still publishing after everything was stopped"
+        );
+    }
+
     /// A run that faults leaves the program slot when the fault is reported,
     /// long before its teardown ends. It must stay tracked until then, or the
     /// next start would not know there is anything to wait for.
