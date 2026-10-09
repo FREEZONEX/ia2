@@ -4,6 +4,7 @@ Status: Accepted (2026-06-13)
 
 Updated: 2026-09-23 — unpatched upstream v0.244.0, single IA2 scheduler.
 Updated: 2026-09-23 — released upstream v0.246.0; SFC state follows step-name encoding.
+Updated: 2026-10-08 — released upstream v0.248.0.
 
 ## Context
 
@@ -63,11 +64,28 @@ concepts into the vendor, and don't reimplement the language in IA2.**
 ## Decision: vendor strategy (released upstream pin, no active patches)
 
 The submodule points directly at `https://github.com/ironplc/ironplc.git`,
-tag [v0.246.0](https://github.com/ironplc/ironplc/releases/tag/v0.246.0),
-commit `6f4a796736576b29cde5d163e75c311639028e15` — an upstream **release**
+tag [v0.248.0](https://github.com/ironplc/ironplc/releases/tag/v0.248.0),
+commit `80a1aa8bdaa8c1da948f0ff56c7b6f35913e9524` — an upstream **release**
 (not a pre-release). There are no IA2 source patches in the submodule.
 
-v0.246.0 over the v0.244.0 pre-release that IA2 #61 surveyed:
+v0.248.0 over v0.246.0:
+
+- Integer `LIMIT` with MN > MX returns MX instead of panicking; unsigned
+  `ABS` preserves its value and LINT powers use the full exponent (upstream
+  [#1859](https://github.com/ironplc/ironplc/pull/1859), first released in
+  v0.247.0). Bridge regressions execute all four integer LIMIT lanes and
+  the unsigned ABS / large-exponent cases.
+- Code generation takes `CleanAnalysis`, enforcing the diagnostic gate
+  already used by IA2. `Vm::load` now returns a Result and rejects invalid
+  call-depth metadata before initialization. Bridge callers handle both
+  API changes; the existing start-failure fault remains visible.
+- Upstream codegen invariant panics are converted to internal diagnostics
+  ([#2080](https://github.com/ironplc/ironplc/pull/2080)). This does not prove
+  every possible compiler input or hand-built container is panic-free.
+- The later upstream uptime/scope/scheduler fixes #2152/#2142/#2153 are
+  outside this release.
+
+Historical v0.246.0 changes over the v0.244.0 pre-release that IA2 #61 surveyed:
 
 - A `STRING` literal holding a character outside Latin-1 is rejected
   (P4052, ironplc [#1733](https://github.com/ironplc/ironplc/issues/1733))

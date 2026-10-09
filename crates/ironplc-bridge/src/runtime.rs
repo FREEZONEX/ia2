@@ -1786,7 +1786,15 @@ async fn run_loop_async(
         .collect();
     let mut runnings: Vec<VmRunning<'_>> = Vec::with_capacity(n_units);
     for (unit, buf) in units.iter().zip(bufs.iter_mut()) {
-        match Vm::new().load(&unit.container, buf).start() {
+        match Vm::new()
+            .load(&unit.container, buf)
+            .map_err(|trap| ironplc_vm::FaultContext {
+                trap,
+                task_id: ironplc_container::TaskId::DEFAULT,
+                instance_id: ironplc_container::InstanceId::DEFAULT,
+            })
+            .and_then(|ready| ready.start())
+        {
             Ok(r) => runnings.push(r),
             Err(ctx) => {
                 tracing::error!(instance = %unit.instance, ?ctx.trap, "vm failed to start");
