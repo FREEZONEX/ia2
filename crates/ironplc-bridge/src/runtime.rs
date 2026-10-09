@@ -1499,6 +1499,27 @@ async fn collect_reconnect_worker(
     }
 }
 
+/// An adapter that connected after the handoff had closed. Nobody will drive
+/// it any more, so drive it safe and shut it down here, on the runtime it
+/// lives on, and count what failed. Each call is isolated, so a panic in one
+/// does not skip the other.
+async fn clean_up_late_adapter(
+    name: &str,
+    mut device: Box<dyn IoDevice>,
+    outcome: &mut ReconnectOutcome,
+) {
+    let failsafe = isolate_device_call(device.enter_failsafe()).await;
+    if !matches!(failsafe, Ok(Ok(()))) {
+        outcome.late_failsafe_failed += 1;
+        tracing::error!(device = %name, ?failsafe, "late connection failsafe failed");
+    }
+    let shutdown = isolate_device_call(device.shutdown()).await;
+    if !matches!(shutdown, Ok(Ok(()))) {
+        outcome.late_shutdown_failed += 1;
+        tracing::error!(device = %name, ?shutdown, "late connection shutdown failed");
+    }
+}
+
 /// Background retry loop for devices that failed the initial connect.
 ///
 /// Runs on its own OS thread with a dedicated single-thread runtime so a
@@ -1569,23 +1590,8 @@ fn reconnect_worker(
                         // Do not cancel connect_one midway: some adapters own
                         // a bus worker already. Finish acquisition, then drain
                         // an unadopted adapter on its owning runtime.
-                        if let Err(mut d) = state.deliver(d) {
-                            let failsafe = isolate_device_call(d.enter_failsafe()).await;
-                            if !matches!(failsafe, Ok(Ok(()))) {
-                                outcome.late_failsafe_failed += 1;
-                                tracing::error!(
-                                    device = %spec.name, ?failsafe,
-                                    "late connection failsafe failed"
-                                );
-                            }
-                            let shutdown = isolate_device_call(d.shutdown()).await;
-                            if !matches!(shutdown, Ok(Ok(()))) {
-                                outcome.late_shutdown_failed += 1;
-                                tracing::error!(
-                                    device = %spec.name, ?shutdown,
-                                    "late connection shutdown failed"
-                                );
-                            }
+                        if let Err(d) = state.deliver(d) {
+                            clean_up_late_adapter(&spec.name, d, &mut outcome).await;
                             break;
                         }
                         tracing::info!(device = %spec.name, "background reconnect succeeded");
