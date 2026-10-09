@@ -35,6 +35,9 @@
 //! expect_watchdog = { tripped = true, within_ms = 3000 }   # reached by deadline
 //! # …or `{ tripped = false, during_ms = 800 }` — HOLDS for the whole window
 //! # (the right shape for a negative control before inject)
+//!
+//! [[steps]]                      # terminal failure, including an infinite loop
+//! expect_fault = { contains = "VM execution budget exceeded", within_ms = 5000 }
 //! ```
 //!
 //! Exit codes follow the CLI contract: 0 = every expectation held,
@@ -73,6 +76,17 @@ struct Step {
     expect_alarm: Option<AlarmStep>,
     inject: Option<InjectStep>,
     expect_watchdog: Option<WatchdogStep>,
+    expect_fault: Option<FaultStep>,
+}
+
+/// An expected terminal runtime fault, read from status rather than a stale
+/// variable snapshot. Both the stopped state and its reason must match.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FaultStep {
+    contains: String,
+    #[serde(default = "default_within")]
+    within_ms: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -492,7 +506,39 @@ fn run_step(
             std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
         }
     }
-    Err("empty step (write one of: wait_ms / set / expect / expect_never / expect_alarm / inject / expect_watchdog)".into())
+    if let Some(expected) = &step.expect_fault {
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(expected.within_ms);
+        loop {
+            let status = client
+                .get("/api/runtime/status")
+                .map_err(|e| format!("expect_fault: {e:#}"))?;
+            let running = status
+                .get("running")
+                .and_then(|v| v.as_bool())
+                .ok_or_else(|| "expect_fault: status carries no boolean running".to_string())?;
+            let error = match status.get("last_error") {
+                Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::String(s)) => Some(s.as_str()),
+                _ => return Err("expect_fault: status carries no string/null last_error".into()),
+            };
+            if let Some(file) = trace {
+                let line = serde_json::json!({"step": n, "status": status});
+                writeln!(file, "{line}").map_err(|e| format!("trace: {e}"))?;
+            }
+            if !running && error.is_some_and(|message| message.contains(&expected.contains)) {
+                return Ok(format!(
+                    "runtime stopped with fault: {}",
+                    error.unwrap_or_default()
+                ));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!("expected stopped runtime with fault containing {:?}; running={running}, last_error={error:?}", expected.contains));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
+        }
+    }
+    Err("empty step (write one of: wait_ms / set / expect / expect_never / expect_alarm / inject / expect_watchdog / expect_fault)".into())
 }
 
 /// Read one variable's numeric value off /api/runtime/snapshot, and
@@ -567,13 +613,14 @@ fn validate(s: &Scenario) -> Result<()> {
             step.expect_alarm.is_some(),
             step.inject.is_some(),
             step.expect_watchdog.is_some(),
+            step.expect_fault.is_some(),
         ]
         .iter()
         .filter(|b| **b)
         .count();
         if set_fields != 1 {
             bail!(
-                "step {}: exactly one of wait_ms / set / expect / expect_never / expect_alarm / inject / expect_watchdog (found {set_fields})",
+                "step {}: exactly one of wait_ms / set / expect / expect_never / expect_alarm / inject / expect_watchdog / expect_fault (found {set_fields})",
                 i + 1
             );
         }
@@ -590,6 +637,11 @@ fn validate(s: &Scenario) -> Result<()> {
                 );
             }
         }
+        if let Some(fault) = &step.expect_fault {
+            if fault.contains.trim().is_empty() {
+                bail!("step {}: expect_fault.contains must not be empty", i + 1);
+            }
+        }
     }
     Ok(())
 }
@@ -597,6 +649,20 @@ fn validate(s: &Scenario) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_expected_fault_requires_a_nonempty_reason_and_its_own_step() {
+        for source in [
+            "[[steps]]\nexpect_fault = { contains = ' ' }",
+            "[[steps]]\nwait_ms = 1\nexpect_fault = { contains = 'budget' }",
+        ] {
+            let scenario: Scenario = toml::from_str(source).unwrap();
+            assert!(validate(&scenario).is_err());
+        }
+        let scenario: Scenario =
+            toml::from_str("[[steps]]\nexpect_fault = { contains = 'budget' }").unwrap();
+        validate(&scenario).unwrap();
+    }
 
     #[test]
     fn scenario_parses_and_validates() {

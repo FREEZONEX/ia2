@@ -124,7 +124,9 @@ echoes, and rejects Output bindings to gear feedback (see 06).
 
 ```
 cs run [--program NAME [--file path.st]]  # tasks.toml schedule, or one PROGRAM
-cs stop
+                                           # waits for the previous run's device teardown;
+                                           # exit 2 + "still shutting down" after 10 s, retry
+cs stop                                    # returns when the stop is requested, not when devices are safe
 cs runtime status [--edge NAME]      # mode + forces (no variable values)
 cs runtime snapshot [--vars a,b] [--edge NAME]   # LIVE VALUES — the read you want
 cs runtime pause | resume | step [N] [--edge NAME]
@@ -185,6 +187,9 @@ cs sim run scenarios/fill.toml [--program NAME] [--trace out.jsonl] [--keep-runn
 Exit 0 = every expectation held; 1 = a step failed (the report names
 the step, the deadline, and the last observed value). Scenario
 vocabulary + alarm/history workflow: `references/09-sim-alarms.md`.
+Use `expect_fault = { contains = "VM execution budget exceeded", within_ms = 5000 }`
+to assert a terminal fault. It requires `running=false` and a matching
+`last_error`; a stopped program without that error does not pass.
 
 ### Deploy / edge
 

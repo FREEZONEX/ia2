@@ -24,6 +24,7 @@ pub(crate) fn run_container(container: &Container, rounds: u32) -> HashMap<Strin
     let mut bufs = VmBuffers::from_container(container);
     let mut vm = Vm::new()
         .load(container, &mut bufs)
+        .expect("vm loads")
         .start()
         .expect("vm starts");
     for r in 0..rounds {
