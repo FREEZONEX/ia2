@@ -351,23 +351,37 @@ impl ProgramHandle {
     /// before it returns. Device failures are logged; completion is not
     /// a guarantee that physical outputs reached their safe state.
     ///
+    /// The scan thread waits at most `RECONNECT_JOIN_GRACE` for the background
+    /// reconnect worker, so a device still mid-connect delays this by at most
+    /// that long; the closing log line then says the worker's outcome is
+    /// unconfirmed rather than "exited cleanly".
+    ///
     /// Unlike `stop`, this waits for completion, so the runtime can drive
     /// the plant safe before exiting rather than racing the service
-    /// supervisor's kill timeout. The join runs on a blocking thread so
-    /// this is safe to call from any async runtime. Idempotent: the first
-    /// caller joins; later calls are no-ops.
+    /// supervisor's kill timeout. Polling completion before joining keeps
+    /// cancellation safe: a caller's timeout cannot leave a blocking join
+    /// behind that wedges Tokio runtime destruction. Concurrent callers all
+    /// wait for completion; one joins the finished thread.
     pub async fn shutdown(&self) {
         self.stop.store(true, Ordering::Relaxed);
-        let handle = self.thread.lock().ok().and_then(|mut g| g.take());
-        let Some(handle) = handle else { return };
-        match tokio::task::spawn_blocking(move || handle.join()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => {
-                tracing::error!(
-                    "scan thread panicked during shutdown; inspect preceding failsafe errors"
-                )
+        loop {
+            let finished = {
+                let mut slot = self.thread.lock().unwrap_or_else(|e| e.into_inner());
+                match slot.as_ref() {
+                    None => return,
+                    Some(thread) if thread.is_finished() => slot.take(),
+                    Some(_) => None,
+                }
+            };
+            if let Some(thread) = finished {
+                if thread.join().is_err() {
+                    tracing::error!(
+                        "scan thread panicked during shutdown; inspect preceding failsafe errors"
+                    );
+                }
+                return;
             }
-            Err(e) => tracing::error!(%e, "failed to join scan thread on shutdown"),
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 
@@ -686,6 +700,8 @@ enum DeviceSource {
     Specs(Vec<DeviceSpec>),
     #[cfg(test)]
     Prebuilt(Vec<Box<dyn IoDevice>>),
+    #[cfg(test)]
+    PrebuiltWithRetries(Vec<Box<dyn IoDevice>>, Vec<DeviceSpec>),
 }
 
 async fn acquire_devices(
@@ -694,20 +710,28 @@ async fn acquire_devices(
     match source {
         DeviceSource::Specs(specs) => connect_devices(specs).await,
         #[cfg(test)]
-        DeviceSource::Prebuilt(devices) => {
-            let reports = devices
-                .iter()
-                .map(|d| DeviceReport {
-                    name: d.name().to_string(),
-                    protocol: "mock".into(),
-                    connected: true,
-                    error: None,
-                    slaves: Vec::new(),
-                })
-                .collect();
-            (devices, reports, Vec::new())
-        }
+        DeviceSource::Prebuilt(devices) => prebuilt_devices(devices, Vec::new()),
+        #[cfg(test)]
+        DeviceSource::PrebuiltWithRetries(devices, retries) => prebuilt_devices(devices, retries),
     }
+}
+
+#[cfg(test)]
+fn prebuilt_devices(
+    devices: Vec<Box<dyn IoDevice>>,
+    retries: Vec<DeviceSpec>,
+) -> (Vec<Box<dyn IoDevice>>, Vec<DeviceReport>, Vec<DeviceSpec>) {
+    let reports = devices
+        .iter()
+        .map(|d| DeviceReport {
+            name: d.name().to_string(),
+            protocol: "mock".into(),
+            connected: true,
+            error: None,
+            slaves: Vec::new(),
+        })
+        .collect();
+    (devices, reports, retries)
 }
 
 fn spawn_units_inner(
@@ -716,6 +740,26 @@ fn spawn_units_inner(
     mappings: Vec<Mapping>,
     state_path: Option<PathBuf>,
     governance: WriteGovernance,
+) -> ProgramHandle {
+    spawn_units_with_grace(
+        units,
+        device_source,
+        mappings,
+        state_path,
+        governance,
+        RECONNECT_JOIN_GRACE,
+    )
+}
+
+/// `spawn_units_inner` with the reconnect worker's wait made explicit, so a
+/// test can exercise the abandoned-worker path without waiting out the default.
+fn spawn_units_with_grace(
+    units: Vec<ProgramUnit>,
+    device_source: DeviceSource,
+    mappings: Vec<Mapping>,
+    state_path: Option<PathBuf>,
+    governance: WriteGovernance,
+    reconnect_join_grace: Duration,
 ) -> ProgramHandle {
     let stop = Arc::new(AtomicBool::new(false));
     // Normalised exactly as `UnitClock::interval` below, and MIN across
@@ -839,31 +883,29 @@ fn spawn_units_inner(
             // EtherCAT bring-up can never stall scan rounds). Reconnected
             // adapters are handed to the scan loop over this channel; the
             // loop binds their parked mappings and the per-round health
-            // refresh flips them healthy. If nothing failed, the sender
-            // drops here and try_recv just reports Disconnected forever.
-            let (reconnect_tx, reconnect_rx) =
-                std::sync::mpsc::channel::<Box<dyn IoDevice>>();
-            // Set once the failsafe + per-device shutdown pass below has
-            // finished — the reconnect worker keeps its runtime (and the
-            // adapters' background tasks) alive until then.
-            let drained = Arc::new(AtomicBool::new(false));
-            if !failed_specs.is_empty() {
-                let drained_flag = drained.clone();
+            // refresh flips them healthy. Scan exit closes the handoff before
+            // draining its queued adapters along with the adopted devices.
+            let reconnect = Arc::new(ReconnectState::default());
+            let reconnect_thread = if !failed_specs.is_empty() {
+                let worker_state = reconnect.clone();
                 let spawned = std::thread::Builder::new()
                     .name("ia2-reconnect".into())
                     .spawn(move || {
                         reconnect_worker(
                             failed_specs,
-                            reconnect_tx,
                             device_reports_reconnect,
                             stop_reconnect,
-                            drained_flag,
+                            worker_state,
                         )
                     });
-                if let Err(e) = spawned {
-                    tracing::error!(%e, "failed to spawn reconnect thread; unconnected devices stay down");
+                match spawned {
+                    Ok(thread) => Some(thread),
+                    Err(e) => {
+                        tracing::error!(%e, "failed to spawn reconnect thread; unconnected devices stay down");
+                        None
+                    }
                 }
-            }
+            } else { None };
 
             // Wrap the scan loop in catch_unwind so a panic in the VM
             // glue / iomap / snapshot fan-out doesn't skip failsafe.
@@ -888,11 +930,15 @@ fn spawn_units_inner(
                 scan_overruns_clone,
                 consecutive_overruns_clone,
                 fault_tx,
-                reconnect_rx,
+                &reconnect,
                 state_path,
             ))
             .catch_unwind()
             .await;
+            // Close delivery and take queued devices in one critical section.
+            // Nothing can be handed to a dead scan after this point. Adapters
+            // queued just before the exit join the same failsafe pass.
+            devices.extend(reconnect.finish());
             // A panic is a fault too: record it so the HTTP layer can
             // surface WHY the run died, not just that snapshots stopped.
             // (The failsafe + teardown below still run either way.)
@@ -955,35 +1001,58 @@ fn spawn_units_inner(
             // Failsafe + teardown done: release the reconnect worker (it
             // holds the runtime that late-connected adapters' background
             // tasks live on, and must outlive the writes above).
-            drained.store(true, Ordering::Relaxed);
+            reconnect.drained.store(true, Ordering::Release);
+            // Bounded: a worker still inside a device connect must not hold
+            // the scan thread (and `shutdown()`) for the adapter's connect time.
+            let reconnect_end = match reconnect_thread {
+                Some(thread) => collect_reconnect_worker(thread, reconnect_join_grace).await,
+                None => ReconnectEnd::default(),
+            };
             // "Cleanly" only when nothing faulted AND no device's failsafe or
             // shutdown call failed: a VM trap or a failed start also returns
             // normally, and a panicking or erroring adapter used to leave this
             // line reading as a clean exit with the failure only in a field.
             let recorded = fault_tx.borrow().clone();
+            let reconnect_failed = reconnect_end.failed;
+            let reconnect_unconfirmed = reconnect_end.unconfirmed;
             match classify_scan_end(
                 result.is_err(),
                 recorded.is_some(),
                 failsafe_failed,
                 shutdown_failed,
+                &reconnect_end,
             ) {
                 ScanEnd::Clean => tracing::info!(
                     devices = dev_count,
                     failsafe_failed,
                     shutdown_failed,
+                    reconnect_failed,
                     "scan loop exited cleanly; failsafe and shutdown attempts completed"
                 ),
                 ScanEnd::StoppedButDevicesFailed => tracing::error!(
                     devices = dev_count,
                     failsafe_failed,
                     shutdown_failed,
-                    "scan loop stopped, but failsafe or shutdown calls FAILED on some devices; \
-                     their outputs are not confirmed safe"
+                    reconnect_failed,
+                    reconnect_unconfirmed,
+                    "scan loop stopped, but failsafe or shutdown calls FAILED on some devices \
+                     (including a late-connecting one or its worker); their outputs are not \
+                     confirmed safe"
+                ),
+                ScanEnd::ReconnectUnconfirmed => tracing::warn!(
+                    devices = dev_count,
+                    failsafe_failed,
+                    shutdown_failed,
+                    "scan loop stopped and every connected device was failsafed and shut down, \
+                     but a reconnect attempt was still in flight; any adapter it produces is \
+                     cleaned up by its worker later and that outcome is NOT confirmed"
                 ),
                 ScanEnd::Fault => tracing::error!(
                     devices = dev_count,
                     failsafe_failed,
                     shutdown_failed,
+                    reconnect_failed,
+                    reconnect_unconfirmed,
                     fault = %recorded.as_deref().unwrap_or_default(),
                     "scan loop ended on a fault; failsafe and shutdown attempts completed"
                 ),
@@ -991,6 +1060,8 @@ fn spawn_units_inner(
                     devices = dev_count,
                     failsafe_failed,
                     shutdown_failed,
+                    reconnect_failed,
+                    reconnect_unconfirmed,
                     "scan loop PANICKED; failsafe and shutdown attempts completed before re-panic"
                 ),
             }
@@ -1027,28 +1098,37 @@ enum ScanEnd {
     /// call delivered.
     Clean,
     /// Ended without a fault, but at least one device's failsafe or shutdown
-    /// call returned an error or panicked.
+    /// call returned an error or panicked, or a late-connecting device's
+    /// cleanup failed, or the reconnect worker itself panicked.
     StoppedButDevicesFailed,
+    /// Every connected device was driven safe, but the reconnect worker was
+    /// still mid-connect when the scan thread stopped waiting for it: whatever
+    /// adapter it produces is failsafed later, off this thread, unconfirmed.
+    ReconnectUnconfirmed,
     /// A VM trap or a failed start recorded a fault.
     Fault,
     /// The scan loop itself panicked.
     Panicked,
 }
 
-/// A panic outranks a fault, which outranks failed device calls, which
-/// outrank "clean".
+/// A panic outranks a fault, which outranks failed device calls (including the
+/// reconnect worker's), which outrank an unconfirmed reconnect, which outranks
+/// "clean".
 fn classify_scan_end(
     panicked: bool,
     faulted: bool,
     failsafe_failed: usize,
     shutdown_failed: usize,
+    reconnect: &ReconnectEnd,
 ) -> ScanEnd {
     if panicked {
         ScanEnd::Panicked
     } else if faulted {
         ScanEnd::Fault
-    } else if failsafe_failed > 0 || shutdown_failed > 0 {
+    } else if failsafe_failed > 0 || shutdown_failed > 0 || reconnect.failed > 0 {
         ScanEnd::StoppedButDevicesFailed
+    } else if reconnect.unconfirmed {
+        ScanEnd::ReconnectUnconfirmed
     } else {
         ScanEnd::Clean
     }
@@ -1294,6 +1374,131 @@ async fn connect_one(spec: &DeviceSpec) -> (Option<Box<dyn IoDevice>>, DeviceRep
     }
 }
 
+/// A closed handoff stops retries immediately, independently of a requested
+/// Stop. `drained` is separate: the worker must still drive the I/O tasks of
+/// adapters already handed off until their failsafe/shutdown calls finish.
+struct ReconnectState {
+    devices: std::sync::Mutex<Option<Vec<Box<dyn IoDevice>>>>,
+    drained: AtomicBool,
+}
+
+impl Default for ReconnectState {
+    fn default() -> Self {
+        Self {
+            devices: std::sync::Mutex::new(Some(Vec::new())),
+            drained: AtomicBool::new(false),
+        }
+    }
+}
+
+impl ReconnectState {
+    fn finished(&self) -> bool {
+        self.devices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none()
+    }
+
+    fn deliver(&self, device: Box<dyn IoDevice>) -> Result<(), Box<dyn IoDevice>> {
+        let mut slot = self.devices.lock().unwrap_or_else(|e| e.into_inner());
+        match slot.as_mut() {
+            Some(devices) => {
+                devices.push(device);
+                Ok(())
+            }
+            None => Err(device),
+        }
+    }
+
+    fn take_devices(&self) -> Vec<Box<dyn IoDevice>> {
+        self.devices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+
+    fn finish(&self) -> Vec<Box<dyn IoDevice>> {
+        self.devices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .unwrap_or_default()
+    }
+}
+
+/// How long the scan thread waits, after its own failsafe/shutdown pass, for
+/// the reconnect worker to report. The worker may be inside an in-flight
+/// `connect_one`, which is deliberately not cancelled (an adapter can own a bus
+/// worker before it returns), so an unbounded wait would hold the scan thread
+/// and `ProgramHandle::shutdown` for as long as the adapter's connect takes.
+/// Past the grace the worker is left to finish alone: it still failsafes and
+/// shuts down any late adapter on its own runtime, but that outcome is
+/// reported as unconfirmed. Kept well under the edge runtime's 7 s drain.
+const RECONNECT_JOIN_GRACE: Duration = Duration::from_secs(2);
+
+/// What the reconnect worker reports when it exits. Adapters that connect after
+/// the scan has already ended are failsafed and shut down by the worker
+/// itself, so a failure there has to travel back to the exit summary.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ReconnectOutcome {
+    late_failsafe_failed: usize,
+    late_shutdown_failed: usize,
+}
+
+impl ReconnectOutcome {
+    fn failures(&self) -> usize {
+        self.late_failsafe_failed + self.late_shutdown_failed
+    }
+}
+
+/// What the scan thread knows about the worker's cleanup once it stopped waiting.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ReconnectEnd {
+    /// Failed late-adapter cleanup calls, plus one if the worker panicked.
+    failed: usize,
+    /// The worker was still busy after the grace: its outcome is not known.
+    unconfirmed: bool,
+}
+
+/// Wait at most `grace` for the reconnect worker, then stop waiting. Dropping
+/// the handle of a worker that is still running detaches it; it owns everything
+/// it touches (its runtime, the shared handoff, cloned `Arc`s) and exits by itself.
+async fn collect_reconnect_worker(
+    thread: std::thread::JoinHandle<ReconnectOutcome>,
+    grace: Duration,
+) -> ReconnectEnd {
+    let deadline = Instant::now() + grace;
+    while !thread.is_finished() {
+        if Instant::now() >= deadline {
+            tracing::error!(
+                grace_ms = grace.as_millis() as u64,
+                "reconnect worker is still inside a device connect; leaving it to clean up \
+                 any late adapter on its own — that outcome is NOT confirmed"
+            );
+            return ReconnectEnd {
+                failed: 0,
+                unconfirmed: true,
+            };
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    match thread.join() {
+        Ok(outcome) => ReconnectEnd {
+            failed: outcome.failures(),
+            unconfirmed: false,
+        },
+        Err(_) => {
+            tracing::error!("reconnect worker panicked during shutdown");
+            ReconnectEnd {
+                failed: 1,
+                unconfirmed: false,
+            }
+        }
+    }
+}
+
 /// Background retry loop for devices that failed the initial connect.
 ///
 /// Runs on its own OS thread with a dedicated single-thread runtime so a
@@ -1301,16 +1506,17 @@ async fn connect_one(spec: &DeviceSpec) -> (Option<Box<dyn IoDevice>>, DeviceRep
 /// stall scan rounds. Retries every pending spec with a shared doubling
 /// backoff (1 s → 30 s cap); each success rewrites that device's
 /// /discover report in place and hands the live adapter to the scan
-/// loop, which binds the mappings it parked at startup. Exits when every
-/// spec has connected or the program stops (checked in ≤200 ms slices so
-/// shutdown isn't held up by a long backoff).
+/// loop, which binds the mappings it parked at startup. Retries stop when
+/// the scan ends (including faults) or Stop is requested, checked in ≤200 ms
+/// backoff slices. In-flight connects finish before their adapter is drained;
+/// delivered adapters keep this runtime alive until scan teardown completes.
+/// Returns the result of any late-adapter cleanup it had to do itself.
 fn reconnect_worker(
     mut pending: Vec<DeviceSpec>,
-    tx: std::sync::mpsc::Sender<Box<dyn IoDevice>>,
     reports: Arc<std::sync::Mutex<Vec<DeviceReport>>>,
     stop: Arc<AtomicBool>,
-    drained: Arc<AtomicBool>,
-) {
+    state: Arc<ReconnectState>,
+) -> ReconnectOutcome {
     const BACKOFF_START: Duration = Duration::from_secs(1);
     const BACKOFF_CAP: Duration = Duration::from_secs(30);
     let rt = match tokio::runtime::Builder::new_current_thread()
@@ -1320,7 +1526,7 @@ fn reconnect_worker(
         Ok(rt) => rt,
         Err(e) => {
             tracing::error!(%e, "failed to create reconnect runtime; unconnected devices stay down");
-            return;
+            return ReconnectOutcome::default();
         }
     };
     // Everything runs inside one block_on: adapters connected here spawn
@@ -1333,12 +1539,14 @@ fn reconnect_worker(
             devices = pending.len(),
             "entering background reconnect for devices that failed to connect"
         );
+        let mut outcome = ReconnectOutcome::default();
         let mut delivered_any = false;
         let mut backoff = BACKOFF_START;
-        while !pending.is_empty() && !stop.load(Ordering::Relaxed) {
+        let finished = || stop.load(Ordering::Relaxed) || state.finished();
+        while !pending.is_empty() && !finished() {
             let deadline = Instant::now() + backoff;
             loop {
-                if stop.load(Ordering::Relaxed) {
+                if finished() {
                     break;
                 }
                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1347,23 +1555,44 @@ fn reconnect_worker(
                 }
                 tokio::time::sleep(remaining.min(Duration::from_millis(200))).await;
             }
-            if stop.load(Ordering::Relaxed) {
+            if finished() {
                 break;
             }
             let mut still_pending = Vec::with_capacity(pending.len());
             for spec in pending {
+                if finished() {
+                    break;
+                }
                 let (device, report) = connect_one(&spec).await;
                 match device {
                     Some(d) => {
+                        // Do not cancel connect_one midway: some adapters own
+                        // a bus worker already. Finish acquisition, then drain
+                        // an unadopted adapter on its owning runtime.
+                        if let Err(mut d) = state.deliver(d) {
+                            let failsafe = isolate_device_call(d.enter_failsafe()).await;
+                            if !matches!(failsafe, Ok(Ok(()))) {
+                                outcome.late_failsafe_failed += 1;
+                                tracing::error!(
+                                    device = %spec.name, ?failsafe,
+                                    "late connection failsafe failed"
+                                );
+                            }
+                            let shutdown = isolate_device_call(d.shutdown()).await;
+                            if !matches!(shutdown, Ok(Ok(()))) {
+                                outcome.late_shutdown_failed += 1;
+                                tracing::error!(
+                                    device = %spec.name, ?shutdown,
+                                    "late connection shutdown failed"
+                                );
+                            }
+                            break;
+                        }
                         tracing::info!(device = %spec.name, "background reconnect succeeded");
                         if let Ok(mut slot) = reports.lock() {
                             if let Some(r) = slot.iter_mut().find(|r| r.name == report.name) {
                                 *r = report;
                             }
-                        }
-                        // Scan loop gone ⇒ nobody left to adopt the device.
-                        if tx.send(d).is_err() {
-                            return;
                         }
                         delivered_any = true;
                     }
@@ -1373,20 +1602,21 @@ fn reconnect_worker(
             pending = still_pending;
             backoff = (backoff * 2).min(BACKOFF_CAP);
         }
-        if pending.is_empty() {
+        if pending.is_empty() && !finished() {
             tracing::info!("background reconnect complete; all configured devices connected");
         }
         if !delivered_any {
-            return; // nothing spawned onto this runtime; safe to wind down
+            return outcome; // nothing spawned onto this runtime; safe to wind down
         }
         // Keep driving the delivered adapters' background tasks until the
         // scan thread reports its failsafe/shutdown pass is DONE (`drained`).
         // Exiting on `stop` alone would race that pass: dropping this
         // runtime kills the poll tasks the failsafe writes go through.
-        while !drained.load(Ordering::Relaxed) {
+        while !state.drained.load(Ordering::Acquire) {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
-    });
+        outcome
+    })
 }
 
 /// Trip the watchdog after this many consecutive scan deadline overruns
@@ -1759,7 +1989,7 @@ async fn run_loop_async(
     // record into the same channel (and so the sender drops — closing
     // the watch — only when the scan thread exits).
     fault: &tokio::sync::watch::Sender<Option<String>>,
-    reconnect_rx: std::sync::mpsc::Receiver<Box<dyn IoDevice>>,
+    reconnect: &ReconnectState,
     state_path: Option<PathBuf>,
 ) {
     if units.is_empty() {
@@ -2100,7 +2330,7 @@ async fn run_loop_async(
         // append to the device set and bind the mappings that were parked
         // at startup because this device wasn't there. Runs before the
         // health refresh so the adopted device flips healthy this round.
-        while let Ok(dev) = reconnect_rx.try_recv() {
+        for dev in reconnect.take_devices() {
             let name = dev.name().to_string();
             let device_index = devices.len();
             devices.push(dev);
@@ -3146,19 +3376,36 @@ mod tests {
     #[test]
     fn the_closing_log_line_is_clean_only_when_nothing_failed() {
         use ScanEnd::*;
-        for (panicked, faulted, fs, sd, want) in [
-            (false, false, 0, 0, Clean),
-            (false, false, 1, 0, StoppedButDevicesFailed),
-            (false, false, 0, 2, StoppedButDevicesFailed),
-            (false, true, 0, 0, Fault),
-            (false, true, 3, 3, Fault),
-            (true, false, 0, 0, Panicked),
-            (true, true, 5, 5, Panicked),
+        let quiet = ReconnectEnd::default();
+        let late_failure = ReconnectEnd {
+            failed: 1,
+            unconfirmed: false,
+        };
+        let in_flight = ReconnectEnd {
+            failed: 0,
+            unconfirmed: true,
+        };
+        for (panicked, faulted, fs, sd, reconnect, want) in [
+            (false, false, 0, 0, &quiet, Clean),
+            (false, false, 1, 0, &quiet, StoppedButDevicesFailed),
+            (false, false, 0, 2, &quiet, StoppedButDevicesFailed),
+            // A late-connecting device's failed cleanup, or a panicked
+            // worker, is a device failure too — not a clean exit.
+            (false, false, 0, 0, &late_failure, StoppedButDevicesFailed),
+            // Still mid-connect: neither clean nor a known failure.
+            (false, false, 0, 0, &in_flight, ReconnectUnconfirmed),
+            (false, false, 1, 0, &in_flight, StoppedButDevicesFailed),
+            (false, true, 0, 0, &quiet, Fault),
+            (false, true, 3, 3, &late_failure, Fault),
+            (false, true, 0, 0, &in_flight, Fault),
+            (true, false, 0, 0, &quiet, Panicked),
+            (true, true, 5, 5, &late_failure, Panicked),
         ] {
             assert_eq!(
-                classify_scan_end(panicked, faulted, fs, sd),
+                classify_scan_end(panicked, faulted, fs, sd, reconnect),
                 want,
-                "panicked={panicked} faulted={faulted} failsafe_failed={fs} shutdown_failed={sd}"
+                "panicked={panicked} faulted={faulted} failsafe_failed={fs} \
+                 shutdown_failed={sd} reconnect={reconnect:?}"
             );
         }
     }
@@ -3169,10 +3416,10 @@ mod tests {
     /// the runtime. (`spawn_blocking(thread.join())` under a timeout does not
     /// have that property: the timeout abandons the future but not the blocking
     /// task, and dropping the runtime then waits for it forever.)
-    async fn join_within(
-        thread: std::thread::JoinHandle<()>,
+    async fn join_within<T>(
+        thread: std::thread::JoinHandle<T>,
         limit: Duration,
-    ) -> Result<std::thread::Result<()>, std::thread::JoinHandle<()>> {
+    ) -> Result<std::thread::Result<T>, std::thread::JoinHandle<T>> {
         let deadline = Instant::now() + limit;
         while !thread.is_finished() {
             if Instant::now() >= deadline {

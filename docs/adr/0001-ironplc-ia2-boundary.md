@@ -207,6 +207,20 @@ bodies and their calls, not compilation, arbitrary container initialization,
 allocation or field-protocol calls. Normal ST initializers must be constant
 expressions. Keep untrusted bytecode validation an upstream concern.
 
+Scan exit atomically closes the reconnect handoff and includes queued
+adapters in failsafe. An in-flight connection completes and is shut down if
+delivery is closed. The worker's I/O runtime remains alive until handed-off
+adapters drain. The scan thread then waits at most 2 s
+(`RECONNECT_JOIN_GRACE`) for the worker to report, so `shutdown()` is not held
+for an adapter's whole connect time (a connect is not cancelled: an adapter can
+own a bus worker before it returns). A worker still connecting after the grace
+is left to finish alone and failsafes/shuts down any late adapter on its own
+runtime. The exit summary reports the worker honestly: failed late-adapter
+cleanup and a worker panic count as device failures, and a worker that did not
+report in time makes the summary say its outcome is unconfirmed instead of
+"cleanly". Cancelling `shutdown()` keeps the scan join handle available and
+creates no detached blocking join.
+
 ## Follow-ups (upstream candidates)
 
 1. Multi-PROGRAM containers and per-instance debug names:

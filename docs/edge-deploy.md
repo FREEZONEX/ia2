@@ -95,7 +95,12 @@ prompts — the IDE runs `ssh -o BatchMode=yes`).
    outputs and final RETAIN state are discarded. A normal stop (deploy,
    SIGTERM) lets the scan in flight finish and writes the final RETAIN
    checkpoint; only a scan still running 250 ms after the stop request is
-   discarded as hung, with no fault and no final RETAIN write.
+   discarded as hung, with no fault and no final RETAIN write. Fault exit
+   stops reconnect attempts while keeping delivered devices' I/O tasks alive
+   through drain. Stopping while a device is still mid-connect delays the
+   scan thread's exit by at most 2 s; the late adapter is failsafed by its
+   own worker, and if that did not finish in time the closing log line says
+   the outcome is unconfirmed rather than "exited cleanly".
 
 3. **Deploy**. Click `Deploy`. The IDE:
    - `tar`s your project directory + (if found) a freshly-built
