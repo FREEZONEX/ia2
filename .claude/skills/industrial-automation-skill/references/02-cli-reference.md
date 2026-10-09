@@ -124,7 +124,9 @@ echoes, and rejects Output bindings to gear feedback (see 06).
 
 ```
 cs run [--program NAME [--file path.st]]  # tasks.toml schedule, or one PROGRAM
-cs stop
+                                           # waits for the previous run's device teardown;
+                                           # exit 2 + "still shutting down" after 10 s, retry
+cs stop                                    # returns when the stop is requested, not when devices are safe
 cs runtime status [--edge NAME]      # mode + forces (no variable values)
 cs runtime snapshot [--vars a,b] [--edge NAME]   # LIVE VALUES — the read you want
 cs runtime pause | resume | step [N] [--edge NAME]

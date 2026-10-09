@@ -1,6 +1,6 @@
 use parking_lot::Mutex;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use iomap_modbus::DemoSlave;
 use ironplc_bridge::{ProgramHandle, VarSnapshot};
@@ -192,6 +192,19 @@ pub struct AppState {
     /// running program belongs to so the IDE can show
     /// "running: foo's main" across windows.
     pub program: Arc<Mutex<Option<RunningProgram>>>,
+    /// Runs that have left `program` (stopped, replaced, project closed or
+    /// faulted) whose scan thread may still be driving outputs safe and
+    /// tearing devices down. `POST /api/run` starts nothing until this is
+    /// empty, so a new run never connects to, or writes to, a device that
+    /// the previous run is still shutting down. Entries leave on their own
+    /// once the scan thread has finished.
+    pub draining: Arc<Mutex<Vec<ProgramHandle>>>,
+    /// Held by `POST /api/run` from retiring the previous run to the new
+    /// run owning the slot, so two overlapping starts cannot both spawn.
+    pub run_gate: Arc<tokio::sync::Mutex<()>>,
+    /// How long `POST /api/run` waits for retired runs to finish tearing
+    /// down before it refuses to start. A field so a test can shorten it.
+    pub run_handover_timeout: Duration,
     pub event_tx: broadcast::Sender<AppEvent>,
     pub demo_slave: DemoSlave,
     /// The address the in-process demo Modbus slave is listening on
@@ -244,6 +257,13 @@ pub struct AppState {
     pub alarms: Arc<Mutex<ironplc_bridge::monitor::AlarmEngine>>,
 }
 
+/// How long `POST /api/run` waits for the previous run to finish its failsafe
+/// pass and device teardown. Teardown is normally tens of milliseconds; the
+/// worst legitimate case is several devices whose adapters each take a couple
+/// of seconds to stop, plus the bridge's 2 s wait for its reconnect worker.
+/// Under the `cs` client's 30 s request timeout, which also covers compiling.
+pub const RUN_HANDOVER_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Pairs the active `ProgramHandle` with the name of the project it
 /// belongs to. Stored together so `/api/runtime/status` can answer
 /// "what's running, and whose project does it belong to?" without an
@@ -281,6 +301,9 @@ impl AppState {
             start_time: Instant::now(),
             projects: Arc::new(Mutex::new(ProjectRegistry::default())),
             program: Arc::new(Mutex::new(None)),
+            draining: Arc::new(Mutex::new(Vec::new())),
+            run_gate: Arc::new(tokio::sync::Mutex::new(())),
+            run_handover_timeout: RUN_HANDOVER_TIMEOUT,
             event_tx,
             demo_slave,
             demo_modbus_addr,
@@ -293,6 +316,46 @@ impl AppState {
             web_dist,
             historian: Arc::new(ironplc_bridge::monitor::Historian::in_memory()),
             alarms: Arc::new(Mutex::new(ironplc_bridge::monitor::AlarmEngine::default())),
+        }
+    }
+
+    /// Take a run out of service without losing track of its teardown.
+    ///
+    /// Requesting a stop returns at once, but the scan thread then still runs
+    /// the failsafe pass, a grace period and each device's shutdown. The handle
+    /// stays in `draining` until that has finished, which is what
+    /// `wait_until_drained` waits for. Retiring the same run twice (a stop
+    /// racing the fault forwarder) is a no-op.
+    pub fn retire(&self, handle: ProgramHandle) {
+        {
+            let mut draining = self.draining.lock();
+            if draining.iter().any(|h| h.same_run(&handle)) {
+                return;
+            }
+            draining.push(handle.clone());
+        }
+        let draining = self.draining.clone();
+        tokio::spawn(async move {
+            // Requests the stop (harmless if already requested) and returns
+            // once the scan thread has actually finished.
+            handle.shutdown().await;
+            draining.lock().retain(|h| !h.same_run(&handle));
+        });
+    }
+
+    /// Wait until no retired run is still tearing down. `Err(n)`: `n` still
+    /// were when `timeout` passed.
+    pub async fn wait_until_drained(&self, timeout: Duration) -> Result<(), usize> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let busy = self.draining.lock().len();
+            if busy == 0 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(busy);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
