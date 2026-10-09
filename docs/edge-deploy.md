@@ -87,9 +87,14 @@ prompts — the IDE runs `ssh -o BatchMode=yes`).
    program is restarted.
 
    ST scans are also bounded to 10,000,000 opcodes or one second (a shorter
-   explicit container watchdog wins). Time is sampled every 256
+   explicit container watchdog wins). The opcode ceiling is independent of
+   the host and is normally the first one a runaway meets; reaching it takes
+   tens of milliseconds on a fast CPU and longer on a slow edge board, so
+   the time ceiling is only the backstop. Time is sampled every 256
    opcodes; this is not a hard real-time interrupt. A loop exceeding either
-   ceiling ends the program with `VM execution budget exceeded`, visible in
+   ceiling ends the program with `VM execution budget exceeded in <instance>:
+   instruction limit (10000000 opcodes per scan)` (or `time limit (<n> ms per
+   scan)`), visible in
    `/health`'s `fault`, then attempts device failsafe/shutdown. Unlike the
    five-overrun latch, this does not keep the VM computing. Partial scan
    outputs and final RETAIN state are discarded. A normal stop (deploy,

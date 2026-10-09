@@ -72,10 +72,18 @@ async fn infinite_scan_faults_drains_devices_and_does_not_publish_or_persist_par
     join_scan_thread(&handle)
         .await
         .expect("budget exhaustion is a fault, not a Rust panic");
-    assert!(handle
-        .fault()
-        .unwrap()
-        .contains("VM execution budget exceeded in main"));
+    let fault = handle.fault().unwrap();
+    assert!(
+        fault.contains("VM execution budget exceeded in main"),
+        "{fault}"
+    );
+    // Which ceiling ends a runaway first depends on the build and the host;
+    // either way the fault names it with its value.
+    assert!(
+        fault.contains("instruction limit (10000000 opcodes per scan)")
+            || fault.contains("time limit (1000 ms per scan)"),
+        "{fault}"
+    );
     assert!(handle.watchdog_tripped());
     assert!(fs.load(Ordering::Relaxed) && sd.load(Ordering::Relaxed));
     assert_eq!(writes.load(Ordering::Relaxed), 0, "no partial outputs");
@@ -85,6 +93,33 @@ async fn infinite_scan_faults_drains_devices_and_does_not_publish_or_persist_par
         checkpoint,
         "keep the last checkpoint"
     );
+}
+
+#[tokio::test]
+async fn an_explicit_container_watchdog_shortens_the_time_ceiling() {
+    // 5 ms is far below the time an optimized VM needs for 10M opcodes, so
+    // the explicit watchdog, not the opcode ceiling, ends this runaway.
+    let mut c = crate::compile(
+        "PROGRAM main VAR x : DINT; END_VAR WHILE TRUE DO x := x + 1; END_WHILE; END_PROGRAM",
+    )
+    .unwrap();
+    for task in &mut c.task_table.tasks {
+        task.watchdog_us = 5_000;
+    }
+    let handle = spawn_units_inner(
+        vec![single_unit(c, 1)],
+        DeviceSource::Prebuilt(Vec::new()),
+        Vec::new(),
+        None,
+        WriteGovernance::default(),
+    );
+    join_scan_thread(&handle).await.unwrap();
+    let fault = handle.fault().unwrap();
+    assert!(
+        fault.contains("VM execution budget exceeded in main: time limit (5 ms per scan)"),
+        "{fault}"
+    );
+    assert!(handle.watchdog_tripped());
 }
 
 #[tokio::test]

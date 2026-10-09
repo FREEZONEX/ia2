@@ -20,18 +20,39 @@ pub(crate) const MAX_SCAN_TIME: Duration = Duration::from_secs(1);
 pub(crate) const STOP_GRACE: Duration = Duration::from_millis(250);
 const CHECK_INTERVAL: u64 = 256;
 
+/// Which per-scan ceiling ended a scan, with its value, so the fault can say
+/// what was exceeded instead of leaving the reader to look the number up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Budget {
+    Instructions(u64),
+    Time(Duration),
+}
+
+impl Budget {
+    pub(crate) fn describe(self) -> String {
+        match self {
+            Budget::Instructions(n) => format!("instruction limit ({n} opcodes per scan)"),
+            Budget::Time(d) if d >= Duration::from_millis(1) => {
+                format!("time limit ({} ms per scan)", d.as_millis())
+            }
+            Budget::Time(d) => format!("time limit ({} us per scan)", d.as_micros()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScanOutcome {
     /// The scan ran to its end; Stop, if pending, is handled at the boundary.
     Completed,
     /// Stop outlasted `STOP_GRACE` inside a scan: the VM state is partial.
     Stopped,
-    BudgetExceeded(&'static str),
+    BudgetExceeded(Budget),
 }
 
 struct ScanGuard<'a> {
     stop: &'a AtomicBool,
     deadline: Instant,
+    time_limit: Duration,
     stop_seen: Option<Instant>,
     stop_grace: Duration,
     /// Opcodes executed before the current window began.
@@ -46,10 +67,11 @@ struct ScanGuard<'a> {
 }
 
 impl<'a> ScanGuard<'a> {
-    fn new(stop: &'a AtomicBool, deadline: Instant, stop_grace: Duration, limit: u64) -> Self {
+    fn new(stop: &'a AtomicBool, time_limit: Duration, stop_grace: Duration, limit: u64) -> Self {
         Self {
             stop,
-            deadline,
+            deadline: Instant::now() + time_limit,
+            time_limit,
             stop_seen: None,
             stop_grace,
             instructions: 0,
@@ -77,7 +99,7 @@ impl<'a> ScanGuard<'a> {
 
     fn check_deadline(&mut self) {
         if self.outcome == ScanOutcome::Completed && Instant::now() >= self.deadline {
-            self.outcome = ScanOutcome::BudgetExceeded("time limit");
+            self.outcome = ScanOutcome::BudgetExceeded(Budget::Time(self.time_limit));
         }
     }
 
@@ -89,7 +111,7 @@ impl<'a> ScanGuard<'a> {
         self.instructions += self.window_len;
         self.check_clock_and_stop();
         if self.outcome == ScanOutcome::Completed && self.instructions >= self.limit {
-            self.outcome = ScanOutcome::BudgetExceeded("instruction limit");
+            self.outcome = ScanOutcome::BudgetExceeded(Budget::Instructions(self.limit));
         }
         if self.outcome != ScanOutcome::Completed {
             // IronPLC exposes a pause, not an abort, on this hook. The bridge
@@ -126,12 +148,7 @@ pub(crate) fn run_scan(
     } else {
         Duration::from_micros(watchdog_us).min(MAX_SCAN_TIME)
     };
-    let mut guard = ScanGuard::new(
-        stop,
-        Instant::now() + time_limit,
-        STOP_GRACE,
-        MAX_SCAN_INSTRUCTIONS,
-    );
+    let mut guard = ScanGuard::new(stop, time_limit, STOP_GRACE, MAX_SCAN_INSTRUCTIONS);
     let result = vm.run_round_debug(uptime_us, &mut guard)?;
     if matches!(result, RoundOutcome::Completed) {
         // Also cover a slow final opcode / a scan shorter than the sampling
@@ -159,19 +176,14 @@ mod tests {
         let mut bufs = VmBuffers::from_container(&c);
         let mut vm = Vm::new().load(&c, &mut bufs).unwrap().start().unwrap();
         let stop = AtomicBool::new(false);
-        let mut guard = ScanGuard::new(
-            &stop,
-            Instant::now() + Duration::from_secs(5),
-            Duration::ZERO,
-            1000,
-        );
+        let mut guard = ScanGuard::new(&stop, Duration::from_secs(5), Duration::ZERO, 1000);
         assert!(matches!(
             vm.run_round_debug(0, &mut guard).unwrap(),
             RoundOutcome::Paused(_)
         ));
         assert_eq!(
             guard.outcome,
-            ScanOutcome::BudgetExceeded("instruction limit")
+            ScanOutcome::BudgetExceeded(Budget::Instructions(1000))
         );
         assert_eq!(guard.instructions, 1000);
         assert!(vm.debug_frames().len() > 1, "interrupted inside the callee");
@@ -182,7 +194,7 @@ mod tests {
         let stop = AtomicBool::new(false);
         let mut guard = ScanGuard::new(
             &stop,
-            Instant::now() + Duration::from_secs(5),
+            Duration::from_secs(5),
             Duration::ZERO,
             MAX_SCAN_INSTRUCTIONS,
         );
@@ -207,12 +219,15 @@ mod tests {
     fn expired_time_budget_stops_before_executing_an_instruction() {
         let stop = AtomicBool::new(false);
         let mut guard =
-            ScanGuard::new(&stop, Instant::now(), Duration::ZERO, MAX_SCAN_INSTRUCTIONS);
+            ScanGuard::new(&stop, Duration::ZERO, Duration::ZERO, MAX_SCAN_INSTRUCTIONS);
         assert!(matches!(
             guard.before_instruction(FunctionId::SCAN, 0, 0),
             HookAction::Pause(_)
         ));
-        assert_eq!(guard.outcome, ScanOutcome::BudgetExceeded("time limit"));
+        assert_eq!(
+            guard.outcome,
+            ScanOutcome::BudgetExceeded(Budget::Time(Duration::ZERO))
+        );
         assert_eq!(guard.instructions, 0);
     }
 
@@ -220,12 +235,8 @@ mod tests {
     fn stop_is_deferred_until_its_grace_has_elapsed() {
         let stop = AtomicBool::new(true);
         let grace = Duration::from_millis(40);
-        let mut guard = ScanGuard::new(
-            &stop,
-            Instant::now() + Duration::from_secs(30),
-            grace,
-            MAX_SCAN_INSTRUCTIONS,
-        );
+        let mut guard =
+            ScanGuard::new(&stop, Duration::from_secs(30), grace, MAX_SCAN_INSTRUCTIONS);
         // The first sample sees Stop but a healthy scan still gets its grace.
         assert_eq!(
             guard.before_instruction(FunctionId::SCAN, 0, 0),
@@ -278,8 +289,7 @@ mod tests {
         let mut bufs = VmBuffers::from_container(&c);
         let mut vm = Vm::new().load(&c, &mut bufs).unwrap().start().unwrap();
         let stop = AtomicBool::new(false);
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let mut guard = ScanGuard::new(&stop, deadline, Duration::ZERO, limit);
+        let mut guard = ScanGuard::new(&stop, Duration::from_secs(30), Duration::ZERO, limit);
         let round = vm.run_round_debug(0, &mut guard).unwrap();
         (round, guard.outcome, guard.instructions)
     }
@@ -309,7 +319,10 @@ mod tests {
         }
         let (round, outcome, executed) = guarded_scan(source, total - 1);
         assert!(matches!(round, RoundOutcome::Paused(_)));
-        assert_eq!(outcome, ScanOutcome::BudgetExceeded("instruction limit"));
+        assert_eq!(
+            outcome,
+            ScanOutcome::BudgetExceeded(Budget::Instructions(total - 1))
+        );
         assert_eq!(
             executed,
             total - 1,
@@ -324,10 +337,31 @@ mod tests {
             assert!(matches!(round, RoundOutcome::Paused(_)), "limit {limit}");
             assert_eq!(
                 outcome,
-                ScanOutcome::BudgetExceeded("instruction limit"),
+                ScanOutcome::BudgetExceeded(Budget::Instructions(limit)),
                 "limit {limit}"
             );
             assert_eq!(executed, limit, "limit {limit}");
         }
+    }
+
+    #[test]
+    fn a_budget_fault_names_the_ceiling_and_its_value() {
+        assert_eq!(
+            Budget::Instructions(MAX_SCAN_INSTRUCTIONS).describe(),
+            "instruction limit (10000000 opcodes per scan)"
+        );
+        assert_eq!(
+            Budget::Time(MAX_SCAN_TIME).describe(),
+            "time limit (1000 ms per scan)"
+        );
+        // A short explicit container watchdog is what the reader must see.
+        assert_eq!(
+            Budget::Time(Duration::from_millis(20)).describe(),
+            "time limit (20 ms per scan)"
+        );
+        assert_eq!(
+            Budget::Time(Duration::from_micros(500)).describe(),
+            "time limit (500 us per scan)"
+        );
     }
 }

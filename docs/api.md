@@ -221,11 +221,21 @@ or cached governance. Absent optional iomap/alarms files still mean none.
 
 ## Compile, run, observe
 
-Each unit-scan is limited to 10,000,000 opcodes or one second, with an
-explicit shorter container watchdog also enforced. Time is checked every
-256 opcodes and on completion, not by preempting an individual opcode.
+Each unit-scan is limited to 10,000,000 opcodes (the *instruction limit*)
+and to one second of wall time (the *time limit*, shorter when the container
+sets an explicit watchdog). The opcode ceiling is the one a runaway scan
+normally meets first, and it does not depend on the host: a scan that needs
+more opcodes faults the same way on a development machine and on an edge board. How long
+10,000,000 opcodes take does depend on it: about 35 ms on an Apple-silicon Mac
+in a release build, about half a second in a debug build, more on
+slower hardware. The time limit is the host-dependent backstop. Both are
+constants, so a legitimately heavy scan has to be spread over several scans
+or tasks. The clock is checked every 256 opcodes and on completion, not by
+preempting an individual opcode.
 Exhaustion terminates the run, attempts device failsafe/shutdown, and reports
-`VM execution budget exceeded` in `last_error` plus SSE `error`/`stopped`.
+`VM execution budget exceeded in <instance>: instruction limit (10000000
+opcodes per scan)` (or `time limit (<n> ms per scan)`) in `last_error` plus
+SSE `error`/`stopped`.
 Partial scan outputs/snapshots and final RETAIN writes are suppressed.
 `POST /api/stop` takes effect at the next scan boundary: the scan in flight
 completes and the final RETAIN checkpoint is written. Only a scan still

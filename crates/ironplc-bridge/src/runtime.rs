@@ -2666,11 +2666,15 @@ async fn run_loop_async(
                     scan_aborted = true;
                     break;
                 }
-                Ok(ScanOutcome::BudgetExceeded(reason)) => {
+                Ok(ScanOutcome::BudgetExceeded(budget)) => {
                     watchdog_tripped.store(true, Ordering::Relaxed);
                     record_fault(
                         fault,
-                        format!("VM execution budget exceeded in {}: {reason}", instances[i]),
+                        format!(
+                            "VM execution budget exceeded in {}: {}",
+                            instances[i],
+                            budget.describe()
+                        ),
                     );
                     scan_aborted = true;
                     break;
