@@ -7,6 +7,26 @@ counts as abnormal (alarms), and answer "what happened at 03:00"
 
 ## `cs sim run` — prove behaviour before hardware
 
+For a terminal fault, use
+`expect_fault = { contains = "VM execution budget exceeded", within_ms = 5000 }`.
+`contains` must be nonempty; `within_ms` defaults to 5000. The step polls
+`/api/runtime/status` and requires both `running=false` and a matching
+`last_error`. It does not accept a stale snapshot, a healthy run or an
+unrelated fault. With `--no-run`, the caller is responsible for starting the
+intended run first, as a previous matching fault may still be present.
+
+The device-free `examples/execution_budget/scenarios/bounded.toml` first
+proves finite scans and an arming alarm, then triggers an ST infinite loop
+and requires the terminal budget fault. Each scan is limited to 10,000,000
+opcodes or one second (a shorter explicit VM watchdog also applies); the
+fault names the ceiling it hit, e.g. `instruction limit (10000000 opcodes per
+scan)`, and the opcode one is host-independent and normally the first.
+Time checks occur every 256 opcodes, not as hard real-time interrupts.
+Stop takes effect at the scan boundary; only a scan still running 250 ms
+after Stop is discarded as hung. Unlike the five-overrun latch, this fault
+ends execution and triggers the device failsafe/shutdown pass. Partial
+output/RETAIN state is not committed.
+
 The program runs on the server against the simulated device layer (the
 demo Modbus slave, `_sim` EtherCAT/CANopen NICs, the fake OPC UA
 server); a scenario file plays the plant. This is the step between

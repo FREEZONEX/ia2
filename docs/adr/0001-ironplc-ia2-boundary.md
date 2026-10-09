@@ -4,6 +4,7 @@ Status: Accepted (2026-06-13)
 
 Updated: 2026-09-23 — unpatched upstream v0.244.0, single IA2 scheduler.
 Updated: 2026-09-23 — released upstream v0.246.0; SFC state follows step-name encoding.
+Updated: 2026-10-08 — released upstream v0.248.0; bounded scans through the public instruction hook.
 
 ## Context
 
@@ -63,11 +64,28 @@ concepts into the vendor, and don't reimplement the language in IA2.**
 ## Decision: vendor strategy (released upstream pin, no active patches)
 
 The submodule points directly at `https://github.com/ironplc/ironplc.git`,
-tag [v0.246.0](https://github.com/ironplc/ironplc/releases/tag/v0.246.0),
-commit `6f4a796736576b29cde5d163e75c311639028e15` — an upstream **release**
+tag [v0.248.0](https://github.com/ironplc/ironplc/releases/tag/v0.248.0),
+commit `80a1aa8bdaa8c1da948f0ff56c7b6f35913e9524` — an upstream **release**
 (not a pre-release). There are no IA2 source patches in the submodule.
 
-v0.246.0 over the v0.244.0 pre-release that IA2 #61 surveyed:
+v0.248.0 over v0.246.0:
+
+- Integer `LIMIT` with MN > MX returns MX instead of panicking; unsigned
+  `ABS` preserves its value and LINT powers use the full exponent (upstream
+  [#1859](https://github.com/ironplc/ironplc/pull/1859), first released in
+  v0.247.0). Bridge regressions execute all four integer LIMIT lanes and
+  the unsigned ABS / large-exponent cases.
+- Code generation takes `CleanAnalysis`, enforcing the diagnostic gate
+  already used by IA2. `Vm::load` now returns a Result and rejects invalid
+  call-depth metadata before initialization. Bridge callers handle both
+  API changes; the existing start-failure fault remains visible.
+- Upstream codegen invariant panics are converted to internal diagnostics
+  ([#2080](https://github.com/ironplc/ironplc/pull/2080)). This does not prove
+  every possible compiler input or hand-built container is panic-free.
+- The later upstream uptime/scope/scheduler fixes #2152/#2142/#2153 are
+  outside this release. Upgrading to it does not itself interrupt ST loops.
+
+Historical v0.246.0 changes over the v0.244.0 pre-release that IA2 #61 surveyed:
 
 - A `STRING` literal holding a character outside Latin-1 is rejected
   (P4052, ironplc [#1733](https://github.com/ironplc/ironplc/issues/1733))
@@ -154,6 +172,58 @@ scan thread**. This is implemented (commit fc4addd):
 If upstream later lands multi-PROGRAM container semantics, the
 bridge can collapse "round-robin many VMs" back to "one container, many
 tasks" with no change to the layers above.
+
+## Decision: interrupt an unfinished scan before publishing outputs
+
+IA2 uses the public `DebugHook` with `run_round_debug` to interrupt the
+single program instance in each unit. A hook pause terminates that run; it
+is never resumed as an operator debug pause. The same dispatcher executes
+IEC instructions, so the bridge does not duplicate language semantics.
+Foreign containers with other than one instance are rejected explicitly.
+The bridge preserves task enable flags and enforces an explicit container
+watchdog when it is shorter than the hard ceiling.
+
+Each unit-scan has a ceiling of 10,000,000 opcodes and one second. Wall
+time is sampled before the first opcode and every 256 opcodes, plus at scan
+completion; an individual opcode is not preempted. These are termination
+ceilings, not a real-time delivery guarantee. The opcode ceiling is a
+property of the program, identical on every host, and is the one a runaway
+meets first (tens of milliseconds on a fast CPU in a release build); the
+wall-clock ceiling is the host-dependent backstop. Both are constants, so a
+legitimately heavy scan has to be split. Budget exhaustion records
+`VM execution budget exceeded in <instance>: <ceiling and its value>`,
+terminates all units, and runs failsafe/shutdown. The interrupted scan's outputs and snapshots are not
+published; final RETAIN flush is skipped so the last saved checkpoint
+remains intact. The existing five-overrun watchdog for scans that complete
+still latches outputs off while letting the logic compute.
+
+Operator Stop is honoured at the next scan boundary, as it was before scans
+were bounded: a healthy scan in flight finishes and publishes, and the final
+RETAIN checkpoint is written. Aborting the scan on Stop would discard that
+checkpoint with a probability proportional to the share of time spent inside
+scans, breaking the documented preservation of RETAIN state across deploys.
+Only a scan still running 250 ms (`STOP_GRACE`) after Stop was first sampled
+is treated as hung: it takes the same exit as an exhausted budget (nothing
+published, no final RETAIN flush) without recording a fault.
+
+Initialization continues through upstream `start`; this hook bounds scan
+bodies and their calls, not compilation, arbitrary container initialization,
+allocation or field-protocol calls. Normal ST initializers must be constant
+expressions. Keep untrusted bytecode validation an upstream concern.
+
+Scan exit atomically closes the reconnect handoff and includes queued
+adapters in failsafe. An in-flight connection completes and is shut down if
+delivery is closed. The worker's I/O runtime remains alive until handed-off
+adapters drain. The scan thread then waits at most 2 s
+(`RECONNECT_JOIN_GRACE`) for the worker to report, so `shutdown()` is not held
+for an adapter's whole connect time (a connect is not cancelled: an adapter can
+own a bus worker before it returns). A worker still connecting after the grace
+is left to finish alone and failsafes/shuts down any late adapter on its own
+runtime. The exit summary reports the worker honestly: failed late-adapter
+cleanup and a worker panic count as device failures, and a worker that did not
+report in time makes the summary say its outcome is unconfirmed instead of
+"cleanly". Cancelling `shutdown()` keeps the scan join handle available and
+creates no detached blocking join.
 
 ## Follow-ups (upstream candidates)
 

@@ -86,6 +86,27 @@ prompts — the IDE runs `ssh -o BatchMode=yes`).
    scan watchdog tripped: every output is zeroed and held off until the
    program is restarted.
 
+   ST scans are also bounded to 10,000,000 opcodes or one second (a shorter
+   explicit container watchdog wins). The opcode ceiling is independent of
+   the host and is normally the first one a runaway meets; reaching it takes
+   tens of milliseconds on a fast CPU and longer on a slow edge board, so
+   the time ceiling is only the backstop. Time is sampled every 256
+   opcodes; this is not a hard real-time interrupt. A loop exceeding either
+   ceiling ends the program with `VM execution budget exceeded in <instance>:
+   instruction limit (10000000 opcodes per scan)` (or `time limit (<n> ms per
+   scan)`), visible in
+   `/health`'s `fault`, then attempts device failsafe/shutdown. Unlike the
+   five-overrun latch, this does not keep the VM computing. Partial scan
+   outputs and final RETAIN state are discarded. A normal stop (deploy,
+   SIGTERM) lets the scan in flight finish and writes the final RETAIN
+   checkpoint; only a scan still running 250 ms after the stop request is
+   discarded as hung, with no fault and no final RETAIN write. Fault exit
+   stops reconnect attempts while keeping delivered devices' I/O tasks alive
+   through drain. Stopping while a device is still mid-connect delays the
+   scan thread's exit by at most 2 s; the late adapter is failsafed by its
+   own worker, and if that did not finish in time the closing log line says
+   the outcome is unconfirmed rather than "exited cleanly".
+
 3. **Deploy**. Click `Deploy`. The IDE:
    - `tar`s your project directory + (if found) a freshly-built
      `ia2-runtime` from the dev machine

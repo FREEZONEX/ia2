@@ -185,6 +185,9 @@ cs sim run scenarios/fill.toml [--program NAME] [--trace out.jsonl] [--keep-runn
 Exit 0 = every expectation held; 1 = a step failed (the report names
 the step, the deadline, and the last observed value). Scenario
 vocabulary + alarm/history workflow: `references/09-sim-alarms.md`.
+Use `expect_fault = { contains = "VM execution budget exceeded", within_ms = 5000 }`
+to assert a terminal fault. It requires `running=false` and a matching
+`last_error`; a stopped program without that error does not pass.
 
 ### Deploy / edge
 
