@@ -3,6 +3,7 @@
 //! API intended for downstream consumption by the server crate.
 
 mod errors;
+mod execution;
 mod fbd_transpile;
 mod ld_transpile;
 pub mod monitor;

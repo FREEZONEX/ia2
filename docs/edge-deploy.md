@@ -86,6 +86,17 @@ prompts — the IDE runs `ssh -o BatchMode=yes`).
    scan watchdog tripped: every output is zeroed and held off until the
    program is restarted.
 
+   ST scans are also bounded to 10,000,000 opcodes or one second (a shorter
+   explicit container watchdog wins). Time is sampled every 256
+   opcodes; this is not a hard real-time interrupt. A loop exceeding either
+   ceiling ends the program with `VM execution budget exceeded`, visible in
+   `/health`'s `fault`, then attempts device failsafe/shutdown. Unlike the
+   five-overrun latch, this does not keep the VM computing. Partial scan
+   outputs and final RETAIN state are discarded. A normal stop (deploy,
+   SIGTERM) lets the scan in flight finish and writes the final RETAIN
+   checkpoint; only a scan still running 250 ms after the stop request is
+   discarded as hung, with no fault and no final RETAIN write.
+
 3. **Deploy**. Click `Deploy`. The IDE:
    - `tar`s your project directory + (if found) a freshly-built
      `ia2-runtime` from the dev machine

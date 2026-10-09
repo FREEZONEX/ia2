@@ -101,6 +101,8 @@ cs set alarms --from alarms.json --if-match @alarms.etag
 # run · simulate · debug
 cs run                                  # schedule everything in tasks.toml
 cs sim run scenarios/fill.toml          # PROVE behaviour against the sim device layer — CI-ready
+# Terminal-fault scenarios use expect_fault = { contains = "...", within_ms = 5000 }.
+# See examples/execution_budget for an ST infinite-loop regression.
 cs runtime snapshot --vars level,pump   # live values
 cs runtime force pump_pct 50.0          # type-aware: REAL bit-packed, BOOL as 0/1
 cs get runtime/alarms && cs runtime ack level_high

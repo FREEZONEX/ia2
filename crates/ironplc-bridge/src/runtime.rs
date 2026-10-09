@@ -5,7 +5,7 @@
 //!
 //! The scan thread is a dedicated `std::thread` that hosts a single-thread
 //! tokio runtime; everything bus-related runs inside it. ironplc's
-//! `VmRunning::run_round` itself is sync.
+//! VM execution is synchronous but interruptible through its instruction hook.
 //!
 //! Multi-PROGRAM execution (ADR-0001): the one scan thread hosts N
 //! `VmRunning` instances ("units"), one per scheduled PROGRAM instance,
@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::execution::{run_scan, ScanOutcome};
 use crate::retain;
 use iocore::{ChannelValue, IoDevice};
 use ironplc_container::debug_format::VariableRenderer;
@@ -328,8 +329,13 @@ pub struct ProgramHandle {
 }
 
 impl ProgramHandle {
-    /// Cooperative stop. The scan loop checks the flag at the top of each
-    /// round; expect a few extra rounds before it actually exits.
+    /// Cooperative stop. The scan loop checks the flag between rounds, so a
+    /// healthy scan in flight finishes, publishes, and the final RETAIN
+    /// checkpoint is written. A scan still running `STOP_GRACE` after the flag
+    /// was first sampled (sampled every 256 VM opcodes) is treated as hung and
+    /// discarded: nothing of it is published and the final RETAIN flush is
+    /// skipped. Adapter calls still finish under their own timeout/teardown
+    /// policies.
     ///
     /// Fire-and-forget: returns immediately, doesn't wait for the failsafe
     /// pass. Use `shutdown` to wait for the bounded failsafe/teardown
@@ -1766,6 +1772,35 @@ async fn run_loop_async(
     }
     let n_units = units.len();
 
+    // The interruptible upstream driver executes one instance. This matches
+    // compile_project_units; reject foreign multi-instance containers instead
+    // of silently skipping their later programs or running them unbounded.
+    for unit in &units {
+        if unit.container.task_table.programs.len() != 1 {
+            record_fault(
+                fault,
+                format!(
+                    "VM requires exactly one program instance in {}",
+                    unit.instance
+                ),
+            );
+            return;
+        }
+    }
+    let execution_tasks: Vec<_> = units
+        .iter()
+        .map(|unit| {
+            let id = unit.container.task_table.programs[0].task_id;
+            unit.container
+                .task_table
+                .tasks
+                .iter()
+                .find(|task| task.task_id == id)
+                .map(|task| (task.flags & 1 != 0, task.watchdog_us))
+                .unwrap_or((false, 0))
+        })
+        .collect();
+
     // IA2 owns cadence, pause and step. Upstream now compiles cyclic task
     // tables; normalize even caller-supplied CONFIGURATIONs so every bridge
     // scan executes exactly once, without a second scheduler skipping it.
@@ -2050,7 +2085,7 @@ async fn run_loop_async(
     // state answers "are outputs latched off" for both the loop and the
     // HTTP layer.
     let mut prev_paused = false;
-    let mut vm_fault = false;
+    let mut scan_aborted = false;
     // Pending fault injection (InjectScanStall). Owned by the loop:
     // written from the command drain, consumed one TICK at a time.
     let mut inject_stall_ms: u64 = 0;
@@ -2386,21 +2421,46 @@ async fn run_loop_async(
 
             // Run one scan for this unit
             let now_us = start.elapsed().as_micros() as u64;
-            if let Err(ctx) = runnings[i].run_round(now_us) {
-                tracing::error!(instance = %instances[i], ?ctx.trap, "vm trap during run_round");
-                // Record WHY before breaking — the watch write is what
-                // wakes the HTTP layer's forwarder, turning a silent halt
-                // into a visible fault on /status + SSE.
-                record_fault(
-                    fault,
-                    format!("VM trap in {}: {:?}", instances[i], ctx.trap),
-                );
-                // One faulted unit stops the whole plant — consistent
-                // with pause semantics ("the plant freezes together")
-                // and the safest default; the wrapper's failsafe pass
-                // then zeroes every output.
-                vm_fault = true;
-                break;
+            let result = if execution_tasks[i].0 {
+                run_scan(&mut runnings[i], now_us, &stop, execution_tasks[i].1)
+            } else {
+                Ok(ScanOutcome::Completed)
+            };
+            match result {
+                Ok(ScanOutcome::Completed) => {}
+                Ok(ScanOutcome::Stopped) => {
+                    // Stop outlasted its grace inside this scan (a hung
+                    // program): the partial scan is never published or
+                    // persisted. A scan that finishes returns Completed and
+                    // the loop-top Stop check ends the run normally.
+                    scan_aborted = true;
+                    break;
+                }
+                Ok(ScanOutcome::BudgetExceeded(reason)) => {
+                    watchdog_tripped.store(true, Ordering::Relaxed);
+                    record_fault(
+                        fault,
+                        format!("VM execution budget exceeded in {}: {reason}", instances[i]),
+                    );
+                    scan_aborted = true;
+                    break;
+                }
+                Err(ctx) => {
+                    tracing::error!(instance = %instances[i], ?ctx.trap, "vm trap during run_round");
+                    // Record WHY before breaking — the watch write is what
+                    // wakes the HTTP layer's forwarder, turning a silent halt
+                    // into a visible fault on /status + SSE.
+                    record_fault(
+                        fault,
+                        format!("VM trap in {}: {:?}", instances[i], ctx.trap),
+                    );
+                    // One faulted unit stops the whole plant — consistent
+                    // with pause semantics ("the plant freezes together")
+                    // and the safest default; the wrapper's failsafe pass
+                    // then zeroes every output.
+                    scan_aborted = true;
+                    break;
+                }
             }
             clocks[i].scan_count += 1;
 
@@ -2504,7 +2564,7 @@ async fn run_loop_async(
                 Ordering::Relaxed,
             );
         }
-        if vm_fault {
+        if scan_aborted {
             break;
         }
 
@@ -2586,8 +2646,10 @@ async fn run_loop_async(
 
     // Final RETAIN flush on graceful exit. Captures whatever the
     // last completed scan produced — that's the right "checkpoint"
-    // value to reload on next startup.
-    if !retain_entries.is_empty() {
+    // value to reload on next startup. Skipped after an abort (VM trap,
+    // exhausted budget, or a Stop that found a hung scan): the interrupted
+    // unit's variables are partial, so the last periodic checkpoint stands.
+    if !scan_aborted && !retain_entries.is_empty() {
         if let Some(path) = state_path.as_deref() {
             let now_us = start.elapsed().as_micros() as u64;
             persist_retain_values(
@@ -2783,6 +2845,8 @@ fn annotate_input_quality(
 mod tests {
     use super::*;
     use iocore::IoError;
+
+    include!("runtime_regressions.rs");
 
     /// Records the order of the safety-critical shutdown callbacks so a
     /// test can assert `enter_failsafe` runs before `shutdown` — the

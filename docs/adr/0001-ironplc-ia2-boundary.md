@@ -4,7 +4,7 @@ Status: Accepted (2026-06-13)
 
 Updated: 2026-09-23 — unpatched upstream v0.244.0, single IA2 scheduler.
 Updated: 2026-09-23 — released upstream v0.246.0; SFC state follows step-name encoding.
-Updated: 2026-10-08 — released upstream v0.248.0.
+Updated: 2026-10-08 — released upstream v0.248.0; bounded scans through the public instruction hook.
 
 ## Context
 
@@ -83,7 +83,7 @@ v0.248.0 over v0.246.0:
   ([#2080](https://github.com/ironplc/ironplc/pull/2080)). This does not prove
   every possible compiler input or hand-built container is panic-free.
 - The later upstream uptime/scope/scheduler fixes #2152/#2142/#2153 are
-  outside this release.
+  outside this release. Upgrading to it does not itself interrupt ST loops.
 
 Historical v0.246.0 changes over the v0.244.0 pre-release that IA2 #61 surveyed:
 
@@ -172,6 +172,40 @@ scan thread**. This is implemented (commit fc4addd):
 If upstream later lands multi-PROGRAM container semantics, the
 bridge can collapse "round-robin many VMs" back to "one container, many
 tasks" with no change to the layers above.
+
+## Decision: interrupt an unfinished scan before publishing outputs
+
+IA2 uses the public `DebugHook` with `run_round_debug` to interrupt the
+single program instance in each unit. A hook pause terminates that run; it
+is never resumed as an operator debug pause. The same dispatcher executes
+IEC instructions, so the bridge does not duplicate language semantics.
+Foreign containers with other than one instance are rejected explicitly.
+The bridge preserves task enable flags and enforces an explicit container
+watchdog when it is shorter than the hard ceiling.
+
+Each unit-scan has a ceiling of 10,000,000 opcodes and one second. Wall
+time is sampled before the first opcode and every 256 opcodes, plus at scan
+completion; an individual opcode is not preempted. These are termination
+ceilings, not a real-time delivery guarantee. Budget exhaustion records
+`VM execution budget exceeded`, terminates all units, and runs
+failsafe/shutdown. The interrupted scan's outputs and snapshots are not
+published; final RETAIN flush is skipped so the last saved checkpoint
+remains intact. The existing five-overrun watchdog for scans that complete
+still latches outputs off while letting the logic compute.
+
+Operator Stop is honoured at the next scan boundary, as it was before scans
+were bounded: a healthy scan in flight finishes and publishes, and the final
+RETAIN checkpoint is written. Aborting the scan on Stop would discard that
+checkpoint with a probability proportional to the share of time spent inside
+scans, breaking the documented preservation of RETAIN state across deploys.
+Only a scan still running 250 ms (`STOP_GRACE`) after Stop was first sampled
+is treated as hung: it takes the same exit as an exhausted budget (nothing
+published, no final RETAIN flush) without recording a fault.
+
+Initialization continues through upstream `start`; this hook bounds scan
+bodies and their calls, not compilation, arbitrary container initialization,
+allocation or field-protocol calls. Normal ST initializers must be constant
+expressions. Keep untrusted bytecode validation an upstream concern.
 
 ## Follow-ups (upstream candidates)
 
