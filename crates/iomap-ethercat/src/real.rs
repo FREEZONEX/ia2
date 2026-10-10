@@ -13,11 +13,12 @@
 //!   1. `Box::leak`s a `PduStorage` (gives `&'static`; required by
 //!      `try_split`). One leaked storage per `connect` — fine, devices
 //!      don't churn at runtime.
-//!   2. Builds the `MainDevice`, spawns `tx_rx_task` as a detached smol
-//!      task, walks the bus with `init_single_group`, transitions to OP.
+//!   2. Builds the `MainDevice`, owns a smol `tx_rx_task`, walks the bus
+//!      with `init_single_group`, transitions to OP.
 //!   3. Reports back through a `tokio::sync::oneshot` so the connect()
 //!      future awaits an "actually live" signal (or an init error).
-//!   4. Enters the cyclic loop, exiting when the shutdown flag flips.
+//!   4. Enters the cyclic loop, exiting when the shutdown flag flips,
+//!      then cancels and drains the socket task before reporting stopped.
 //!
 //! - **PDI mirror** (`Arc<Mutex<PdiMirror>>`): the cyclic task is the
 //!   sole owner of the `SubDeviceGroup`. Reader/writer paths
@@ -836,19 +837,92 @@ fn spawn_cycle_watchdog(
         });
 }
 
-/// RTSO-HOLD-0731 fix: build (or rebuild) the EtherCAT transport — a
-/// freshly leaked PduStorage, a MainDevice over it, and the detached
-/// TX/RX socket pump. The pump flips `pump_dead` on ANY exit, return or
-/// panic; the supervise loop rebuilds the whole transport when it sees
-/// that flag, because a PduStorage can only be split once and a dead
-/// pump makes every subsequent exchange time out forever (so retrying
-/// the walk without rebuilding could never converge). One PduStorage
-/// leaks per pump death; pump deaths are rare, hard failures.
+/// Own the socket task for exactly one transport generation. Cancellation
+/// must finish before the cyclic worker reports stopped: otherwise its raw
+/// socket can consume the next Run's frames using the previous PDU storage.
+struct SocketPump {
+    task: Option<smol::Task<()>>,
+    closing: Arc<AtomicBool>,
+    dead: Arc<AtomicBool>,
+}
+
+impl SocketPump {
+    fn spawn<F, E>(future: F) -> Self
+    where
+        F: std::future::Future<Output = Result<(), E>> + Send + 'static,
+        E: std::fmt::Debug + Send + 'static,
+    {
+        let closing = Arc::new(AtomicBool::new(false));
+        let dead = Arc::new(AtomicBool::new(false));
+        struct PumpGuard {
+            closing: Arc<AtomicBool>,
+            dead: Arc<AtomicBool>,
+        }
+        impl Drop for PumpGuard {
+            fn drop(&mut self) {
+                if !self.closing.load(Ordering::Relaxed) {
+                    self.dead.store(true, Ordering::Relaxed);
+                    tracing::error!(
+                        "ethercat tx_rx socket pump EXITED (return or panic) — \
+                         the supervise loop will rebuild the transport"
+                    );
+                }
+            }
+        }
+        let guard = PumpGuard {
+            closing: closing.clone(),
+            dead: dead.clone(),
+        };
+        let task = smol::spawn(async move {
+            let _guard = guard;
+            if let Err(e) = future.await {
+                tracing::error!(?e, "ethercat tx_rx task exited");
+            }
+        });
+        Self {
+            task: Some(task),
+            closing,
+            dead,
+        }
+    }
+
+    fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Relaxed)
+    }
+
+    async fn stop(&mut self) {
+        use smol::future::FutureExt;
+        self.closing.store(true, Ordering::Relaxed);
+        if let Some(task) = self.task.take() {
+            // cancel().await also drops the socket future before returning.
+            // A previously panicked pump must not unwind the worker again,
+            // especially while its owner is already unwinding.
+            if std::panic::AssertUnwindSafe(task.cancel())
+                .catch_unwind()
+                .await
+                .is_err()
+            {
+                tracing::error!("ethercat tx_rx socket pump panic collected during teardown");
+            }
+            tracing::info!("ethercat tx_rx socket pump stopped; socket released");
+        }
+    }
+}
+
+impl Drop for SocketPump {
+    fn drop(&mut self) {
+        // Init errors and unwinding also need the socket ownership barrier.
+        // The task runs on smol's global executor, independently of this worker.
+        smol::block_on(self.stop());
+    }
+}
+
+/// Build a freshly leaked PduStorage, MainDevice and owned TX/RX pump.
+/// A dead pump needs fresh storage because PduStorage can only be split once.
 fn build_transport(
     nic: &str,
     dc_static_sync_iterations: u32,
-    pump_dead: Arc<AtomicBool>,
-) -> Result<Arc<MainDevice<'static>>, String> {
+) -> Result<(Arc<MainDevice<'static>>, SocketPump), String> {
     let storage: &'static Storage = Box::leak(Box::new(Storage::new()));
     let (tx, rx, pdu_loop) = storage
         .try_split()
@@ -873,27 +947,8 @@ fn build_transport(
     ));
     let tx_rx = ethercrab::std::tx_rx_task(nic, tx, rx)
         .map_err(|e| format!("tx_rx_task on {nic}: {e} (need CAP_NET_RAW + real NIC)"))?;
-    smol::spawn(async move {
-        // The guard fires on unwind too, closing the silent panic exit;
-        // the flag is what turns a dead pump from a permanent wedge into
-        // a transport rebuild.
-        struct PumpGuard(Arc<AtomicBool>);
-        impl Drop for PumpGuard {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::Relaxed);
-                tracing::error!(
-                    "ethercat tx_rx socket pump EXITED (return or panic) — \
-                     the supervise loop will rebuild the transport"
-                );
-            }
-        }
-        let _g = PumpGuard(pump_dead);
-        if let Err(e) = tx_rx.await {
-            tracing::error!(?e, "ethercat tx_rx task exited");
-        }
-    })
-    .detach();
-    Ok(maindevice)
+    let pump = SocketPump::spawn(async move { tx_rx.await.map(|_| ()) });
+    Ok((maindevice, pump))
 }
 
 /// RTSO-HOLD-0731 fix: backoff before the Nth consecutive failed bus
@@ -1058,12 +1113,9 @@ fn smol_main(
 
     let nic_owned = nic.to_string();
     smol::block_on(async move {
-        // Transport = leaked PduStorage + MainDevice + detached TX/RX
-        // pump. Built once here; rebuilt from a fresh leak if the pump
-        // ever dies (see build_transport).
-        let pump_dead = Arc::new(AtomicBool::new(false));
-        let mut maindevice =
-            match build_transport(&nic_owned, dc_static_sync_iterations, pump_dead.clone()) {
+        // The owned pump closes on every return or unwind, before DoneGuard.
+        let (mut maindevice, mut pump) =
+            match build_transport(&nic_owned, dc_static_sync_iterations) {
                 Ok(m) => m,
                 Err(msg) => {
                     let _ = init_tx.send(InitResult::Err(msg));
@@ -1114,15 +1166,16 @@ fn smol_main(
                 }
             }
 
-            if pump_dead.load(Ordering::Relaxed) {
+            if pump.is_dead() {
                 tracing::error!(
                     "rebuilding ethercat transport after pump death \
                      (fresh PduStorage + MainDevice + pump)"
                 );
-                match build_transport(&nic_owned, dc_static_sync_iterations, pump_dead.clone()) {
-                    Ok(m) => {
+                pump.stop().await;
+                match build_transport(&nic_owned, dc_static_sync_iterations) {
+                    Ok((m, replacement)) => {
                         maindevice = m;
-                        pump_dead.store(false, Ordering::Relaxed);
+                        pump = replacement;
                     }
                     Err(msg) => {
                         if walk_fail(first_init, &init_tx, &mut reinit_attempt, msg) {
@@ -1565,7 +1618,7 @@ fn smol_main(
                             }
                             Err(e) => {
                                 note_txrx_failure(&mut health, &e);
-                                if pump_dead.load(Ordering::Relaxed) {
+                                if pump.is_dead() {
                                     // A dead pump cannot recover by retrying
                                     // tx_rx — leave for a transport rebuild.
                                     healthy.store(false, Ordering::Relaxed);
@@ -1667,7 +1720,7 @@ fn smol_main(
                             }
                             Err(e) => {
                                 note_txrx_failure(&mut health, &e);
-                                if pump_dead.load(Ordering::Relaxed) {
+                                if pump.is_dead() {
                                     healthy.store(false, Ordering::Relaxed);
                                     demoted = true;
                                 }
@@ -1696,12 +1749,92 @@ fn smol_main(
                 }
             }
         }
+        // Keep the pump alive through the final zero-output exchange above.
+        // Complete its cancellation before the worker's stopped flag is set.
+        pump.stop().await;
     });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct PumpResource(mpsc::Sender<()>);
+
+    impl Drop for PumpResource {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    fn pending_pump() -> (SocketPump, mpsc::Receiver<()>) {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        let resource = PumpResource(dropped_tx);
+        let pump = SocketPump::spawn(async move {
+            let _resource = resource;
+            ready_tx.send(()).unwrap();
+            std::future::pending::<Result<(), ()>>().await
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        (pump, dropped_rx)
+    }
+
+    #[test]
+    fn stop_releases_pending_socket_before_handover_without_reporting_pump_death() {
+        let (mut pump, dropped) = pending_pump();
+        smol::block_on(pump.stop());
+        // A queued cancellation alone is insufficient: the resource must
+        // already be gone when Stop allows the next transport to start.
+        dropped
+            .try_recv()
+            .expect("socket released before Stop returns");
+        assert!(!pump.is_dead(), "intentional Stop is not transport failure");
+        let (replacement, replacement_dropped) = pending_pump();
+        drop(pump);
+        assert!(replacement_dropped.try_recv().is_err());
+        assert!(!replacement.is_dead());
+        drop(replacement);
+        replacement_dropped.try_recv().unwrap();
+    }
+
+    #[test]
+    fn early_return_and_worker_panic_drain_pending_socket() {
+        for panic_worker in [false, true] {
+            let (pump, dropped) = pending_pump();
+            let worker = thread::spawn(move || {
+                let _pump = pump;
+                if panic_worker {
+                    panic!("cyclic worker failed before final flush");
+                }
+            });
+            assert_eq!(worker.join().is_err(), panic_worker);
+            dropped.try_recv().expect("socket gone before worker join");
+        }
+    }
+
+    #[test]
+    fn unexpected_pump_return_error_and_panic_request_rebuild_and_are_drained() {
+        for outcome in 0..3 {
+            let (tx, rx) = mpsc::channel();
+            let resource = PumpResource(tx);
+            let pump = SocketPump::spawn(async move {
+                let _resource = resource;
+                match outcome {
+                    0 => Ok(()),
+                    1 => Err("receive error"),
+                    _ => panic!("socket task panic"),
+                }
+            });
+            rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !pump.is_dead() {
+                assert!(Instant::now() < deadline, "pump exit must request rebuild");
+                thread::yield_now();
+            }
+            drop(pump); // A pump panic must not propagate into owner teardown.
+        }
+    }
 
     /// Respond through EtherCrab's actual PDU storage/parser, with no NIC
     /// or privilege. The only request must be BRD(Type), never a write to

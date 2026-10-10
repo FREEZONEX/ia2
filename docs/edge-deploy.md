@@ -310,6 +310,13 @@ logs remain the evidence for that run.
 
 ## EtherCAT mode selection
 
+Each real EtherCAT transport owns its TX/RX socket task. On shutdown the
+cyclic worker attempts its final zero-output exchange, then cancels and
+waits for the socket task to release its resources before the worker exits.
+Initialization errors and worker panics also drain that task. A subsequent
+Run therefore does not inherit a detached socket from a joined worker;
+the existing bounded worker-join timeout still applies.
+
 `iomap-ethercat` picks between two implementations based on the device
 config's `nic` field:
 
