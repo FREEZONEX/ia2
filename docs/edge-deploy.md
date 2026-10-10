@@ -317,6 +317,21 @@ Initialization errors and worker panics also drain that task. A subsequent
 Run therefore does not inherit a detached socket from a joined worker;
 the existing bounded worker-join timeout still applies.
 
+Worker/socket closure and output delivery are reported separately. Only
+a final exchange of an entirely zero output image, returning the expected
+LRW working counter and all configured subdevices in OP, is logged as
+`final zero-output exchange acknowledged`. This is protocol evidence,
+not measured voltage, torque, or actuator position. DC and free-run modes
+use the same check, including PDI split across multiple LRWs.
+
+During an unhealthy bus or re-walk/backoff, failsafe still disengages gears
+and zeros the local mirror, but reports that delivery is unconfirmed. Stop
+does not start a new re-walk just to flush outputs. If no final cyclic
+exchange ran, it failed, returned partial WKC/non-OP states, or the worker
+did not join successfully, shutdown returns an error to the shared bridge.
+The final failure counts and closing log therefore preserve unconfirmed
+delivery even when the worker and socket closed normally.
+
 `iomap-ethercat` picks between two implementations based on the device
 config's `nic` field:
 

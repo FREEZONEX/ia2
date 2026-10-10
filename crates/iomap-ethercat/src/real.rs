@@ -70,7 +70,8 @@ const UNHEALTHY_AFTER_TX_ERRORS: u32 = 10;
 // several times over. MAX_SUBDEVICES must be a power of 2 > 1;
 // MAX_PDU_DATA at ~1100 tracks the Ethernet frame limit.
 const MAX_SUBDEVICES: usize = 128;
-const MAX_PDU_DATA: usize = PduStorage::element_size(1100);
+const MAX_LRW_DATA: usize = 1100;
+const MAX_PDU_DATA: usize = PduStorage::element_size(MAX_LRW_DATA);
 const MAX_FRAMES: usize = 64;
 const PDI_LEN: usize = 4096;
 
@@ -140,6 +141,103 @@ macro_rules! copy_outputs_to_bus {
             }
         }
     }};
+}
+
+/// Both cyclic modes record the actual final exchange, independently of
+/// joining the worker/socket. Re-walk/backoff exits never call this macro
+/// and therefore retain the initial unconfirmed result.
+macro_rules! final_zero_exchange {
+    ($group:expr, $maindevice:expr, $pdi:expr, $latch:expr, $outcome:expr, $dc:expr, $exchange:expr) => {{
+        copy_outputs_to_bus!($group, $maindevice, $pdi, $latch);
+        let layout: Vec<(usize, usize)> = $group
+            .iter(&$maindevice)
+            .map(|sd| {
+                let inputs = sd.inputs_raw().len();
+                let outputs = sd.outputs_raw_mut().len();
+                (inputs, outputs)
+            })
+            .collect();
+        let outputs_zero = $group
+            .iter(&$maindevice)
+            .all(|sd| sd.outputs_raw_mut().iter().all(|byte| *byte == 0));
+        let expected_wkc = final_exchange_wkc(&layout, $dc);
+        let result = match $exchange.await {
+            Ok(response) => check_final_exchange(
+                outputs_zero,
+                expected_wkc,
+                layout.len(),
+                response.working_counter,
+                &response.subdevice_states,
+            ),
+            Err(error) => Err(format!("final zero-output exchange failed: {error}")),
+        };
+        match &result {
+            Ok(()) => tracing::info!(expected_wkc, "ethercat final zero-output exchange acknowledged"),
+            Err(error) => tracing::warn!(%error, "ethercat final zero-output delivery unconfirmed"),
+        }
+        *$outcome.lock().unwrap_or_else(PoisonError::into_inner) = result;
+    }};
+}
+
+/// EtherCrab 0.7 lays out all input segments followed by all output
+/// segments and splits LRW data at the storage payload limit (1100 bytes).
+/// The first DC frame reserves a 20-byte FRMW. A slave contributes one
+/// read and/or two write counts to each LRW overlapping its segment.
+/// Include boundary-crossing segments; 3 * slave_count is insufficient
+/// for input-only/output-only devices and multi-frame PDI.
+fn final_exchange_wkc(layout: &[(usize, usize)], dc: bool) -> u16 {
+    let mut segments = Vec::new();
+    let mut end = 0;
+    for direction in [0, 1] {
+        for &(inputs, outputs) in layout {
+            let len = if direction == 0 { inputs } else { outputs };
+            if len > 0 {
+                segments.push((end..end + len, if direction == 0 { 1 } else { 2 }));
+                end += len;
+            }
+        }
+    }
+    let mut start = 0;
+    let mut wkc = 0;
+    while start < end {
+        let capacity = MAX_LRW_DATA - if start == 0 && dc { 20 } else { 0 };
+        let chunk_end = (start + capacity).min(end);
+        for (range, count) in &segments {
+            if range.start < chunk_end && start < range.end {
+                wkc += count;
+            }
+        }
+        start = chunk_end;
+    }
+    wkc
+}
+
+fn check_final_exchange(
+    outputs_zero: bool,
+    expected_wkc: u16,
+    expected_subdevices: usize,
+    working_counter: u16,
+    states: &[ethercrab::SubDeviceState],
+) -> Result<(), String> {
+    if !outputs_zero {
+        return Err("final output image was not entirely zero".into());
+    }
+    if expected_subdevices == 0
+        || states.len() != expected_subdevices
+        || states
+            .iter()
+            .any(|state| *state != ethercrab::SubDeviceState::Op)
+    {
+        return Err(format!(
+            "final exchange did not confirm all {expected_subdevices} subdevices in OP: {states:?}"
+        ));
+    }
+    if working_counter != expected_wkc {
+        return Err(format!(
+            "final exchange working counter: expected {expected_wkc}, received {working_counter}"
+        ));
+    }
+    Ok(())
 }
 
 /// In-cycle gear tick: for every configured gear axis, read the follower's
@@ -286,8 +384,8 @@ fn lock_pdi_for_cycle<'a>(
 
 /// Bounded wait for the cyclic worker thread to stop on graceful
 /// shutdown. The loop observes `shutdown` within ~one cycle (plus, at
-/// worst, one ethercrab PDU timeout on a wedged bus), then flushes a
-/// final zeroed frame and exits — comfortably inside this budget. Capped
+/// worst, one ethercrab PDU timeout on a wedged bus), then attempts a
+/// final zeroed exchange if a cyclic group is still owned. Capped
 /// so a hung bus can't push the whole shutdown past systemd's kill
 /// timeout: if we blow it, we abandon the thread and let process
 /// teardown reap it.
@@ -309,10 +407,14 @@ pub struct RealEthercat {
     /// `UNHEALTHY_AFTER_TX_ERRORS` consecutive `tx_rx` failures, `true`
     /// again on the first successful exchange.
     healthy: Arc<AtomicBool>,
+    reinitializing: Arc<AtomicBool>,
+    /// Worker-owned final exchange result. Joining only proves closure;
+    /// success here requires a returned zero PDI exchange with full WKC/OP.
+    final_exchange: Arc<Mutex<Result<(), String>>>,
     /// Subdevices found during the bus walk at connect (for `/discover`).
     discovered: Vec<SlaveDiscovery>,
     // The cyclic worker. Joined by `shutdown` on a clean stop (so the
-    // final zeroed frame is guaranteed on the wire); on `Drop` it's only
+    // final exchange outcome can be collected); on `Drop` it's only
     // signalled, not joined — drop can run mid-teardown and must not block.
     _thread: Option<thread::JoinHandle<()>>,
 }
@@ -324,6 +426,7 @@ struct WorkerShared {
     shutdown: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
     healthy: Arc<AtomicBool>,
+    final_exchange: Arc<Mutex<Result<(), String>>>,
     /// Latched `true` by the worker the first time it meets a poisoned PDI
     /// mirror: from then on every cycle forces the outputs to zero and keeps
     /// the gear engines disengaged (see `lock_pdi_for_cycle`). Never cleared —
@@ -350,8 +453,8 @@ struct WorkerShared {
 }
 
 /// Wait up to `timeout` for the worker to flag `stopped`, then join it.
-/// Returns `true` if the thread was joined, `false` if it didn't stop in
-/// time (caller abandons the handle; the process exit reaps the thread).
+/// Returns `true` if the thread was joined without panic, `false` on panic
+/// or timeout (on timeout the process exit reaps the abandoned thread).
 /// Sync + bounded so it can run on a blocking pool without ever holding
 /// the shutdown past the service supervisor's deadline.
 fn join_worker(
@@ -367,7 +470,7 @@ fn join_worker(
         thread::sleep(Duration::from_millis(2));
     }
     if let Some(handle) = handle {
-        let _ = handle.join();
+        return handle.join().is_ok();
     }
     true
 }
@@ -444,6 +547,9 @@ impl RealEthercat {
         let shutdown = Arc::new(AtomicBool::new(false));
         let stopped = Arc::new(AtomicBool::new(false));
         let healthy = Arc::new(AtomicBool::new(true));
+        let final_exchange = Arc::new(Mutex::new(Err(
+            "no final zero-output exchange was completed".into(),
+        )));
         let pdi_poisoned = Arc::new(AtomicBool::new(false));
         let cycles = Arc::new(AtomicU64::new(0));
         let input_changes = Arc::new(AtomicU64::new(0));
@@ -461,6 +567,7 @@ impl RealEthercat {
             shutdown: shutdown.clone(),
             stopped: stopped.clone(),
             healthy: healthy.clone(),
+            final_exchange: final_exchange.clone(),
             pdi_poisoned,
             cycles: cycles.clone(),
             input_changes: input_changes.clone(),
@@ -544,7 +651,7 @@ impl RealEthercat {
                     stopped.clone(),
                     healthy.clone(),
                     shutdown.clone(),
-                    reinitializing,
+                    reinitializing.clone(),
                     reinits,
                 );
                 Ok(Self {
@@ -555,6 +662,8 @@ impl RealEthercat {
                     shutdown,
                     stopped,
                     healthy,
+                    reinitializing,
+                    final_exchange,
                     discovered,
                     _thread: Some(thread),
                 })
@@ -671,13 +780,12 @@ impl IoDevice for RealEthercat {
     /// Zero the entire output PDI mirror for every discovered slave.
     /// The next cyclic tick on the worker thread copies these zeros
     /// onto the bus surface and `tx_rx`'s them out — at default cycle
-    /// times that's a millisecond or two. Wait a couple of cycle
-    /// periods after returning if you need to guarantee propagation
-    /// before exiting (the bridge does this).
+    /// times that's a millisecond or two. Acceptance here does not confirm
+    /// delivery; shutdown collects the worker's final exchange result.
     ///
-    /// Returns `Err` when the cyclic worker has already stopped: the mirror
-    /// is still zeroed, but nothing will transmit it, so `Ok` would be a
-    /// false report of a safe state having been commanded.
+    /// Returns `Err` when the worker has stopped or cyclic delivery is
+    /// unavailable during an unhealthy bus/re-walk. The mirror is still
+    /// zeroed even when transmission cannot be confirmed.
     async fn enter_failsafe(&mut self) -> Result<(), IoError> {
         // Gear axes first: drop every engage request so the engines fall
         // back to shadow/hold instead of re-driving targets over the
@@ -718,14 +826,22 @@ impl IoDevice for RealEthercat {
                 self.name
             )));
         }
-        tracing::info!(device = %self.name, "ethercat output PDI zeroed for failsafe");
+        if self.reinitializing.load(Ordering::Relaxed) || !self.healthy.load(Ordering::Relaxed) {
+            return Err(IoError::Transport(format!(
+                "ethercat '{}': output PDI zeroed, but cyclic delivery is unavailable during \
+                 an unhealthy bus or re-walk/backoff; zero-output delivery unconfirmed",
+                self.name
+            )));
+        }
+        tracing::info!(device = %self.name, "ethercat output PDI zeroed for failsafe; delivery pending cyclic exchange");
         Ok(())
     }
 
     /// Graceful teardown: signal the cyclic worker to stop and JOIN it.
     /// After `enter_failsafe` clears the output mirror, the worker attempts
-    /// one final `tx_rx` before exiting. Joining confirms worker completion,
-    /// not successful transmission or physical output state.
+    /// one last `tx_rx` if it still owns a cyclic group. Joining confirms
+    /// resource closure; its separately recorded exchange result confirms
+    /// protocol acknowledgement, not physical actuator state.
     /// Bounded so a wedged bus can't stall the process past its kill
     /// timeout. The join runs on a blocking thread so we don't park the
     /// async executor on a std thread join.
@@ -738,15 +854,24 @@ impl IoDevice for RealEthercat {
                 .await
                 .unwrap_or(false);
         if joined {
-            tracing::info!(device = %self.name, "ethercat cyclic worker joined; final frame delivery is unconfirmed");
+            tracing::info!(device = %self.name, "ethercat cyclic worker joined; socket resources drained");
         } else {
             tracing::warn!(
                 device = %self.name,
                 timeout_s = WORKER_JOIN_TIMEOUT.as_secs(),
-                "ethercat cyclic worker did not stop in time; abandoning thread (process teardown will reap it)"
+                "ethercat cyclic worker did not join successfully; timeout or panic, resource closure unconfirmed"
             );
+            return Err(IoError::Transport(format!(
+                "ethercat '{}': worker join failed; resource closure and zero-output delivery unconfirmed",
+                self.name
+            )));
         }
-        Ok(())
+        self.final_exchange.lock().unwrap_or_else(PoisonError::into_inner).clone().map_err(|error| {
+            IoError::Transport(format!(
+                "ethercat '{}': worker joined and socket drained, but zero-output delivery unconfirmed: {error}",
+                self.name
+            ))
+        })
     }
 }
 
@@ -1092,6 +1217,7 @@ fn smol_main(
         shutdown,
         stopped,
         healthy,
+        final_exchange,
         pdi_poisoned,
         cycles,
         input_changes,
@@ -1642,8 +1768,15 @@ fn smol_main(
                         // controlword = 0 (Disable Voltage) before the thread stops,
                         // instead of de-energizing only via its own SyncManager
                         // watchdog once the master goes away.
-                        copy_outputs_to_bus!(group, maindevice, pdi, pdi_poisoned);
-                        let _ = group.tx_rx_dc(&maindevice).await;
+                        final_zero_exchange!(
+                            group,
+                            maindevice,
+                            pdi,
+                            pdi_poisoned,
+                            final_exchange,
+                            true,
+                            group.tx_rx_dc(&maindevice)
+                        );
                         tracing::info!("ethercat cyclic loop exiting (shutdown signalled)");
                     }
                 }
@@ -1742,8 +1875,15 @@ fn smol_main(
                         // Final flush before teardown: failsafe has zeroed the
                         // output mirror; push it out once more so the SubDevices
                         // latch their safe (zero) outputs before the thread stops.
-                        copy_outputs_to_bus!(group, maindevice, pdi, pdi_poisoned);
-                        let _ = group.tx_rx(&maindevice).await;
+                        final_zero_exchange!(
+                            group,
+                            maindevice,
+                            pdi,
+                            pdi_poisoned,
+                            final_exchange,
+                            false,
+                            group.tx_rx(&maindevice)
+                        );
                         tracing::info!("ethercat cyclic loop exiting (shutdown signalled)");
                     }
                 }
@@ -1936,14 +2076,17 @@ mod tests {
             shutdown: Arc::new(AtomicBool::new(false)),
             stopped: Arc::new(AtomicBool::new(stopped_flag)),
             healthy: Arc::new(AtomicBool::new(true)),
+            reinitializing: Arc::new(AtomicBool::new(false)),
+            final_exchange: Arc::new(Mutex::new(Err(
+                "no final zero-output exchange was completed".into(),
+            ))),
             discovered: Vec::new(),
             _thread: None,
         }
     }
 
-    /// Zeroing the mirror is not the failsafe — the worker's next tick
-    /// putting it on the wire is. With the worker alive that tick is coming,
-    /// so `Ok` is the truth.
+    /// An available cyclic worker accepts the zero image. Shutdown must
+    /// still collect an actual exchange result before reporting delivery.
     #[tokio::test]
     async fn failsafe_zeroes_the_output_mirror_and_reports_ok_while_the_worker_runs() {
         let mut dev = device_with_outputs(false);
@@ -1977,7 +2120,7 @@ mod tests {
             rt.block_on(dev.enter_failsafe())
         }));
         let result = outcome.expect("enter_failsafe panicked on a poisoned PDI lock");
-        result.expect("worker alive => the zeroed mirror is the failsafe, so Ok");
+        result.expect("available worker accepts the zero image");
         let mirror = lock_pdi(&dev.pdi);
         assert_eq!(
             mirror.outputs[&0],
@@ -2024,6 +2167,115 @@ mod tests {
             vec![0u8; 4],
             "the mirror is zeroed even when it cannot be sent"
         );
+    }
+
+    #[tokio::test]
+    async fn stop_during_rewalk_zeroes_mirror_and_joins_but_does_not_confirm_delivery() {
+        let mut dev = device_with_outputs(false);
+        dev.reinitializing.store(true, Ordering::Relaxed);
+        // This is the bench failure: a live worker parks in re-walk/backoff,
+        // then exits without owning a cyclic group or attempting a flush.
+        let shutdown = dev.shutdown.clone();
+        let stopped = dev.stopped.clone();
+        dev._thread = Some(thread::spawn(move || {
+            while !shutdown.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(2));
+            }
+            stopped.store(true, Ordering::Relaxed);
+        }));
+        let error = dev.enter_failsafe().await.unwrap_err().to_string();
+        assert!(error.contains("re-walk/backoff"), "{error}");
+        assert_eq!(lock_pdi(&dev.pdi).outputs[&0], vec![0; 4]);
+        let start = Instant::now();
+        let error = dev.shutdown().await.unwrap_err().to_string();
+        assert!(
+            error.contains("worker joined and socket drained"),
+            "{error}"
+        );
+        assert!(error.contains("no final zero-output exchange"), "{error}");
+        assert!(dev.stopped.load(Ordering::Relaxed));
+        assert!(dev._thread.is_none());
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn shutdown_propagates_the_workers_final_exchange_result() {
+        for outcome in [
+            Ok(()),
+            Err("final exchange timed out".into()),
+            Err("partial WKC".into()),
+        ] {
+            let mut dev = device_with_outputs(false);
+            let shutdown = dev.shutdown.clone();
+            let stopped = dev.stopped.clone();
+            let exchange = dev.final_exchange.clone();
+            let worker_outcome = outcome.clone();
+            dev._thread = Some(thread::spawn(move || {
+                while !shutdown.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                *exchange.lock().unwrap() = worker_outcome;
+                stopped.store(true, Ordering::Relaxed);
+            }));
+            dev.enter_failsafe().await.unwrap();
+            let result = dev.shutdown().await;
+            assert_eq!(result.is_ok(), outcome.is_ok());
+            if let Err(expected) = outcome {
+                assert!(result.unwrap_err().to_string().contains(&expected));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_does_not_report_a_panicked_worker_as_joined() {
+        let mut dev = device_with_outputs(false);
+        let stopped = dev.stopped.clone();
+        // Even an earlier success cannot mask a subsequent panic.
+        *dev.final_exchange.lock().unwrap() = Ok(());
+        dev._thread = Some(thread::spawn(move || {
+            stopped.store(true, Ordering::Relaxed);
+            panic!("worker panic after exchange");
+        }));
+        let error = dev.shutdown().await.unwrap_err().to_string();
+        assert!(error.contains("worker join failed"), "{error}");
+    }
+
+    #[test]
+    fn final_exchange_requires_zero_full_wkc_and_all_op() {
+        use ethercrab::SubDeviceState::{Op, SafeOp};
+        let states = [Op; 4];
+        assert!(check_final_exchange(true, 12, 4, 12, &states).is_ok());
+        for (zero, count, wkc, states) in [
+            (false, 4, 12, states.as_slice()),
+            (true, 4, 9, states.as_slice()),
+            (true, 4, 15, states.as_slice()),
+            (true, 4, 12, &states[..3]),
+            (true, 4, 12, &[Op, Op, Op, SafeOp]),
+            (true, 0, 0, &[]),
+        ] {
+            assert!(check_final_exchange(zero, 12, count, wkc, states).is_err());
+        }
+    }
+
+    #[test]
+    fn final_wkc_accounts_for_io_directions_and_lrw_chunk_boundaries() {
+        assert_eq!(
+            final_exchange_wkc(&[(28, 12), (28, 12), (28, 12), (27, 8)], false),
+            12
+        );
+        assert_eq!(
+            final_exchange_wkc(&[(28, 12), (28, 12), (28, 12), (27, 8)], true),
+            12
+        );
+        assert_eq!(final_exchange_wkc(&[(4, 0), (0, 4), (0, 0)], false), 3);
+        // A single input FMMU crosses only the first DC frame's boundary.
+        assert_eq!(final_exchange_wkc(&[(1090, 0)], false), 1);
+        assert_eq!(final_exchange_wkc(&[(1090, 0)], true), 2);
+        // Input/output segments crossing several LRWs contribute once per
+        // direction per chunk. No triple-count assumption per subdevice.
+        assert_eq!(final_exchange_wkc(&[(1200, 1200)], false), 6);
+        assert_eq!(final_exchange_wkc(&[(1100, 1100)], false), 3);
+        assert_eq!(final_exchange_wkc(&[(1100, 1100)], true), 6);
     }
 
     #[test]
@@ -2236,6 +2488,60 @@ mod worker_poison_latch {
             inputs: HashMap::new(),
             outputs: HashMap::from([(0, outputs)]),
         })
+    }
+
+    #[tokio::test]
+    async fn final_flush_in_both_modes_records_errors_and_checks_the_actual_bus_image() {
+        struct Reply {
+            working_counter: u16,
+            subdevice_states: Vec<ethercrab::SubDeviceState>,
+        }
+        use ethercrab::SubDeviceState::{Op, SafeOp};
+        for dc in [false, true] {
+            for (image, wkc, state, timeout, confirmed) in [
+                (vec![0; 4], 3, Op, false, true),
+                (vec![0; 4], 3, Op, true, false),
+                (vec![0; 4], 2, Op, false, false),
+                (vec![0; 4], 3, SafeOp, false, false),
+                (vec![1; 4], 3, Op, false, false),
+                // Short mirror leaves old nonzero bus bytes: checking
+                // the mirror alone would falsely confirm this exchange.
+                (vec![0; 2], 3, Op, false, false),
+            ] {
+                let group = group(4, vec![0; 4]);
+                let pdi = mirror(image);
+                let latch = AtomicBool::new(false);
+                let outcome = Mutex::new(Err("no exchange completed".into()));
+                let reply = if timeout {
+                    Err("PDU timeout")
+                } else {
+                    Ok(Reply {
+                        working_counter: wkc,
+                        subdevice_states: vec![state],
+                    })
+                };
+                // Run the exact production macro shared by tx_rx_dc and
+                // tx_rx, against a bus surface initially holding 0xEE.
+                final_zero_exchange!(
+                    group,
+                    (),
+                    pdi,
+                    latch,
+                    outcome,
+                    dc,
+                    std::future::ready(reply)
+                );
+                assert_eq!(outcome.lock().unwrap().is_ok(), confirmed);
+                if timeout {
+                    assert!(outcome
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap_err()
+                        .contains("PDU timeout"));
+                }
+            }
+        }
     }
 
     /// One follower axis: controlword at output byte 0, i32 target at byte 2;
