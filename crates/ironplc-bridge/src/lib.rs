@@ -3,6 +3,7 @@
 //! API intended for downstream consumption by the server crate.
 
 mod errors;
+mod execution;
 mod fbd_transpile;
 mod ld_transpile;
 pub mod monitor;
@@ -127,12 +128,11 @@ fn compile_library(library: &Library, sources: &Sources) -> Result<Container, Br
     let (analyzed, context) = ironplc_analyzer::stages::analyze(&[library], &options)
         .map_err(|ds| BridgeError::Analyze(format!("{ds:?}")))?;
 
-    if context.has_diagnostics() {
-        return Err(BridgeError::Analyze(format!("{:?}", context.diagnostics())));
-    }
+    let analysis = ironplc_analyzer::CleanAnalysis::new(&analyzed, &context)
+        .map_err(|ds| BridgeError::Analyze(format!("{ds:?}")))?;
 
     let codegen_options = ironplc_codegen::CodegenOptions::default();
-    ironplc_codegen::compile(&analyzed, &context, &codegen_options, sources)
+    ironplc_codegen::compile(analysis, &codegen_options, sources)
         .map_err(|d| BridgeError::Codegen(format!("{d:?}")))
 }
 

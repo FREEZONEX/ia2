@@ -250,6 +250,47 @@ fn sim_run_proves_and_refutes_against_a_real_server() {
 }
 
 #[test]
+fn infinite_loop_scenario_reports_a_fault_and_rejects_a_healthy_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("execution_budget");
+    copy_dir(&repo_root().join("examples/execution_budget"), &proj);
+    let server = spawn_server(tmp.path());
+    server.open_project(&proj);
+    cs(&server.base)
+        .args(["project", "check"])
+        .arg(&proj)
+        .assert()
+        .success();
+    let trace = tmp.path().join("fault.jsonl");
+    cs(&server.base)
+        .args(["--project", "execution_budget", "sim", "run"])
+        .arg(proj.join("scenarios/bounded.toml"))
+        .arg("--trace")
+        .arg(&trace)
+        .timeout(std::time::Duration::from_secs(15))
+        .assert()
+        .success()
+        .stderr(predicates::str::contains(
+            "runtime stopped with fault: VM execution budget exceeded",
+        ));
+    assert!(std::fs::read_to_string(trace)
+        .unwrap()
+        .contains("VM execution budget exceeded"));
+
+    // A fresh run clears the previous fault. A stale snapshot / a healthy
+    // running program must not satisfy an expected terminal fault.
+    let bad = tmp.path().join("no-fault.toml");
+    std::fs::write(&bad, "[[steps]]\nexpect_fault = { contains = \"VM execution budget exceeded\", within_ms = 400 }\n").unwrap();
+    cs(&server.base)
+        .args(["--project", "execution_budget", "sim", "run"])
+        .arg(&bad)
+        .timeout(std::time::Duration::from_secs(5))
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("last_error=None"));
+}
+
+#[test]
 fn stale_agent_cannot_remove_another_writers_alarm_or_program_edit() {
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("sim_smoke");

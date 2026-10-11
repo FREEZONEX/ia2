@@ -1,0 +1,19 @@
+description = "finite scans work; a deliberate ST infinite loop becomes a visible terminal fault"
+
+[[steps]]
+expect = { var = "total", op = "eq", value = 5050, within_ms = 3000 }
+
+[[steps]]
+expect = { var = "scans", op = "ge", value = 3, within_ms = 3000 }
+
+[[steps]]
+set = { var = "arm_hang", value = true }
+
+[[steps]]
+expect_alarm = { id = "loop_test_armed", active = true, within_ms = 3000 }
+
+[[steps]]
+set = { var = "run_hang", value = true }
+
+[[steps]]
+expect_fault = { contains = "VM execution budget exceeded", within_ms = 5000 }
