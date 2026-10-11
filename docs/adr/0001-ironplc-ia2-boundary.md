@@ -186,9 +186,13 @@ watchdog when it is shorter than the hard ceiling.
 Each unit-scan has a ceiling of 10,000,000 opcodes and one second. Wall
 time is sampled before the first opcode and every 256 opcodes, plus at scan
 completion; an individual opcode is not preempted. These are termination
-ceilings, not a real-time delivery guarantee. Budget exhaustion records
-`VM execution budget exceeded`, terminates all units, and runs
-failsafe/shutdown. The interrupted scan's outputs and snapshots are not
+ceilings, not a real-time delivery guarantee. The opcode ceiling is a
+property of the program, identical on every host, and is the one a runaway
+meets first (tens of milliseconds on a fast CPU in a release build); the
+wall-clock ceiling is the host-dependent backstop. Both are constants, so a
+legitimately heavy scan has to be split. Budget exhaustion records
+`VM execution budget exceeded in <instance>: <ceiling and its value>`,
+terminates all units, and runs failsafe/shutdown. The interrupted scan's outputs and snapshots are not
 published; final RETAIN flush is skipped so the last saved checkpoint
 remains intact. The existing five-overrun watchdog for scans that complete
 still latches outputs off while letting the logic compute.

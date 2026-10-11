@@ -18,7 +18,9 @@ intended run first, as a previous matching fault may still be present.
 The device-free `examples/execution_budget/scenarios/bounded.toml` first
 proves finite scans and an arming alarm, then triggers an ST infinite loop
 and requires the terminal budget fault. Each scan is limited to 10,000,000
-opcodes or one second (a shorter explicit VM watchdog also applies).
+opcodes or one second (a shorter explicit VM watchdog also applies); the
+fault names the ceiling it hit, e.g. `instruction limit (10000000 opcodes per
+scan)`, and the opcode one is host-independent and normally the first.
 Time checks occur every 256 opcodes, not as hard real-time interrupts.
 Stop takes effect at the scan boundary; only a scan still running 250 ms
 after Stop is discarded as hung. Unlike the five-overrun latch, this fault
