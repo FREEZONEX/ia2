@@ -124,7 +124,9 @@ echoes, and rejects Output bindings to gear feedback (see 06).
 
 ```
 cs run [--program NAME [--file path.st]]  # tasks.toml schedule, or one PROGRAM
-cs stop
+                                           # waits for device teardown, including late reconnects;
+                                           # exit 2 + "still shutting down" after 10 s, retry
+cs stop                                    # returns when the stop is requested, not when devices are safe
 cs runtime status [--edge NAME]      # mode + forces (no variable values)
 cs runtime snapshot [--vars a,b] [--edge NAME]   # LIVE VALUES — the read you want
 cs runtime pause | resume | step [N] [--edge NAME]
@@ -137,6 +139,9 @@ cs runtime ack <alarm-id>            # acknowledge an alarm (see 09-sim-alarms.m
 Value encoding for force/write: human notation — `TRUE`/`FALSE`/`1`/`0`
 for BOOL, `50.0` for REAL (the CLI bit-packs by the variable's live
 type). Negative numbers after `--`: `cs runtime force setpoint -- -5`.
+
+A timed-out or cancelled `cs run` does not abandon the previous run's
+cleanup. Retry waits for the same teardown before starting anything.
 
 Snapshot `value` is display text from ironplc's `VariableRenderer`:
 STRING is a single-quoted Latin-1 IEC literal; WSTRING is double-quoted

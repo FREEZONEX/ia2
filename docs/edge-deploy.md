@@ -236,7 +236,10 @@ rollback is just "point `current` at an older version and restart".
 ## Shutdown and failsafe evidence
 
 A completed bridge drain means the failsafe and teardown **attempts**
-finished, not that every physical output was confirmed safe. The scan
+finished for the scan thread; a reconnect worker beyond its two-second
+grace is still unconfirmed. The server waits for that worker too before
+allowing another run; the edge process keeps its existing bounded exit.
+Neither proves that every physical output was confirmed safe. The scan
 loop's final log includes `failsafe_failed` and `shutdown_failed` device
 counts; inspect the preceding device/channel errors whenever either is
 nonzero. Even zero counts do not replace physical readback or a hardware
