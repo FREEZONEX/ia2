@@ -323,8 +323,9 @@ impl AppState {
     ///
     /// Requesting a stop returns at once, but the scan thread then still runs
     /// the failsafe pass, a grace period and each device's shutdown. The handle
-    /// stays in `draining` until that has finished, which is what
-    /// `wait_until_drained` waits for. Retiring the same run twice (a stop
+    /// stays in `draining` until that and any late reconnect cleanup have
+    /// finished, which is what `wait_until_drained` waits for.
+    /// Retiring the same run twice (a stop
     /// racing the fault forwarder) is a no-op.
     pub fn retire(&self, handle: ProgramHandle) {
         {
@@ -337,8 +338,8 @@ impl AppState {
         let draining = self.draining.clone();
         tokio::spawn(async move {
             // Requests the stop (harmless if already requested) and returns
-            // once the scan thread has actually finished.
-            handle.shutdown().await;
+            // once neither the scan nor a late reconnect can write again.
+            handle.wait_for_teardown().await;
             draining.lock().retain(|h| !h.same_run(&handle));
         });
     }

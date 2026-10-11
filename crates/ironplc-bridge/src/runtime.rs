@@ -326,6 +326,9 @@ pub struct ProgramHandle {
     /// is how a caller waits for the always-run failsafe pass + per-device
     /// teardown (EtherCAT thread join) to actually finish.
     thread: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
+    /// Never sends a value. Closes only after the reconnect worker has
+    /// dropped its adapters and I/O runtime, including on panic.
+    reconnect_done: tokio::sync::watch::Receiver<()>,
 }
 
 impl ProgramHandle {
@@ -355,6 +358,8 @@ impl ProgramHandle {
     /// reconnect worker, so a device still mid-connect delays this by at most
     /// that long; the closing log line then says the worker's outcome is
     /// unconfirmed rather than "exited cleanly".
+    /// Use [`Self::wait_for_teardown`] before starting a replacement run;
+    /// a worker beyond this grace may still write its late failsafe.
     ///
     /// Unlike `stop`, this waits for completion, so the runtime can drive
     /// the plant safe before exiting rather than racing the service
@@ -383,6 +388,17 @@ impl ProgramHandle {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+
+    /// Stop and wait for both the scan thread and any late reconnect cleanup.
+    /// Unlike `shutdown`, this has no reconnect grace limit. A caller may
+    /// time out or cancel its wait, but must not start a replacement until a
+    /// subsequent wait completes. Clones can wait independently. Completion
+    /// means no further calls from this run, not confirmed physical safety.
+    pub async fn wait_for_teardown(&self) {
+        self.shutdown().await;
+        // No values are sent, so closure is the only possible notification.
+        let _ = self.reconnect_done.clone().changed().await;
     }
 
     /// Subscribe to the per-cycle VarSnapshot stream.
@@ -788,6 +804,7 @@ fn spawn_units_with_grace(
     let device_health = Arc::new(std::sync::Mutex::new(Vec::<DeviceHealth>::new()));
     let watchdog_tripped = Arc::new(AtomicBool::new(false));
     let (fault_tx, fault_rx) = tokio::sync::watch::channel(None::<String>);
+    let (reconnect_done_tx, reconnect_done_rx) = tokio::sync::watch::channel(());
 
     let stop_clone = stop.clone();
     let stop_reconnect = stop.clone();
@@ -891,6 +908,9 @@ fn spawn_units_with_grace(
                 let spawned = std::thread::Builder::new()
                     .name("ia2-reconnect".into())
                     .spawn(move || {
+                        // Keep this guard until reconnect_worker returns and
+                        // its I/O runtime has dropped, even when it panics.
+                        let _done = reconnect_done_tx;
                         reconnect_worker(
                             failed_specs,
                             device_reports_reconnect,
@@ -1087,6 +1107,7 @@ fn spawn_units_with_grace(
         watchdog_tripped,
         fault: fault_rx,
         thread: Arc::new(std::sync::Mutex::new(Some(join_handle))),
+        reconnect_done: reconnect_done_rx,
     }
 }
 

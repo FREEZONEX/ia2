@@ -221,6 +221,14 @@ report in time makes the summary say its outcome is unconfirmed instead of
 "cleanly". Cancelling `shutdown()` keeps the scan join handle available and
 creates no detached blocking join.
 
+That bounded `shutdown()` is not the server's handover barrier.
+`wait_for_teardown()` also waits for the reconnect worker's completion
+channel to close, after its adapters and runtime drop. The server keeps the
+old run in its drain list until this completes. A start times out after 10 s
+with 409; cancellation or timeout never releases ownership to a new run.
+Fault retirement registers the drain while still holding the program-slot
+lock, so a concurrent start cannot miss it.
+
 ## Follow-ups (upstream candidates)
 
 1. Multi-PROGRAM containers and per-instance debug names:

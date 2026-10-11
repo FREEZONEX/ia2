@@ -2509,8 +2509,10 @@ fn settle_fault(state: &AppState, run: &ironplc_bridge::ProgramHandle) {
             None => {}
         }
         *state.last_error.lock() = Some(msg.clone());
+        // Register teardown before releasing the slot lock: a concurrent
+        // start must never see both an empty slot and an empty drain list.
+        state.retire(run.clone());
     }
-    state.retire(run.clone());
     let _ = state.event_tx.send(AppEvent::Error(msg));
     let _ = state.event_tx.send(AppEvent::Stopped);
 }
@@ -3807,6 +3809,9 @@ mod launch_run_tests {
 }
 
 #[cfg(test)]
+mod reconnect_handover_tests;
+
+#[cfg(test)]
 mod run_handover_tests {
     //! `POST /api/run` must not start a run while the previous one is still
     //! failsafing and tearing down its devices. The slow teardown is made
@@ -3841,7 +3846,7 @@ mod run_handover_tests {
         (addr, task.abort_handle())
     }
 
-    fn modbus_device(name: &str, addr: std::net::SocketAddr) -> project::Device {
+    pub(super) fn modbus_device(name: &str, addr: std::net::SocketAddr) -> project::Device {
         project::Device {
             name: name.into(),
             config: project::ProtocolConfig::Modbus(project::ModbusConfig {
@@ -3870,7 +3875,7 @@ mod run_handover_tests {
     const IDLE: &str = "PROGRAM main\n VAR x : INT; END_VAR\n x := x + 1;\nEND_PROGRAM";
     const TRAP: &str = "PROGRAM main\n VAR x : DINT; z : DINT; END_VAR\n x := 1 / z;\nEND_PROGRAM";
 
-    fn app_with(
+    pub(super) fn app_with(
         dir: &std::path::Path,
         source: &str,
         device: project::Device,
@@ -3889,7 +3894,7 @@ mod run_handover_tests {
         (app, state)
     }
 
-    async fn post_run(app: &Router) -> (StatusCode, String) {
+    pub(super) async fn post_run(app: &Router) -> (StatusCode, String) {
         let response = app
             .clone()
             .oneshot(
@@ -3905,7 +3910,7 @@ mod run_handover_tests {
         (status, String::from_utf8_lossy(&body).into_owned())
     }
 
-    async fn post_stop(app: &Router) {
+    pub(super) async fn post_stop(app: &Router) {
         let response = app
             .clone()
             .oneshot(Request::post("/api/stop").body(Body::empty()).unwrap())
@@ -3914,7 +3919,7 @@ mod run_handover_tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-    fn current(state: &AppState) -> ironplc_bridge::ProgramHandle {
+    pub(super) fn current(state: &AppState) -> ironplc_bridge::ProgramHandle {
         state
             .program
             .lock()
