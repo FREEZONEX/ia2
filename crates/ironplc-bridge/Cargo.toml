@@ -23,6 +23,9 @@ ts-rs.workspace = true
 # FutureExt::catch_unwind — the scan loop wraps run_loop_async in a
 # panic guard so a panic inside the VM glue still triggers failsafe.
 futures-util.workspace = true
+# The historian is shared by the IDE server and the edge runtime; a lock that
+# does not poison keeps one panicking caller from taking every later one down.
+parking_lot.workspace = true
 
 iocore = { path = "../iocore" }
 project = { path = "../project" }

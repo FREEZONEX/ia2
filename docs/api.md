@@ -332,7 +332,7 @@ below, same get→edit→set shape as iomap); alarm STATE lives here.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/api/runtime/history` | Downsampled history. Query: `vars=a,b` (empty = all), `from_us`, `to_us` (0 = open), `step_ms` (default 1000). Returns `HistoryResponse { series: [{ name, points: [{ t_us, min, max, v }] }], oldest_us, sample_interval_us }`. |
+| `GET` | `/api/runtime/history` | Downsampled history. Query: `vars=a,b` (empty = all), `from_us`, `to_us` (0 = open), `step_ms` (default 1000; `0` is read as 1, and a step too large to express in microseconds is one bucket covering the whole window). Returns `HistoryResponse { series: [{ name, points: [{ t_us, min, max, v }] }], oldest_us, sample_interval_us }`. |
 | `GET` | `/api/runtime/alarms` | Live alarm states, standing-first then severity. Returns `AlarmState[]` (`active`, `acked`, `raised_at_us`, `value_at_raise`, `count`). |
 | `POST` | `/api/runtime/alarms/{id}/ack` | Acknowledge one alarm. Returns the updated `AlarmState`; 404 unknown id. |
 | `GET` | `/api/runtime/alarms-journal` | Most-recent-first event journal (`raised` / `acked` / `returned`). Query: `limit` (default 100, ring-capped at 1000). Returns `AlarmJournalEntry[]`. |

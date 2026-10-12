@@ -2395,6 +2395,7 @@ dependencies = [
  "ironplc-dsl",
  "ironplc-parser",
  "ironplc-vm",
+ "parking_lot",
  "project",
  "serde",
  "serde_json",
