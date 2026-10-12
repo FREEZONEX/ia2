@@ -84,7 +84,12 @@ prompts — the IDE runs `ssh -o BatchMode=yes`).
    answers but its program stopped (a VM trap, say) — hover it, or read
    the status grid, for the reason. A red `outputs locked` badge means the
    scan watchdog tripped: every output is zeroed and held off until the
-   program is restarted.
+   program is restarted. An ochre `degraded` badge also covers a runtime
+   whose snapshot task has ended: the program and the buses are fine, but
+   history is not recording and process alarms are not being evaluated
+   (`/health`'s `snapshot_tap.running` is `false`; restart the runtime). The
+   badge only judges that persistent state; whether `snapshot_tap.faults` is
+   still climbing is for `cs probe` and a second look.
 
    ST scans are also bounded to 10,000,000 opcodes or one second (a shorter
    explicit container watchdog wins). The opcode ceiling is independent of

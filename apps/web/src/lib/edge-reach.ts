@@ -38,5 +38,19 @@ export function edgeReach(probe: EdgeProbe): EdgeReach {
       detail: `Runtime is up, but ${down.length === 1 ? "this device is" : "these devices are"} down (inputs frozen, outputs dropped): ${down.join(", ")}`,
     }
   }
+  // The program runs and every bus is up, but the task that feeds history and
+  // process alarms from the scan loop has ended: nothing is recorded, no alarm
+  // is evaluated, and the scan count is frozen. Only `running: false` is judged
+  // here; whether `faults` is still climbing needs two probes, and `cs probe`
+  // prints it.
+  const tap = probe.snapshot_tap
+  if (tap && !tap.running) {
+    return {
+      kind: "degraded",
+      detail:
+        "The program is running, but the runtime's snapshot task has ended: history is not recording, process alarms are not being evaluated and the scan count is frozen. Restart the runtime to recover" +
+        (tap.last_fault ? `. Last: ${tap.last_fault}` : ""),
+    }
+  }
   return { kind: "running", detail: "Edge runtime is responding" }
 }

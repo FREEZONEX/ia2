@@ -220,6 +220,16 @@ runtime answers while running nothing. `probe` prints `PROGRAM FAULTED —
 predating the field reports `fault: null` here even when faulted, so check
 `cs get edges/<n>/status` on an old edge.
 
+`snapshot_tap` is the fifth: the task that feeds history and process alarms
+from the scan loop can end (or fail on every snapshot) while the program runs
+fine, so the edge is reachable, fieldbus-healthy and scanning while it records
+no history and evaluates no alarms — `alarms_standing: 0` then means "nothing
+is evaluating", not "no alarms". `probe` prints `SNAPSHOT TAP STOPPED` when
+`snapshot_tap.running` is `false` (only a restart clears it) and
+`snapshot tap FAULTED N×` when `faults` is above zero; a count that climbs
+between two probes is failing now. It is `null` for an edge build that
+predates the field.
+
 Deploy first freezes regular project files into a private temporary snapshot.
 Preflight and upload use the same copy; later saves cannot alter the upload.
 Symlinks and special files are refused before upload; replace them with regular

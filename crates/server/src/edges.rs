@@ -17,6 +17,7 @@ use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use ironplc_bridge::monitor::SnapshotTapHealth;
 use ironplc_bridge::DeviceHealth;
 use project::Edge;
 use serde::{Deserialize, Serialize};
@@ -123,6 +124,15 @@ pub struct EdgeProbe {
     /// the edge runs a build whose `/health` predates the field (its
     /// `/status` still carries `fault`).
     pub fault: Option<String>,
+    /// Whether the edge's history, process alarms and `scan_count` are still
+    /// being fed from its scan loop. A runtime whose feeding task has ended
+    /// is reachable, fieldbus-healthy and running its program, while it
+    /// records no history and evaluates no alarms, so a gate that reads only
+    /// the fields above calls it healthy. `running: false` is the persistent
+    /// state; a `faults` count that climbs between two probes means it is
+    /// failing now. `None` when unreachable, or when the edge runs a build
+    /// whose `/health` predates the field.
+    pub snapshot_tap: Option<SnapshotTapHealth>,
     /// First line of stderr / error message when unreachable. Gives the
     /// user enough hint to fix `~/.ssh/config` or `install_dir`.
     pub error: Option<String>,
@@ -282,6 +292,7 @@ fn unreachable_probe(error: String) -> EdgeProbe {
         unhealthy_devices: vec![],
         watchdog_tripped: None,
         fault: None,
+        snapshot_tap: None,
         error: Some(error),
     }
 }
@@ -309,6 +320,9 @@ fn probe_from_health_body(body: &str) -> EdgeProbe {
         /// Absent on an older edge build, which reads as "none reported".
         #[serde(default)]
         fault: Option<String>,
+        /// Absent on an older edge build, which reads as "unknown".
+        #[serde(default)]
+        snapshot_tap: Option<SnapshotTapHealth>,
     }
     let Ok(parsed) = serde_json::from_str::<Health>(body) else {
         return unreachable_probe(format!("unexpected body: {}", first_line(body)));
@@ -330,6 +344,7 @@ fn probe_from_health_body(body: &str) -> EdgeProbe {
             .collect(),
         watchdog_tripped: parsed.watchdog_tripped,
         fault: parsed.fault,
+        snapshot_tap: parsed.snapshot_tap,
         error: None,
     }
 }
@@ -1707,6 +1722,30 @@ mod tests {
         assert!(probe.error.is_none());
     }
 
+    /// A runtime whose feeding task has ended still answers `/health` with
+    /// `status: "ok"` and a climbing-or-frozen scan count. The probe must
+    /// carry the tap state through, or the badge and `cs probe` call an edge
+    /// that records no history and evaluates no alarms healthy.
+    #[test]
+    fn probe_carries_the_snapshot_tap_of_a_reachable_edge() {
+        let probe = probe_from_health_body(
+            r#"{"status":"ok","uptime_secs":90,"scan_count":4,
+                "fieldbus_healthy":true,"devices":[],"watchdog_tripped":false,
+                "fault":null,
+                "snapshot_tap":{"running":false,"faults":3,
+                                "last_fault":"the alarms stage panicked on scan 4: boom"}}"#,
+        );
+        assert!(probe.reachable, "the runtime did answer");
+        let tap = probe.snapshot_tap.expect("carried through");
+        assert!(!tap.running);
+        assert_eq!(tap.faults, 3);
+        assert_eq!(
+            tap.last_fault.as_deref(),
+            Some("the alarms stage panicked on scan 4: boom")
+        );
+        assert!(probe.error.is_none());
+    }
+
     #[test]
     fn probe_reports_a_fully_healthy_edge_cleanly() {
         let probe = probe_from_health_body(
@@ -1729,6 +1768,7 @@ mod tests {
         assert_eq!(probe.fieldbus_healthy, None, "unknown, not false");
         assert!(probe.unhealthy_devices.is_empty());
         assert_eq!(probe.fault, None);
+        assert_eq!(probe.snapshot_tap, None, "unknown, not stopped");
     }
 
     /// The proxy must carry the edge's own status through — a

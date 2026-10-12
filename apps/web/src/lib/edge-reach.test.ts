@@ -13,6 +13,7 @@ function probe(patch: Partial<EdgeProbe> = {}): EdgeProbe {
     unhealthy_devices: [],
     watchdog_tripped: false,
     fault: null,
+    snapshot_tap: null,
     error: null,
     ...patch,
   }
@@ -39,6 +40,26 @@ describe("edgeReach", () => {
     const reach = edgeReach(probe({ fieldbus_healthy: false, unhealthy_devices: ["coupler"] }))
     expect(reach.kind).toBe("degraded")
     expect(reach.detail).toContain("coupler")
+  })
+
+  // The program runs and the buses are up while history and alarms are not
+  // being fed; it showed green.
+  it("calls an edge whose snapshot task ended degraded, with the last fault", () => {
+    const reach = edgeReach(
+      probe({
+        snapshot_tap: { running: false, faults: 1, last_fault: "the alarms stage panicked on scan 4" },
+      }),
+    )
+    expect(reach.kind).toBe("degraded")
+    expect(reach.detail).toContain("history is not recording")
+    expect(reach.detail).toContain("the alarms stage panicked on scan 4")
+  })
+
+  it("does not call an edge degraded for a tap that is running, or unknown", () => {
+    expect(
+      edgeReach(probe({ snapshot_tap: { running: true, faults: 3, last_fault: "x" } })).kind,
+    ).toBe("running")
+    expect(edgeReach(probe({ snapshot_tap: null })).kind).toBe("running")
   })
 
   it("puts the root cause first", () => {

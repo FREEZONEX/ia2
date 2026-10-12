@@ -152,6 +152,7 @@ function Editor({
         unhealthy_devices: [],
         watchdog_tripped: null,
         fault: null,
+        snapshot_tap: null,
         error: String(e),
       })
     } finally {
