@@ -43,6 +43,7 @@ use tracing_subscriber::EnvFilter;
 
 mod northbound;
 mod panic_guard;
+mod tap;
 
 const DEFAULT_BIND: &str = "127.0.0.1:13001";
 
@@ -304,6 +305,9 @@ struct AppState {
     /// Bounded ring of every write attempt (HTTP + MQTT northbound)
     /// with its origin — backs GET /audit (ADR-0002 attribution).
     audit: AuditLog,
+    /// The task feeding history, alarms and `latest` — reported on /health
+    /// and /status so its failure is not silent.
+    tap: Arc<tap::TapStatus>,
 }
 
 #[tokio::main]
@@ -440,23 +444,17 @@ async fn main() -> Result<()> {
     let latest: Arc<Mutex<Option<VarSnapshot>>> = Arc::new(Mutex::new(None));
     let shutdown = Arc::new(tokio::sync::Notify::new());
 
-    {
-        let snapshot_tx = snapshot_tx.clone();
-        let latest = latest.clone();
-        let historian = historian.clone();
-        let alarms = alarms.clone();
-        let mut rx = handle.subscribe();
-        tokio::spawn(async move {
-            while let Ok(snap) = rx.recv().await {
-                historian.note_snapshot(&snap);
-                alarms
-                    .lock()
-                    .note_snapshot(&snap, ironplc_bridge::monitor::wall_now_us());
-                *latest.lock() = Some(snap.clone());
-                let _ = snapshot_tx.send(snap);
-            }
-        });
-    }
+    let tap = tap::TapStatus::new();
+    tokio::spawn(tap::run(
+        handle.subscribe(),
+        tap::standard_stages(
+            historian.clone(),
+            alarms.clone(),
+            latest.clone(),
+            snapshot_tx.clone(),
+        ),
+        tap.clone(),
+    ));
 
     let store = Arc::new(store);
     let state = AppState {
@@ -473,6 +471,7 @@ async fn main() -> Result<()> {
         historian,
         alarms,
         audit: AuditLog::default(),
+        tap,
     };
 
     // ---- Northbound (MQTT -> supOS/Tier0) ----
@@ -691,6 +690,14 @@ struct Health {
     /// does: without this field a probe of `/health` called such an edge
     /// healthy while it ran nothing.
     fault: Option<String>,
+    /// Whether history, process alarms and `scan_count` are still being fed
+    /// from the scan loop. The scan loop is a separate thread: when this
+    /// task stops, or fails on every snapshot, the program keeps running and
+    /// `status` stays `"ok"`, while history stops recording, process alarms
+    /// stop being evaluated and `scan_count` freezes. `running: false` means
+    /// the task ended; a `faults` count that climbs between two polls means a
+    /// stage is failing now.
+    snapshot_tap: monitor::SnapshotTapHealth,
 }
 
 async fn health(State(state): State<AppState>) -> Json<Health> {
@@ -704,12 +711,18 @@ async fn health(State(state): State<AppState>) -> Json<Health> {
         &state.handle,
         scan_count,
         state.start_time.elapsed().as_secs(),
+        state.tap.health(),
     ))
 }
 
 /// The `/health` body for the run behind `handle`. Split out of the
 /// handler so the contract is testable without a whole `AppState`.
-fn health_of(handle: &ProgramHandle, scan_count: u64, uptime_secs: u64) -> Health {
+fn health_of(
+    handle: &ProgramHandle,
+    scan_count: u64,
+    uptime_secs: u64,
+    snapshot_tap: monitor::SnapshotTapHealth,
+) -> Health {
     let devices = handle.device_health();
     Health {
         status: "ok",
@@ -719,6 +732,7 @@ fn health_of(handle: &ProgramHandle, scan_count: u64, uptime_secs: u64) -> Healt
         devices,
         watchdog_tripped: handle.watchdog_tripped(),
         fault: handle.fault(),
+        snapshot_tap,
     }
 }
 
@@ -868,6 +882,11 @@ struct Status {
     /// The full list is one GET /alarms away; the count rides on
     /// /status so panels see it on their existing poll.
     alarms_standing: usize,
+    /// Same as `/health`'s `snapshot_tap`. Read it before trusting
+    /// `last_snapshot`, `scan_count` and `alarms_standing`: if the tap has
+    /// ended they stop moving, and `alarms_standing: 0` then means "nothing
+    /// is evaluating alarms", not "no alarms".
+    snapshot_tap: monitor::SnapshotTapHealth,
 }
 
 async fn status(State(state): State<AppState>) -> Json<Status> {
@@ -900,6 +919,7 @@ async fn status(State(state): State<AppState>) -> Json<Status> {
         forces: monitor::force_entries(&state.handle),
         fault: state.handle.fault(),
         alarms_standing,
+        snapshot_tap: state.tap.health(),
     })
 }
 
@@ -1505,7 +1525,13 @@ mod tests {
         .expect("the division by zero traps within 5 s")
         .expect("the trap is recorded as a fault");
 
-        let body = serde_json::to_value(health_of(&handle, 0, 1)).unwrap();
+        let body = serde_json::to_value(health_of(
+            &handle,
+            0,
+            1,
+            crate::tap::TapStatus::new().health(),
+        ))
+        .unwrap();
         assert_eq!(body["status"], "ok", "the process still answers");
         let fault = body["fault"].as_str().expect("fault is a string");
         assert!(fault.contains("main_inst"), "{fault}");
@@ -1515,12 +1541,48 @@ mod tests {
     async fn health_of_a_running_program_has_a_null_fault() {
         let handle = spawn_main("x := x + 1;");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let body = serde_json::to_value(health_of(&handle, 0, 1)).unwrap();
+        let body = serde_json::to_value(health_of(
+            &handle,
+            0,
+            1,
+            crate::tap::TapStatus::new().health(),
+        ))
+        .unwrap();
         assert_eq!(body["status"], "ok");
         assert!(
             body.get("fault").is_some_and(|f| f.is_null()),
             "present and null, so clients can rely on the key: {body}"
         );
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
+    /// `/health` says whether history and alarms are still being fed: a
+    /// program that keeps scanning while its tap is gone must not read as
+    /// healthy, and an older client that ignores the key must still parse
+    /// the rest (it is a new key, not a changed one).
+    #[tokio::test]
+    async fn health_carries_the_snapshot_tap_state() {
+        let handle = spawn_main("x := x + 1;");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let tap = ironplc_bridge::monitor::SnapshotTapHealth {
+            running: false,
+            faults: 7,
+            last_fault: Some("the alarms stage panicked on scan 12: boom".into()),
+        };
+        let body = serde_json::to_value(health_of(&handle, 12, 1, tap)).unwrap();
+        assert_eq!(body["status"], "ok", "the process still answers");
+        assert_eq!(body["snapshot_tap"]["running"], false);
+        assert_eq!(body["snapshot_tap"]["faults"], 7);
+        assert!(body["snapshot_tap"]["last_fault"]
+            .as_str()
+            .is_some_and(|t| t.contains("alarms stage panicked")));
+
+        let healthy = crate::tap::TapStatus::new().health();
+        let body = serde_json::to_value(health_of(&handle, 0, 1, healthy)).unwrap();
+        assert_eq!(body["snapshot_tap"]["running"], true);
+        assert!(body["snapshot_tap"]["last_fault"].is_null(), "{body}");
         tokio::time::timeout(std::time::Duration::from_secs(5), handle.shutdown())
             .await
             .expect("shutdown");

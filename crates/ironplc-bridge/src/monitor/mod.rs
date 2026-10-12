@@ -51,6 +51,34 @@ fn default_step_cycles() -> u32 {
     1
 }
 
+/// How the edge runtime's snapshot tap is doing: the task that takes each
+/// snapshot off the scan loop and feeds the historian, the alarm engine, the
+/// latest-snapshot slot behind `/status` and the `/events` stream.
+///
+/// The scan loop is a separate thread. When the tap stops, or fails on every
+/// snapshot, the program keeps running and `/health` keeps answering `ok`,
+/// while history stops recording, process alarms stop being evaluated and
+/// `scan_count` stops moving: a monitoring probe that only checks `status`
+/// would call that runtime healthy. Hence its own field, like
+/// `watchdog_tripped` and `fault`.
+///
+/// `Deserialize` as well as `Serialize`: the IDE server parses this back out
+/// of a remote edge runtime's `/health` when probing it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SnapshotTapHealth {
+    /// `false` once the tap has ended and will not come back until the runtime
+    /// restarts: nothing is feeding history, alarms or `/status` any more.
+    pub running: bool,
+    /// Incidents since the runtime started: a stage that panicked on a
+    /// snapshot, or snapshots skipped because the tap fell behind the scan
+    /// loop. A count that climbs between two polls means it is failing now.
+    #[ts(type = "number")]
+    pub faults: u64,
+    /// The latest incident in words, `null` when there has been none.
+    pub last_fault: Option<String>,
+}
+
 /// Wall-clock microseconds since the UNIX epoch — the human-facing
 /// time base for alarm journals and ack stamps.
 pub fn wall_now_us() -> u64 {
