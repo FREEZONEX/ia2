@@ -13,7 +13,7 @@ use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -32,6 +32,7 @@ use ironplc_bridge::{
     DeviceHealth, DeviceReport, DeviceSpec, ProgramHandle, RuntimeMode, RuntimeWriteError,
     VarSnapshot, WriteOutcome,
 };
+use parking_lot::Mutex;
 use project::{ProjectStore, ProtocolConfig, StoreError};
 use serde::Serialize;
 use tokio::signal;
@@ -80,7 +81,7 @@ impl LogCapture {
 
     fn push_line(&self, line: String) {
         {
-            let mut b = self.buf.lock().expect("log buffer");
+            let mut b = self.buf.lock();
             while b.len() >= self.cap {
                 b.pop_front();
             }
@@ -92,7 +93,7 @@ impl LogCapture {
 
     /// Most recent `n` captured lines, oldest-first.
     fn tail(&self, n: usize) -> Vec<String> {
-        let b = self.buf.lock().expect("log buffer");
+        let b = self.buf.lock();
         let start = b.len().saturating_sub(n);
         b.iter().skip(start).cloned().collect()
     }
@@ -450,9 +451,8 @@ async fn main() -> Result<()> {
                 historian.note_snapshot(&snap);
                 alarms
                     .lock()
-                    .expect("alarms mutex")
                     .note_snapshot(&snap, ironplc_bridge::monitor::wall_now_us());
-                *latest.lock().expect("latest mutex") = Some(snap.clone());
+                *latest.lock() = Some(snap.clone());
                 let _ = snapshot_tx.send(snap);
             }
         });
@@ -696,7 +696,6 @@ async fn health(State(state): State<AppState>) -> Json<Health> {
     let scan_count = state
         .latest
         .lock()
-        .expect("latest")
         .as_ref()
         .map(|s| s.scan_count)
         .unwrap_or(0);
@@ -871,12 +870,11 @@ struct Status {
 }
 
 async fn status(State(state): State<AppState>) -> Json<Status> {
-    let last_snapshot = state.latest.lock().expect("latest").clone();
+    let last_snapshot = state.latest.lock().clone();
     let scan_count = last_snapshot.as_ref().map(|s| s.scan_count).unwrap_or(0);
     let alarms_standing = state
         .alarms
         .lock()
-        .expect("alarms mutex")
         .states()
         .iter()
         .filter(|a| a.standing())
@@ -943,7 +941,7 @@ async fn history(
 async fn alarms_state(
     State(state): State<AppState>,
 ) -> Json<Vec<ironplc_bridge::monitor::AlarmState>> {
-    Json(state.alarms.lock().expect("alarms mutex").states())
+    Json(state.alarms.lock().states())
 }
 
 async fn alarms_ack(
@@ -954,7 +952,6 @@ async fn alarms_ack(
     state
         .alarms
         .lock()
-        .expect("alarms mutex")
         .ack(&id, now_us)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, e))
@@ -974,7 +971,7 @@ async fn alarms_journal(
     State(state): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<JournalQuery>,
 ) -> Json<Vec<ironplc_bridge::monitor::AlarmJournalEntry>> {
-    Json(state.alarms.lock().expect("alarms mutex").journal(q.limit))
+    Json(state.alarms.lock().journal(q.limit))
 }
 
 /// Same row shape as the IDE server's `HmiListEntry` (whose ts-rs export
@@ -1240,7 +1237,7 @@ fn record_audit(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let mut g = log.lock().expect("audit mutex");
+    let mut g = log.lock();
     if g.len() >= AUDIT_CAP {
         g.pop_front();
     }
@@ -1454,13 +1451,7 @@ async fn rt_inject_scan_stall(
 /// and every MQTT northbound write lands here with its origin and
 /// outcome — denied and failed writes included.
 async fn rt_audit(State(state): State<AppState>) -> Json<Vec<AuditEntry>> {
-    let entries: Vec<AuditEntry> = state
-        .audit
-        .lock()
-        .expect("audit mutex")
-        .iter()
-        .cloned()
-        .collect();
+    let entries: Vec<AuditEntry> = state.audit.lock().iter().cloned().collect();
     Json(entries)
 }
 
@@ -1548,11 +1539,56 @@ mod tests {
                 "ok",
             );
         }
-        let g = log.lock().unwrap();
+        let g = log.lock();
         assert_eq!(g.len(), AUDIT_CAP);
         // Oldest entries were evicted: the first survivor is v10.
         assert_eq!(g.front().unwrap().name, "v10");
         assert_eq!(g.back().unwrap().name, format!("v{}", AUDIT_CAP + 9));
+    }
+
+    /// The audit ring and the log buffer are shared by every request and by
+    /// the snapshot task. A panic under one of their locks must free it: if it
+    /// poisoned, the next write would panic in `record_audit`, and then the
+    /// one after that.
+    #[test]
+    fn a_panic_under_a_shared_lock_does_not_fail_later_callers() {
+        let log = AuditLog::default();
+        record_audit(&log, "gui", "write", "before", Some(1), Some(1), "ok");
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = log.lock();
+            panic!("a caller died holding the audit lock");
+        }));
+        assert!(caught.is_err());
+        record_audit(&log, "gui", "write", "after", Some(2), Some(2), "ok");
+        let names: Vec<String> = log.lock().iter().map(|e| e.name.clone()).collect();
+        assert_eq!(names, ["before", "after"]);
+
+        let capture = super::LogCapture::new(10);
+        capture.push_line("before".into());
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = capture.buf.lock();
+            panic!("a caller died holding the log buffer");
+        }));
+        assert!(caught.is_err());
+        capture.push_line("after".into());
+        assert_eq!(capture.tail(10), ["before", "after"]);
+    }
+
+    /// `tail` is what `GET /logs?tail=` asks for: any count, including none
+    /// and more than exists, is a bound on the answer and nothing else.
+    #[test]
+    fn log_tail_is_a_bound_not_a_size() {
+        let capture = super::LogCapture::new(3);
+        for i in 0..5 {
+            capture.push_line(format!("line {i}"));
+        }
+        assert_eq!(capture.tail(0), Vec::<String>::new());
+        assert_eq!(capture.tail(2), ["line 3", "line 4"]);
+        assert_eq!(
+            capture.tail(usize::MAX),
+            ["line 2", "line 3", "line 4"],
+            "the ring keeps its cap; a huge request gets what there is"
+        );
     }
 
     /// A clamped write records BOTH sides of the story — the audit
@@ -1565,7 +1601,7 @@ mod tests {
 
         let log = AuditLog::default();
         record_audit(&log, "mqtt", "write", "sp", Some(150), applied, &outcome);
-        let g = log.lock().unwrap();
+        let g = log.lock();
         let e = g.back().unwrap();
         assert_eq!(e.requested, Some(150));
         assert_eq!(e.applied, Some(100));
@@ -1593,7 +1629,7 @@ mod tests {
 
         let log = AuditLog::default();
         record_audit(&log, "curl", "write", "sp", Some(150), applied, &outcome);
-        let g = log.lock().unwrap();
+        let g = log.lock();
         let e = g.back().unwrap();
         assert_eq!(e.requested, Some(150));
         assert_eq!(e.applied, None);

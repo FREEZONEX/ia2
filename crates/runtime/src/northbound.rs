@@ -17,10 +17,11 @@
 //!     same semantics as POST /write (the program can overwrite next
 //!     scan; use program logic to latch setpoints).
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use ironplc_bridge::{ProgramHandle, VarSnapshot};
+use parking_lot::Mutex;
 use project::MqttNorthbound;
 use rumqttc::{AsyncClient, Event, LastWill, MqttOptions, Packet, QoS};
 
@@ -92,7 +93,7 @@ async fn run(ctx: NorthboundCtx) {
                 .await;
             loop {
                 tick.tick().await;
-                let snap = latest.lock().expect("latest mutex").clone();
+                let snap = latest.lock().clone();
                 let Some(snap) = snap else { continue };
                 let payload = snapshot_json(&snap);
                 if let Err(e) = client
@@ -164,7 +165,6 @@ async fn handle_write(ctx: &NorthboundCtx, payload: &[u8]) {
     let type_name = ctx
         .latest
         .lock()
-        .expect("latest mutex")
         .as_ref()
         .and_then(|s| s.vars.iter().find(|v| v.name == req.name))
         .map(|v| v.type_name.clone());
@@ -477,10 +477,7 @@ mod governance_roundtrip_tests {
             loop {
                 match eventloop.poll().await {
                     Ok(Event::Incoming(Packet::Publish(p))) => {
-                        seen_task
-                            .lock()
-                            .expect("seen mutex")
-                            .push((p.topic.clone(), p.payload.to_vec()));
+                        seen_task.lock().push((p.topic.clone(), p.payload.to_vec()));
                     }
                     Ok(_) => {}
                     Err(_) => break,
@@ -497,7 +494,6 @@ mod governance_roundtrip_tests {
         loop {
             let online = seen
                 .lock()
-                .expect("seen mutex")
                 .iter()
                 .any(|(t, p)| t == "ia2/nbtest/status" && p.as_slice() == b"online");
             if online {
@@ -524,7 +520,7 @@ mod governance_roundtrip_tests {
         // The audit ring is the contract: poll until all three land.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
-            if audit.lock().expect("audit mutex").len() >= 3 {
+            if audit.lock().len() >= 3 {
                 break;
             }
             assert!(
@@ -533,8 +529,7 @@ mod governance_roundtrip_tests {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        let entries: Vec<crate::AuditEntry> =
-            audit.lock().expect("audit mutex").iter().cloned().collect();
+        let entries: Vec<crate::AuditEntry> = audit.lock().iter().cloned().collect();
         assert_eq!(entries.len(), 3, "{entries:?}");
         for e in &entries {
             assert_eq!(e.origin, "mqtt", "{e:?}");
@@ -569,7 +564,6 @@ mod governance_roundtrip_tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let stray: Vec<String> = seen
             .lock()
-            .expect("seen mutex")
             .iter()
             .map(|(t, _)| t.clone())
             .filter(|t| {
