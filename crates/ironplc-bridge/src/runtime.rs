@@ -1174,7 +1174,7 @@ fn classify_scan_end(
 }
 
 /// The text of a panic payload, for logs and the recorded fault.
-fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+pub(crate) fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
     panic
         .downcast_ref::<&str>()
         .map(|s| s.to_string())

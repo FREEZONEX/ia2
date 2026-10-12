@@ -8,6 +8,8 @@ mod error;
 mod events;
 mod hmi_routes;
 mod library;
+#[cfg(test)]
+mod listing_tests;
 mod routes;
 mod runtime_routes;
 mod state;

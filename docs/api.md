@@ -124,15 +124,28 @@ disk, and the tree (in `/api/project`) shows each declaration as its
 own node. The URL identifier in these routes is the **file path** —
 slash-separated under `pous/`, no `.st` extension.
 
+Declarations and variables are read with the compiler's parser and are
+best-effort listings: a file that does not parse lists none, and it is
+still shown in the tree and still readable, so it can be opened and fixed.
+The same holds when the compiler itself panics on a source (an internal
+compiler bug): the panic is logged at ERROR and that file lists nothing,
+while `GET /api/project`, `GET /api/pous/{path}` (its `source` is always
+returned), `GET /api/pous/{path}/variables`, `GET /api/project/pous`,
+`GET /api/project/variables` and `POST /api/symbols` keep answering. An
+empty listing therefore never means "this source is valid": that is what
+`POST /api/check` answers (a `compiler-panic` diagnostic in this case), and
+`POST /api/project/validate` and `POST /api/run` answer `500` with the
+panic text.
+
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/api/pous` | Create a POU file. Body: `CreatePouRequest { path, type, language }`. `type` is `program` / `function_block` / `function`; `language` is `st` / `ld` / `fbd` / `sfc` (picks the on-disk extension). |
 | `POST` | `/api/pous/folders` | Create a folder under `pous/`. Body: `CreateFolderRequest { path }`. |
 | `DELETE` | `/api/pous/folders/{path}` | Delete an empty folder. |
-| `GET` | `/api/pous/{path}` | Read a POU file. Returns `Pou { path, source, declarations: PouDecl[] }`. |
+| `GET` | `/api/pous/{path}` | Read a POU file. Returns `Pou { path, source, declarations: PouDecl[] }`. `declarations` is empty when the source cannot be parsed; `source` is returned regardless. |
 | `PUT` | `/api/pous/{path}` | Write POU source. Body is raw `text/plain`. |
 | `DELETE` | `/api/pous/{path}` | Delete a POU file (and every declaration inside it). |
-| `GET` | `/api/pous/{path}/variables` | Variables declared in the file. Returns `VariableInfo[]`. |
+| `GET` | `/api/pous/{path}/variables` | Variables declared in the file. Returns `VariableInfo[]` (`[]` when the source cannot be parsed). |
 
 ## Libraries & device catalog
 
@@ -260,15 +273,15 @@ when empty, so clients can consume diagnostics without missing-field checks.
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/api/check` | Compile-check ONE source string (no project required). Body: `text/plain`. Returns `CheckDiagnostic[]`; `[]` means the source WAS checked and is clean. If the compiler itself panics during the check (an internal compiler bug, not necessarily a mistake in this source: with a project open the sibling files are parsed as context, so the panic may come from another file in the project, and then every buffer of that project gets this answer) the answer is still `200`, but with one `error` diagnostic at line 1 column 1 whose `code` is `compiler-panic` and whose message carries the panic text and says the source was NOT checked (`check-aborted` if the check task was cancelled); never `[]`. The panic is also in the server log. | Fast feedback for editor squiggles
-| `POST` | `/api/symbols?language=st\|ld\|fbd\|sfc` | Extract declared variables from one source string (any language; default `st`). Body: `text/plain`. Returns `VariableInfo[]`. | Backs the editor's binding picker
+| `POST` | `/api/symbols?language=st\|ld\|fbd\|sfc` | Extract declared variables from one source string (any language; default `st`). Body: `text/plain`. Returns `VariableInfo[]`; `[]` when the source cannot be parsed, including when the compiler panics on it (see POUs above). | Backs the editor's binding picker
 | `POST` | `/api/run` | Compile the whole project + spawn the bridge. Body: `{}` or `RunRequest`. A run still in the slot is stopped, and **the start waits for every earlier run to finish its failsafe pass and device teardown, including late reconnect workers** (also after `POST /api/stop`, a project close, or a fault, which release the slot at once), so the new run never connects to or writes to a device the old one is still shutting down. If that takes longer than 10 s the answer is `409` ("the previous run is still shutting down its devices …; nothing was started") and nothing is started; retry. A timed-out or cancelled request does not release this gate. Starts are serialized. | Reads `tasks.toml` to decide what runs
 | `POST` | `/api/stop` | Stop the running program (cooperative; scan loop drains). Answers as soon as the stop is requested, not when the devices are safe: the `stopped` event and `running=false` mean the run has left the slot. The next `POST /api/run` waits for the teardown. |
 | `GET` | `/api/runtime/status` | Synchronous overview of the runtime. Returns `RuntimeStatus { running, project, program_instances, devices, device_health, watchdog_tripped, scan_period_ms, scan_count, last_snapshot_us, last_error, running_info, mode, forces }`; `last_error` carries why a run died — a VM trap, a VM that failed to start, an execution-budget exhaustion, or a panic — (also emitted as SSE `error` + `stopped`), `null` after a clean run. `devices` lists the project's configured device names, while `device_health` reports whether each one's transport is actually live — a `false` entry means that device's inputs are frozen at last-known values and its outputs are dropped, even though `running` stays `true` and the scan count keeps climbing. `watchdog_tripped` is `true` once the scan watchdog latched: the program lost real-time guarantees, every output was zeroed and the output phase stays off until a restart — check it before reading any variable value as plant state, because the VM keeps computing and `scan_count` keeps climbing after a trip. `scan_period_ms` is the fastest task's interval — the cadence at which `scan_count` can advance — so a client judging "is this live data current?" can size its window from the project's own rate instead of a fixed guess: `interval_ms` has no upper bound, and on a 5 s-cycle project a 4 s-old value is the newest one that exists. It says nothing about how long a scan actually takes; the overrun watchdog owns that. `scan_overruns` counts missed scan deadlines since the program started (summed over units) and `consecutive_scan_overruns` is the longest streak any unit is currently on — the achieved cadence, which `scan_period_ms` cannot describe. The overrun log line fires once per unit and then suppresses itself, so before these there was no way to tell a runtime quietly missing every fourth deadline from one meeting them all; `watchdog_tripped` only covers the terminal case. A total that climbs between two polls means it is missing them now. `scan_period_ms`, `scan_overruns` and `consecutive_scan_overruns` are `null` when nothing is running. | One-shot, agent-friendly
 | `GET` | `/api/runtime/snapshot` | Latest `VarSnapshot` or `null`. | No SSE needed for one-off queries
 | `POST` | `/api/runtime/variables/{name}` | Write a variable while running. Body: `WriteVariableRequest { value: <i32-coerceable> }`. Returns the new value. Subject to the project's `[governance]` (project.toml): in `allowlist` mode a write to an unlisted variable is 403, and a rule's `min`/`max` clamp the written value (the response echoes the clamped value). A write no honest clamp exists for is denied 403 instead: `NaN` to a min/max-ruled REAL, or a rule range containing no representable value of the variable's type. The response also carries `undelivered_device`: when the variable has an Output mapping onto a device whose transport is down, the write is still applied (a Stop that flushes when the link returns beats one never commanded) and this names that device, so a caller must not report a bare success. `null` on a healthy link or an internal variable — and it is transport health only, never proof that the value took effect. | Critical for debugging closed loops
 | `GET` | `/api/events` | SSE stream of `AppEvent` (`snapshot` / `started` / `stopped` / `error`). | For long-running IDE clients
-| `GET` | `/api/project/variables` | Flat list of every variable across every POU in the project. Returns `ProjectVariables { variables: [...] }`. | Cross-POU index for agents
-| `GET` | `/api/project/pous` | Every IEC POU declared anywhere in the project (parser-driven). Returns `ProjectPous { pous: [{ application, name, kind }] }` — `kind` ∈ `program` / `function_block` / `function`. | Source of truth for "what's schedulable" — multi-POU files (one .st declaring PROGRAM + FB + FUNCTION) are correctly enumerated, unlike `application.kind` which is a heuristic |
+| `GET` | `/api/project/variables` | Flat list of every variable across every POU in the project. Returns `ProjectVariables { variables: [...] }`. A file that cannot be parsed contributes none. | Cross-POU index for agents
+| `GET` | `/api/project/pous` | Every IEC POU declared anywhere in the project (parser-driven). Returns `ProjectPous { pous: [{ file_path, name, type, language }] }` — `type` ∈ `program` / `function_block` / `function`. A file that cannot be parsed contributes none. | Source of truth for "what's schedulable" — multi-POU files (one .st declaring PROGRAM + FB + FUNCTION) are correctly enumerated, unlike `application.kind` which is a heuristic |
 
 ## Runtime debug control
 

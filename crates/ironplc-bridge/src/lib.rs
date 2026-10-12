@@ -1079,7 +1079,9 @@ pub struct VariableInfo {
 /// Dispatches on `language`:
 ///
 /// - `St`  — runs the ironplc parser and emits one `PouDecl` per
-///   top-level PROGRAM / FUNCTION_BLOCK / FUNCTION.
+///   top-level PROGRAM / FUNCTION_BLOCK / FUNCTION. Empty when the source
+///   does not parse, and also when the compiler panics on it (logged at
+///   ERROR; see `list_or_empty_on_compiler_panic`).
 /// - `Ld`  — parses the `.ld.json` source and emits a single `PouDecl`
 ///   built from the `LdProgram`'s name + pou_type. LD files are
 ///   single-declaration by design (see `crates/project/src/ld.rs`).
@@ -1153,28 +1155,62 @@ pub fn extract_pou_declarations(
 
 fn extract_st_declarations(source: &str) -> Vec<project::PouDecl> {
     use project::{PouDecl, PouLanguage, PouType};
-    let file_id = FileId::default();
-    let options = parser_options();
-    let Ok(library) = ironplc_parser::parse_program(source, &file_id, &options) else {
-        return vec![];
-    };
-    let mut out = Vec::new();
-    for element in &library.elements {
-        let (name, type_) = match element {
-            LibraryElementKind::ProgramDeclaration(p) => (p.name.to_string(), PouType::Program),
-            LibraryElementKind::FunctionBlockDeclaration(fb) => {
-                (fb.name.to_string(), PouType::FunctionBlock)
-            }
-            LibraryElementKind::FunctionDeclaration(f) => (f.name.to_string(), PouType::Function),
-            _ => continue,
+    list_or_empty_on_compiler_panic("POU declarations", || {
+        let file_id = FileId::default();
+        let options = parser_options();
+        let Ok(library) = ironplc_parser::parse_program(source, &file_id, &options) else {
+            return vec![];
         };
-        out.push(PouDecl {
-            name,
-            type_,
-            language: PouLanguage::St,
-        });
+        let mut out = Vec::new();
+        for element in &library.elements {
+            let (name, type_) = match element {
+                LibraryElementKind::ProgramDeclaration(p) => (p.name.to_string(), PouType::Program),
+                LibraryElementKind::FunctionBlockDeclaration(fb) => {
+                    (fb.name.to_string(), PouType::FunctionBlock)
+                }
+                LibraryElementKind::FunctionDeclaration(f) => {
+                    (f.name.to_string(), PouType::Function)
+                }
+                _ => continue,
+            };
+            out.push(PouDecl {
+                name,
+                type_,
+                language: PouLanguage::St,
+            });
+        }
+        out
+    })
+}
+
+/// Run one of the listing extractors (`extract_pou_declarations`,
+/// `extract_variables`, and through it `extract_symbols`) so that a
+/// compiler panic on the source yields an empty list instead of unwinding
+/// into the caller.
+///
+/// These feed the project tree, the POU reader and the variable pickers,
+/// and their contract is already "nothing to list when the source does
+/// not parse". The vendored compiler still has input-dependent panics; a
+/// source that hits one is, for a listing, one more source that could not
+/// be parsed, and the tree and the file have to stay readable so it can be
+/// opened and fixed. The panic is logged at ERROR.
+///
+/// Whether a source is VALID is not answered here: `check` and the compile
+/// paths do not go through this, and they still report the panic.
+fn list_or_empty_on_compiler_panic<T>(what: &'static str, list: impl FnOnce() -> Vec<T>) -> Vec<T> {
+    // The closure only reads the source and builds a fresh Vec, so an
+    // unwind leaves no half-updated state behind.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(list)) {
+        Ok(items) => items,
+        Err(payload) => {
+            let detail = runtime::panic_message(payload.as_ref());
+            tracing::error!(
+                %detail,
+                "the compiler panicked while listing {what}; treating the source as unparseable"
+            );
+            Vec::new()
+        }
     }
-    out
 }
 
 /// Language-agnostic symbol extraction. Same role as `extract_variables`
@@ -1184,7 +1220,7 @@ fn extract_st_declarations(source: &str) -> Vec<project::PouDecl> {
 ///
 /// Returns `[]` for unsupported languages and for malformed sources —
 /// callers shouldn't fall over when the user is mid-edit and the JSON
-/// is briefly invalid.
+/// is briefly invalid. An ST source the compiler panics on is `[]` too.
 pub fn extract_symbols(source: &str, language: project::PouLanguage) -> Vec<VariableInfo> {
     use project::PouLanguage;
     match language {
@@ -1251,34 +1287,38 @@ fn ld_section_str(s: project::LdVarSection) -> &'static str {
 
 /// Parse an ST source (no full compile required) and pull out the declared
 /// variables of any PROGRAM or FUNCTION_BLOCK at the top level. Returns an
-/// empty list if parsing fails — the frontend can fall back to free text.
+/// empty list if parsing fails — the frontend can fall back to free text —
+/// and also if the compiler panics on the source (logged at ERROR; see
+/// `list_or_empty_on_compiler_panic`).
 pub fn extract_variables(source: &str) -> Vec<VariableInfo> {
-    let file_id = FileId::default();
-    // `allow_empty_var_blocks` mirrors the ironplc CLI flag. POU templates
-    // we ship intentionally start with empty VAR / VAR_INPUT / VAR_OUTPUT
-    // blocks — those should compile, not error.
-    let options = parser_options();
-    let library = match ironplc_parser::parse_program(source, &file_id, &options) {
-        Ok(l) => l,
-        Err(_) => return vec![],
-    };
-
-    let mut out: Vec<VariableInfo> = Vec::new();
-    for element in &library.elements {
-        let vars = match element {
-            LibraryElementKind::ProgramDeclaration(p) => Some(&p.variables),
-            LibraryElementKind::FunctionBlockDeclaration(fb) => Some(&fb.variables),
-            _ => None,
+    list_or_empty_on_compiler_panic("variables", || {
+        let file_id = FileId::default();
+        // `allow_empty_var_blocks` mirrors the ironplc CLI flag. POU templates
+        // we ship intentionally start with empty VAR / VAR_INPUT / VAR_OUTPUT
+        // blocks — those should compile, not error.
+        let options = parser_options();
+        let library = match ironplc_parser::parse_program(source, &file_id, &options) {
+            Ok(l) => l,
+            Err(_) => return vec![],
         };
-        if let Some(vars) = vars {
-            for v in vars {
-                if let Some(info) = var_decl_to_info(v) {
-                    out.push(info);
+
+        let mut out: Vec<VariableInfo> = Vec::new();
+        for element in &library.elements {
+            let vars = match element {
+                LibraryElementKind::ProgramDeclaration(p) => Some(&p.variables),
+                LibraryElementKind::FunctionBlockDeclaration(fb) => Some(&fb.variables),
+                _ => None,
+            };
+            if let Some(vars) = vars {
+                for v in vars {
+                    if let Some(info) = var_decl_to_info(v) {
+                        out.push(info);
+                    }
                 }
             }
         }
-    }
-    out
+        out
+    })
 }
 
 fn var_decl_to_info(v: &VarDecl) -> Option<VariableInfo> {
@@ -1413,6 +1453,66 @@ fn lookup_locations(
         SourceMapKind::Ld(m) => (m.lookup(line).cloned(), None, None),
         SourceMapKind::Fbd(m) => (None, m.lookup(line).cloned(), None),
         SourceMapKind::Sfc(m) => (None, None, m.lookup(line).cloned()),
+    }
+}
+
+#[cfg(test)]
+mod listing_panic_tests {
+    use super::{
+        extract_pou_declarations, extract_symbols, extract_variables,
+        list_or_empty_on_compiler_panic,
+    };
+    use project::PouLanguage;
+
+    #[test]
+    fn list_or_empty_when_listing_returns_then_items_pass_through() {
+        let items = list_or_empty_on_compiler_panic("test items", || vec![1, 2, 3]);
+        assert_eq!(items, vec![1, 2, 3]);
+        let none = list_or_empty_on_compiler_panic("test items", Vec::<u8>::new);
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn list_or_empty_when_listing_panics_then_empty_list_not_unwind() {
+        let n = 2;
+        let items: Vec<u8> =
+            list_or_empty_on_compiler_panic("test items", || panic!("no group at index '{n}'"));
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn list_or_empty_when_panic_payload_is_not_text_then_empty_list() {
+        let items: Vec<u8> =
+            list_or_empty_on_compiler_panic("test items", || std::panic::panic_any(42_u32));
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn listings_when_source_is_ordinary_then_declarations_and_variables_are_listed() {
+        let source = "PROGRAM main\nVAR\n  level : INT;\nEND_VAR\nEND_PROGRAM\n";
+        let decls = extract_pou_declarations(source, PouLanguage::St);
+        assert_eq!(
+            decls.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            ["main"]
+        );
+        let names = |vars: Vec<super::VariableInfo>| -> Vec<String> {
+            vars.into_iter().map(|v| v.name).collect()
+        };
+        assert_eq!(names(extract_variables(source)), ["level"]);
+        assert_eq!(names(extract_symbols(source, PouLanguage::St)), ["level"]);
+    }
+
+    /// A direct address with no size letter makes the vendored compiler
+    /// (v0.248.0) panic inside its parser. The listings have to come back
+    /// anyway, or the project tree and the file itself cannot be read. If a
+    /// later vendor version parses this source, these calls return for the
+    /// ordinary reason and the test only pins that.
+    #[test]
+    fn listings_when_compiler_panics_on_the_source_then_they_still_return() {
+        let source = "PROGRAM main\nVAR\n  x AT %I1 : BOOL;\nEND_VAR\nEND_PROGRAM\n";
+        assert!(extract_pou_declarations(source, PouLanguage::St).len() <= 1);
+        assert!(extract_variables(source).len() <= 1);
+        assert!(extract_symbols(source, PouLanguage::St).len() <= 1);
     }
 }
 
