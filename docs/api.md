@@ -21,7 +21,11 @@ serves a smaller subset on its own port — see `docs/edge-deploy.md`.
   and malformed encoded values return HTTP 400 instead of falling back
   to the active project.
 - Errors are HTTP status + a human-readable body. 4xx for client errors,
-  5xx for server bugs.
+  5xx for server bugs. A panic inside a request handler is one of those
+  bugs: it is answered `500` with the panic text in the body and logged at
+  ERROR, not with a closed connection. The handler may have got part of the
+  way first, so after such a `500` on a write, re-read the resource before
+  retrying.
 - Generated TypeScript types live under `apps/web/src/types/generated/` and
   are the source of truth for request/response shapes.
 
