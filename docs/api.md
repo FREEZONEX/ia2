@@ -436,6 +436,12 @@ full online-debug set — bound to `127.0.0.1` only. The IDE proxies most of
 these through `/api/edges/{name}/…` (and `/api/edges/{name}/runtime/{op}` for
 the debug ops).
 
+As on the IDE server, a panic inside one of these handlers is answered `500`
+with the panic text as a plain-text body (and logged at ERROR), not with a
+closed connection; the handler may have got part of the way first, so after
+such a `500` on a write, re-read the resource before retrying. The standalone
+panel's static files (`/hmi`, `--static-dir`) are not behind that guard.
+
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/health` | Liveness: status, uptime, scan count, plus `fieldbus_healthy` (true only when every configured device's transport is live), a per-device `devices` health breakdown, and `watchdog_tripped` (the scan watchdog latched the outputs off — a probe that only checks `status: "ok"` would otherwise call a latched runtime healthy, since it keeps serving HTTP and keeps scanning). `fault` is the same message as `/status`'s: why the program stopped, `null` while it runs. `status` stays `"ok"` for a faulted runtime — it only says the process answers. |

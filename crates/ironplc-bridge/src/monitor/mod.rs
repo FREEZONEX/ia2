@@ -60,6 +60,29 @@ pub fn wall_now_us() -> u64 {
         .unwrap_or(0)
 }
 
+/// The text of a caught panic payload (`panic!("literal")` carries a `&str`;
+/// a formatted `panic!` or an `expect`/`unwrap` failure carries a `String`).
+pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    crate::runtime::panic_message(payload)
+}
+
+/// The body both HTTP servers (IDE server, edge runtime) answer with when a
+/// request handler panicked: the panic text, and what the caller can rely on.
+///
+/// Without an answer the connection just closes, which a client cannot tell
+/// from a network fault. The handler may have got part of the way before it
+/// panicked, so the text does not claim that nothing happened. Logs the panic
+/// at ERROR; one implementation, so the two surfaces cannot drift (the
+/// status stays each server's own `500`).
+pub fn handler_panic_body(payload: &(dyn std::any::Any + Send)) -> String {
+    let detail = panic_message(payload);
+    tracing::error!(%detail, "a request handler panicked; answering 500");
+    format!(
+        "internal error: the request handler panicked ({detail}). This is a server bug. \
+         The request did not finish; if it was a write, re-read the resource before retrying."
+    )
+}
+
 /// Snapshot of the currently-forced variables.
 pub fn force_entries(handle: &ProgramHandle) -> Vec<ForceEntry> {
     let mut entries: Vec<ForceEntry> = handle
@@ -222,6 +245,26 @@ mod tests {
             typed_value("STRING", 0, "'hello'"),
             serde_json::json!("'hello'")
         );
+    }
+
+    #[test]
+    fn handler_panic_body_carries_the_panic_text_and_the_retry_advice() {
+        let literal = std::panic::catch_unwind(|| panic!("no group at index")).unwrap_err();
+        let body = handler_panic_body(literal.as_ref());
+        assert!(body.contains("no group at index"), "{body}");
+        assert!(body.contains("handler panicked"), "{body}");
+        assert!(body.contains("re-read the resource"), "{body}");
+
+        let formatted = std::panic::catch_unwind(|| {
+            let n = 2;
+            panic!("no group at index '{n}'")
+        })
+        .unwrap_err();
+        assert!(handler_panic_body(formatted.as_ref()).contains("index '2'"));
+
+        // A payload that is not text still gets a body, not a second panic.
+        let other = std::panic::catch_unwind(|| std::panic::panic_any(42_u32)).unwrap_err();
+        assert!(handler_panic_body(other.as_ref()).contains("non-string panic payload"));
     }
 
     #[test]

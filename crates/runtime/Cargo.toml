@@ -40,3 +40,4 @@ project = { path = "../project" }
 [dev-dependencies]
 rumqttd = "0.20.0"
 tempfile = "3"
+tower.workspace = true

@@ -39,10 +39,10 @@ use tokio::signal;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt as _;
-use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
 
 mod northbound;
+mod panic_guard;
 
 const DEFAULT_BIND: &str = "127.0.0.1:13001";
 
@@ -498,31 +498,32 @@ async fn main() -> Result<()> {
     // through an SSH port-forward we (the dev) opened. The audience here
     // is "whatever dev tool is on the other end of the tunnel" — making
     // the IDE / curl / browser direct EventSource all work is the goal.
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/status", get(status))
-        .route("/events", get(events))
-        .route("/logs", get(logs))
-        .route("/logs/stream", get(logs_stream))
-        .route("/discover", get(discover))
-        .route("/system", get(system))
-        .route("/pause", post(rt_pause))
-        .route("/resume", post(rt_resume))
-        .route("/step", post(rt_step))
-        .route("/write", post(rt_write))
-        .route("/force", post(rt_force))
-        .route("/unforce", post(rt_unforce))
-        .route("/inject-scan-stall", post(rt_inject_scan_stall))
-        .route("/audit", get(rt_audit))
-        .route("/history", get(history))
-        .route("/alarms", get(alarms_state))
-        .route("/alarms/{id}/ack", post(alarms_ack))
-        .route("/alarms-journal", get(alarms_journal))
-        .route("/stop", post(stop_handler))
-        .route("/api/hmi", get(hmi_list))
-        .route("/api/hmi/{path}", get(hmi_get))
-        .layer(CorsLayer::permissive())
-        .with_state(state);
+    let app = panic_guard::with_api_layers(
+        Router::new()
+            .route("/health", get(health))
+            .route("/status", get(status))
+            .route("/events", get(events))
+            .route("/logs", get(logs))
+            .route("/logs/stream", get(logs_stream))
+            .route("/discover", get(discover))
+            .route("/system", get(system))
+            .route("/pause", post(rt_pause))
+            .route("/resume", post(rt_resume))
+            .route("/step", post(rt_step))
+            .route("/write", post(rt_write))
+            .route("/force", post(rt_force))
+            .route("/unforce", post(rt_unforce))
+            .route("/inject-scan-stall", post(rt_inject_scan_stall))
+            .route("/audit", get(rt_audit))
+            .route("/history", get(history))
+            .route("/alarms", get(alarms_state))
+            .route("/alarms/{id}/ack", post(alarms_ack))
+            .route("/alarms-journal", get(alarms_journal))
+            .route("/stop", post(stop_handler))
+            .route("/api/hmi", get(hmi_list))
+            .route("/api/hmi/{path}", get(hmi_get)),
+    )
+    .with_state(state);
 
     // ---- Standalone HMI panel (optional) ----
     // With `--static-dir` pointing at the built web assets, operator
