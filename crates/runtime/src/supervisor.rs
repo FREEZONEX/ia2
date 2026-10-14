@@ -58,8 +58,8 @@ impl From<&SupervisionConfig> for Policy {
 }
 
 impl Policy {
-    /// What is reported on `/health` and `/status`: the policy this process is
-    /// enforcing.
+    /// The policy this process is enforcing, without where it stands right now
+    /// (see [`SupervisionStatus::in_force`] for that).
     pub fn in_force(&self) -> monitor::SupervisionInForce {
         monitor::SupervisionInForce {
             on_loss: match self.on_loss {
@@ -68,6 +68,8 @@ impl Policy {
             }
             .to_string(),
             grace_secs: self.grace.as_secs(),
+            lost_for_ms: None,
+            latch_in_ms: None,
         }
     }
 
@@ -150,6 +152,21 @@ impl Supervisor {
         }
     }
 
+    /// Where the current episode stands after the last [`Supervisor::step`], for
+    /// whoever reads `/health`. `outputs_latched` is what was passed to that
+    /// step.
+    pub fn episode(&self, outputs_latched: bool) -> Episode {
+        let latch_at = self.lost_since.filter(|_| {
+            self.policy.on_loss == SupervisionAction::SafeState
+                && !self.latch_requested
+                && !outputs_latched
+        });
+        Episode {
+            lost_since: self.lost_since,
+            latch_at: latch_at.map(|since| since + self.policy.grace),
+        }
+    }
+
     /// One look. `lost` is [`assess`]'s answer; `outputs_latched` is whether the
     /// outputs are already latched off (by the scan watchdog, say), in which
     /// case there is nothing left to ask for.
@@ -208,6 +225,90 @@ impl Supervisor {
     }
 }
 
+/// Where an episode of lost alarm evaluation stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Episode {
+    /// When the supervisor first saw it lost; `None` while it is not.
+    pub lost_since: Option<Instant>,
+    /// When `safe_state` will latch the outputs off; `None` when nothing is
+    /// pending (not lost, mode `report`, already requested, already latched).
+    pub latch_at: Option<Instant>,
+}
+
+/// The supervisor looks this many times before a reader stops trusting what it
+/// last published.
+const STALE_AFTER_TICKS: u32 = 5;
+
+/// What `/health` and `/status` say about alarm supervision: the policy in
+/// force, and, while alarm evaluation is lost, how long and how long until the
+/// policy acts. Written by the supervisor loop, read by the HTTP handlers.
+pub struct SupervisionStatus {
+    policy: Policy,
+    seen: Mutex<Seen>,
+}
+
+#[derive(Clone, Copy)]
+struct Seen {
+    episode: Episode,
+    /// After this, the supervisor has not looked for long enough that what it
+    /// published says nothing about now.
+    good_until: Instant,
+}
+
+impl SupervisionStatus {
+    pub fn new(policy: Policy) -> Arc<Self> {
+        Arc::new(Self {
+            policy,
+            // Nothing seen yet: not lost, and not trusted past the first look.
+            seen: Mutex::new(Seen {
+                episode: Episode {
+                    lost_since: None,
+                    latch_at: None,
+                },
+                good_until: Instant::now(),
+            }),
+        })
+    }
+
+    pub fn policy(&self) -> &Policy {
+        &self.policy
+    }
+
+    fn publish(&self, now: Instant, tick: Duration, episode: Episode) {
+        *self.seen.lock() = Seen {
+            episode,
+            good_until: now + tick * STALE_AFTER_TICKS,
+        };
+    }
+
+    /// The wire answer now.
+    pub fn in_force(&self) -> monitor::SupervisionInForce {
+        self.in_force_at(Instant::now())
+    }
+
+    /// The wire answer at `now`. Durations are measured here, not at the last
+    /// look, so they are current between looks. A supervisor that has stopped
+    /// looking (its task is stuck, say on a scan loop that never answers) is
+    /// not believed: an old "latch in 12 s" would otherwise read "now" for ever
+    /// while nothing happens, so the pending state goes back to unknown (`null`).
+    pub fn in_force_at(&self, now: Instant) -> monitor::SupervisionInForce {
+        let mut report = self.policy.in_force();
+        let seen = *self.seen.lock();
+        if now <= seen.good_until {
+            let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+            report.lost_for_ms = seen
+                .episode
+                .lost_since
+                .map(|since| ms(now.saturating_duration_since(since)));
+            report.latch_in_ms = seen
+                .episode
+                .latch_at
+                .map(|at| ms(at.saturating_duration_since(now)));
+        }
+        report
+    }
+}
+
 /// How long the supervisor waits for the alarm engine's lock before it gives
 /// up on this tick's alarm update. The policy must never depend on it.
 const ALARM_LOCK_WAIT: Duration = Duration::from_millis(50);
@@ -241,9 +342,9 @@ pub async fn supervise(
     tap: Arc<TapStatus>,
     handle: ProgramHandle,
     alarms: Arc<Mutex<AlarmEngine>>,
-    policy: Policy,
+    status: Arc<SupervisionStatus>,
 ) {
-    supervise_every(TICK, tap, handle, alarms, policy).await
+    supervise_every(TICK, tap, handle, alarms, status).await
 }
 
 pub async fn supervise_every(
@@ -251,8 +352,9 @@ pub async fn supervise_every(
     tap: Arc<TapStatus>,
     handle: ProgramHandle,
     alarms: Arc<Mutex<AlarmEngine>>,
-    policy: Policy,
+    status: Arc<SupervisionStatus>,
 ) {
+    let policy = status.policy().clone();
     let mut supervisor = Supervisor::new(policy.clone());
     let mut lock_misses = 0u64;
     let mut interval = tokio::time::interval(tick);
@@ -261,7 +363,14 @@ pub async fn supervise_every(
         interval.tick().await;
         let lost = assess(&tap.health());
         note_alarm(&alarms, lost.as_deref(), &mut lock_misses);
-        for action in supervisor.step(Instant::now(), lost, handle.watchdog_tripped()) {
+        let now = Instant::now();
+        let latched = handle.watchdog_tripped();
+        let actions = supervisor.step(now, lost, latched);
+        // Published BEFORE the actions are carried out: asking the scan loop to
+        // latch waits for its answer, and what is published must not still say
+        // "latch in 0 s" while that wait goes on.
+        status.publish(now, tick, supervisor.episode(latched));
+        for action in actions {
             carry_out(action, &policy, &handle).await;
         }
     }
@@ -512,6 +621,134 @@ mod tests {
         }
         assert_eq!(lost_lines, 7, "episodes 1, 2, 4, 8, 16, 32, 64");
         assert_eq!(restored_lines, lost_lines, "every announced loss is closed");
+    }
+
+    fn episode_after(
+        s: &mut Supervisor,
+        t0: Instant,
+        sec: u64,
+        lost: Option<String>,
+        outputs_latched: bool,
+    ) -> Episode {
+        s.step(t0 + Duration::from_secs(sec), lost, outputs_latched);
+        s.episode(outputs_latched)
+    }
+
+    /// What a reader is told about an episode: since when, and under
+    /// `safe_state` until when, and nothing pending once the latch has been
+    /// asked for, was done by someone else, or is not this project's policy.
+    #[test]
+    fn the_episode_says_since_when_and_until_when_and_then_nothing_is_pending() {
+        let t0 = Instant::now();
+        let at = |sec: u64| t0 + Duration::from_secs(sec);
+
+        let mut s = Supervisor::new(policy(SupervisionAction::SafeState, 30));
+        let calm = episode_after(&mut s, t0, 0, None, false);
+        assert_eq!((calm.lost_since, calm.latch_at), (None, None));
+        let lost_now = episode_after(&mut s, t0, 5, lost(), false);
+        assert_eq!(lost_now.lost_since, Some(at(5)));
+        assert_eq!(lost_now.latch_at, Some(at(35)), "the grace counts from 5");
+        let later = episode_after(&mut s, t0, 20, lost(), false);
+        assert_eq!(later, lost_now, "a longer loss does not move either");
+        let asked = episode_after(&mut s, t0, 35, lost(), false);
+        assert_eq!(asked.lost_since, Some(at(5)));
+        assert_eq!(asked.latch_at, None, "asked for: nothing is pending");
+        let back = episode_after(&mut s, t0, 40, None, true);
+        assert_eq!((back.lost_since, back.latch_at), (None, None));
+
+        // A hiccup inside the grace starts the count over.
+        let mut s = Supervisor::new(policy(SupervisionAction::SafeState, 30));
+        episode_after(&mut s, t0, 0, lost(), false);
+        episode_after(&mut s, t0, 10, None, false);
+        let again = episode_after(&mut s, t0, 12, lost(), false);
+        assert_eq!(again.latch_at, Some(at(42)));
+
+        // `report` is lost but has nothing pending; so is an already-latched run.
+        let mut s = Supervisor::new(policy(SupervisionAction::Report, 30));
+        let report = episode_after(&mut s, t0, 3, lost(), false);
+        assert_eq!((report.lost_since, report.latch_at), (Some(at(3)), None));
+        let mut s = Supervisor::new(policy(SupervisionAction::SafeState, 30));
+        let latched = episode_after(&mut s, t0, 3, lost(), true);
+        assert_eq!((latched.lost_since, latched.latch_at), (Some(at(3)), None));
+    }
+
+    fn published(
+        status: &SupervisionStatus,
+        now: Instant,
+        tick: Duration,
+        lost_since: Option<Instant>,
+        latch_at: Option<Instant>,
+    ) {
+        status.publish(
+            now,
+            tick,
+            Episode {
+                lost_since,
+                latch_at,
+            },
+        );
+    }
+
+    /// The durations are worked out when asked, so they are current between the
+    /// supervisor's looks, and `0` is "due" rather than a negative number.
+    #[test]
+    fn the_durations_are_measured_when_asked_and_a_due_latch_reads_zero() {
+        let t0 = Instant::now();
+        let tick = Duration::from_secs(1);
+        let status = SupervisionStatus::new(policy(SupervisionAction::SafeState, 30));
+        published(
+            &status,
+            t0,
+            tick,
+            Some(t0),
+            Some(t0 + Duration::from_secs(30)),
+        );
+        let a = status.in_force_at(t0 + Duration::from_millis(2500));
+        assert_eq!(a.lost_for_ms, Some(2500));
+        assert_eq!(a.latch_in_ms, Some(27_500));
+        assert_eq!((a.on_loss.as_str(), a.grace_secs), ("safe_state", 30));
+
+        // Due, but the supervisor has not looked yet.
+        let due_tick = Duration::from_secs(60);
+        published(
+            &status,
+            t0,
+            due_tick,
+            Some(t0),
+            Some(t0 + Duration::from_secs(30)),
+        );
+        let due = status.in_force_at(t0 + Duration::from_secs(31));
+        assert_eq!(due.latch_in_ms, Some(0));
+        assert_eq!(due.lost_for_ms, Some(31_000));
+    }
+
+    /// A supervisor that has stopped looking cannot vouch for "latch in 12 s":
+    /// it would read "due" for ever while nothing happens. The policy is still
+    /// reported; what is pending is not.
+    #[test]
+    fn a_supervisor_that_has_stopped_looking_is_not_believed() {
+        let t0 = Instant::now();
+        let tick = Duration::from_secs(1);
+        let status = SupervisionStatus::new(policy(SupervisionAction::SafeState, 30));
+        published(
+            &status,
+            t0,
+            tick,
+            Some(t0),
+            Some(t0 + Duration::from_secs(30)),
+        );
+        let fresh = status.in_force_at(t0 + Duration::from_secs(4));
+        assert!(fresh.lost_for_ms.is_some() && fresh.latch_in_ms.is_some());
+        let stale = status.in_force_at(t0 + Duration::from_secs(6));
+        assert_eq!((stale.lost_for_ms, stale.latch_in_ms), (None, None));
+        assert_eq!(
+            (stale.on_loss.as_str(), stale.grace_secs),
+            ("safe_state", 30)
+        );
+        // And a supervisor that never looked has nothing to say either.
+        let never = SupervisionStatus::new(policy(SupervisionAction::SafeState, 30));
+        let r = never.in_force_at(Instant::now() + Duration::from_secs(1));
+        assert_eq!((r.lost_for_ms, r.latch_in_ms), (None, None));
     }
 
     #[test]

@@ -100,13 +100,15 @@ pub struct SnapshotTapHealth {
 }
 
 /// The alarm-supervision policy a running edge runtime is ACTUALLY enforcing,
-/// as served on its `/health` and `/status`.
+/// as served on its `/health` and `/status`, and where it stands right now.
 ///
-/// This is what the process read at startup, not what `alarms.toml` says now
-/// (edits apply on the next restart). It exists so a reader can tell whether a
-/// declared `[supervision]` is in force: a deploy that carries an older runtime
-/// binary forward ignores the table without a word, and the project then runs
-/// without the protection it declared.
+/// The policy is what the process read at startup, not what `alarms.toml` says
+/// now (edits apply on the next restart). It exists so a reader can tell
+/// whether a declared `[supervision]` is in force: a deploy that carries an
+/// older runtime binary forward ignores the table without a word, and the
+/// project then runs without the protection it declared. `lost_for_ms` and
+/// `latch_in_ms` are the one part that changes: how long alarm evaluation has
+/// been lost, and how long until the policy acts on it.
 ///
 /// Deliberately lenient where `project::SupervisionConfig` is strict: that one
 /// refuses unknown keys and unknown modes so a typo in a protective setting
@@ -121,6 +123,25 @@ pub struct SupervisionInForce {
     /// Seconds alarm evaluation may stay lost before `on_loss` is carried out.
     #[ts(type = "number")]
     pub grace_secs: u64,
+    /// Milliseconds alarm evaluation has been lost in the current episode;
+    /// `null` while it is not. Measured when the answer is built, from when the
+    /// supervisor first saw it lost, so it is current between the supervisor's
+    /// looks. `null` as well when the supervisor has not looked recently (its
+    /// own task stuck): unknown is not "not lost". Absent from a build that
+    /// predates the field.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub lost_for_ms: Option<u64>,
+    /// Milliseconds until `safe_state` latches the outputs off, `0` once it is
+    /// due; `null` when nothing is pending: alarm evaluation is not lost, the
+    /// mode is `report`, or the outputs are already latched (`latch_reason`
+    /// then says why). The supervisor looks once a second and the request waits
+    /// on the scan loop, so "due" means the outputs are being latched, not that
+    /// they already are: `watchdog_tripped` says when they are. Absent from a
+    /// build that predates the field.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub latch_in_ms: Option<u64>,
 }
 
 /// Wall-clock microseconds since the UNIX epoch — the human-facing

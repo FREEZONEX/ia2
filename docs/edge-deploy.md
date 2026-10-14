@@ -400,6 +400,12 @@ grace_secs = 30         # 1..=3600; ignored for "report"
   what the process read at startup, so a later edit of `alarms.toml` shows up
   only after a restart. A runtime built before `[supervision]` ignores the table
   and omits the key.
+- **While it is lost, the same object says how long and how long is left**
+  (`lost_for_ms`, and under `safe_state` `latch_in_ms` until the outputs are
+  latched off). `cs probe` prints both on the policy line; they are `null` when
+  nothing is lost, under `report`, after the latch (the `latch_reason` is the
+  answer then), and when the supervisor has not looked for several seconds, so an
+  old countdown is never shown as a live one.
 - **It is also a standing alarm.** While alarm evaluation is lost, `GET /alarms`
   lists `__supervision/snapshot_tap` (Critical) beside the process alarms,
   `alarms_standing` counts it, the journal records it, and after it returns it

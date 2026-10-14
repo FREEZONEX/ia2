@@ -195,15 +195,36 @@ fn supervision_line(policy: Option<&serde_json::Value>) -> String {
     let grace = policy
         .and_then(|p| p.get("grace_secs"))
         .and_then(|v| v.as_u64());
+    // Where it stands now, from the same object: how long it has been lost and,
+    // under safe_state, how long is left. `null` is not lost / nothing pending.
+    let lost_for = policy
+        .and_then(|p| p.get("lost_for_ms"))
+        .and_then(|v| v.as_u64());
+    let latch_in = policy
+        .and_then(|p| p.get("latch_in_ms"))
+        .and_then(|v| v.as_u64());
+    let standing = match (lost_for, latch_in) {
+        (Some(lost), Some(0)) => format!(
+            "; lost for {} s, and the outputs are due to be latched off now",
+            lost / 1000
+        ),
+        (Some(lost), Some(left)) => format!(
+            "; lost for {} s, the outputs are latched off in {} s unless it comes back",
+            lost / 1000,
+            left / 1000
+        ),
+        (Some(lost), None) => format!("; lost for {} s", lost / 1000),
+        (None, _) => String::new(),
+    };
     match (mode, grace) {
         (Some("safe_state"), Some(grace)) => format!(
             "  policy: on_loss = safe_state — the outputs are latched off if alarm \
-             evaluation stays lost for {grace} s"
+             evaluation stays lost for {grace} s{standing}"
         ),
         (Some("report"), _) => {
-            "  policy: on_loss = report — nothing is stopped automatically".to_string()
+            format!("  policy: on_loss = report — nothing is stopped automatically{standing}")
         }
-        (Some(other), _) => format!("  policy: on_loss = {other}"),
+        (Some(other), _) => format!("  policy: on_loss = {other}{standing}"),
         (None, _) => "  policy: not reported — this runtime predates `[supervision]`, so a \
                       declared safe_state is NOT in force on this edge"
             .to_string(),
@@ -324,6 +345,32 @@ mod tests {
                 .unwrap()
                 .contains("nothing is stopped automatically"),
             "{report:?}"
+        );
+        // And how long it has been lost and what is still ahead, when it says.
+        let counting = with(json!({
+            "on_loss": "safe_state", "grace_secs": 45,
+            "lost_for_ms": 12_400, "latch_in_ms": 32_600
+        }));
+        assert!(
+            counting.last().unwrap().contains("lost for 12 s")
+                && counting.last().unwrap().contains("latched off in 32 s"),
+            "{counting:?}"
+        );
+        let due = with(json!({
+            "on_loss": "safe_state", "grace_secs": 45,
+            "lost_for_ms": 45_100, "latch_in_ms": 0
+        }));
+        assert!(
+            due.last().unwrap().contains("due to be latched off now"),
+            "{due:?}"
+        );
+        let reporting = with(json!({
+            "on_loss": "report", "grace_secs": 30, "lost_for_ms": 90_000, "latch_in_ms": null
+        }));
+        assert!(
+            reporting.last().unwrap().contains("lost for 90 s")
+                && !reporting.last().unwrap().contains("latched off in"),
+            "{reporting:?}"
         );
         let older = reachable_report("pi", &probe(stopped(json!({}))));
         assert!(older.last().unwrap().contains("NOT in force"), "{older:?}");

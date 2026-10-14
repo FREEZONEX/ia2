@@ -1942,8 +1942,35 @@ mod tests {
             (policy.on_loss.as_str(), policy.grace_secs),
             ("safe_state", 45)
         );
+        assert_eq!(
+            (policy.lost_for_ms, policy.latch_in_ms),
+            (None, None),
+            "a runtime that predates the countdown fields reports none"
+        );
         let older = probe_from_health_body(r#"{"status":"ok","uptime_secs":9,"scan_count":4}"#);
         assert_eq!(older.supervision, None, "unknown, not report");
+    }
+
+    /// While alarm evaluation is lost the edge says for how long and how long is
+    /// left before `safe_state` acts; the probe carries both through, so `cs
+    /// probe` and the IDE can show them.
+    #[test]
+    fn probe_carries_how_long_alarms_have_been_lost_and_when_the_policy_acts() {
+        let probe = probe_from_health_body(
+            r#"{"status":"ok","uptime_secs":9,"scan_count":4,
+                "supervision":{"on_loss":"safe_state","grace_secs":45,
+                               "lost_for_ms":12400,"latch_in_ms":32600}}"#,
+        );
+        let policy = probe.supervision.expect("carried through");
+        assert_eq!(policy.lost_for_ms, Some(12_400));
+        assert_eq!(policy.latch_in_ms, Some(32_600));
+        let calm = probe_from_health_body(
+            r#"{"status":"ok","uptime_secs":9,"scan_count":4,
+                "supervision":{"on_loss":"report","grace_secs":30,
+                               "lost_for_ms":null,"latch_in_ms":null}}"#,
+        );
+        let policy = calm.supervision.expect("carried through");
+        assert_eq!((policy.lost_for_ms, policy.latch_in_ms), (None, None));
     }
 
     /// A newer runtime may report a mode this server has never heard of. The
