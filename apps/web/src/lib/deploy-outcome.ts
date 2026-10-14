@@ -4,6 +4,7 @@ import type { DeployReport } from "@/types/generated/DeployReport"
 export type DeployOutcome =
   | { kind: "live"; version: string; detail: string }
   | { kind: "not_running"; version: string; detail: string }
+  | { kind: "unmonitored"; version: string; detail: string }
   | { kind: "unconfirmed"; version: string; detail: string }
   | { kind: "failed" }
 
@@ -15,6 +16,11 @@ export function deployOutcome(report: DeployReport): DeployOutcome {
     }
     if (health.state === "faulted" || health.state === "not_running") {
       return { kind: "not_running", version: report.version, detail: health.detail }
+    }
+    // The program may be scanning, but the runtime's history and alarm task is
+    // gone: nothing is recorded and no alarm can be raised.
+    if (health.state === "unmonitored") {
+      return { kind: "unmonitored", version: report.version, detail: health.detail }
     }
     return { kind: "unconfirmed", version: report.version, detail: health.detail }
   }

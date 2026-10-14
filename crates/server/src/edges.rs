@@ -522,6 +522,13 @@ pub enum DeployHealthState {
     Faulted,
     /// The runtime explicitly reports paused or single-step mode.
     NotRunning,
+    /// The runtime answers, but the task that feeds its history, its process
+    /// alarms and the scan counter this check reads has stopped, or is
+    /// failing right now. Nothing is recorded and no alarm is evaluated, and
+    /// because `scan_count` freezes with it, the program's progress cannot be
+    /// confirmed either. Fails the deploy: a runtime that cannot raise an
+    /// alarm is not one to leave running unattended.
+    Unmonitored,
     /// The check could not confirm progress within its deadline. This is
     /// not evidence that the program or the physical equipment stopped.
     Unknown,
@@ -817,6 +824,11 @@ struct StatusReading {
     fault: Option<String>,
     watchdog_tripped: bool,
     unhealthy_devices: Vec<String>,
+    /// `snapshot_tap` from the runtime's `/status`; `None` for a build that
+    /// predates it (unknown, never a failure).
+    tap_running: Option<bool>,
+    tap_faults: Option<u64>,
+    tap_last_fault: Option<String>,
 }
 
 fn status_reading(v: &serde_json::Value) -> StatusReading {
@@ -844,6 +856,12 @@ fn status_reading(v: &serde_json::Value) -> StatusReading {
             .filter(|d| d.get("healthy").and_then(|h| h.as_bool()) == Some(false))
             .filter_map(|d| d.get("name").and_then(|n| n.as_str()).map(String::from))
             .collect(),
+        tap_running: v.pointer("/snapshot_tap/running").and_then(|r| r.as_bool()),
+        tap_faults: v.pointer("/snapshot_tap/faults").and_then(|n| n.as_u64()),
+        tap_last_fault: v
+            .pointer("/snapshot_tap/last_fault")
+            .and_then(|t| t.as_str())
+            .map(String::from),
     }
 }
 
@@ -883,6 +901,9 @@ where
     };
     let deadline = tokio::time::Instant::now() + window;
     let mut previous: Option<StatusReading> = None;
+    // The tap's fault count at the previous read, kept across every mode: a
+    // count that rises between two reads means it is failing now.
+    let mut tap_faults_before: Option<u64> = None;
     let mut detail = "no status observation".to_string();
     loop {
         if tokio::time::Instant::now() >= deadline {
@@ -905,6 +926,49 @@ where
                         r.unhealthy_devices,
                     );
                 }
+                // Before the mode and progress checks: a stopped tap freezes
+                // the very `scan_count` they read, and the specific cause
+                // beats a generic "progress not confirmed".
+                let latest = r
+                    .tap_last_fault
+                    .as_deref()
+                    .map(|t| format!(" (latest: {t})"))
+                    .unwrap_or_default();
+                if r.tap_running == Some(false) {
+                    return verdict(
+                        DeployHealthState::Unmonitored,
+                        format!(
+                            "the runtime's snapshot task has stopped: no history is recorded \
+                             and no alarm is evaluated, and the scan count this check reads is \
+                             frozen with it, so the program's progress cannot be confirmed{latest}"
+                        ),
+                        r.unhealthy_devices,
+                    );
+                }
+                if let (Some(before), Some(now)) = (tap_faults_before, r.tap_faults) {
+                    if now > before {
+                        return verdict(
+                            DeployHealthState::Unmonitored,
+                            format!(
+                                "the runtime's snapshot task is failing ({before} -> {now} faults \
+                                 between two reads): history and alarm evaluation are missing \
+                                 snapshots{latest}"
+                            ),
+                            r.unhealthy_devices,
+                        );
+                    }
+                }
+                if r.tap_faults.is_some() {
+                    tap_faults_before = r.tap_faults;
+                }
+                // A fault that has not recurred does not fail the deploy, but
+                // the verdict must not read as if there had been none.
+                let tap_note = match r.tap_faults {
+                    Some(n) if n > 0 => format!(
+                        "; the snapshot task recorded {n} fault(s) since the runtime started{latest}"
+                    ),
+                    _ => String::new(),
+                };
                 match r.mode.as_deref() {
                     Some("paused" | "step") => {
                         return verdict(
@@ -918,7 +982,10 @@ where
                         if previous.as_ref().is_some_and(|p| r.advances_from(p)) {
                             return verdict(
                                 DeployHealthState::Running,
-                                format!("the program is running ({} scans)", r.scan_count.unwrap()),
+                                format!(
+                                    "the program is running ({} scans){tap_note}",
+                                    r.scan_count.unwrap()
+                                ),
                                 r.unhealthy_devices,
                             );
                         }
@@ -1978,6 +2045,127 @@ mod tests {
         assert_eq!(health.state, DeployHealthState::Running, "{health:?}");
         assert_eq!(health.unhealthy_devices, vec!["coupler".to_string()]);
     }
+    /// A running-mode `/status` read with the runtime's `snapshot_tap`.
+    fn with_tap(
+        scan_count: u64,
+        running: bool,
+        faults: u64,
+        last_fault: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        let mut v = status(scan_count, None).unwrap();
+        v["snapshot_tap"] =
+            serde_json::json!({"running": running, "faults": faults, "last_fault": last_fault});
+        Ok(v)
+    }
+
+    /// The task that feeds history and process alarms has ended. The program
+    /// may well be scanning, but nothing is recorded, no alarm can be raised,
+    /// and `scan_count` froze with the tap, so the old check could only say
+    /// "unknown" without saying why. A runtime that cannot raise an alarm
+    /// fails the deploy, and says so.
+    #[tokio::test]
+    async fn a_stopped_snapshot_task_fails_the_deploy_as_unmonitored() {
+        let health = watch(vec![with_tap(
+            12,
+            false,
+            2,
+            Some("the alarms stage panicked on scan 12: boom"),
+        )])
+        .await;
+        assert_eq!(health.state, DeployHealthState::Unmonitored, "{health:?}");
+        assert!(!health.state.deploy_ok(), "{health:?}");
+        assert!(
+            health.detail.contains("no alarm is evaluated"),
+            "{health:?}"
+        );
+        assert!(
+            health.detail.contains("alarms stage panicked"),
+            "{health:?}"
+        );
+    }
+
+    /// Frozen counters alone stay "unknown"; the tap field is what names
+    /// the cause, and it wins over the generic verdict.
+    #[tokio::test]
+    async fn a_stopped_snapshot_task_is_named_even_when_the_scan_count_is_frozen() {
+        let health = watch(vec![
+            with_tap(7, false, 0, None),
+            with_tap(7, false, 0, None),
+        ])
+        .await;
+        assert_eq!(health.state, DeployHealthState::Unmonitored, "{health:?}");
+        assert!(!health.detail.contains("not confirmed by"), "{health:?}");
+    }
+
+    /// A tap that is still running but fails on every snapshot is the same
+    /// loss of alarms. It shows as a fault count that rises between reads.
+    #[tokio::test]
+    async fn a_snapshot_task_whose_fault_count_is_rising_fails_the_deploy() {
+        let health = watch(vec![
+            with_tap(
+                2,
+                true,
+                3,
+                Some("the alarms stage panicked on scan 2: boom"),
+            ),
+            with_tap(
+                6,
+                true,
+                9,
+                Some("the alarms stage panicked on scan 6: boom"),
+            ),
+        ])
+        .await;
+        assert_eq!(health.state, DeployHealthState::Unmonitored, "{health:?}");
+        assert!(health.detail.contains("3 -> 9 faults"), "{health:?}");
+        assert!(health.detail.contains("scan 6"), "{health:?}");
+    }
+
+    /// A fault that happened once and has not recurred does not fail the
+    /// deploy, but the verdict says it happened.
+    #[tokio::test]
+    async fn a_steady_fault_count_passes_with_the_fault_in_the_verdict() {
+        let health = watch(vec![
+            with_tap(
+                2,
+                true,
+                1,
+                Some("fell behind the scan loop: 4 snapshots were skipped"),
+            ),
+            with_tap(
+                6,
+                true,
+                1,
+                Some("fell behind the scan loop: 4 snapshots were skipped"),
+            ),
+            with_tap(
+                9,
+                true,
+                1,
+                Some("fell behind the scan loop: 4 snapshots were skipped"),
+            ),
+        ])
+        .await;
+        assert_eq!(health.state, DeployHealthState::Running, "{health:?}");
+        assert!(health.detail.contains("recorded 1 fault"), "{health:?}");
+        assert!(
+            health.detail.contains("4 snapshots were skipped"),
+            "{health:?}"
+        );
+    }
+
+    /// A healthy tap, and a runtime build that predates the field, change
+    /// nothing about the verdict.
+    #[tokio::test]
+    async fn a_healthy_or_missing_snapshot_tap_does_not_change_the_verdict() {
+        let healthy = watch(vec![with_tap(1, true, 0, None), with_tap(5, true, 0, None)]).await;
+        assert_eq!(healthy.state, DeployHealthState::Running, "{healthy:?}");
+        assert!(!healthy.detail.contains("fault"), "{healthy:?}");
+
+        let older = watch(vec![status(1, None), status(5, None)]).await;
+        assert_eq!(older.state, DeployHealthState::Running, "{older:?}");
+    }
+
     fn reading(n: u64, uptime: u64, id: &str, mode: &str) -> Result<serde_json::Value, String> {
         let mut v = status(n, None).unwrap();
         v["uptime_secs"] = uptime.into();

@@ -247,8 +247,11 @@ A changed `runtime_id` or reset counter/uptime restarts that observation; older
 runtimes without an identity use the weaker counter/uptime evidence. Equal
 counts are waited for (long-cycle tasks). The entire check, including SSH
 reads and sleeps, is bounded to 30 s. `health.state` is `faulted` for a fault
-or watchdog, `not_running` for paused/step, or `unknown` when progress cannot
-be confirmed by the deadline; all are `ok:false` (exit 1). **Unknown does not
+or watchdog, `not_running` for paused/step, `unmonitored` when the runtime's
+snapshot task (history, process alarms, the scan counter) has stopped or its
+`snapshot_tap.faults` is rising — the program may scan but no alarm can be
+raised, and the deploy says so instead of "program not running" — or `unknown`
+when progress cannot be confirmed by the deadline; all are `ok:false` (exit 1). **Unknown does not
 prove stopped or safe.** A task longer than the window can remain unknown.
 The new version stays current; inspect runtime and plant state before manual
 rollback/restart. There is no automatic restart of the old program. The log's
