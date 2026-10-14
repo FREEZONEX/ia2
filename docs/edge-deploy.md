@@ -381,6 +381,15 @@ grace_secs = 30         # 1..=3600; ignored for "report"
   outside 1..=3600: a misspelt protective setting must not deploy and protect
   nothing. (An unreadable `alarms.toml` used to deploy, with the runtime
   logging a warning and running without alarms.)
+- **The runtime refuses to start on one too.** It reads the project through the
+  same loader as the deploy preflight, so an `alarms.toml` it cannot read makes
+  `ia2-runtime` exit at startup with the reason, instead of running without
+  alarms as it used to. The case that can surface this is an edge whose project
+  was deployed by an older server and whose runtime is then upgraded. The
+  service retries a few times (`Restart=on-failure`, `StartLimitBurst=5` in 60 s)
+  and then stays `failed`, with the reason in the journal; the program does not
+  run, and what the outputs do meanwhile is the I/O side's own failsafe, as for
+  any stopped runtime. Fix the file and redeploy.
 - **Logging is not proportional to time.** Losing alarm evaluation is logged
   at ERROR the moment it is seen, with the policy in the line; reminders then
   back off (1, 2, 4, 8 ... minutes into the episode, at most hourly), and

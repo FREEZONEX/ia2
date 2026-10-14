@@ -155,7 +155,7 @@ Leave it at `report` unless you know the plant: an unplanned stop can be the
 more dangerous direction. `safe_state` latches like a scan-watchdog trip and only
 a person restarting the program re-arms it. A body for `cs set alarms` that
 omits `supervision` KEEPS the declared one; say `report` explicitly to drop it.
-A misspelt key or bad value fails the deploy. See `docs/edge-deploy.md`.
+A misspelt key or bad value fails the deploy, and an `alarms.toml` the runtime cannot read also stops `ia2-runtime` from starting (it no longer runs without alarms). See `docs/edge-deploy.md`.
 
 Definitions are project config (`alarms.toml`), authored like any other
 doc — and YOU should author them alongside the control logic; a program
