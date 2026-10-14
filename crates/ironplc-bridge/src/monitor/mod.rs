@@ -77,6 +77,26 @@ pub struct SnapshotTapHealth {
     pub faults: u64,
     /// The latest incident in words, `null` when there has been none.
     pub last_fault: Option<String>,
+    /// Milliseconds the tap has been inside ONE snapshot, once that has gone
+    /// on for longer than a healthy stage ever takes (2 s; the scan loop
+    /// emits a snapshot every 100 ms); `null` while it keeps up. A stage that
+    /// blocks, say a stalled disk under the historian, neither panics nor
+    /// lags yet (`running` stays true, `faults` stays 0) but history, alarms,
+    /// `scan_count` and `/events` stop moving with it. Measured from inside
+    /// the tap, so it does not mistake a program that has stopped, and so
+    /// emits no snapshots, for a stuck tap. Absent from a build that predates
+    /// the field.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub stalled_for_ms: Option<u64>,
+    /// How long ago the latest incident in `last_fault` happened, in
+    /// milliseconds; `null` when there has been none. `faults` only grows, so
+    /// on its own it cannot say whether the task is failing NOW; this can, to
+    /// any reader that polls once, without remembering the previous read.
+    /// Absent from a build that predates the field.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub last_fault_age_ms: Option<u64>,
 }
 
 /// Wall-clock microseconds since the UNIX epoch — the human-facing

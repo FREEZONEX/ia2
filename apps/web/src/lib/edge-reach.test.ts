@@ -47,7 +47,13 @@ describe("edgeReach", () => {
   it("calls an edge whose snapshot task ended degraded, with the last fault", () => {
     const reach = edgeReach(
       probe({
-        snapshot_tap: { running: false, faults: 1, last_fault: "the alarms stage panicked on scan 4" },
+        snapshot_tap: {
+          running: false,
+          faults: 1,
+          last_fault: "the alarms stage panicked on scan 4",
+          stalled_for_ms: null,
+          last_fault_age_ms: null,
+        },
       }),
     )
     expect(reach.kind).toBe("degraded")
@@ -55,9 +61,34 @@ describe("edgeReach", () => {
     expect(reach.detail).toContain("the alarms stage panicked on scan 4")
   })
 
+  // A blocked stage neither panics nor lags: running stays true, faults 0.
+  it("calls an edge whose snapshot task is stuck degraded", () => {
+    const reach = edgeReach(
+      probe({
+        snapshot_tap: {
+          running: true,
+          faults: 0,
+          last_fault: null,
+          stalled_for_ms: 4200,
+          last_fault_age_ms: null,
+        },
+      }),
+    )
+    expect(reach.kind).toBe("degraded")
+    expect(reach.detail).toContain("stuck on one snapshot for 4.2 s")
+  })
+
   it("does not call an edge degraded for a tap that is running, or unknown", () => {
     expect(
-      edgeReach(probe({ snapshot_tap: { running: true, faults: 3, last_fault: "x" } })).kind,
+      edgeReach(probe({
+        snapshot_tap: {
+          running: true,
+          faults: 3,
+          last_fault: "x",
+          stalled_for_ms: null,
+          last_fault_age_ms: 90000,
+        },
+      })).kind,
     ).toBe("running")
     expect(edgeReach(probe({ snapshot_tap: null })).kind).toBe("running")
   })

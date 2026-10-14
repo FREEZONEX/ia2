@@ -376,7 +376,14 @@ could honestly narrow that. The runtime scopes it instead: it knows the Output
 mapping, applies the write, and returns `undelivered_device` when that
 variable's own device cannot carry the value out. The canvas reports that
 caveat — applied, not delivered — and never retries. The standalone panel maps `watchdog_tripped` to an output-lock
-fault just as the IDE does, even when scan counts continue advancing. After the
+fault just as the IDE does, even when scan counts continue advancing. When the edge's
+`snapshot_tap` says its snapshot task has stopped, is stuck, or faulted within the
+last 10 s, the header shows an `ALARMS OFF` chip and the alarm bar reads
+"ALARMS NOT EVALUATED" in the alert tone, ranked below comms loss and a program
+fault and above a down device: the alarm list, history and live feed all come
+from that task, so a quiet list then means nothing is looking, not that nothing is
+wrong. It is a banner, not a gate: writes, Stop included, are not refused for it
+(a feed that has really stopped is refused by the snapshot-freshness check). After the
 status await the canvas rechecks connection generation, snapshot freshness,
 Operate mode, screen/document identity, current `bind.enable` and variable type.
 An unresolved or false enable binding refuses the write. A failed check displays

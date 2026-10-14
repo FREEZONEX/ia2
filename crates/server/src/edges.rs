@@ -829,6 +829,8 @@ struct StatusReading {
     tap_running: Option<bool>,
     tap_faults: Option<u64>,
     tap_last_fault: Option<String>,
+    /// `snapshot_tap.stalled_for_ms`: the tap is stuck inside one snapshot.
+    tap_stalled_ms: Option<u64>,
 }
 
 fn status_reading(v: &serde_json::Value) -> StatusReading {
@@ -858,6 +860,9 @@ fn status_reading(v: &serde_json::Value) -> StatusReading {
             .collect(),
         tap_running: v.pointer("/snapshot_tap/running").and_then(|r| r.as_bool()),
         tap_faults: v.pointer("/snapshot_tap/faults").and_then(|n| n.as_u64()),
+        tap_stalled_ms: v
+            .pointer("/snapshot_tap/stalled_for_ms")
+            .and_then(|n| n.as_u64()),
         tap_last_fault: v
             .pointer("/snapshot_tap/last_fault")
             .and_then(|t| t.as_str())
@@ -941,6 +946,17 @@ where
                             "the runtime's snapshot task has stopped: no history is recorded \
                              and no alarm is evaluated, and the scan count this check reads is \
                              frozen with it, so the program's progress cannot be confirmed{latest}"
+                        ),
+                        r.unhealthy_devices,
+                    );
+                }
+                if let Some(ms) = r.tap_stalled_ms {
+                    return verdict(
+                        DeployHealthState::Unmonitored,
+                        format!(
+                            "the runtime's snapshot task is stuck on one snapshot ({ms} ms): \
+                             history, process alarms, the scan count and the live feed are not \
+                             updating, so the program's progress cannot be confirmed{latest}"
                         ),
                         r.unhealthy_devices,
                     );
@@ -2045,6 +2061,23 @@ mod tests {
         assert_eq!(health.state, DeployHealthState::Running, "{health:?}");
         assert_eq!(health.unhealthy_devices, vec!["coupler".to_string()]);
     }
+    /// A stage that blocks neither panics nor lags: `running` stays true and
+    /// `faults` stays 0. The runtime reports it as `stalled_for_ms`, and the
+    /// check must treat it like a stopped task, since history, alarms and the
+    /// scan count have stopped moving all the same.
+    #[tokio::test]
+    async fn a_snapshot_task_stuck_on_one_snapshot_fails_the_deploy() {
+        let mut stuck = with_tap(12, true, 0, None).unwrap();
+        stuck["snapshot_tap"]["stalled_for_ms"] = serde_json::json!(4200);
+        let health = watch(vec![Ok(stuck)]).await;
+        assert_eq!(health.state, DeployHealthState::Unmonitored, "{health:?}");
+        assert!(
+            health.detail.contains("stuck on one snapshot (4200 ms)"),
+            "{health:?}"
+        );
+        assert!(!health.state.deploy_ok());
+    }
+
     /// A running-mode `/status` read with the runtime's `snapshot_tap`.
     fn with_tap(
         scan_count: u64,

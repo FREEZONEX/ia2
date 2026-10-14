@@ -29,6 +29,11 @@ export type HmiRuntimeState = {
   /** Devices whose transport is down (their input variables are frozen
    *  at last-known values). Empty/absent = fieldbus healthy. */
   unhealthyDevices?: string[]
+  /** Why the runtime is NOT evaluating alarms right now (its snapshot task
+   *  stopped, is stuck, or faulted a moment ago); null/absent when it is.
+   *  History, the alarm list and the live feed all come from that task, so
+   *  a quiet alarm list then means "nothing is looking", not "all clear". */
+  alarmsBlind?: string | null
   /** The runtime's fastest task interval in ms — the cadence at which
    *  `scan_count` can advance. Feeds the live store's freshness budget, so
    *  a slow-cycle project is judged against its own rate instead of a fixed

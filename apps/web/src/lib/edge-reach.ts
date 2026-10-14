@@ -44,6 +44,12 @@ export function edgeReach(probe: EdgeProbe): EdgeReach {
   // here; whether `faults` is still climbing needs two probes, and `cs probe`
   // prints it.
   const tap = probe.snapshot_tap
+  if (tap && tap.stalled_for_ms != null) {
+    return {
+      kind: "degraded",
+      detail: `The program is running, but the runtime's snapshot task has been stuck on one snapshot for ${(tap.stalled_for_ms / 1000).toFixed(1)} s (a blocked write, usually): history is not recording, process alarms are not being evaluated and the scan count is frozen`,
+    }
+  }
   if (tap && !tap.running) {
     return {
       kind: "degraded",
