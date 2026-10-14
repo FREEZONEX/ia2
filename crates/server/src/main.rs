@@ -8,6 +8,8 @@ mod error;
 mod events;
 mod hmi_routes;
 mod library;
+#[cfg(test)]
+mod listing_tests;
 mod routes;
 mod runtime_routes;
 mod state;
@@ -26,7 +28,9 @@ use axum::{
 use clap::Parser;
 use iomap_modbus::{run_demo_slave, DemoSlave};
 use project::{load_last_opened, migrate_legacy_dirs, ProjectStore};
-use tower_http::{cors::CorsLayer, services::ServeDir, trace::TraceLayer};
+use tower_http::{
+    catch_panic::CatchPanicLayer, cors::CorsLayer, services::ServeDir, trace::TraceLayer,
+};
 use tracing_subscriber::EnvFilter;
 
 use crate::state::AppState;
@@ -429,7 +433,10 @@ async fn main() -> anyhow::Result<()> {
     // same Arc<Mutex<...>> with the request handlers is correct.
     let state_for_watchdog = state.clone();
 
+    // Innermost, so the 500 it produces still gets the CORS headers and
+    // shows up in the request trace like any other answer.
     let app = app
+        .layer(CatchPanicLayer::custom(error::handler_panic_response))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);

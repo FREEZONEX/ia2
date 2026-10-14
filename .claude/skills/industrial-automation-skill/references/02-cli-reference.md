@@ -109,7 +109,7 @@ cs check hmi/overview                # server-side screen check (structure + var
 cs check P0002                       # a problem code prints its full explanation
 cs check bad.st --explain            # human mode + explanations (JSON always carries them)
 cs transpile motor.ld.json [--with-map]   # the ST a graphical POU compiles to
-cs symbols motor.fbd.json [--name pid]    # declared variables / FB instances
+cs symbols motor.fbd.json [--name pid]    # declared variables / FB instances (nothing if the file can't be parsed — `cs check` says why)
 cs project check [dir]               # strongest offline gate: full project compile
 cs project info  [dir]               # offline orientation (POUs/devices/edges)
 ```

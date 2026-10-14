@@ -2092,7 +2092,7 @@ fn join_error_diagnostic(e: tokio::task::JoinError) -> CheckDiagnostic {
 
 /// The message of a caught panic (`panic!("literal")` carries a `&str`,
 /// a formatted `panic!` or an `expect`/`unwrap` failure carries a `String`).
-fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+pub(crate) fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     match payload.downcast::<String>() {
         Ok(message) => *message,
         Err(payload) => match payload.downcast::<&'static str>() {

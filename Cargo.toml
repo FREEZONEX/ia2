@@ -38,7 +38,7 @@ tower = "0.5"
 # `fs` lets the server host the built React app for desktop / single-binary
 # distribution (`server --static-dir apps/web/dist`). `cors` + `trace` are
 # the original feature set; keep them.
-tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
+tower-http = { version = "0.6", features = ["catch-panic", "cors", "trace", "fs"] }
 
 # locks — parking_lot doesn't poison: a panic while holding a lock frees
 # it instead of turning every later .lock() into a cascade of panics,

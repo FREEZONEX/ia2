@@ -87,9 +87,93 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// What a request gets when its handler panics: a `500` with the panic
+/// text, like any other server bug. Without this the connection just
+/// closes with no response, which a client cannot tell from a network
+/// fault. Mounted on the whole router through `CatchPanicLayer::custom`.
+///
+/// The handler may have got part of the way before it panicked, so the
+/// body does not claim that nothing happened.
+pub fn handler_panic_response(payload: Box<dyn std::any::Any + Send + 'static>) -> Response {
+    let detail = crate::routes::panic_message(payload);
+    tracing::error!(%detail, "a request handler panicked; answering 500");
+    ApiError::Internal(format!(
+        "internal error: the request handler panicked ({detail}). This is a server bug. \
+         The request did not finish; if it was a write, re-read the resource before retrying."
+    ))
+    .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use axum::routing::get;
+    use axum::Router;
+    use tower::ServiceExt;
+    use tower_http::catch_panic::CatchPanicLayer;
+
+    async fn answer(app: Router, url: &str) -> (StatusCode, String) {
+        let response = app
+            .oneshot(Request::get(url).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    async fn literal() -> &'static str {
+        panic!("no group at index")
+    }
+
+    async fn formatted() -> &'static str {
+        let n = 2;
+        panic!("no group at index '{n}'")
+    }
+
+    async fn other_payload() -> &'static str {
+        std::panic::panic_any(42_u32)
+    }
+
+    fn app_with_panicking_handlers() -> Router {
+        Router::new()
+            .route("/ok", get(|| async { "fine" }))
+            .route("/literal", get(literal))
+            .route("/formatted", get(formatted))
+            .route("/other", get(other_payload))
+            .layer(CatchPanicLayer::custom(handler_panic_response))
+    }
+
+    #[tokio::test]
+    async fn handler_panic_when_message_is_a_literal_then_500_with_the_message() {
+        let (status, body) = answer(app_with_panicking_handlers(), "/literal").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.contains("no group at index"), "{body}");
+        assert!(body.contains("handler panicked"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn handler_panic_when_message_is_formatted_then_500_with_the_message() {
+        let (status, body) = answer(app_with_panicking_handlers(), "/formatted").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.contains("no group at index '2'"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn handler_panic_when_payload_is_not_text_then_still_500() {
+        let (status, body) = answer(app_with_panicking_handlers(), "/other").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.contains("no panic message"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn handler_panic_layer_when_handler_returns_then_answer_is_untouched() {
+        let (status, body) = answer(app_with_panicking_handlers(), "/ok").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "fine");
+    }
 
     /// The negative path the governance feature exists for: a policy
     /// denial is a 403 with an explanatory body — not a 404, not a
