@@ -442,7 +442,7 @@ the debug ops).
 | `GET` | `/alarms-journal` | Most-recent-first alarm event journal (`raised` / `acked` / `returned`). Query: `limit`. |
 | `POST` | `/stop` | Request graceful shutdown. |
 | `GET` | `/api/hmi` | HMI screens deployed with the project: `[{ path, title, level }]` (same row shape as the IDE route). Read-only — screens are edited in the IDE and arrive via deploy. |
-| `GET` | `/api/hmi/{path}` | One screen's full `HmiDoc` JSON. 404 if the deployed project has no such screen. |
+| `GET` | `/api/hmi/{path}` | One screen's full `HmiDoc` JSON. 400 if the screen name is not a valid slug (empty, an empty or `.`-prefixed segment, `\` or `:`; the body states the rule), 404 if the deployed project has no such screen, 500 if the deployed file exists but is not a valid `HmiDoc`. |
 
 With `--static-dir` pointing at the built web assets the runtime also serves the
 standalone operator panel: `GET /hmi` lists the deployed screens, `GET /hmi/{rest}`
