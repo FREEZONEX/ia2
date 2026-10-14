@@ -43,6 +43,7 @@ use tracing_subscriber::EnvFilter;
 
 mod northbound;
 mod panic_guard;
+mod supervisor;
 mod tap;
 
 const DEFAULT_BIND: &str = "127.0.0.1:13001";
@@ -331,6 +332,7 @@ async fn main() -> Result<()> {
         devices,
         iomap,
         units,
+        supervision,
     } = ironplc_bridge::load_edge_project(&args.project_dir).map_err(|e| anyhow!(e))?;
     let project_name = store.name().to_string();
     let program_instances: Vec<String> =
@@ -445,6 +447,13 @@ async fn main() -> Result<()> {
     let shutdown = Arc::new(tokio::sync::Notify::new());
 
     let tap = tap::TapStatus::new();
+    let supervision = supervisor::Policy::from(&supervision);
+    tracing::info!(policy = %supervision.describe(), "alarm supervision policy");
+    tokio::spawn(supervisor::supervise(
+        tap.clone(),
+        handle.clone(),
+        supervision,
+    ));
     tokio::spawn(tap::run(
         handle.subscribe(),
         tap::standard_stages(
@@ -1679,6 +1688,63 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), handle.shutdown())
             .await
             .expect("shutdown");
+    }
+
+    /// A snapshot task that has ended, watched by the real supervisor against a
+    /// real run: under `safe_state` the outputs are latched off once the grace
+    /// runs out, and say why; under `report` (the default) nothing is stopped,
+    /// however long it stays lost.
+    #[tokio::test]
+    async fn the_supervisor_latches_the_outputs_only_when_the_project_asks_for_it() {
+        use ironplc_bridge::monitor::SnapshotTapHealth;
+        use project::SupervisionAction;
+        use std::time::Duration;
+
+        async fn lost_tap() -> std::sync::Arc<crate::tap::TapStatus> {
+            // A tap that ended: `run` clears `running` as it goes away.
+            let (tx, rx) = tokio::sync::broadcast::channel::<ironplc_bridge::VarSnapshot>(2);
+            let status = crate::tap::TapStatus::new();
+            let task = tokio::spawn(crate::tap::run(rx, vec![], status.clone()));
+            tokio::task::yield_now().await;
+            task.abort();
+            let _ = task.await;
+            drop(tx);
+            let health: SnapshotTapHealth = status.health();
+            assert!(!health.running, "the tap is lost");
+            status
+        }
+
+        for (on_loss, expect_latched) in [
+            (SupervisionAction::SafeState, true),
+            (SupervisionAction::Report, false),
+        ] {
+            let handle = spawn_main("x := x + 1;");
+            let tap = lost_tap().await;
+            let supervisor = tokio::spawn(crate::supervisor::supervise_every(
+                Duration::from_millis(20),
+                tap,
+                handle.clone(),
+                crate::supervisor::Policy {
+                    on_loss,
+                    grace: Duration::from_millis(100),
+                },
+            ));
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert_eq!(handle.watchdog_tripped(), expect_latched, "{on_loss:?}");
+            if expect_latched {
+                let reason = handle.latch_reason().expect("a latched run says why");
+                assert!(
+                    reason.contains("alarm supervision lost") && reason.contains("has stopped"),
+                    "{reason}"
+                );
+            } else {
+                assert_eq!(handle.latch_reason(), None, "report stops nothing");
+            }
+            supervisor.abort();
+            tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+                .await
+                .expect("shutdown");
+        }
     }
 
     /// The latch is one flag, `watchdog_tripped`, whoever set it. `/health`

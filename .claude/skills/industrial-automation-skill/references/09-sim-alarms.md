@@ -134,6 +134,24 @@ Process alarms neither raise nor clear on stale inputs; debounce restarts on
 valid input. History buckets containing stale samples carry `stale: true`,
 including persisted edge history: graph them as gaps, not healthy flat lines.
 
+**`[supervision]` (edge only) is a hazard decision, not a tuning knob.** The
+edge runtime's alarm evaluation can stop (its snapshot task ends, sticks or
+keeps failing); a quiet alarm list then means nothing is looking. `alarms.toml`
+may declare what the runtime does about it:
+
+```toml
+[supervision]
+on_loss = "report"        # default: report it, keep running
+# on_loss = "safe_state"  # latch the outputs off after grace_secs of lost alarm evaluation
+grace_secs = 30
+```
+
+Leave it at `report` unless you know the plant: an unplanned stop can be the
+more dangerous direction. `safe_state` latches like a scan-watchdog trip and only
+a person restarting the program re-arms it. A body for `cs set alarms` that
+omits `supervision` KEEPS the declared one; say `report` explicitly to drop it.
+A misspelt key or bad value fails the deploy. See `docs/edge-deploy.md`.
+
 Definitions are project config (`alarms.toml`), authored like any other
 doc — and YOU should author them alongside the control logic; a program
 that can misbehave silently is only half-delivered:

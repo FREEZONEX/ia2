@@ -1506,6 +1506,65 @@ pub struct Tasks {
 pub struct AlarmConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub alarms: Vec<AlarmDef>,
+    /// What the edge runtime does when it can no longer evaluate alarms.
+    /// `None` = the file does not say, which means [`SupervisionAction::Report`];
+    /// kept distinct from an explicit `report` so that an edit that only
+    /// touches `alarms` (`PUT /api/alarms` with a body that omits this)
+    /// cannot silently remove a declared `safe_state`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub supervision: Option<SupervisionConfig>,
+}
+
+/// `[supervision]` in `alarms.toml`: the project's own answer to "what
+/// should the runtime do if it stops being able to evaluate alarms?" (its
+/// snapshot task stopped, is stuck, or keeps failing). A missing alarm
+/// reads as "nothing is wrong", so this is a hazard question, and whether
+/// stopping the plant is the safe direction depends on the plant: the
+/// runtime cannot decide it, the project declares it. The default does NOT
+/// stop anything.
+///
+/// Unknown keys are refused, not ignored: a typo in a protective setting
+/// (`on_los = "safe_state"`) must fail the deploy, not silently leave the
+/// project unprotected.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisionConfig {
+    #[serde(default)]
+    pub on_loss: SupervisionAction,
+    /// How long alarm evaluation may stay lost before `on_loss` is carried
+    /// out, in seconds (1..=3600). Ignored for `report`.
+    #[serde(default = "default_supervision_grace_secs")]
+    pub grace_secs: u32,
+}
+
+impl Default for SupervisionConfig {
+    fn default() -> Self {
+        Self {
+            on_loss: SupervisionAction::Report,
+            grace_secs: default_supervision_grace_secs(),
+        }
+    }
+}
+
+fn default_supervision_grace_secs() -> u32 {
+    30
+}
+
+/// What to do when alarm evaluation is lost for longer than the grace.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisionAction {
+    /// Say so (logs, `/health`, `/status`, the panel, `cs probe`) and keep
+    /// running. The default.
+    #[default]
+    Report,
+    /// Latch the outputs off, as the scan watchdog does: every device into
+    /// failsafe, no further output writes, until a person restarts the
+    /// program. Never undone automatically.
+    SafeState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

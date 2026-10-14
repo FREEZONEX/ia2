@@ -342,6 +342,46 @@ one carrying your SSH / management traffic.
   `/alarms-journal`, and encoded-id ack endpoint expose it. Process alarms do
   not evaluate stale field inputs, and persisted history marks stale buckets.
 
+### Alarm supervision
+
+The alarm engine, the history and the live feed all hang off one task in the
+edge runtime. When it stops, is stuck inside one snapshot, or keeps failing,
+the alarm list is quiet because nothing is looking, which on a panel reads as
+"nothing is wrong". The runtime reports that state (`snapshot_tap` in
+`/health` and `/status`, `cs probe`, the edge badge, the operator panel's
+`ALARMS OFF`, and a failed `unmonitored` post-restart check), and the project
+says what the runtime does about it in `alarms.toml`:
+
+```toml
+[supervision]
+on_loss = "report"      # default: report it and keep running
+# on_loss = "safe_state"  # latch the outputs off if alarm evaluation stays lost
+grace_secs = 30         # 1..=3600; ignored for "report"
+```
+
+- **`report` is the default, and stops nothing.** Whether stopping is the safe
+  direction depends on the plant (an unplanned stop can itself be the
+  hazard), so the runtime does not decide it. Choose `safe_state` only where
+  losing alarm evaluation is the more dangerous of the two.
+- **`safe_state`** latches the outputs off once alarm evaluation has been lost
+  for `grace_secs` in a row, exactly like a scan-watchdog trip: every device
+  goes into failsafe and no further output is written, while the loop keeps
+  scanning so the live state stays visible. `/health` and `/status` say why
+  (`latch_reason`). It is never undone automatically and never done by
+  restarting the process: a person restarts the program to re-arm.
+  A loss that clears inside the grace starts the clock over.
+- **Deploy refuses an `alarms.toml` it cannot read**, and a `[supervision]`
+  table with an unknown key (`on_los`), an unknown `on_loss` or a `grace_secs`
+  outside 1..=3600: a misspelt protective setting must not deploy and protect
+  nothing. (An unreadable `alarms.toml` used to deploy, with the runtime
+  logging a warning and running without alarms.)
+- **Logging is not proportional to time.** Losing alarm evaluation is logged
+  at ERROR the moment it is seen, with the policy in the line; reminders then
+  back off (1, 2, 4, 8 ... minutes into the episode, at most hourly), and
+  recovery is one INFO line. A task that flaps is announced at the 1st, 2nd,
+  4th, 8th ... episode. The state itself is always in `snapshot_tap`.
+- Edge runtime only: the IDE server's local run has no such task to supervise.
+
 - **No EtherCAT hardware on the dev machine**: leave `nic = "_sim"`. The
   IDE will let you configure PDOs and the bridge will respond in sim
   mode. On the edge, configure the real NIC.

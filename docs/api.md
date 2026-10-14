@@ -336,8 +336,8 @@ below, same get→edit→set shape as iomap); alarm STATE lives here.
 | `GET` | `/api/runtime/alarms` | Live alarm states, standing-first then severity. Returns `AlarmState[]` (`active`, `acked`, `raised_at_us`, `value_at_raise`, `count`). |
 | `POST` | `/api/runtime/alarms/{id}/ack` | Acknowledge one alarm. Returns the updated `AlarmState`; 404 unknown id. |
 | `GET` | `/api/runtime/alarms-journal` | Most-recent-first event journal (`raised` / `acked` / `returned`). Query: `limit` (default 100, ring-capped at 1000). Returns `AlarmJournalEntry[]`. |
-| `GET` | `/api/alarms` | Read the project's alarm definitions (`alarms.toml`). Returns `AlarmConfig { alarms: AlarmDef[] }`. |
-| `PUT` | `/api/alarms` | Replace the alarm definitions. Rejects duplicate ids and numeric conditions without a `limit`. Applies on the NEXT run. |
+| `GET` | `/api/alarms` | Read the project's alarm definitions (`alarms.toml`). Returns `AlarmConfig { alarms: AlarmDef[], supervision? }`; `supervision` is the project's declared answer to "what does the edge runtime do if it can no longer evaluate alarms" (`{ on_loss: report \| safe_state, grace_secs }`) and is absent when the file does not say, which means `report` (see `docs/edge-deploy.md`, *Alarm supervision*). |
+| `PUT` | `/api/alarms` | Replace the alarm definitions. Rejects duplicate ids and numeric conditions without a `limit`, a `supervision` table with an unknown key or an unknown `on_loss`, and a `grace_secs` outside 1..=3600. A body that omits `supervision` keeps the one the project already declares, so an edit of the definitions cannot silently remove a protective `safe_state`; send `{"supervision": {"on_loss": "report"}}` to change it. Applies on the NEXT run. |
 
 ## Agent activity (takeover overlay)
 

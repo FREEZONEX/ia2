@@ -1859,6 +1859,14 @@ pub async fn put_alarms(
     let response = with_project(&state, &project, |store| {
         let file = conditional::file(store, "alarms", "")?;
         conditional::check(&file, &headers)?;
+        // The body replaces the alarm DEFINITIONS. A body that does not
+        // mention `supervision` (an agent editing only `alarms`) must not
+        // silently remove a protective `safe_state` the project declared;
+        // writing `{"supervision": {"on_loss": "report"}}` is how to drop it.
+        let mut config = config.clone();
+        if config.supervision.is_none() {
+            config.supervision = store.read_alarms().ok().and_then(|c| c.supervision);
+        }
         store.write_alarms(&config)?;
         conditional::written(&file, RunResponse { ok: true })
     })?;

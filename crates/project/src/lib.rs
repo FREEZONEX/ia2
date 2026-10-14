@@ -72,3 +72,4 @@ pub use types::{
     ProgramInstance, ProjectListing, ProjectManifest, ProjectTree, ProjectTreeSkeleton, Protocol,
     ProtocolConfig, Task, Tasks, WriteGovernance, WriteMode, WriteRule, ETHERCAT_SIM_NIC,
 };
+pub use types::{SupervisionAction, SupervisionConfig};
