@@ -104,6 +104,9 @@ export type EdgeStatus = {
   project?: string | null
   fault?: string | null
   watchdog_tripped?: boolean
+  /** Why the outputs are latched off, when `watchdog_tripped` is true (the
+   *  scan watchdog, or the project's alarm-supervision policy). */
+  latch_reason?: string | null
   mode?: RuntimeMode | null
   device_health?: DeviceHealth[] | null
   /** Fastest task interval in ms; absent on an older runtime. */
@@ -143,7 +146,11 @@ export function alarmsBlindReason(
 export function edgeRuntimeState(s: EdgeStatus): HmiRuntimeState {
   return {
     running: !s.watchdog_tripped && s.fault == null && (s.mode == null || s.mode.kind === "running"),
-    alarm: s.watchdog_tripped ? "Watchdog tripped — outputs are locked" : s.fault ?? null,
+    alarm: s.watchdog_tripped
+      ? s.latch_reason
+        ? `Outputs latched off — ${s.latch_reason}`
+        : "Watchdog tripped — outputs are locked"
+      : s.fault ?? null,
     mode: s.mode?.kind,
     scanPeriodMs: s.scan_period_ms ?? null,
     unhealthyDevices: (s.device_health ?? [])

@@ -83,8 +83,9 @@ prompts — the IDE runs `ssh -o BatchMode=yes`).
    and its outputs are dropped. A red `faulted` badge means the runtime
    answers but its program stopped (a VM trap, say) — hover it, or read
    the status grid, for the reason. A red `outputs locked` badge means the
-   scan watchdog tripped: every output is zeroed and held off until the
-   program is restarted. An ochre `degraded` badge also covers a runtime
+   outputs are latched off, by the scan watchdog or by the project's
+   alarm-supervision policy (the badge says which): every output is zeroed and
+   held off until the program is restarted. An ochre `degraded` badge also covers a runtime
    whose snapshot task has ended or is stuck on one snapshot: the program and
    the buses are fine, but history is not recording and process alarms are not
    being evaluated (`/health`'s `snapshot_tap.running` is `false`, or

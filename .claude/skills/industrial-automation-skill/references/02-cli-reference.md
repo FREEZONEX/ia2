@@ -212,7 +212,9 @@ gate on health must read `fieldbus_healthy` / `unhealthy_devices` from
 `watchdog_tripped` is the third field such a gate must read, and the
 nastiest: a latched runtime is reachable AND fieldbus-healthy AND its scan
 count keeps climbing, while it drives nothing. `probe` prints
-`WATCHDOG LATCHED` for it; only a restart clears it.
+`WATCHDOG LATCHED` for it, or `OUTPUTS LATCHED OFF — <reason>` when the runtime says
+something else latched them (the project's `[supervision] safe_state` policy, an
+execution-budget trap): `latch_reason` in `cs probe --json`. Only a restart clears it.
 
 `fault` is the fourth: the edge's program stopped (a VM trap, say), and the
 runtime answers while running nothing. `probe` prints `PROGRAM FAULTED —

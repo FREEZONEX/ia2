@@ -149,6 +149,24 @@ describe("edge watchdog status", () => {
   })
 })
 
+describe("edge latch reason", () => {
+  it("says why the outputs are latched when the runtime says so, not 'watchdog'", () => {
+    const state = edgeRuntimeState({
+      fault: null,
+      mode: { kind: "running" as const },
+      watchdog_tripped: true,
+      latch_reason: "alarm supervision lost for 30 s: the snapshot task has stopped",
+    })
+    expect(state.running).toBe(false)
+    expect(state.alarm).toBe(
+      "Outputs latched off — alarm supervision lost for 30 s: the snapshot task has stopped",
+    )
+    const health = derivePanelHealth(state, 0)
+    expect(health.kind).toBe("fault")
+    expect(health.text).not.toContain("Watchdog")
+  })
+})
+
 describe("edge scan period", () => {
   it("carries the runtime's own cadence through, and null when absent", () => {
     expect(edgeRuntimeState({ fault: null, scan_period_ms: 5000 }).scanPeriodMs).toBe(5000)

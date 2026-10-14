@@ -151,6 +151,7 @@ function Editor({
         fieldbus_healthy: null,
         unhealthy_devices: [],
         watchdog_tripped: null,
+        latch_reason: null,
         fault: null,
         snapshot_tap: null,
         error: String(e),

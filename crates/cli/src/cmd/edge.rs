@@ -93,6 +93,7 @@ fn reachable_report(name: &str, value: &serde_json::Value) -> Vec<String> {
         .get("watchdog_tripped")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let latch_reason = value.get("latch_reason").and_then(|v| v.as_str());
     // Harsher still: the program itself is gone, and only the reason says so.
     let fault = value.get("fault").and_then(|v| v.as_str());
     // The task that feeds history and process alarms from the scan loop. The
@@ -132,11 +133,18 @@ fn reachable_report(name: &str, value: &serde_json::Value) -> Vec<String> {
         ));
     }
     if latched {
-        lines.push(
-            "  WATCHDOG LATCHED — scan deadline lost; outputs zeroed and \
-             held off until the program is restarted"
+        // One latch flag, whoever set it. When the runtime says why, say that:
+        // calling every latch a lost scan deadline sends people to the wrong
+        // fault.
+        lines.push(match latch_reason {
+            Some(why) => format!(
+                "  OUTPUTS LATCHED OFF — {why}; zeroed and held off until the \
+                 program is restarted"
+            ),
+            None => "  WATCHDOG LATCHED — scan deadline lost; outputs zeroed and \
+                     held off until the program is restarted"
                 .into(),
-        );
+        });
     }
     if !down.is_empty() {
         lines.push(format!(
@@ -270,6 +278,25 @@ mod tests {
             let lines = reachable_report("pi", &probe(extra.clone()));
             assert!(lines[0].starts_with('✓'), "{extra}: {lines:?}");
         }
+    }
+
+    /// The supervision policy can latch the outputs; it is not a lost scan
+    /// deadline, and the probe must not say it is.
+    #[test]
+    fn a_latch_the_runtime_explains_is_not_called_a_watchdog_trip() {
+        let lines = reachable_report(
+            "pi",
+            &probe(json!({
+                "watchdog_tripped": true,
+                "latch_reason": "alarm supervision lost for 30 s: the snapshot task has stopped"
+            })),
+        );
+        assert!(lines[0].starts_with('⚠'), "{lines:?}");
+        assert!(
+            lines[1].contains("OUTPUTS LATCHED OFF — alarm supervision lost"),
+            "{lines:?}"
+        );
+        assert!(!lines[1].contains("WATCHDOG"), "{lines:?}");
     }
 
     #[test]

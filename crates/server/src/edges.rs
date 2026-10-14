@@ -117,6 +117,13 @@ pub struct EdgeProbe {
     /// gates only on those two would call a dead plant healthy. `None` when
     /// unreachable, or when the edge runs a build predating the flag.
     pub watchdog_tripped: Option<bool>,
+    /// Why the outputs are latched off, when `watchdog_tripped` is true: the
+    /// scan watchdog, an execution-budget trap, or the project's
+    /// alarm-supervision policy. A reader must not call every latch a watchdog
+    /// trip. `None` when not latched, when unreachable, or when the edge runs a
+    /// build that predates the field (which could only have latched by the
+    /// scan watchdog).
+    pub latch_reason: Option<String>,
     /// Why the edge's program stopped (a VM trap, say), when it did. Such a
     /// runtime is reachable — it answers HTTP — while running nothing, so
     /// like `watchdog_tripped` this must be read before calling the edge
@@ -291,6 +298,7 @@ fn unreachable_probe(error: String) -> EdgeProbe {
         fieldbus_healthy: None,
         unhealthy_devices: vec![],
         watchdog_tripped: None,
+        latch_reason: None,
         fault: None,
         snapshot_tap: None,
         error: Some(error),
@@ -319,6 +327,9 @@ fn probe_from_health_body(body: &str) -> EdgeProbe {
         watchdog_tripped: Option<bool>,
         /// Absent on an older edge build, which reads as "none reported".
         #[serde(default)]
+        latch_reason: Option<String>,
+        /// Absent on an older edge build, which reads as "none reported".
+        #[serde(default)]
         fault: Option<String>,
         /// Absent on an older edge build, which reads as "unknown".
         #[serde(default)]
@@ -343,6 +354,7 @@ fn probe_from_health_body(body: &str) -> EdgeProbe {
             .map(|d| d.name.clone())
             .collect(),
         watchdog_tripped: parsed.watchdog_tripped,
+        latch_reason: parsed.latch_reason,
         fault: parsed.fault,
         snapshot_tap: parsed.snapshot_tap,
         error: None,
@@ -831,6 +843,8 @@ struct StatusReading {
     tap_last_fault: Option<String>,
     /// `snapshot_tap.stalled_for_ms`: the tap is stuck inside one snapshot.
     tap_stalled_ms: Option<u64>,
+    /// Why the outputs are latched off (`latch_reason`), when they are.
+    latch_reason: Option<String>,
 }
 
 fn status_reading(v: &serde_json::Value) -> StatusReading {
@@ -863,6 +877,10 @@ fn status_reading(v: &serde_json::Value) -> StatusReading {
         tap_stalled_ms: v
             .pointer("/snapshot_tap/stalled_for_ms")
             .and_then(|n| n.as_u64()),
+        latch_reason: v
+            .get("latch_reason")
+            .and_then(|r| r.as_str())
+            .map(String::from),
         tap_last_fault: v
             .pointer("/snapshot_tap/last_fault")
             .and_then(|t| t.as_str())
@@ -925,11 +943,12 @@ where
                     );
                 }
                 if r.watchdog_tripped {
-                    return verdict(
-                        DeployHealthState::Faulted,
-                        "the scan watchdog latched the runtime's output phase off".into(),
-                        r.unhealthy_devices,
-                    );
+                    // The flag is one latch, whoever set it; the reason says who.
+                    let detail = match r.latch_reason.as_deref() {
+                        Some(why) => format!("the runtime latched its output phase off: {why}"),
+                        None => "the scan watchdog latched the runtime's output phase off".into(),
+                    };
+                    return verdict(DeployHealthState::Faulted, detail, r.unhealthy_devices);
                 }
                 // Before the mode and progress checks: a stopped tap freezes
                 // the very `scan_count` they read, and the specific cause
@@ -2033,6 +2052,44 @@ mod tests {
         ])
         .await;
         assert_eq!(health.state, DeployHealthState::Running, "{health:?}");
+    }
+
+    /// The latch is one flag, set by the scan watchdog or by the project's
+    /// supervision policy. A verdict that blames the watchdog for the latter
+    /// sends the operator to the wrong fault.
+    #[tokio::test]
+    async fn a_latch_the_runtime_explains_is_faulted_with_its_own_reason() {
+        let latched = Ok(serde_json::json!({
+            "scan_count": 40, "fault": null, "watchdog_tripped": true, "device_health": [],
+            "latch_reason": "alarm supervision lost for 30 s: the snapshot task has stopped",
+        }));
+        let health = watch(vec![latched]).await;
+        assert_eq!(health.state, DeployHealthState::Faulted, "{health:?}");
+        assert!(
+            health.detail.contains("alarm supervision lost for 30 s"),
+            "{health:?}"
+        );
+        assert!(!health.detail.contains("scan watchdog"), "{health:?}");
+    }
+
+    #[test]
+    fn probe_carries_the_latch_reason_and_reads_an_older_edge_as_none() {
+        let probe = probe_from_health_body(
+            r#"{"status":"ok","uptime_secs":9,"scan_count":4,"watchdog_tripped":true,
+                "latch_reason":"alarm supervision lost for 30 s: the snapshot task has stopped"}"#,
+        );
+        assert_eq!(probe.watchdog_tripped, Some(true));
+        assert_eq!(
+            probe.latch_reason.as_deref(),
+            Some("alarm supervision lost for 30 s: the snapshot task has stopped")
+        );
+        let older = probe_from_health_body(
+            r#"{"status":"ok","uptime_secs":9,"scan_count":4,"watchdog_tripped":true}"#,
+        );
+        assert_eq!(
+            older.latch_reason, None,
+            "unknown, and the old wording stands"
+        );
     }
 
     #[tokio::test]
