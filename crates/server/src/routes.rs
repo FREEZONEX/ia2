@@ -2026,15 +2026,191 @@ pub async fn check(
     // debounce and re-parses all sibling POUs.
     let store = owned_store(&state, &project).ok();
     let path = q.path.clone();
-    let diags = tokio::task::spawn_blocking(move || match &store {
+    let diags = run_check(move || match &store {
         Some(store) => {
             ironplc_bridge::check_pou_in_project(store, &body, language, path.as_deref())
         }
         None => ironplc_bridge::check_pou_source(&body, language),
     })
-    .await
-    .unwrap_or_default();
+    .await;
     Json(diags)
+}
+
+/// `code` of the diagnostic `POST /api/check` returns when the compiler
+/// panicked during the check: on the buffer or, with a project open, on
+/// one of the sibling files parsed as its context (an internal compiler
+/// bug, not necessarily a mistake in the program being edited).
+pub const CHECK_PANIC_CODE: &str = "compiler-panic";
+
+/// `code` of the diagnostic `POST /api/check` returns when the check task
+/// was cancelled before it finished (the runtime is shutting down).
+pub const CHECK_ABORTED_CODE: &str = "check-aborted";
+
+/// Run one editor check on the blocking pool.
+///
+/// A check that did not finish is never reported as a clean file: the
+/// editor and agents read `[]` as "verified, nothing wrong", so a compiler
+/// panic (the vendored compiler still has input-dependent panics) must not
+/// collapse into it. The panic becomes one error diagnostic instead, so
+/// the squiggle says the source was NOT checked, and the panic message
+/// goes to the server log.
+async fn run_check<F>(check: F) -> Vec<CheckDiagnostic>
+where
+    F: FnOnce() -> Vec<CheckDiagnostic> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(check).await {
+        Ok(diags) => diags,
+        Err(e) => vec![join_error_diagnostic(e)],
+    }
+}
+
+/// The diagnostic that stands in for the result of a check that did not
+/// finish.
+fn join_error_diagnostic(e: tokio::task::JoinError) -> CheckDiagnostic {
+    if e.is_panic() {
+        let detail = panic_message(e.into_panic());
+        tracing::error!(%detail, "POST /api/check: the compiler panicked during a check");
+        // The project-aware check parses every sibling POU as context, so
+        // the panic is not necessarily about the buffer that was posted.
+        unchecked_diagnostic(
+            CHECK_PANIC_CODE,
+            format!(
+                "Internal compiler error: the compiler panicked during this check \
+                 ({detail}). This is a bug in the compiler, not necessarily a mistake \
+                 in this source: with a project open, the panic may come from another \
+                 file in the project. The source was NOT checked."
+            ),
+        )
+    } else {
+        tracing::warn!(error = %e, "POST /api/check: the check task did not finish");
+        unchecked_diagnostic(
+            CHECK_ABORTED_CODE,
+            format!("The check did not finish ({e}); the source was NOT checked."),
+        )
+    }
+}
+
+/// The message of a caught panic (`panic!("literal")` carries a `&str`,
+/// a formatted `panic!` or an `expect`/`unwrap` failure carries a `String`).
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(message) => *message,
+        Err(payload) => match payload.downcast::<&'static str>() {
+            Ok(message) => (*message).to_string(),
+            Err(_) => "no panic message".to_string(),
+        },
+    }
+}
+
+/// An error diagnostic that is about the check itself, not a position in
+/// the source, so it sits at line 1, column 1.
+fn unchecked_diagnostic(code: &str, message: String) -> CheckDiagnostic {
+    CheckDiagnostic {
+        severity: "error".into(),
+        code: code.into(),
+        message,
+        start_line: 1,
+        start_column: 1,
+        end_line: 1,
+        end_column: 1,
+        context: vec![],
+        related: vec![],
+        explanation: None,
+        ld_location: None,
+        fbd_location: None,
+        sfc_location: None,
+    }
+}
+
+#[cfg(test)]
+mod run_check_tests {
+    use super::{run_check, CHECK_ABORTED_CODE, CHECK_PANIC_CODE};
+
+    #[tokio::test]
+    async fn run_check_when_check_returns_then_its_diagnostics_pass_through() {
+        let diags =
+            run_check(|| vec![super::unchecked_diagnostic("P0002", "Syntax error".into())]).await;
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "P0002");
+        assert!(
+            run_check(Vec::new).await.is_empty(),
+            "a clean check stays empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_check_when_check_panics_with_str_then_error_diagnostic_not_empty() {
+        let diags = run_check(|| panic!("no group at index")).await;
+        assert_eq!(diags.len(), 1, "a panic must not look like a clean file");
+        assert_eq!(diags[0].severity, "error");
+        assert_eq!(diags[0].code, CHECK_PANIC_CODE);
+        assert!(
+            diags[0].message.contains("no group at index"),
+            "{}",
+            diags[0].message
+        );
+        assert!(
+            diags[0].message.contains("NOT checked"),
+            "{}",
+            diags[0].message
+        );
+    }
+
+    #[tokio::test]
+    async fn run_check_when_check_panics_with_string_then_message_is_reported() {
+        let n = 2;
+        let diags = run_check(move || panic!("no group at index '{n}'")).await;
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, CHECK_PANIC_CODE);
+        assert!(
+            diags[0].message.contains("no group at index '2'"),
+            "{}",
+            diags[0].message
+        );
+    }
+
+    #[tokio::test]
+    async fn run_check_when_check_panics_with_other_payload_then_still_an_error() {
+        let diags = run_check(|| std::panic::panic_any(42_u32)).await;
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, CHECK_PANIC_CODE);
+        assert!(
+            diags[0].message.contains("no panic message"),
+            "{}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn join_error_diagnostic_when_task_was_cancelled_then_aborted_error_not_clean() {
+        // One blocking thread: the second task cannot start while the first
+        // holds it, so aborting it cancels it before it ever runs.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let diag = rt.block_on(async {
+            let (release, hold) = std::sync::mpsc::channel::<()>();
+            let first = tokio::task::spawn_blocking(move || {
+                let _ = hold.recv();
+            });
+            let second = tokio::task::spawn_blocking(|| vec![0_u8]);
+            second.abort();
+            // The cancellation is only noticed when a blocking thread reaches
+            // the queued task, so free the thread before awaiting it.
+            release.send(()).unwrap();
+            first.await.unwrap();
+            let err = second
+                .await
+                .expect_err("a cancelled task must not yield a value");
+            assert!(err.is_cancelled());
+            super::join_error_diagnostic(err)
+        });
+        assert_eq!(diag.severity, "error");
+        assert_eq!(diag.code, CHECK_ABORTED_CODE);
+        assert!(diag.message.contains("NOT checked"), "{}", diag.message);
+    }
 }
 
 /// Compile the whole project (every POU + tasks.toml-synthesized
