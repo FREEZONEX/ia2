@@ -382,7 +382,15 @@ last 10 s, the header shows an `ALARMS OFF` chip and the alarm bar reads
 "ALARMS NOT EVALUATED" in the alert tone, ranked below comms loss and a program
 fault and above a down device: the alarm list, history and live feed all come
 from that task, so a quiet list then means nothing is looking, not that nothing is
-wrong. It is a banner, not a gate: writes, Stop included, are not refused for it
+wrong. The banner also says how long alarm evaluation has been lost (`supervision.lost_for_ms`
+in the runtime's status, counted by the runtime's own supervisor), and under a project
+whose `[supervision]` policy is `safe_state` how long is left before the runtime latches
+the outputs off, on the chip as well (`ALARMS OFF · OUTPUTS OFF IN 24 s`; `… NOW` once due),
+as of the last status read (every 2 s) and rounded down, so it errs towards sooner. If the
+runtime's supervisor says alarm evaluation is lost while the panel's own reading of
+`snapshot_tap` does not, the banner and countdown still show: a pending latch is not for a
+client-side guess to hide. Under `report` there is no countdown, and once the outputs are
+latched the fault line replaces it. It is a banner, not a gate: writes, Stop included, are not refused for it
 (a feed that has really stopped is refused by the snapshot-freshness check). After the
 status await the canvas rechecks connection generation, snapshot freshness,
 Operate mode, screen/document identity, current `bind.enable` and variable type.

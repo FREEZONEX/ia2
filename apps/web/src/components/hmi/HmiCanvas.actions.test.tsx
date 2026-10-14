@@ -274,8 +274,11 @@ describe("HMI write revalidation", () => {
     // The banner says it; refusing here would cost every control, Stop
     // included, at the moment an operator most needs one. A feed that has
     // really stopped is refused by the snapshot-freshness check instead.
+    // Not even with a latch countdown running: the operator may be about to
+    // lose the outputs and Stop is exactly what they might reach for.
     vi.mocked(host.runtimeState).mockResolvedValue({
       running: true, alarm: null, alarmsBlind: "the runtime's snapshot task is stuck",
+      alarmsLostForMs: 12_000, outputsLatchInMs: 18_000,
     })
     render(canvas())
     await screen.findByRole("button", { name: "Quick set" })

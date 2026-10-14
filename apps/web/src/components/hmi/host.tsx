@@ -34,6 +34,14 @@ export type HmiRuntimeState = {
    *  History, the alarm list and the live feed all come from that task, so
    *  a quiet alarm list then means "nothing is looking", not "all clear". */
   alarmsBlind?: string | null
+  /** How long alarm evaluation has been lost, in ms, as the runtime's own
+   *  supervisor counts it; null/absent when it does not say (or when it is
+   *  not lost). Only read alongside `alarmsBlind`. */
+  alarmsLostForMs?: number | null
+  /** Under a project whose policy is `safe_state`: ms until the runtime latches
+   *  the outputs off if alarm evaluation has not returned (0 = due); null/absent
+   *  when nothing is pending. As of the last status read. */
+  outputsLatchInMs?: number | null
   /** The runtime's fastest task interval in ms — the cadence at which
    *  `scan_count` can advance. Feeds the live store's freshness budget, so
    *  a slow-cycle project is judged against its own rate instead of a fixed
