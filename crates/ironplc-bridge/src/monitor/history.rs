@@ -12,8 +12,8 @@
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
-use std::sync::Mutex;
 
+use parking_lot::Mutex;
 use serde::Serialize;
 use ts_rs::TS;
 
@@ -75,6 +75,13 @@ struct Persist {
 }
 
 /// Thread-safe historian handle; cheap to share behind an Arc.
+///
+/// The lock does not poison: a panic while it is held frees it, and the next
+/// caller carries on with whatever the rings held at that moment. A ring is a
+/// list of independent samples, so a sample missing from one series is the
+/// worst a half-finished `note_snapshot` leaves behind; a poisoned lock would
+/// instead make every later call panic, and the snapshot task that feeds this
+/// is one of them.
 pub struct Historian {
     inner: Mutex<Inner>,
     capacity: usize,
@@ -115,7 +122,7 @@ impl Historian {
     /// Drop every ring (project closed). Persistence files are left
     /// alone — they belong to the edge's post-mortem story.
     pub fn clear(&self) {
-        let mut inner = self.inner.lock().expect("historian lock");
+        let mut inner = self.inner.lock();
         inner.series.clear();
         inner.last_sample_us = 0;
     }
@@ -123,7 +130,7 @@ impl Historian {
     /// Feed one live snapshot; throttled internally to the sample
     /// cadence. Non-numeric variables are skipped (BOOL records 0/1).
     pub fn note_snapshot(&self, snap: &VarSnapshot) {
-        let mut inner = self.inner.lock().expect("historian lock");
+        let mut inner = self.inner.lock();
         // `timestamp_us` is elapsed-since-THIS-run, so it rewinds to zero every
         // time a program is started. The IDE server shares one historian across
         // runs — `clear()` only fires on project close — so without this a
@@ -185,8 +192,12 @@ impl Historian {
         to_us: u64,
         step_ms: u64,
     ) -> HistoryResponse {
-        let inner = self.inner.lock().expect("historian lock");
-        let step_us = (step_ms.max(1)) * 1000;
+        let inner = self.inner.lock();
+        // `step_ms` comes straight off the request. Saturating, so a step too
+        // large to express in microseconds is one bucket covering everything
+        // rather than an overflow (and, where it wraps to zero, a division by
+        // zero in the bucketing below).
+        let step_us = step_ms.max(1).saturating_mul(1000);
         let names: Vec<String> = if vars.is_empty() {
             let mut n: Vec<String> = inner.series.keys().cloned().collect();
             n.sort();
@@ -438,6 +449,98 @@ mod tests {
         let resp = h.query(&[], 0, 0, 1_000);
         assert_eq!(resp.series[0].points.len(), 10, "ring trimmed to capacity");
         assert_eq!(resp.oldest_us, 40 * 1_000_000);
+    }
+
+    /// A `Historian` holding four 1 s samples (1 s .. 4 s) of `flow`.
+    fn four_samples() -> Historian {
+        let h = Historian::new(1_000_000, 100, None);
+        for (t, v) in [(1, 1.0), (2, 8.0), (3, 3.0), (4, 4.0)] {
+            h.note_snapshot(&snap(t * 1_000_000, v));
+        }
+        h
+    }
+
+    #[test]
+    fn query_when_step_is_too_large_for_microseconds_then_one_bucket_not_a_panic() {
+        // `step_ms` is a request parameter. Past u64::MAX / 1000 the product
+        // into microseconds overflows, and 2^61 ms wraps to EXACTLY zero —
+        // the next thing the bucketing does is `% step_us`.
+        for step_ms in [u64::MAX / 1000 + 1, 1 << 61, u64::MAX] {
+            let h = four_samples();
+            let resp = h.query(&["flow".into()], 0, 0, step_ms);
+            let pts = &resp.series[0].points;
+            assert_eq!(pts.len(), 1, "step_ms={step_ms}: one bucket: {pts:?}");
+            assert_eq!(pts[0].min, 1.0, "step_ms={step_ms}");
+            assert_eq!(pts[0].max, 8.0, "step_ms={step_ms}");
+            assert_eq!(
+                pts[0].v, 4.0,
+                "step_ms={step_ms}: last sample of the window"
+            );
+        }
+    }
+
+    #[test]
+    fn query_when_step_is_the_largest_that_fits_then_unchanged() {
+        // The boundary itself must not be caught by the guard above.
+        let h = four_samples();
+        let resp = h.query(&["flow".into()], 0, 0, u64::MAX / 1000);
+        assert_eq!(resp.series[0].points.len(), 1);
+    }
+
+    #[test]
+    fn query_when_step_is_zero_then_it_means_one_millisecond() {
+        let h = four_samples();
+        let resp = h.query(&["flow".into()], 0, 0, 0);
+        assert_eq!(resp.series[0].points.len(), 4, "one point per 1 s sample");
+    }
+
+    #[test]
+    fn query_when_window_is_inverted_or_empty_then_no_points() {
+        let h = four_samples();
+        // from after to: nothing can satisfy both bounds.
+        let resp = h.query(&["flow".into()], 3_500_000, 1_500_000, 1_000);
+        assert!(resp.series[0].points.is_empty(), "{:?}", resp.series);
+        // from beyond the newest sample.
+        let resp = h.query(&["flow".into()], u64::MAX, 0, 1_000);
+        assert!(resp.series[0].points.is_empty());
+        // The window bounds are inclusive and to_us = 0 means open-ended.
+        let resp = h.query(&["flow".into()], 2_000_000, 3_000_000, 1_000);
+        assert_eq!(resp.series[0].points.len(), 2);
+        let resp = h.query(&["flow".into()], 2_000_000, 0, 1_000);
+        assert_eq!(resp.series[0].points.len(), 3);
+        // The extremes together.
+        let resp = h.query(&["flow".into()], 0, u64::MAX, u64::MAX);
+        assert_eq!(resp.series[0].points.len(), 1);
+    }
+
+    #[test]
+    fn query_names_the_requested_series_even_when_nothing_was_recorded() {
+        let h = Historian::new(1_000_000, 100, None);
+        let resp = h.query(&["never_seen".into()], 0, 0, 1_000);
+        assert_eq!(resp.series.len(), 1);
+        assert!(resp.series[0].points.is_empty());
+        assert_eq!(resp.oldest_us, 0, "0 = none");
+    }
+
+    #[test]
+    fn a_panic_while_the_lock_is_held_does_not_take_later_calls_down() {
+        // The historian is fed by a background task and read by request
+        // handlers. With a poisoning lock one panic under it turns every
+        // later call into another panic — the feeding task included, so
+        // recording would stop for good. Hold the lock, panic, and check the
+        // next caller still works and still sees what was recorded.
+        let h = four_samples();
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = h.inner.lock();
+            panic!("a caller died holding the historian lock");
+        }));
+        assert!(caught.is_err());
+
+        h.note_snapshot(&snap(5_000_000, 5.0));
+        let pts = &h.query(&["flow".into()], 0, 0, 1_000).series[0].points;
+        assert_eq!(pts.len(), 5, "history survives and keeps recording");
+        h.clear();
+        assert!(h.query(&[], 0, 0, 1_000).series.is_empty());
     }
 
     #[test]

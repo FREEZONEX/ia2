@@ -95,8 +95,23 @@ fn reachable_report(name: &str, value: &serde_json::Value) -> Vec<String> {
         .unwrap_or(false);
     // Harsher still: the program itself is gone, and only the reason says so.
     let fault = value.get("fault").and_then(|v| v.as_str());
+    // The task that feeds history and process alarms from the scan loop. The
+    // program keeps running without it, so only this says that nothing is
+    // being recorded or evaluated. `null` is an edge build that predates it.
+    let tap = value.get("snapshot_tap").filter(|v| v.is_object());
+    let tap_running = tap
+        .and_then(|t| t.get("running"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let tap_faults = tap
+        .and_then(|t| t.get("faults"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let tap_last = tap
+        .and_then(|t| t.get("last_fault"))
+        .and_then(|v| v.as_str());
     let summary = format!("{name} reachable · v{version} · {scans} scans · up {uptime}");
-    if down.is_empty() && !latched && fault.is_none() {
+    if down.is_empty() && !latched && fault.is_none() && tap_running && tap_faults == 0 {
         return vec![format!("✓ {summary}")];
     }
     let mut lines = vec![format!("⚠ {summary}")];
@@ -119,6 +134,23 @@ fn reachable_report(name: &str, value: &serde_json::Value) -> Vec<String> {
             down.join(", ")
         ));
     }
+    if !tap_running {
+        lines.push(format!(
+            "  SNAPSHOT TAP STOPPED — history is not recording, process alarms are not \
+             being evaluated and the scan count is frozen (the program itself keeps \
+             running); restart the runtime{}",
+            tap_last.map(|t| format!(". Last: {t}")).unwrap_or_default()
+        ));
+    } else if tap_faults > 0 {
+        lines.push(format!(
+            "  snapshot tap FAULTED {tap_faults}× since the runtime started (history or \
+             alarm evaluation missed snapshots); a count that climbs between probes is \
+             failing now{}",
+            tap_last
+                .map(|t| format!(". Latest: {t}"))
+                .unwrap_or_default()
+        ));
+    }
     lines
 }
 
@@ -132,7 +164,7 @@ mod tests {
             "reachable": true, "scan_count": 12, "uptime_secs": 30,
             "runtime_version": null, "fieldbus_healthy": true,
             "unhealthy_devices": [], "watchdog_tripped": false,
-            "fault": null, "error": null,
+            "fault": null, "snapshot_tap": null, "error": null,
         });
         v.as_object_mut()
             .unwrap()
@@ -160,6 +192,50 @@ mod tests {
             lines[1].contains("PROGRAM FAULTED — VM trap in main_inst: DivideByZero"),
             "{lines:?}"
         );
+    }
+
+    /// The task that feeds history and alarms can end while the program runs.
+    /// Everything else on the probe is green then; it printed ✓.
+    #[test]
+    fn an_edge_whose_snapshot_tap_stopped_warns() {
+        let lines = reachable_report(
+            "pi",
+            &probe(json!({"snapshot_tap": {
+                "running": false, "faults": 2,
+                "last_fault": "fell behind the scan loop: 8 snapshots were skipped"
+            }})),
+        );
+        assert!(lines[0].starts_with('⚠'), "{lines:?}");
+        assert!(lines[1].contains("SNAPSHOT TAP STOPPED"), "{lines:?}");
+        assert!(lines[1].contains("8 snapshots were skipped"), "{lines:?}");
+    }
+
+    #[test]
+    fn an_edge_whose_snapshot_tap_faulted_but_runs_says_how_often() {
+        let lines = reachable_report(
+            "pi",
+            &probe(json!({"snapshot_tap": {
+                "running": true, "faults": 5,
+                "last_fault": "the alarms stage panicked on scan 9: boom"
+            }})),
+        );
+        assert!(lines[0].starts_with('⚠'), "{lines:?}");
+        assert!(lines[1].contains("snapshot tap FAULTED 5×"), "{lines:?}");
+        assert!(lines[1].contains("alarms stage panicked"), "{lines:?}");
+    }
+
+    /// An edge build that predates the field, or a tap that never faulted,
+    /// is not a warning.
+    #[test]
+    fn a_missing_or_clean_snapshot_tap_is_not_a_warning() {
+        for extra in [
+            json!({}),
+            json!({"snapshot_tap": null}),
+            json!({"snapshot_tap": {"running": true, "faults": 0, "last_fault": null}}),
+        ] {
+            let lines = reachable_report("pi", &probe(extra.clone()));
+            assert!(lines[0].starts_with('✓'), "{extra}: {lines:?}");
+        }
     }
 
     #[test]

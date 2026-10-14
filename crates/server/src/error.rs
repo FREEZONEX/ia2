@@ -95,11 +95,9 @@ impl IntoResponse for ApiError {
 /// The handler may have got part of the way before it panicked, so the
 /// body does not claim that nothing happened.
 pub fn handler_panic_response(payload: Box<dyn std::any::Any + Send + 'static>) -> Response {
-    let detail = crate::routes::panic_message(payload);
-    tracing::error!(%detail, "a request handler panicked; answering 500");
-    ApiError::Internal(format!(
-        "internal error: the request handler panicked ({detail}). This is a server bug. \
-         The request did not finish; if it was a write, re-read the resource before retrying."
+    // The body is the one the edge runtime answers with too.
+    ApiError::Internal(ironplc_bridge::monitor::handler_panic_body(
+        payload.as_ref(),
     ))
     .into_response()
 }
@@ -165,7 +163,7 @@ mod tests {
     async fn handler_panic_when_payload_is_not_text_then_still_500() {
         let (status, body) = answer(app_with_panicking_handlers(), "/other").await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(body.contains("no panic message"), "{body}");
+        assert!(body.contains("non-string panic payload"), "{body}");
     }
 
     #[tokio::test]

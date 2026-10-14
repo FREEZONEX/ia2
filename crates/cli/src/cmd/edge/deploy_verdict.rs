@@ -32,6 +32,10 @@ pub(super) fn deploy_verdict(name: &str, value: &serde_json::Value) -> Vec<Strin
         (false, Some(v)) if health.is_some() => {
             let outcome = if matches!(state, Some("faulted" | "not_running")) {
                 "its program is not running"
+            } else if state == Some("unmonitored") {
+                // The program may well be scanning; what is gone is the
+                // task that records history and evaluates alarms.
+                "the runtime is not recording history or evaluating alarms"
             } else {
                 "program state is unconfirmed"
             };
@@ -120,6 +124,30 @@ mod tests {
             "  program state not checked: nothing was restarted"
         );
     }
+    /// The runtime's snapshot task is gone: the program may scan, but no
+    /// history is recorded and no alarm can be raised. `cs deploy` must fail
+    /// it, and must not claim the program is not running.
+    #[test]
+    fn a_deploy_whose_runtime_cannot_raise_alarms_fails_with_the_reason() {
+        let lines = deploy_verdict(
+            "pi",
+            &report(json!({"ok": false, "health": {"state": "unmonitored",
+                "detail": "the runtime's snapshot task has stopped: no alarm is evaluated",
+                "unhealthy_devices": []}})),
+        );
+        assert!(lines[0].starts_with('✗'), "{lines:?}");
+        assert!(
+            lines[0].contains("not recording history or evaluating alarms"),
+            "{lines:?}"
+        );
+        assert!(lines[0].contains("no alarm is evaluated"), "{lines:?}");
+        assert!(!lines[0].contains("not running"), "{lines:?}");
+        assert!(
+            lines[1].contains("inspect runtime and plant state"),
+            "{lines:?}"
+        );
+    }
+
     #[test]
     fn an_unknown_state_is_not_reported_as_stopped() {
         let lines = deploy_verdict(

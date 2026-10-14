@@ -84,7 +84,12 @@ prompts — the IDE runs `ssh -o BatchMode=yes`).
    answers but its program stopped (a VM trap, say) — hover it, or read
    the status grid, for the reason. A red `outputs locked` badge means the
    scan watchdog tripped: every output is zeroed and held off until the
-   program is restarted.
+   program is restarted. An ochre `degraded` badge also covers a runtime
+   whose snapshot task has ended: the program and the buses are fine, but
+   history is not recording and process alarms are not being evaluated
+   (`/health`'s `snapshot_tap.running` is `false`; restart the runtime). The
+   badge only judges that persistent state; whether `snapshot_tap.faults` is
+   still climbing is for `cs probe` and a second look.
 
    ST scans are also bounded to 10,000,000 opcodes or one second (a shorter
    explicit container watchdog wins). The opcode ceiling is independent of
@@ -149,8 +154,13 @@ prompts — the IDE runs `ssh -o BatchMode=yes`).
      to counter/uptime evidence, which cannot exclude every fast restart;
    - the entire check, including SSH reads and poll sleeps, has a 30 s deadline.
      A fault/watchdog is `faulted`, paused/single-step mode is `not_running`, and
-     failure to confirm progress before the deadline is `unknown`. All fail the
-     deploy (`ok:false`). **Unknown does not prove stopped or physically safe.**
+     failure to confirm progress before the deadline is `unknown`. A runtime whose
+     snapshot task has stopped, or whose `snapshot_tap.faults` rose between two
+     reads, is `unmonitored`: nothing is recorded, no process alarm can be raised,
+     and `scan_count` freezes with the task, so progress cannot be confirmed
+     either. A fault count that is steady does not change the verdict but is
+     named in it. `faulted`, `not_running`, `unmonitored` and `unknown` all fail
+     the deploy (`ok:false`). **Unknown does not prove stopped or physically safe.**
      A task with a period longer than the observation window may remain unknown;
    - the new version stays installed and current. No automatic rollback or
      restart of the previous program occurs after a failed health check. Inspect

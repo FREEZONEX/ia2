@@ -389,6 +389,22 @@ mod tests {
     }
 
     #[test]
+    fn journal_limit_is_a_bound_not_a_size() {
+        // `limit` comes straight off GET /alarms-journal. Zero is an empty
+        // slice, anything past what is held is everything held, and the
+        // largest value must not be turned into an allocation or a range.
+        let mut eng = high_alarm(0.0, 0);
+        eng.note_snapshot(&snap(1_000_000, 95.0), 11);
+        eng.note_snapshot(&snap(2_000_000, 50.0), 22);
+        assert_eq!(eng.journal(0).len(), 0);
+        assert_eq!(eng.journal(1).len(), 1);
+        assert_eq!(eng.journal(1)[0].event, "returned", "newest first");
+        assert_eq!(eng.journal(2).len(), 2);
+        assert_eq!(eng.journal(usize::MAX).len(), 2);
+        assert_eq!(AlarmEngine::default().journal(usize::MAX).len(), 0);
+    }
+
+    #[test]
     fn cleared_unacked_stays_standing_until_ack() {
         let mut eng = high_alarm(0.0, 0);
         eng.note_snapshot(&snap(1_000_000, 95.0), 11);

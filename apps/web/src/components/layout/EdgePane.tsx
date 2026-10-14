@@ -152,6 +152,7 @@ function Editor({
         unhealthy_devices: [],
         watchdog_tripped: null,
         fault: null,
+        snapshot_tap: null,
         error: String(e),
       })
     } finally {
@@ -875,6 +876,13 @@ function DeployVerdict({ report }: { report: DeployReport }) {
             before restarting or rolling back.
           </span>
         </div>
+      ) : outcome.kind === "unmonitored" ? (
+        <ErrorBox className="max-w-full whitespace-pre-wrap break-words p-2 text-xs">
+          Version <span className="font-mono">{outcome.version}</span> is installed and
+          current, but the runtime is not recording history or evaluating alarms:{" "}
+          {outcome.detail}. Inspect runtime and plant state before restarting or rolling
+          back — the log names the previous version.
+        </ErrorBox>
       ) : outcome.kind === "not_running" ? (
         <ErrorBox className="max-w-full whitespace-pre-wrap break-words p-2 text-xs">
           Version <span className="font-mono">{outcome.version}</span> is installed and

@@ -13,7 +13,7 @@ use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -32,16 +32,18 @@ use ironplc_bridge::{
     DeviceHealth, DeviceReport, DeviceSpec, ProgramHandle, RuntimeMode, RuntimeWriteError,
     VarSnapshot, WriteOutcome,
 };
+use parking_lot::Mutex;
 use project::{ProjectStore, ProtocolConfig, StoreError};
 use serde::Serialize;
 use tokio::signal;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt as _;
-use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
 
 mod northbound;
+mod panic_guard;
+mod tap;
 
 const DEFAULT_BIND: &str = "127.0.0.1:13001";
 
@@ -80,7 +82,7 @@ impl LogCapture {
 
     fn push_line(&self, line: String) {
         {
-            let mut b = self.buf.lock().expect("log buffer");
+            let mut b = self.buf.lock();
             while b.len() >= self.cap {
                 b.pop_front();
             }
@@ -92,7 +94,7 @@ impl LogCapture {
 
     /// Most recent `n` captured lines, oldest-first.
     fn tail(&self, n: usize) -> Vec<String> {
-        let b = self.buf.lock().expect("log buffer");
+        let b = self.buf.lock();
         let start = b.len().saturating_sub(n);
         b.iter().skip(start).cloned().collect()
     }
@@ -303,6 +305,9 @@ struct AppState {
     /// Bounded ring of every write attempt (HTTP + MQTT northbound)
     /// with its origin — backs GET /audit (ADR-0002 attribution).
     audit: AuditLog,
+    /// The task feeding history, alarms and `latest` — reported on /health
+    /// and /status so its failure is not silent.
+    tap: Arc<tap::TapStatus>,
 }
 
 #[tokio::main]
@@ -439,24 +444,17 @@ async fn main() -> Result<()> {
     let latest: Arc<Mutex<Option<VarSnapshot>>> = Arc::new(Mutex::new(None));
     let shutdown = Arc::new(tokio::sync::Notify::new());
 
-    {
-        let snapshot_tx = snapshot_tx.clone();
-        let latest = latest.clone();
-        let historian = historian.clone();
-        let alarms = alarms.clone();
-        let mut rx = handle.subscribe();
-        tokio::spawn(async move {
-            while let Ok(snap) = rx.recv().await {
-                historian.note_snapshot(&snap);
-                alarms
-                    .lock()
-                    .expect("alarms mutex")
-                    .note_snapshot(&snap, ironplc_bridge::monitor::wall_now_us());
-                *latest.lock().expect("latest mutex") = Some(snap.clone());
-                let _ = snapshot_tx.send(snap);
-            }
-        });
-    }
+    let tap = tap::TapStatus::new();
+    tokio::spawn(tap::run(
+        handle.subscribe(),
+        tap::standard_stages(
+            historian.clone(),
+            alarms.clone(),
+            latest.clone(),
+            snapshot_tx.clone(),
+        ),
+        tap.clone(),
+    ));
 
     let store = Arc::new(store);
     let state = AppState {
@@ -473,6 +471,7 @@ async fn main() -> Result<()> {
         historian,
         alarms,
         audit: AuditLog::default(),
+        tap,
     };
 
     // ---- Northbound (MQTT -> supOS/Tier0) ----
@@ -498,31 +497,32 @@ async fn main() -> Result<()> {
     // through an SSH port-forward we (the dev) opened. The audience here
     // is "whatever dev tool is on the other end of the tunnel" — making
     // the IDE / curl / browser direct EventSource all work is the goal.
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/status", get(status))
-        .route("/events", get(events))
-        .route("/logs", get(logs))
-        .route("/logs/stream", get(logs_stream))
-        .route("/discover", get(discover))
-        .route("/system", get(system))
-        .route("/pause", post(rt_pause))
-        .route("/resume", post(rt_resume))
-        .route("/step", post(rt_step))
-        .route("/write", post(rt_write))
-        .route("/force", post(rt_force))
-        .route("/unforce", post(rt_unforce))
-        .route("/inject-scan-stall", post(rt_inject_scan_stall))
-        .route("/audit", get(rt_audit))
-        .route("/history", get(history))
-        .route("/alarms", get(alarms_state))
-        .route("/alarms/{id}/ack", post(alarms_ack))
-        .route("/alarms-journal", get(alarms_journal))
-        .route("/stop", post(stop_handler))
-        .route("/api/hmi", get(hmi_list))
-        .route("/api/hmi/{path}", get(hmi_get))
-        .layer(CorsLayer::permissive())
-        .with_state(state);
+    let app = panic_guard::with_api_layers(
+        Router::new()
+            .route("/health", get(health))
+            .route("/status", get(status))
+            .route("/events", get(events))
+            .route("/logs", get(logs))
+            .route("/logs/stream", get(logs_stream))
+            .route("/discover", get(discover))
+            .route("/system", get(system))
+            .route("/pause", post(rt_pause))
+            .route("/resume", post(rt_resume))
+            .route("/step", post(rt_step))
+            .route("/write", post(rt_write))
+            .route("/force", post(rt_force))
+            .route("/unforce", post(rt_unforce))
+            .route("/inject-scan-stall", post(rt_inject_scan_stall))
+            .route("/audit", get(rt_audit))
+            .route("/history", get(history))
+            .route("/alarms", get(alarms_state))
+            .route("/alarms/{id}/ack", post(alarms_ack))
+            .route("/alarms-journal", get(alarms_journal))
+            .route("/stop", post(stop_handler))
+            .route("/api/hmi", get(hmi_list))
+            .route("/api/hmi/{path}", get(hmi_get)),
+    )
+    .with_state(state);
 
     // ---- Standalone HMI panel (optional) ----
     // With `--static-dir` pointing at the built web assets, operator
@@ -690,13 +690,20 @@ struct Health {
     /// does: without this field a probe of `/health` called such an edge
     /// healthy while it ran nothing.
     fault: Option<String>,
+    /// Whether history, process alarms and `scan_count` are still being fed
+    /// from the scan loop. The scan loop is a separate thread: when this
+    /// task stops, or fails on every snapshot, the program keeps running and
+    /// `status` stays `"ok"`, while history stops recording, process alarms
+    /// stop being evaluated and `scan_count` freezes. `running: false` means
+    /// the task ended; a `faults` count that climbs between two polls means a
+    /// stage is failing now.
+    snapshot_tap: monitor::SnapshotTapHealth,
 }
 
 async fn health(State(state): State<AppState>) -> Json<Health> {
     let scan_count = state
         .latest
         .lock()
-        .expect("latest")
         .as_ref()
         .map(|s| s.scan_count)
         .unwrap_or(0);
@@ -704,12 +711,18 @@ async fn health(State(state): State<AppState>) -> Json<Health> {
         &state.handle,
         scan_count,
         state.start_time.elapsed().as_secs(),
+        state.tap.health(),
     ))
 }
 
 /// The `/health` body for the run behind `handle`. Split out of the
 /// handler so the contract is testable without a whole `AppState`.
-fn health_of(handle: &ProgramHandle, scan_count: u64, uptime_secs: u64) -> Health {
+fn health_of(
+    handle: &ProgramHandle,
+    scan_count: u64,
+    uptime_secs: u64,
+    snapshot_tap: monitor::SnapshotTapHealth,
+) -> Health {
     let devices = handle.device_health();
     Health {
         status: "ok",
@@ -719,6 +732,7 @@ fn health_of(handle: &ProgramHandle, scan_count: u64, uptime_secs: u64) -> Healt
         devices,
         watchdog_tripped: handle.watchdog_tripped(),
         fault: handle.fault(),
+        snapshot_tap,
     }
 }
 
@@ -868,15 +882,19 @@ struct Status {
     /// The full list is one GET /alarms away; the count rides on
     /// /status so panels see it on their existing poll.
     alarms_standing: usize,
+    /// Same as `/health`'s `snapshot_tap`. Read it before trusting
+    /// `last_snapshot`, `scan_count` and `alarms_standing`: if the tap has
+    /// ended they stop moving, and `alarms_standing: 0` then means "nothing
+    /// is evaluating alarms", not "no alarms".
+    snapshot_tap: monitor::SnapshotTapHealth,
 }
 
 async fn status(State(state): State<AppState>) -> Json<Status> {
-    let last_snapshot = state.latest.lock().expect("latest").clone();
+    let last_snapshot = state.latest.lock().clone();
     let scan_count = last_snapshot.as_ref().map(|s| s.scan_count).unwrap_or(0);
     let alarms_standing = state
         .alarms
         .lock()
-        .expect("alarms mutex")
         .states()
         .iter()
         .filter(|a| a.standing())
@@ -901,6 +919,7 @@ async fn status(State(state): State<AppState>) -> Json<Status> {
         forces: monitor::force_entries(&state.handle),
         fault: state.handle.fault(),
         alarms_standing,
+        snapshot_tap: state.tap.health(),
     })
 }
 
@@ -943,7 +962,7 @@ async fn history(
 async fn alarms_state(
     State(state): State<AppState>,
 ) -> Json<Vec<ironplc_bridge::monitor::AlarmState>> {
-    Json(state.alarms.lock().expect("alarms mutex").states())
+    Json(state.alarms.lock().states())
 }
 
 async fn alarms_ack(
@@ -954,7 +973,6 @@ async fn alarms_ack(
     state
         .alarms
         .lock()
-        .expect("alarms mutex")
         .ack(&id, now_us)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, e))
@@ -974,7 +992,7 @@ async fn alarms_journal(
     State(state): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<JournalQuery>,
 ) -> Json<Vec<ironplc_bridge::monitor::AlarmJournalEntry>> {
-    Json(state.alarms.lock().expect("alarms mutex").journal(q.limit))
+    Json(state.alarms.lock().journal(q.limit))
 }
 
 /// Same row shape as the IDE server's `HmiListEntry` (whose ts-rs export
@@ -1240,7 +1258,7 @@ fn record_audit(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let mut g = log.lock().expect("audit mutex");
+    let mut g = log.lock();
     if g.len() >= AUDIT_CAP {
         g.pop_front();
     }
@@ -1454,13 +1472,7 @@ async fn rt_inject_scan_stall(
 /// and every MQTT northbound write lands here with its origin and
 /// outcome — denied and failed writes included.
 async fn rt_audit(State(state): State<AppState>) -> Json<Vec<AuditEntry>> {
-    let entries: Vec<AuditEntry> = state
-        .audit
-        .lock()
-        .expect("audit mutex")
-        .iter()
-        .cloned()
-        .collect();
+    let entries: Vec<AuditEntry> = state.audit.lock().iter().cloned().collect();
     Json(entries)
 }
 
@@ -1513,7 +1525,13 @@ mod tests {
         .expect("the division by zero traps within 5 s")
         .expect("the trap is recorded as a fault");
 
-        let body = serde_json::to_value(health_of(&handle, 0, 1)).unwrap();
+        let body = serde_json::to_value(health_of(
+            &handle,
+            0,
+            1,
+            crate::tap::TapStatus::new().health(),
+        ))
+        .unwrap();
         assert_eq!(body["status"], "ok", "the process still answers");
         let fault = body["fault"].as_str().expect("fault is a string");
         assert!(fault.contains("main_inst"), "{fault}");
@@ -1523,12 +1541,48 @@ mod tests {
     async fn health_of_a_running_program_has_a_null_fault() {
         let handle = spawn_main("x := x + 1;");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let body = serde_json::to_value(health_of(&handle, 0, 1)).unwrap();
+        let body = serde_json::to_value(health_of(
+            &handle,
+            0,
+            1,
+            crate::tap::TapStatus::new().health(),
+        ))
+        .unwrap();
         assert_eq!(body["status"], "ok");
         assert!(
             body.get("fault").is_some_and(|f| f.is_null()),
             "present and null, so clients can rely on the key: {body}"
         );
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
+    /// `/health` says whether history and alarms are still being fed: a
+    /// program that keeps scanning while its tap is gone must not read as
+    /// healthy, and an older client that ignores the key must still parse
+    /// the rest (it is a new key, not a changed one).
+    #[tokio::test]
+    async fn health_carries_the_snapshot_tap_state() {
+        let handle = spawn_main("x := x + 1;");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let tap = ironplc_bridge::monitor::SnapshotTapHealth {
+            running: false,
+            faults: 7,
+            last_fault: Some("the alarms stage panicked on scan 12: boom".into()),
+        };
+        let body = serde_json::to_value(health_of(&handle, 12, 1, tap)).unwrap();
+        assert_eq!(body["status"], "ok", "the process still answers");
+        assert_eq!(body["snapshot_tap"]["running"], false);
+        assert_eq!(body["snapshot_tap"]["faults"], 7);
+        assert!(body["snapshot_tap"]["last_fault"]
+            .as_str()
+            .is_some_and(|t| t.contains("alarms stage panicked")));
+
+        let healthy = crate::tap::TapStatus::new().health();
+        let body = serde_json::to_value(health_of(&handle, 0, 1, healthy)).unwrap();
+        assert_eq!(body["snapshot_tap"]["running"], true);
+        assert!(body["snapshot_tap"]["last_fault"].is_null(), "{body}");
         tokio::time::timeout(std::time::Duration::from_secs(5), handle.shutdown())
             .await
             .expect("shutdown");
@@ -1548,11 +1602,56 @@ mod tests {
                 "ok",
             );
         }
-        let g = log.lock().unwrap();
+        let g = log.lock();
         assert_eq!(g.len(), AUDIT_CAP);
         // Oldest entries were evicted: the first survivor is v10.
         assert_eq!(g.front().unwrap().name, "v10");
         assert_eq!(g.back().unwrap().name, format!("v{}", AUDIT_CAP + 9));
+    }
+
+    /// The audit ring and the log buffer are shared by every request and by
+    /// the snapshot task. A panic under one of their locks must free it: if it
+    /// poisoned, the next write would panic in `record_audit`, and then the
+    /// one after that.
+    #[test]
+    fn a_panic_under_a_shared_lock_does_not_fail_later_callers() {
+        let log = AuditLog::default();
+        record_audit(&log, "gui", "write", "before", Some(1), Some(1), "ok");
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = log.lock();
+            panic!("a caller died holding the audit lock");
+        }));
+        assert!(caught.is_err());
+        record_audit(&log, "gui", "write", "after", Some(2), Some(2), "ok");
+        let names: Vec<String> = log.lock().iter().map(|e| e.name.clone()).collect();
+        assert_eq!(names, ["before", "after"]);
+
+        let capture = super::LogCapture::new(10);
+        capture.push_line("before".into());
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = capture.buf.lock();
+            panic!("a caller died holding the log buffer");
+        }));
+        assert!(caught.is_err());
+        capture.push_line("after".into());
+        assert_eq!(capture.tail(10), ["before", "after"]);
+    }
+
+    /// `tail` is what `GET /logs?tail=` asks for: any count, including none
+    /// and more than exists, is a bound on the answer and nothing else.
+    #[test]
+    fn log_tail_is_a_bound_not_a_size() {
+        let capture = super::LogCapture::new(3);
+        for i in 0..5 {
+            capture.push_line(format!("line {i}"));
+        }
+        assert_eq!(capture.tail(0), Vec::<String>::new());
+        assert_eq!(capture.tail(2), ["line 3", "line 4"]);
+        assert_eq!(
+            capture.tail(usize::MAX),
+            ["line 2", "line 3", "line 4"],
+            "the ring keeps its cap; a huge request gets what there is"
+        );
     }
 
     /// A clamped write records BOTH sides of the story — the audit
@@ -1565,7 +1664,7 @@ mod tests {
 
         let log = AuditLog::default();
         record_audit(&log, "mqtt", "write", "sp", Some(150), applied, &outcome);
-        let g = log.lock().unwrap();
+        let g = log.lock();
         let e = g.back().unwrap();
         assert_eq!(e.requested, Some(150));
         assert_eq!(e.applied, Some(100));
@@ -1593,7 +1692,7 @@ mod tests {
 
         let log = AuditLog::default();
         record_audit(&log, "curl", "write", "sp", Some(150), applied, &outcome);
-        let g = log.lock().unwrap();
+        let g = log.lock();
         let e = g.back().unwrap();
         assert_eq!(e.requested, Some(150));
         assert_eq!(e.applied, None);

@@ -32,6 +32,27 @@ describe("deployOutcome", () => {
     })
   })
 
+  // The program may scan, but the runtime's history and alarm task is gone:
+  // nothing is recorded and no alarm can be raised. Not live, and not "not
+  // running" either.
+  it("shows a runtime that cannot raise alarms as unmonitored, not live", () => {
+    const outcome = deployOutcome(
+      report({
+        ok: false,
+        health: {
+          state: "unmonitored",
+          detail: "the runtime's snapshot task has stopped: no alarm is evaluated",
+          unhealthy_devices: [],
+        },
+      }),
+    )
+    expect(outcome).toEqual({
+      kind: "unmonitored",
+      version: "2026-09-24T02-00-00Z.abc",
+      detail: "the runtime's snapshot task has stopped: no alarm is evaluated",
+    })
+  })
+
   // The restart succeeded and the program trapped at once: not live.
   it("shows an installed version whose program faulted as not running", () => {
     const outcome = deployOutcome(
