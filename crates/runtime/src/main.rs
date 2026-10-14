@@ -690,6 +690,11 @@ struct Health {
     /// does: without this field a probe of `/health` called such an edge
     /// healthy while it ran nothing.
     fault: Option<String>,
+    /// Why the outputs are latched off, once `watchdog_tripped` is true: the
+    /// scan watchdog, an execution-budget trap, or the project's
+    /// alarm-supervision policy (see `alarms.toml`). `null` while they are
+    /// not latched.
+    latch_reason: Option<String>,
     /// Whether history, process alarms and `scan_count` are still being fed
     /// from the scan loop. The scan loop is a separate thread: when this
     /// task stops, or fails on every snapshot, the program keeps running and
@@ -732,6 +737,7 @@ fn health_of(
         devices,
         watchdog_tripped: handle.watchdog_tripped(),
         fault: handle.fault(),
+        latch_reason: handle.latch_reason(),
         snapshot_tap,
     }
 }
@@ -978,6 +984,8 @@ struct Status {
     /// The full list is one GET /alarms away; the count rides on
     /// /status so panels see it on their existing poll.
     alarms_standing: usize,
+    /// Why the outputs are latched off; see `/health`.
+    latch_reason: Option<String>,
     /// Same as `/health`'s `snapshot_tap`. Read it before trusting
     /// `last_snapshot`, `scan_count` and `alarms_standing`: if the tap has
     /// ended they stop moving, and `alarms_standing: 0` then means "nothing
@@ -1015,6 +1023,7 @@ async fn status(State(state): State<AppState>) -> Json<Status> {
         forces: monitor::force_entries(&state.handle),
         fault: state.handle.fault(),
         alarms_standing,
+        latch_reason: state.handle.latch_reason(),
         snapshot_tap: state.tap.health(),
     })
 }
@@ -1667,6 +1676,33 @@ mod tests {
             body.get("fault").is_some_and(|f| f.is_null()),
             "present and null, so clients can rely on the key: {body}"
         );
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
+    /// The latch is one flag, `watchdog_tripped`, whoever set it. `/health`
+    /// says why, so a reader does not blame the scan watchdog for a latch the
+    /// project's supervision policy asked for.
+    #[tokio::test]
+    async fn health_says_why_the_outputs_are_latched() {
+        let handle = spawn_main("x := x + 1;");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let healthy = crate::tap::TapStatus::new().health();
+        let before = serde_json::to_value(health_of(&handle, 0, 1, healthy.clone())).unwrap();
+        assert_eq!(before["watchdog_tripped"], false);
+        assert!(
+            before["latch_reason"].is_null(),
+            "present and null: {before}"
+        );
+
+        assert!(handle
+            .latch_outputs_off("alarm supervision lost for 30 s")
+            .await
+            .unwrap());
+        let after = serde_json::to_value(health_of(&handle, 0, 1, healthy)).unwrap();
+        assert_eq!(after["watchdog_tripped"], true);
+        assert_eq!(after["latch_reason"], "alarm supervision lost for 30 s");
         tokio::time::timeout(std::time::Duration::from_secs(5), handle.shutdown())
             .await
             .expect("shutdown");
