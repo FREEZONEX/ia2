@@ -262,5 +262,5 @@ How the **edge runtime** publishes live data up to the plant platform. MQTT only
 ```
 
 - `topic_prefix` defaults to `ia2/<project>`; `client_id` to `ia2-<project>`.
-- Topics: `<prefix>/status` (retained `online`/`offline` via LWT — the platform sees crashes), `<prefix>/snapshot` (periodic `{"ts_us":…,"scan":…,"values":{…}}` typed JSON), `<prefix>/write` (only when `allow_write`; `{"name":"sp_flow","value":12.5}` → one-shot write).
+- Topics: `<prefix>/status` (retained `online`/`offline` via LWT — the platform sees crashes — and `degraded` while the runtime's snapshot task is lost: the program runs but alarms, history and the live values are not being updated, so NO snapshot is published until it is back; an absent snapshot with `degraded` is a stated condition, not silence; a broker reconnect re-asserts the CURRENT status, never a stale `online`), `<prefix>/snapshot` (periodic `{"ts_us":…,"scan":…,"values":{…}}` typed JSON), `<prefix>/write` (only when `allow_write`; `{"name":"sp_flow","value":12.5}` → one-shot write).
 - `allow_write` is **off by default** — making the link a control path is an explicit decision. Writes are one-shot (program can overwrite next scan); latch setpoints in program logic.

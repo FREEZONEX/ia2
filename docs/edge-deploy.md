@@ -380,6 +380,12 @@ grace_secs = 30         # 1..=3600; ignored for "report"
   back off (1, 2, 4, 8 ... minutes into the episode, at most hourly), and
   recovery is one INFO line. A task that flaps is announced at the 1st, 2nd,
   4th, 8th ... episode. The state itself is always in `snapshot_tap`.
+- **The northbound MQTT feed follows it.** While alarm evaluation is lost the
+  runtime's latest snapshot is frozen, so publishing it would hand the platform
+  the same old values every interval next to a retained `online`. Instead the
+  retained `<prefix>/status` becomes `degraded` (once, logged) and no snapshot is
+  published until it recovers, when `online` is asserted again; a broker
+  reconnect re-asserts whichever is current.
 - Edge runtime only: the IDE server's local run has no such task to supervise.
 
 - **No EtherCAT hardware on the dev machine**: leave `nic = "_sim"`. The

@@ -493,6 +493,7 @@ async fn main() -> Result<()> {
                     latest: state.latest.clone(),
                     handle: handle.clone(),
                     audit: state.audit.clone(),
+                    tap: state.tap.clone(),
                 });
             } else {
                 tracing::info!("northbound disabled (no enabled [mqtt] in northbound.toml)");

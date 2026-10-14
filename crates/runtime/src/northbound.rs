@@ -17,6 +17,7 @@
 //!     same semantics as POST /write (the program can overwrite next
 //!     scan; use program logic to latch setpoints).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,6 +34,51 @@ pub struct NorthboundCtx {
     /// Write-audit ring shared with the HTTP handlers — northbound
     /// writes are recorded with origin `mqtt` (ADR-0002 attribution).
     pub audit: crate::AuditLog,
+    /// The task that keeps `latest` current. When alarm evaluation is lost,
+    /// `latest` is frozen, so publishing it would hand the platform an old
+    /// value every interval, with a retained `online` beside it.
+    pub tap: Arc<crate::tap::TapStatus>,
+}
+
+/// What the publisher is telling the platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Feed {
+    /// Snapshots are current; the retained status is `online`.
+    Live,
+    /// The runtime is up but its snapshot task is lost (see
+    /// `supervisor::assess`): `latest` is frozen. No snapshot is published,
+    /// and the retained status is `degraded`, so an absent snapshot is a
+    /// stated condition and not just silence.
+    Degraded,
+}
+
+impl Feed {
+    pub(crate) fn status_text(self) -> &'static str {
+        match self {
+            Feed::Live => "online",
+            Feed::Degraded => "degraded",
+        }
+    }
+}
+
+/// One publisher tick's decision, pure so every transition is testable.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct FeedStep {
+    pub next: Feed,
+    /// The retained status to publish now: only on a change, and never a stale
+    /// `online`.
+    pub status: Option<&'static str>,
+    /// Whether this tick's snapshot may be published.
+    pub publish_snapshot: bool,
+}
+
+pub(crate) fn feed_step(prev: Feed, lost: bool) -> FeedStep {
+    let next = if lost { Feed::Degraded } else { Feed::Live };
+    FeedStep {
+        next,
+        status: (next != prev).then(|| next.status_text()),
+        publish_snapshot: next == Feed::Live,
+    }
 }
 
 /// Spawn the northbound task. Returns immediately; the task owns the
@@ -40,6 +86,21 @@ pub struct NorthboundCtx {
 /// own, so a broker restart just pauses publishing).
 pub fn spawn(ctx: NorthboundCtx) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run(ctx))
+}
+
+/// The retained status to assert on connect and on every RE-connect: what the
+/// feed is now. A hard-coded `online` here would announce a lost snapshot task
+/// as healthy again the moment the broker connection blips.
+pub(crate) fn status_now(degraded: &AtomicBool) -> &'static str {
+    feed_of(degraded).status_text()
+}
+
+fn feed_of(degraded: &AtomicBool) -> Feed {
+    if degraded.load(Ordering::Relaxed) {
+        Feed::Degraded
+    } else {
+        Feed::Live
+    }
 }
 
 fn qos_of(q: u8) -> QoS {
@@ -76,6 +137,9 @@ async fn run(ctx: NorthboundCtx) {
     }
 
     let (client, mut event_loop) = AsyncClient::new(options, 32);
+    // Shared by the publisher and the reconnect handler below, so a broker
+    // reconnect while degraded re-asserts `degraded`, not a false `online`.
+    let degraded = Arc::new(AtomicBool::new(false));
 
     // Publisher half — periodic snapshot + retained birth message. Owned
     // by the runtime process; dies with it (no explicit join needed).
@@ -83,16 +147,40 @@ async fn run(ctx: NorthboundCtx) {
         let client = client.clone();
         let prefix = prefix.clone();
         let latest = ctx.latest.clone();
+        let tap = ctx.tap.clone();
+        let degraded = degraded.clone();
         let interval = Duration::from_millis(cfg.publish_interval_ms.max(100) as u64);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            // Birth: retained online (delivery rides on the event loop).
+            // Birth: the retained status (delivery rides on the event loop).
             let _ = client
-                .publish(format!("{prefix}/status"), qos, true, "online")
+                .publish(format!("{prefix}/status"), qos, true, status_now(&degraded))
                 .await;
             loop {
                 tick.tick().await;
+                let lost = crate::supervisor::assess(&tap.health()).is_some();
+                let prev = feed_of(&degraded);
+                let step = feed_step(prev, lost);
+                if let Some(status) = step.status {
+                    degraded.store(step.next == Feed::Degraded, Ordering::Relaxed);
+                    tracing::warn!(
+                        status,
+                        "northbound feed is now {status}: {}",
+                        if lost {
+                            "the runtime's snapshot task is lost, so no snapshot is published \
+                             (the last one is stale)"
+                        } else {
+                            "snapshots are current again"
+                        }
+                    );
+                    let _ = client
+                        .publish(format!("{prefix}/status"), qos, true, status)
+                        .await;
+                }
+                if !step.publish_snapshot {
+                    continue;
+                }
                 let snap = latest.lock().clone();
                 let Some(snap) = snap else { continue };
                 let payload = snapshot_json(&snap);
@@ -132,9 +220,10 @@ async fn run(ctx: NorthboundCtx) {
             }
             Ok(Event::Incoming(Packet::ConnAck(_))) => {
                 tracing::info!("northbound mqtt connected");
-                // (Re)assert retained online after every (re)connect.
+                // (Re)assert the retained status after every (re)connect: what
+                // the feed is NOW, which is `online` only while it is live.
                 let _ = client
-                    .publish(format!("{prefix}/status"), qos, true, "online")
+                    .publish(format!("{prefix}/status"), qos, true, status_now(&degraded))
                     .await;
             }
             Ok(_) => {}
@@ -280,6 +369,68 @@ mod tests {
         assert_eq!(json["values"]["label"], serde_json::json!("'hello'"));
     }
 
+    /// Every transition of the publisher's decision. A lost snapshot task
+    /// freezes `latest`; publishing it would give the platform the same old
+    /// value every interval next to a retained `online`.
+    #[test]
+    fn the_feed_announces_degraded_once_stops_snapshots_and_announces_recovery() {
+        use super::{feed_step, Feed, FeedStep};
+
+        assert_eq!(
+            feed_step(Feed::Live, false),
+            FeedStep {
+                next: Feed::Live,
+                status: None,
+                publish_snapshot: true
+            },
+            "a healthy feed publishes and says nothing new"
+        );
+        assert_eq!(
+            feed_step(Feed::Live, true),
+            FeedStep {
+                next: Feed::Degraded,
+                status: Some("degraded"),
+                publish_snapshot: false
+            },
+            "losing it is announced once, and the stale snapshot is not published"
+        );
+        assert_eq!(
+            feed_step(Feed::Degraded, true),
+            FeedStep {
+                next: Feed::Degraded,
+                status: None,
+                publish_snapshot: false
+            },
+            "while it stays lost: no repeat announcement and still no snapshot"
+        );
+        assert_eq!(
+            feed_step(Feed::Degraded, false),
+            FeedStep {
+                next: Feed::Live,
+                status: Some("online"),
+                publish_snapshot: true
+            },
+            "recovery says online again and resumes publishing"
+        );
+        assert_eq!(Feed::Live.status_text(), "online");
+        assert_eq!(Feed::Degraded.status_text(), "degraded");
+    }
+
+    /// What is asserted on connect and re-connect follows the shared flag.
+    #[test]
+    fn the_status_asserted_on_connect_is_the_current_one() {
+        use super::status_now;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let degraded = AtomicBool::new(false);
+        assert_eq!(status_now(&degraded), "online");
+        degraded.store(true, Ordering::Relaxed);
+        assert_eq!(
+            status_now(&degraded),
+            "degraded",
+            "a reconnect while the feed is lost must not re-assert online"
+        );
+    }
+
     #[test]
     fn snapshot_preserves_last_value_and_marks_its_field_quality() {
         let mut input = var("flow", "REAL", "12.5", 12.5f32.to_bits() as u64);
@@ -386,6 +537,155 @@ mod governance_roundtrip_tests {
         v.to_bits() as i32
     }
 
+    /// When the runtime's snapshot task is lost, `latest` is frozen. The
+    /// platform must be told (retained status `degraded`) and must stop being
+    /// fed that old snapshot as if it were live; before this it kept getting the
+    /// same values every interval next to a retained `online`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lost_snapshot_task_is_announced_degraded_and_the_stale_snapshots_stop() {
+        let port = broker_on_free_port();
+        let handle = ironplc_bridge::spawn_units(
+            vec![ironplc_bridge::ProgramUnit {
+                instance: "main".into(),
+                task_name: "t".into(),
+                interval_ms: 10,
+                priority: 1,
+                container: ironplc_bridge::compile(
+                    "PROGRAM main\nVAR tick : INT := 0; END_VAR\ntick := tick + 1;\nEND_PROGRAM",
+                )
+                .expect("test program compiles"),
+                retain_vars: Vec::new(),
+            }],
+            Vec::new(),
+            Vec::new(),
+            None,
+            project::WriteGovernance::default(),
+        );
+        let latest = Arc::new(Mutex::new(Some(VarSnapshot {
+            timestamp_us: 1,
+            scan_count: 1,
+            device_health: None,
+            vars: vec![VarValue {
+                name: "tick".into(),
+                type_name: "INT".into(),
+                value: "1".into(),
+                bits: 1,
+                input: None,
+            }],
+        })));
+
+        // A real snapshot task, so that aborting it is how the tap is lost.
+        let tap = crate::tap::TapStatus::new();
+        let (_tx, rx) = tokio::sync::broadcast::channel::<VarSnapshot>(4);
+        let tap_task = tokio::spawn(crate::tap::run(rx, vec![], tap.clone()));
+
+        let _nb = spawn(NorthboundCtx {
+            config: MqttNorthbound {
+                enabled: true,
+                broker_host: "127.0.0.1".into(),
+                broker_port: port,
+                client_id: String::new(),
+                username: String::new(),
+                password: String::new(),
+                topic_prefix: String::new(),
+                publish_interval_ms: 100,
+                qos: 0,
+                allow_write: false,
+            },
+            project_name: "nbdeg".into(),
+            latest,
+            handle: handle.clone(),
+            audit: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            tap,
+        });
+
+        let mut opts = MqttOptions::new("nbdeg-probe", "127.0.0.1", port);
+        opts.set_keep_alive(Duration::from_secs(5));
+        let (client, mut eventloop) = AsyncClient::new(opts, 16);
+        let seen: SeenMessages = Arc::new(Mutex::new(Vec::new()));
+        let seen_task = Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Ok(ev) = eventloop.poll().await {
+                if let Event::Incoming(Packet::Publish(p)) = ev {
+                    seen_task.lock().push((p.topic.clone(), p.payload.to_vec()));
+                }
+            }
+        });
+        client
+            .subscribe("ia2/nbdeg/#", QoS::AtLeastOnce)
+            .await
+            .expect("subscribe");
+
+        let count = |topic: &str, payload: Option<&[u8]>| {
+            seen.lock()
+                .iter()
+                .filter(|(t, p)| t == topic && payload.is_none_or(|want| p.as_slice() == want))
+                .count()
+        };
+        let wait_for = |what: &'static str, mut done: Box<dyn FnMut() -> bool>| async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while !done() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "timed out waiting for {what}"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+
+        // Live: online, and snapshots flow.
+        let seen_a = Arc::clone(&seen);
+        wait_for(
+            "online plus snapshots",
+            Box::new(move || {
+                let g = seen_a.lock();
+                g.iter()
+                    .any(|(t, p)| t == "ia2/nbdeg/status" && p == b"online")
+                    && g.iter().filter(|(t, _)| t == "ia2/nbdeg/snapshot").count() >= 2
+            }),
+        )
+        .await;
+        assert_eq!(
+            count("ia2/nbdeg/status", Some(b"degraded")),
+            0,
+            "not degraded yet"
+        );
+
+        // Lose the snapshot task.
+        tap_task.abort();
+        let _ = tap_task.await;
+        let seen_b = Arc::clone(&seen);
+        wait_for(
+            "the degraded status",
+            Box::new(move || {
+                seen_b
+                    .lock()
+                    .iter()
+                    .any(|(t, p)| t == "ia2/nbdeg/status" && p == b"degraded")
+            }),
+        )
+        .await;
+
+        // From here on no snapshot is published, however long it stays lost.
+        tokio::time::sleep(Duration::from_millis(300)).await; // in-flight ones land
+        let before = count("ia2/nbdeg/snapshot", None);
+        tokio::time::sleep(Duration::from_millis(800)).await; // 8 intervals
+        assert_eq!(
+            count("ia2/nbdeg/snapshot", None),
+            before,
+            "stale snapshots must not be published while the feed is degraded"
+        );
+        assert_eq!(
+            count("ia2/nbdeg/status", Some(b"degraded")),
+            1,
+            "degraded is announced once, not every interval"
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
     type SeenMessages = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
     /// The whole MQTT write path against REAL governance: an unlisted
@@ -461,6 +761,7 @@ mod governance_roundtrip_tests {
             latest,
             handle: handle.clone(),
             audit: Arc::clone(&audit),
+            tap: crate::tap::TapStatus::new(),
         };
         let _nb = spawn(ctx);
 
