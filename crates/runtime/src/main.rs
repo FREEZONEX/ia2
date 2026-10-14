@@ -779,6 +779,102 @@ mod write_response_tests {
 }
 
 #[cfg(test)]
+mod hmi_read_error_tests {
+    use super::{hmi_read_error, StatusCode, StoreError};
+    use project::ProjectStore;
+
+    /// A store with one deployed screen `ok`, one unparseable screen
+    /// `broken`, and a nested slug `loops/overview`.
+    fn store_with_screens() -> (tempfile::TempDir, ProjectStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProjectStore::create(dir.path().join("p"), "p").unwrap();
+        store.create_hmi("ok", "Ok").unwrap();
+        store.create_hmi("loops/overview", "Overview").unwrap();
+        store.create_hmi("broken", "Broken").unwrap();
+        std::fs::write(dir.path().join("p/hmi/broken.hmi.json"), "{ not json").unwrap();
+        (dir, store)
+    }
+
+    /// What `GET /api/hmi/{path}` answers when `read_hmi` fails for `path`.
+    fn answer(store: &ProjectStore, path: &str) -> (StatusCode, String) {
+        let e = store
+            .read_hmi(path)
+            .err()
+            .unwrap_or_else(|| panic!("'{path}' unexpectedly read"));
+        hmi_read_error(path, &e)
+    }
+
+    #[test]
+    fn a_screen_name_the_store_rejects_is_a_bad_request() {
+        let (_dir, store) = store_with_screens();
+        // Every shape `validate_path` refuses: empty, empty segment (leading,
+        // trailing, doubled), dot-prefixed segment, backslash, colon.
+        for bad in [
+            "", "/a", "a/", "a//b", ".x", "..", "a/.x", "a/../b", "a\\b", "a:b",
+        ] {
+            let (status, body) = answer(&store, bad);
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "'{bad}' is the caller's mistake, not a server bug"
+            );
+            assert!(
+                body.contains("invalid name") && body.contains("must be non-empty"),
+                "the body must state the naming rule, got: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_well_formed_name_with_no_screen_is_still_404_with_its_text() {
+        let (_dir, store) = store_with_screens();
+        for absent in ["ghost", "loops/ghost", "ok/child"] {
+            let (status, body) = answer(&store, absent);
+            assert_eq!(status, StatusCode::NOT_FOUND, "'{absent}'");
+            assert_eq!(
+                body,
+                format!("no HMI screen '{absent}' in the deployed project"),
+                "the 404 text is unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn a_deployed_screen_that_will_not_parse_is_a_server_fault() {
+        // The request is fine; the file on the edge box is bad. Deliberately
+        // 500 here although the IDE server answers 400 for the same error.
+        let (_dir, store) = store_with_screens();
+        let (status, body) = answer(&store, "broken");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.contains("not a valid document"), "got: {body}");
+    }
+
+    #[test]
+    fn other_store_failures_stay_500() {
+        let io = StoreError::Io(std::io::Error::other("disk gone"));
+        let (status, body) = hmi_read_error("ok", &io);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.contains("disk gone"), "got: {body}");
+        // A variant `read_hmi` never returns still lands on the fall-through,
+        // not on 400/404 by accident.
+        let other = StoreError::PouNotFound("x".into());
+        assert_eq!(
+            hmi_read_error("ok", &other).0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn the_valid_screens_the_other_cases_rely_on_do_read() {
+        // Guards the fixtures above: if `ok` / the nested slug stopped
+        // reading, the "absent" and "broken" cases would prove nothing.
+        let (_dir, store) = store_with_screens();
+        assert!(store.read_hmi("ok").is_ok());
+        assert!(store.read_hmi("loops/overview").is_ok());
+    }
+}
+
+#[cfg(test)]
 mod build_stamp_tests {
     /// A provenance stamp that silently degrades to an empty string is worse
     /// than none — `/status` would serve a field that looks answered. Assert
@@ -1030,12 +1126,30 @@ async fn hmi_list(State(state): State<AppState>) -> Response {
 async fn hmi_get(State(state): State<AppState>, AxumPath(path): AxumPath<String>) -> Response {
     match state.store.read_hmi(&path) {
         Ok(doc) => Json(doc).into_response(),
-        Err(StoreError::HmiNotFound(_)) => (
+        Err(e) => hmi_read_error(&path, &e).into_response(),
+    }
+}
+
+/// Status and body for a failed `read_hmi` of the screen `path`.
+///
+/// - `InvalidName` (the screen name breaks the store's path grammar:
+///   empty, an empty or dot-prefixed segment, `\` or `:`) is the caller's
+///   mistake → 400, with the store's own message stating the rule. Same
+///   status the IDE server answers for it.
+/// - `HmiNotFound` → 404.
+/// - `HmiCorrupt` stays 500, unlike the IDE server (which answers 400
+///   because there the broken file is the user's own saved document):
+///   here the request is fine and the DEPLOYED file is bad — a fault on
+///   the edge box, not something the caller can fix by changing the request.
+/// - Anything else (I/O, …) is a genuine server-side failure → 500.
+fn hmi_read_error(path: &str, e: &StoreError) -> (StatusCode, String) {
+    match e {
+        StoreError::InvalidName(_) => (StatusCode::BAD_REQUEST, e.to_string()),
+        StoreError::HmiNotFound(_) => (
             StatusCode::NOT_FOUND,
             format!("no HMI screen '{path}' in the deployed project"),
-        )
-            .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        ),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
 
