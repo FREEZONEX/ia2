@@ -452,6 +452,7 @@ async fn main() -> Result<()> {
     tokio::spawn(supervisor::supervise(
         tap.clone(),
         handle.clone(),
+        alarms.clone(),
         supervision,
     ));
     tokio::spawn(tap::run(
@@ -1721,10 +1722,14 @@ mod tests {
         ] {
             let handle = spawn_main("x := x + 1;");
             let tap = lost_tap().await;
+            let alarms = std::sync::Arc::new(parking_lot::Mutex::new(
+                ironplc_bridge::monitor::AlarmEngine::default(),
+            ));
             let supervisor = tokio::spawn(crate::supervisor::supervise_every(
                 Duration::from_millis(20),
                 tap,
                 handle.clone(),
+                alarms.clone(),
                 crate::supervisor::Policy {
                     on_loss,
                     grace: Duration::from_millis(100),
@@ -1732,6 +1737,14 @@ mod tests {
             ));
             tokio::time::sleep(Duration::from_millis(500)).await;
             assert_eq!(handle.watchdog_tripped(), expect_latched, "{on_loss:?}");
+            // Whatever the policy, the loss is a standing alarm in the list.
+            let listed = alarms.lock().states();
+            let sup = listed
+                .iter()
+                .find(|a| a.id == project::SUPERVISION_ALARM_ID)
+                .unwrap_or_else(|| panic!("{on_loss:?}: not in the alarm list: {listed:?}"));
+            assert!(sup.active && sup.standing(), "{on_loss:?}: {sup:?}");
+            assert!(sup.message.contains("has stopped"), "{sup:?}");
             if expect_latched {
                 let reason = handle.latch_reason().expect("a latched run says why");
                 assert!(
@@ -1746,6 +1759,69 @@ mod tests {
                 .await
                 .expect("shutdown");
         }
+    }
+
+    /// The alarm engine being wedged is one way alarm evaluation gets lost, and
+    /// the supervisor must not be taken down with it: the policy still acts on
+    /// time while the engine's lock is held elsewhere, and the alarm appears as
+    /// soon as the lock is free.
+    #[tokio::test]
+    async fn a_wedged_alarm_engine_does_not_stop_the_supervisor_or_its_policy() {
+        use std::time::Duration;
+
+        let handle = spawn_main("x := x + 1;");
+        let (tx, rx) = tokio::sync::broadcast::channel::<ironplc_bridge::VarSnapshot>(2);
+        let tap = crate::tap::TapStatus::new();
+        let task = tokio::spawn(crate::tap::run(rx, vec![], tap.clone()));
+        tokio::task::yield_now().await;
+        task.abort();
+        let _ = task.await;
+        drop(tx);
+
+        let alarms = std::sync::Arc::new(parking_lot::Mutex::new(
+            ironplc_bridge::monitor::AlarmEngine::default(),
+        ));
+        // Another thread holds the engine's lock for 700 ms, as if it were stuck.
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let wedge = {
+            let alarms = alarms.clone();
+            std::thread::spawn(move || {
+                let _guard = alarms.lock();
+                held_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(700));
+            })
+        };
+        held_rx.recv().expect("the other thread holds the lock");
+        let supervisor = tokio::spawn(crate::supervisor::supervise_every(
+            Duration::from_millis(20),
+            tap,
+            handle.clone(),
+            alarms.clone(),
+            crate::supervisor::Policy {
+                on_loss: project::SupervisionAction::SafeState,
+                grace: Duration::from_millis(100),
+            },
+        ));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            handle.watchdog_tripped(),
+            "the policy must act even though the alarm engine cannot be locked"
+        );
+
+        wedge.join().unwrap(); // the lock is free again
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            alarms
+                .lock()
+                .states()
+                .iter()
+                .any(|a| a.id == project::SUPERVISION_ALARM_ID && a.active),
+            "and the alarm appears once the engine is free"
+        );
+        supervisor.abort();
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
     }
 
     /// The latch is one flag, `watchdog_tripped`, whoever set it. `/health`

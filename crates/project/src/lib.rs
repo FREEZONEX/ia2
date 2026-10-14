@@ -33,7 +33,10 @@ mod sfc;
 mod store;
 mod types;
 
-pub use alarm_check::{validate_alarms, AlarmIssue, DEVICE_ALARM_PREFIX};
+pub use alarm_check::{
+    validate_alarms, AlarmIssue, DEVICE_ALARM_PREFIX, SUPERVISION_ALARM_ID,
+    SUPERVISION_ALARM_PREFIX,
+};
 pub use device_check::{
     duplicate_channel_names, pdi_bit_offset_problem, validate_devices, DeviceIssue,
     MAX_PDI_BIT_OFFSET,

@@ -1233,6 +1233,21 @@ fn validate_alarm_ids(config: &crate::types::AlarmConfig) -> Result<(), StoreErr
     if let Some(def) = config
         .alarms
         .iter()
+        .find(|d| d.id.starts_with(crate::SUPERVISION_ALARM_PREFIX))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "alarm id '{}' uses the reserved supervision prefix '{}'",
+                def.id,
+                crate::SUPERVISION_ALARM_PREFIX
+            ),
+        )
+        .into());
+    }
+    if let Some(def) = config
+        .alarms
+        .iter()
         .find(|d| d.id.starts_with(crate::DEVICE_ALARM_PREFIX))
     {
         return Err(std::io::Error::new(
@@ -1742,6 +1757,25 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("reserved"));
+    }
+
+    #[test]
+    fn alarm_store_refuses_the_supervision_id_on_read_and_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProjectStore::create(dir.path().join("project"), "test").unwrap();
+        let text = "[[alarms]]\nid = '__supervision/snapshot_tap'\nvariable = 'x'\ncondition = 'is_true'\nmessage = 'shadow'\n";
+        let config = toml::from_str(text).unwrap();
+        assert!(store
+            .write_alarms(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("reserved supervision prefix"));
+        fs::write(store.root.join("alarms.toml"), text).unwrap();
+        assert!(store
+            .read_alarms()
+            .unwrap_err()
+            .to_string()
+            .contains("reserved supervision prefix"));
     }
 
     // ---- crash-safe saves ----------------------------------------------

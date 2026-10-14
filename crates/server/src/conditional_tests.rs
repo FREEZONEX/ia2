@@ -148,6 +148,29 @@ async fn a_supervision_table_with_a_typo_or_a_bad_grace_is_refused() {
     }
 }
 
+#[tokio::test]
+async fn the_supervision_alarm_id_cannot_be_shadowed_by_project_definitions() {
+    let (_dir, app) = setup();
+    let response = app
+        .oneshot(
+            Request::put("/api/alarms")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"alarms": [{
+                        "id": "__supervision/snapshot_tap", "variable": "x",
+                        "condition": "is_true", "message": "shadow"
+                    }]})
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(response.status().is_client_error());
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("reserved supervision prefix"));
+}
+
 fn put(url: &str, body: &str, etag: Option<&str>) -> Request<Body> {
     let mut request = Request::put(url).header("Content-Type", "application/json");
     if let Some(etag) = etag {

@@ -24,8 +24,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ironplc_bridge::monitor::SnapshotTapHealth;
+use ironplc_bridge::monitor::{self, AlarmEngine, SnapshotTapHealth};
 use ironplc_bridge::ProgramHandle;
+use parking_lot::Mutex;
 use project::{SupervisionAction, SupervisionConfig};
 
 use crate::tap::TapStatus;
@@ -194,23 +195,59 @@ impl Supervisor {
     }
 }
 
+/// How long the supervisor waits for the alarm engine's lock before it gives
+/// up on this tick's alarm update. The policy must never depend on it.
+const ALARM_LOCK_WAIT: Duration = Duration::from_millis(50);
+
+/// Keep the built-in "alarm evaluation is lost" alarm in step with the
+/// assessment, every tick (idempotent): it must follow EVERY state change, not
+/// only the logged ones. If the engine's lock cannot be had, the alarm is left
+/// as it is and that is reported (1st, 2nd, 4th ...): the engine being wedged is
+/// itself one way alarm evaluation gets lost, and the supervisor, the policy
+/// and the other channels (log, `/health`, the panel, MQTT) carry on without it.
+fn note_alarm(alarms: &Mutex<AlarmEngine>, lost: Option<&str>, lock_misses: &mut u64) {
+    match alarms.try_lock_for(ALARM_LOCK_WAIT) {
+        Some(mut engine) => {
+            engine.note_supervision(lost, monitor::wall_now_us());
+        }
+        None => {
+            *lock_misses += 1;
+            if lock_misses.is_power_of_two() {
+                tracing::error!(
+                    misses = *lock_misses,
+                    "the alarm engine's lock could not be had: the supervision alarm is \
+                     not being updated (the engine may be wedged); the policy is unaffected"
+                );
+            }
+        }
+    }
+}
+
 /// Watch the snapshot task for the life of the process.
-pub async fn supervise(tap: Arc<TapStatus>, handle: ProgramHandle, policy: Policy) {
-    supervise_every(TICK, tap, handle, policy).await
+pub async fn supervise(
+    tap: Arc<TapStatus>,
+    handle: ProgramHandle,
+    alarms: Arc<Mutex<AlarmEngine>>,
+    policy: Policy,
+) {
+    supervise_every(TICK, tap, handle, alarms, policy).await
 }
 
 pub async fn supervise_every(
     tick: Duration,
     tap: Arc<TapStatus>,
     handle: ProgramHandle,
+    alarms: Arc<Mutex<AlarmEngine>>,
     policy: Policy,
 ) {
     let mut supervisor = Supervisor::new(policy.clone());
+    let mut lock_misses = 0u64;
     let mut interval = tokio::time::interval(tick);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
         let lost = assess(&tap.health());
+        note_alarm(&alarms, lost.as_deref(), &mut lock_misses);
         for action in supervisor.step(Instant::now(), lost, handle.watchdog_tripped()) {
             carry_out(action, &policy, &handle).await;
         }

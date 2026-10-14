@@ -381,6 +381,14 @@ grace_secs = 30         # 1..=3600; ignored for "report"
   back off (1, 2, 4, 8 ... minutes into the episode, at most hourly), and
   recovery is one INFO line. A task that flaps is announced at the 1st, 2nd,
   4th, 8th ... episode. The state itself is always in `snapshot_tap`.
+- **It is also a standing alarm.** While alarm evaluation is lost, `GET /alarms`
+  lists `__supervision/snapshot_tap` (Critical) beside the process alarms,
+  `alarms_standing` counts it, the journal records it, and after it returns it
+  stays standing until an operator acknowledges it, so the alarm list is not
+  quiet in exactly the case it must not be. The supervisor raises it, not a
+  snapshot, so it works when snapshots have stopped. If the alarm engine's own
+  lock is wedged it cannot be listed (that is logged, and the policy, the log,
+  `/health`, the panel and MQTT carry on). The id is reserved like `__device/`.
 - **The northbound MQTT feed follows it.** While alarm evaluation is lost the
   runtime's latest snapshot is frozen, so publishing it would hand the platform
   the same old values every interval next to a retained `online`. Instead the

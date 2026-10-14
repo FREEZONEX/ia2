@@ -123,8 +123,13 @@ Device loss also has a zero-config alarm: `__device/<device-name>` raises at
 high severity after 1 s continuously unhealthy, including a device that never
 connected. It uses the same alarm journal and acknowledgement commands;
 recovery alone does not dismiss an unacknowledged occurrence. Do not define
-ids beginning `__device/` in `alarms.toml` (reserved). These alerts do not change
+ids beginning `__device/` or `__supervision/` in `alarms.toml` (reserved). These alerts do not change
 the scan program or failsafe policy.
+
+The edge runtime also raises `__supervision/snapshot_tap` (Critical, at once) when ITS OWN alarm
+evaluation is lost: the task behind the alarm list, history and live feed stopped, stuck or failing. A
+quiet alarm list is then not an all-clear, and this alarm says so in the list itself. It counts in
+`alarms_standing`, is journalled, and stays standing after it returns until acknowledged.
 
 Inspect `snapshot.vars[].input` for mapped field inputs: `{device, channel,
 stale}`. A stale value is last-known, not live; a link recovering while paused

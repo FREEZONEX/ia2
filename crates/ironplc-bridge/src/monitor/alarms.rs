@@ -86,6 +86,9 @@ struct AlarmRuntime {
 pub struct AlarmEngine {
     defs: Vec<AlarmDef>,
     device_defs: HashMap<String, AlarmDef>,
+    /// The built-in "alarm evaluation is lost" alarm, once it has ever been
+    /// raised (see [`AlarmEngine::note_supervision`]).
+    supervision_def: Option<AlarmDef>,
     states: HashMap<String, AlarmRuntime>,
     journal: VecDeque<AlarmJournalEntry>,
 }
@@ -99,13 +102,83 @@ impl AlarmEngine {
         Self {
             defs,
             device_defs: HashMap::new(),
+            supervision_def: None,
             states,
             journal: VecDeque::new(),
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.defs.is_empty() && self.device_defs.is_empty()
+        self.defs.is_empty() && self.device_defs.is_empty() && self.supervision_def.is_none()
+    }
+
+    /// Raise or return the built-in alarm for "alarm evaluation is lost", the
+    /// one condition no definition in `alarms.toml` can express: the engine
+    /// cannot evaluate a condition about its own feed. Driven by the runtime's
+    /// supervisor, not by a snapshot, so it still works when snapshots have
+    /// stopped. `lost` is why (`Some`) or healthy (`None`).
+    ///
+    /// Same lifecycle as every other alarm: raises at once (the supervisor has
+    /// already waited out the blips), returns when evaluation is back, stays
+    /// standing after returning until an operator acknowledges it, and shows in
+    /// `GET /alarms`, the journal and `alarms_standing`. A quiet alarm list is
+    /// otherwise indistinguishable from "all clear". Returns whether it
+    /// changed. Idempotent: the same state twice is no change.
+    pub fn note_supervision(&mut self, lost: Option<&str>, wall_now_us: u64) -> bool {
+        let id = project::SUPERVISION_ALARM_ID;
+        match lost {
+            Some(why) => {
+                if self.states.get(id).is_some_and(|st| st.active) {
+                    return false;
+                }
+                let def = AlarmDef {
+                    id: id.to_string(),
+                    variable: "snapshot_tap".to_string(),
+                    condition: AlarmCondition::IsFalse,
+                    limit: None,
+                    deadband: 0.0,
+                    delay_ms: 0,
+                    severity: AlarmSeverity::Critical,
+                    message: format!(
+                        "Alarm evaluation is lost: {why}. Process alarms are not being \
+                         evaluated, so a quiet alarm list is not an all-clear; treat \
+                         the alarm list and live values as stale"
+                    ),
+                };
+                let st = self.states.entry(id.to_string()).or_default();
+                st.active = true;
+                st.acked = false;
+                st.cleared_unacked = false;
+                st.raised_at_us = wall_now_us;
+                st.value_at_raise = 0.0;
+                st.count += 1;
+                push_journal(
+                    &mut self.journal,
+                    journal_entry(&def, wall_now_us, "raised", 0.0),
+                );
+                self.supervision_def = Some(def);
+                true
+            }
+            None => {
+                let (Some(st), Some(def)) =
+                    (self.states.get_mut(id), self.supervision_def.as_ref())
+                else {
+                    return false;
+                };
+                if !st.active {
+                    return false;
+                }
+                st.active = false;
+                if !st.acked {
+                    st.cleared_unacked = true;
+                }
+                push_journal(
+                    &mut self.journal,
+                    journal_entry(def, wall_now_us, "returned", 0.0),
+                );
+                true
+            }
+        }
     }
 
     /// Evaluate every definition against a sampled snapshot. Returns
@@ -209,6 +282,7 @@ impl AlarmEngine {
             .defs
             .iter()
             .chain(self.device_defs.values())
+            .chain(self.supervision_def.iter())
             .find(|d| d.id == id)
             .ok_or_else(|| format!("no alarm '{id}'"))?
             .clone();
@@ -228,6 +302,7 @@ impl AlarmEngine {
             .defs
             .iter()
             .chain(self.device_defs.values())
+            .chain(self.supervision_def.iter())
             .map(|d| state_of(d, self.states.get(&d.id).unwrap_or(&DEFAULT_RT)))
             .collect();
         out.sort_by(|a, b| {
@@ -386,6 +461,77 @@ mod tests {
 
         let events: Vec<String> = eng.journal(10).iter().map(|j| j.event.clone()).collect();
         assert_eq!(events, ["returned", "acked", "raised"]);
+    }
+
+    /// The one alarm no `alarms.toml` entry can express: "alarm evaluation
+    /// itself is lost". It must look and behave like any other standing alarm
+    /// (listed, counted, journalled, held until acknowledged), or the list
+    /// stays quiet in exactly the case it must not.
+    #[test]
+    fn the_supervision_alarm_raises_returns_and_waits_for_an_acknowledge_like_any_other() {
+        let id = project::SUPERVISION_ALARM_ID;
+        let mut eng = high_alarm(0.0, 0);
+        assert!(
+            eng.states().iter().all(|s| s.id != id),
+            "absent while healthy"
+        );
+
+        assert!(eng.note_supervision(Some("the snapshot task has stopped"), 1_000));
+        assert!(
+            !eng.note_supervision(Some("it is stuck now"), 2_000),
+            "idempotent"
+        );
+        let s = eng.states().into_iter().find(|s| s.id == id).unwrap();
+        assert!(s.active && !s.acked && s.standing());
+        assert_eq!(s.count, 1);
+        assert_eq!(s.raised_at_us, 1_000, "the first raise, not the repeat");
+        assert!(s.message.contains("has stopped") && s.message.contains("not an all-clear"));
+        assert_eq!(
+            eng.states()[0].id,
+            id,
+            "standing and Critical, so it leads the list"
+        );
+
+        // Back: it returns but stays standing until someone acknowledges it.
+        assert!(eng.note_supervision(None, 3_000));
+        assert!(!eng.note_supervision(None, 4_000), "idempotent");
+        let s = eng.states().into_iter().find(|s| s.id == id).unwrap();
+        assert!(!s.active && s.standing(), "returned but unacknowledged");
+
+        let acked = eng.ack(id, 5_000).expect("an operator can acknowledge it");
+        assert!(acked.acked && !acked.standing());
+
+        // And it can happen again.
+        assert!(eng.note_supervision(Some("the snapshot task has stopped"), 6_000));
+        let s = eng.states().into_iter().find(|s| s.id == id).unwrap();
+        assert_eq!((s.active, s.count), (true, 2));
+
+        let events: Vec<String> = eng
+            .journal(10)
+            .iter()
+            .filter(|j| j.id == id)
+            .map(|j| j.event.clone())
+            .collect();
+        assert_eq!(events, ["raised", "acked", "returned", "raised"]);
+        assert!(!eng.is_empty());
+    }
+
+    /// Process alarms keep working beside it; neither disturbs the other.
+    #[test]
+    fn the_supervision_alarm_does_not_disturb_process_alarms() {
+        let mut eng = high_alarm(0.0, 0);
+        eng.note_snapshot(&snap(1_000_000, 95.0), 11);
+        eng.note_supervision(Some("x"), 12);
+        eng.note_snapshot(&snap(2_000_000, 50.0), 13);
+        let by_id = |id: &str| eng.states().into_iter().find(|s| s.id == id).unwrap();
+        assert!(
+            !by_id("level_high").active,
+            "the process alarm still returned"
+        );
+        assert!(
+            by_id(project::SUPERVISION_ALARM_ID).active,
+            "and this one still stands"
+        );
     }
 
     #[test]

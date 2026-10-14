@@ -1839,6 +1839,13 @@ pub async fn put_alarms(
                 project::DEVICE_ALARM_PREFIX
             )));
         }
+        if def.id.starts_with(project::SUPERVISION_ALARM_PREFIX) {
+            return Err(ApiError::BadRequest(format!(
+                "alarm id '{}' uses the reserved supervision prefix '{}'",
+                def.id,
+                project::SUPERVISION_ALARM_PREFIX
+            )));
+        }
         if !seen.insert(def.id.as_str()) {
             return Err(ApiError::BadRequest(format!(
                 "duplicate alarm id '{}'",

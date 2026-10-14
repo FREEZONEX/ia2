@@ -320,6 +320,8 @@ state/journal/ack machinery on server and edge; they do not change PLC logic
 or output safety policy. Process alarms watching stale inputs neither raise
 nor clear, and their pending debounce resets until valid input returns.
 
+On the edge runtime, when its alarm evaluation is lost (the snapshot task that feeds the alarm engine, the history and the live feed has stopped, is stuck or is failing), a built-in `Critical` alarm `__supervision/snapshot_tap` is raised at once and listed beside the process alarms; `alarms_standing` counts it, the journal records it, and it stays standing after it returns until acknowledged (URL-encode the whole id for the ack route, as for `__device/`). It is raised by the runtime's supervisor, not by a snapshot, so it works when snapshots have stopped. The `__supervision/` prefix is reserved, and `PUT /api/alarms` refuses an id that uses it.
+
 History points add optional `stale: true` when any sample in the bucket was
 stale. Consumers must show a gap/unknown interval, not a fresh flat line;
 the edge's persisted history retains this flag across restarts.
