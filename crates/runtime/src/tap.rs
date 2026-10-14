@@ -40,6 +40,8 @@ pub struct TapStatus {
     running: AtomicBool,
     faults: AtomicU64,
     last_fault: Mutex<Option<String>>,
+    /// When `last_fault` happened.
+    last_fault_at: Mutex<Option<Instant>>,
     /// When the snapshot now being processed began; `None` between snapshots.
     busy_since: Mutex<Option<Instant>>,
     stall_after: Duration,
@@ -52,6 +54,7 @@ impl TapStatus {
             running: AtomicBool::new(true),
             faults: AtomicU64::new(0),
             last_fault: Mutex::new(None),
+            last_fault_at: Mutex::new(None),
             busy_since: Mutex::new(None),
             stall_after: STALL_AFTER,
         })
@@ -73,6 +76,10 @@ impl TapStatus {
             faults: self.faults.load(Ordering::Relaxed),
             last_fault: self.last_fault.lock().clone(),
             stalled_for_ms: stalled_for.map(|d| d.as_millis() as u64),
+            last_fault_age_ms: self
+                .last_fault_at
+                .lock()
+                .map(|at| now.saturating_duration_since(at).as_millis() as u64),
         }
     }
 
@@ -86,6 +93,7 @@ impl TapStatus {
 
     fn record_fault(&self, what: String) {
         *self.last_fault.lock() = Some(what.clone());
+        *self.last_fault_at.lock() = Some(Instant::now());
         let n = self.faults.fetch_add(1, Ordering::Relaxed) + 1;
         // A stage that fails on every snapshot would write ten log lines a
         // second for as long as the runtime lives; the count and the latest
@@ -225,9 +233,30 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&h).unwrap(),
             serde_json::json!(
-                {"running": true, "faults": 0, "last_fault": null, "stalled_for_ms": null}
+                {"running": true, "faults": 0, "last_fault": null, "stalled_for_ms": null,
+                 "last_fault_age_ms": null}
             ),
             "present and null, so clients can rely on the keys"
+        );
+    }
+
+    /// `faults` only grows, so it cannot say whether the task is failing now.
+    /// The age of the latest incident can, to a reader that polls once.
+    #[test]
+    fn last_fault_age_counts_from_the_latest_incident() {
+        let status = TapStatus::new();
+        assert_eq!(status.health().last_fault_age_ms, None, "none yet");
+
+        status.record_fault("the alarms stage panicked on scan 3: boom".into());
+        let soon = status.health().last_fault_age_ms.expect("set by the fault");
+        assert!(soon < 1000, "just happened: {soon} ms");
+
+        let later = status.health_at(Instant::now() + Duration::from_secs(60));
+        let age = later.last_fault_age_ms.expect("still reported a minute on");
+        assert!((60_000..61_000).contains(&age), "{age} ms");
+        assert_eq!(
+            later.faults, 1,
+            "the count is unchanged by the passing of time"
         );
     }
 

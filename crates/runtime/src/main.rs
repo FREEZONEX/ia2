@@ -1571,12 +1571,14 @@ mod tests {
             faults: 7,
             last_fault: Some("the alarms stage panicked on scan 12: boom".into()),
             stalled_for_ms: Some(2500),
+            last_fault_age_ms: Some(300),
         };
         let body = serde_json::to_value(health_of(&handle, 12, 1, tap)).unwrap();
         assert_eq!(body["status"], "ok", "the process still answers");
         assert_eq!(body["snapshot_tap"]["running"], false);
         assert_eq!(body["snapshot_tap"]["faults"], 7);
         assert_eq!(body["snapshot_tap"]["stalled_for_ms"], 2500);
+        assert_eq!(body["snapshot_tap"]["last_fault_age_ms"], 300);
         assert!(body["snapshot_tap"]["last_fault"]
             .as_str()
             .is_some_and(|t| t.contains("alarms stage panicked")));

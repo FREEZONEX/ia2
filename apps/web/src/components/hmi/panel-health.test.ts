@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest"
 
 import type { HmiRuntimeState } from "./host"
 import {
+  ALARM_FAULT_RECENT_MS,
+  alarmsBlindReason,
   COMMS_LOST_POLLS,
   derivePanelHealth,
   edgeRuntimeState,
@@ -42,6 +44,34 @@ describe("derivePanelHealth", () => {
     expect(h.kind).toBe("fault")
     expect(h.tone).toBe("alert")
     expect(h.text).toBe("trap: divide by zero")
+  })
+
+  // The program runs and the buses are up, but nothing evaluates alarms: a
+  // quiet alarm list must not read as "all clear".
+  it("never shows a runtime that is not evaluating alarms as a calm run", () => {
+    const h = derivePanelHealth(
+      { ...running, alarmsBlind: "the runtime's snapshot task has stopped" },
+      0,
+    )
+    expect(h.kind).toBe("alarms_blind")
+    expect(h.tone).toBe("alert")
+    expect(h.badge).toBe("ALARMS OFF")
+    expect(h.text).toContain("ALARMS NOT EVALUATED")
+    expect(h.text).toContain("snapshot task has stopped")
+  })
+
+  it("ranks alarm blindness below comms loss and a fault, above a device and a pause", () => {
+    const blind = { alarmsBlind: "stuck" }
+    expect(derivePanelHealth({ ...running, ...blind }, COMMS_LOST_POLLS).kind).toBe("unreachable")
+    expect(
+      derivePanelHealth({ ...running, ...blind, alarm: "trap: divide by zero" }, 0).kind,
+    ).toBe("fault")
+    expect(
+      derivePanelHealth({ ...running, ...blind, unhealthyDevices: ["plc1"] }, 0).kind,
+    ).toBe("alarms_blind")
+    expect(derivePanelHealth({ ...running, ...blind, mode: "paused" }, 0).kind).toBe(
+      "alarms_blind",
+    )
   })
 
   it("surfaces unhealthy devices with their names", () => {
@@ -123,5 +153,45 @@ describe("edge scan period", () => {
   it("carries the runtime's own cadence through, and null when absent", () => {
     expect(edgeRuntimeState({ fault: null, scan_period_ms: 5000 }).scanPeriodMs).toBe(5000)
     expect(edgeRuntimeState({ fault: null }).scanPeriodMs).toBeNull()
+  })
+})
+
+describe("alarmsBlindReason", () => {
+  const tap = (patch: object) => ({
+    running: true,
+    faults: 0,
+    last_fault: null,
+    stalled_for_ms: null,
+    last_fault_age_ms: null,
+    ...patch,
+  })
+
+  it("names a stopped task, a stuck one and a recent fault", () => {
+    expect(alarmsBlindReason(tap({ running: false }))).toContain("has stopped")
+    expect(alarmsBlindReason(tap({ stalled_for_ms: 4200 }))).toContain("stuck for 4.2 s")
+    const recent = alarmsBlindReason(
+      tap({ faults: 2, last_fault: "the alarms stage panicked on scan 9", last_fault_age_ms: 1500 }),
+    )
+    expect(recent).toContain("faulted 2 s ago")
+    expect(recent).toContain("alarms stage panicked")
+  })
+
+  // One old incident is history, not a banner; a missing or older runtime is
+  // unknown, never a problem.
+  it("says nothing about a healthy task, an old fault or an unknown runtime", () => {
+    expect(alarmsBlindReason(tap({}))).toBeNull()
+    expect(
+      alarmsBlindReason(tap({ faults: 1, last_fault: "x", last_fault_age_ms: ALARM_FAULT_RECENT_MS })),
+    ).toBeNull()
+    expect(alarmsBlindReason(null)).toBeNull()
+    expect(alarmsBlindReason(undefined)).toBeNull()
+    expect(alarmsBlindReason({ running: true })).toBeNull()
+  })
+
+  it("rides on the runtime state mapped from /status", () => {
+    expect(
+      edgeRuntimeState({ snapshot_tap: tap({ running: false }) }).alarmsBlind,
+    ).toContain("has stopped")
+    expect(edgeRuntimeState({}).alarmsBlind).toBeNull()
   })
 })

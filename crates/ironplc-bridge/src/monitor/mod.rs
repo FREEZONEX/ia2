@@ -89,6 +89,14 @@ pub struct SnapshotTapHealth {
     #[serde(default)]
     #[ts(type = "number | null")]
     pub stalled_for_ms: Option<u64>,
+    /// How long ago the latest incident in `last_fault` happened, in
+    /// milliseconds; `null` when there has been none. `faults` only grows, so
+    /// on its own it cannot say whether the task is failing NOW; this can, to
+    /// any reader that polls once, without remembering the previous read.
+    /// Absent from a build that predates the field.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub last_fault_age_ms: Option<u64>,
 }
 
 /// Wall-clock microseconds since the UNIX epoch — the human-facing

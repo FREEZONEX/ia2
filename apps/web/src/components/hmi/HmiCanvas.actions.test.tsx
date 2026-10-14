@@ -270,6 +270,19 @@ describe("HMI write revalidation", () => {
     await waitFor(() => expect(host.write).toHaveBeenCalledTimes(1))
   })
 
+  it("does not take a control away because alarms are not being evaluated", async () => {
+    // The banner says it; refusing here would cost every control, Stop
+    // included, at the moment an operator most needs one. A feed that has
+    // really stopped is refused by the snapshot-freshness check instead.
+    vi.mocked(host.runtimeState).mockResolvedValue({
+      running: true, alarm: null, alarmsBlind: "the runtime's snapshot task is stuck",
+    })
+    render(canvas())
+    await screen.findByRole("button", { name: "Quick set" })
+    fireEvent.click(screen.getByRole("button", { name: "Quick set" }))
+    await waitFor(() => expect(host.write).toHaveBeenCalledTimes(1))
+  })
+
   it("reports an applied-but-undelivered write instead of a bare success", async () => {
     vi.mocked(host.write).mockResolvedValue('device "bus_a" link is down')
     render(canvas())
