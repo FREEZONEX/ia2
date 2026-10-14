@@ -381,6 +381,11 @@ grace_secs = 30         # 1..=3600; ignored for "report"
   back off (1, 2, 4, 8 ... minutes into the episode, at most hourly), and
   recovery is one INFO line. A task that flaps is announced at the 1st, 2nd,
   4th, 8th ... episode. The state itself is always in `snapshot_tap`.
+- **The runtime says which policy it is enforcing** (`supervision` on `/health`
+  and `/status`, and in `cs probe` beside any alarm-evaluation warning). It is
+  what the process read at startup, so a later edit of `alarms.toml` shows up
+  only after a restart. A runtime built before `[supervision]` ignores the table
+  and omits the key.
 - **It is also a standing alarm.** While alarm evaluation is lost, `GET /alarms`
   lists `__supervision/snapshot_tap` (Critical) beside the process alarms,
   `alarms_standing` counts it, the journal records it, and after it returns it

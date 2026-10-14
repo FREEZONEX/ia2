@@ -230,7 +230,7 @@ is evaluating", not "no alarms". `probe` prints `SNAPSHOT TAP STOPPED` when
 `snapshot_tap.running` is `false` (only a restart clears it),
 `SNAPSHOT TAP STALLED` when `stalled_for_ms` is set (a stage blocked inside one
 snapshot, usually a write that does not return: `running` stays true and
-`faults` stays 0) and `snapshot tap FAULTED N×` when `faults` is above zero; a count that climbs
+`faults` stays 0) and `snapshot tap FAULTED N×` when `faults` is above zero, each followed by a `policy:` line (the `supervision` the runtime is enforcing; "not reported" means an older runtime that IGNORES a declared `[supervision]`); a count that climbs
 between two probes is failing now. It is `null` for an edge build that
 predates the field.
 

@@ -17,7 +17,7 @@ use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use ironplc_bridge::monitor::SnapshotTapHealth;
+use ironplc_bridge::monitor::{SnapshotTapHealth, SupervisionInForce};
 use ironplc_bridge::DeviceHealth;
 use project::Edge;
 use serde::{Deserialize, Serialize};
@@ -140,6 +140,13 @@ pub struct EdgeProbe {
     /// failing now. `None` when unreachable, or when the edge runs a build
     /// whose `/health` predates the field.
     pub snapshot_tap: Option<SnapshotTapHealth>,
+    /// The alarm-supervision policy the edge's runtime is actually enforcing
+    /// (what it read at startup). `None` when unreachable, or when the runtime
+    /// predates the field: for a project that declares `on_loss = "safe_state"`
+    /// that means the declared protection is NOT in force, because such a
+    /// runtime ignores the table. The post-restart check of a deploy compares
+    /// this with the project's declaration.
+    pub supervision: Option<SupervisionInForce>,
     /// First line of stderr / error message when unreachable. Gives the
     /// user enough hint to fix `~/.ssh/config` or `install_dir`.
     pub error: Option<String>,
@@ -301,6 +308,7 @@ fn unreachable_probe(error: String) -> EdgeProbe {
         latch_reason: None,
         fault: None,
         snapshot_tap: None,
+        supervision: None,
         error: Some(error),
     }
 }
@@ -334,6 +342,9 @@ fn probe_from_health_body(body: &str) -> EdgeProbe {
         /// Absent on an older edge build, which reads as "unknown".
         #[serde(default)]
         snapshot_tap: Option<SnapshotTapHealth>,
+        /// Absent on a runtime that predates it, which reads as "unknown".
+        #[serde(default)]
+        supervision: Option<SupervisionInForce>,
     }
     let Ok(parsed) = serde_json::from_str::<Health>(body) else {
         return unreachable_probe(format!("unexpected body: {}", first_line(body)));
@@ -357,6 +368,7 @@ fn probe_from_health_body(body: &str) -> EdgeProbe {
         latch_reason: parsed.latch_reason,
         fault: parsed.fault,
         snapshot_tap: parsed.snapshot_tap,
+        supervision: parsed.supervision,
         error: None,
     }
 }
@@ -1846,6 +1858,33 @@ mod tests {
             Some("the alarms stage panicked on scan 4: boom")
         );
         assert!(probe.error.is_none());
+    }
+
+    #[test]
+    fn probe_carries_the_supervision_policy_and_reads_an_older_edge_as_none() {
+        let probe = probe_from_health_body(
+            r#"{"status":"ok","uptime_secs":9,"scan_count":4,
+                "supervision":{"on_loss":"safe_state","grace_secs":45}}"#,
+        );
+        let policy = probe.supervision.expect("carried through");
+        assert_eq!(
+            (policy.on_loss.as_str(), policy.grace_secs),
+            ("safe_state", 45)
+        );
+        let older = probe_from_health_body(r#"{"status":"ok","uptime_secs":9,"scan_count":4}"#);
+        assert_eq!(older.supervision, None, "unknown, not report");
+    }
+
+    /// A newer runtime may report a mode this server has never heard of. The
+    /// probe must still read the edge, not call the whole thing unreachable.
+    #[test]
+    fn probe_survives_a_supervision_mode_it_does_not_know() {
+        let probe = probe_from_health_body(
+            r#"{"status":"ok","uptime_secs":9,"scan_count":4,
+                "supervision":{"on_loss":"a_future_mode","grace_secs":10,"extra":true}}"#,
+        );
+        assert!(probe.reachable, "{probe:?}");
+        assert_eq!(probe.supervision.unwrap().on_loss, "a_future_mode");
     }
 
     #[test]

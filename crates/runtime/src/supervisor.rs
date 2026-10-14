@@ -58,6 +58,19 @@ impl From<&SupervisionConfig> for Policy {
 }
 
 impl Policy {
+    /// What is reported on `/health` and `/status`: the policy this process is
+    /// enforcing.
+    pub fn in_force(&self) -> monitor::SupervisionInForce {
+        monitor::SupervisionInForce {
+            on_loss: match self.on_loss {
+                SupervisionAction::Report => "report",
+                SupervisionAction::SafeState => "safe_state",
+            }
+            .to_string(),
+            grace_secs: self.grace.as_secs(),
+        }
+    }
+
     /// One line for the startup log and for the loss message, so the journal
     /// says what will happen without a trip to the project files.
     pub fn describe(&self) -> String {
@@ -499,6 +512,18 @@ mod tests {
         }
         assert_eq!(lost_lines, 7, "episodes 1, 2, 4, 8, 16, 32, 64");
         assert_eq!(restored_lines, lost_lines, "every announced loss is closed");
+    }
+
+    #[test]
+    fn the_policy_in_force_is_reported_by_name_and_grace() {
+        let report = Policy::from(&SupervisionConfig::default()).in_force();
+        assert_eq!((report.on_loss.as_str(), report.grace_secs), ("report", 30));
+        let safe = Policy::from(&SupervisionConfig {
+            on_loss: SupervisionAction::SafeState,
+            grace_secs: 45,
+        })
+        .in_force();
+        assert_eq!((safe.on_loss.as_str(), safe.grace_secs), ("safe_state", 45));
     }
 
     #[test]

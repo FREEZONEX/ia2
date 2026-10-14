@@ -309,6 +309,8 @@ struct AppState {
     /// The task feeding history, alarms and `latest` — reported on /health
     /// and /status so its failure is not silent.
     tap: Arc<tap::TapStatus>,
+    /// The alarm-supervision policy this process is enforcing.
+    supervision: monitor::SupervisionInForce,
 }
 
 #[tokio::main]
@@ -448,6 +450,7 @@ async fn main() -> Result<()> {
 
     let tap = tap::TapStatus::new();
     let supervision = supervisor::Policy::from(&supervision);
+    let supervision_in_force = supervision.in_force();
     tracing::info!(policy = %supervision.describe(), "alarm supervision policy");
     tokio::spawn(supervisor::supervise(
         tap.clone(),
@@ -482,6 +485,7 @@ async fn main() -> Result<()> {
         alarms,
         audit: AuditLog::default(),
         tap,
+        supervision: supervision_in_force,
     };
 
     // ---- Northbound (MQTT -> supOS/Tier0) ----
@@ -714,6 +718,12 @@ struct Health {
     /// the task ended; a `faults` count that climbs between two polls means a
     /// stage is failing now.
     snapshot_tap: monitor::SnapshotTapHealth,
+    /// The alarm-supervision policy this process is enforcing (what it read at
+    /// startup, not what `alarms.toml` says now): what happens if alarm
+    /// evaluation is lost. A reader compares it with what the project declares;
+    /// a runtime built before the field omits it, which for a project that
+    /// declares `safe_state` means that protection is NOT in force.
+    supervision: monitor::SupervisionInForce,
 }
 
 async fn health(State(state): State<AppState>) -> Json<Health> {
@@ -728,6 +738,7 @@ async fn health(State(state): State<AppState>) -> Json<Health> {
         scan_count,
         state.start_time.elapsed().as_secs(),
         state.tap.health(),
+        state.supervision.clone(),
     ))
 }
 
@@ -738,6 +749,7 @@ fn health_of(
     scan_count: u64,
     uptime_secs: u64,
     snapshot_tap: monitor::SnapshotTapHealth,
+    supervision: monitor::SupervisionInForce,
 ) -> Health {
     let devices = handle.device_health();
     Health {
@@ -750,6 +762,7 @@ fn health_of(
         fault: handle.fault(),
         latch_reason: handle.latch_reason(),
         snapshot_tap,
+        supervision,
     }
 }
 
@@ -997,6 +1010,8 @@ struct Status {
     alarms_standing: usize,
     /// Why the outputs are latched off; see `/health`.
     latch_reason: Option<String>,
+    /// The alarm-supervision policy in force; see `/health`.
+    supervision: monitor::SupervisionInForce,
     /// Same as `/health`'s `snapshot_tap`. Read it before trusting
     /// `last_snapshot`, `scan_count` and `alarms_standing`: if the tap has
     /// ended they stop moving, and `alarms_standing: 0` then means "nothing
@@ -1035,6 +1050,7 @@ async fn status(State(state): State<AppState>) -> Json<Status> {
         fault: state.handle.fault(),
         alarms_standing,
         latch_reason: state.handle.latch_reason(),
+        supervision: state.supervision.clone(),
         snapshot_tap: state.tap.health(),
     })
 }
@@ -1622,6 +1638,11 @@ mod tests {
         RuntimeWriteError, StatusCode, AUDIT_CAP,
     };
 
+    /// The policy a project that declares nothing runs with.
+    fn default_policy() -> ironplc_bridge::monitor::SupervisionInForce {
+        crate::supervisor::Policy::from(&project::SupervisionConfig::default()).in_force()
+    }
+
     /// Spawn a one-unit run of `body` (the statements of PROGRAM main,
     /// which declares `x` and `z : INT`).
     fn spawn_main(body: &str) -> ironplc_bridge::ProgramHandle {
@@ -1664,6 +1685,7 @@ mod tests {
             0,
             1,
             crate::tap::TapStatus::new().health(),
+            default_policy(),
         ))
         .unwrap();
         assert_eq!(body["status"], "ok", "the process still answers");
@@ -1680,6 +1702,7 @@ mod tests {
             0,
             1,
             crate::tap::TapStatus::new().health(),
+            default_policy(),
         ))
         .unwrap();
         assert_eq!(body["status"], "ok");
@@ -1824,6 +1847,36 @@ mod tests {
             .expect("shutdown");
     }
 
+    /// `/health` says which alarm-supervision policy this process is enforcing.
+    /// A reader compares it with what the project declares: a runtime that does
+    /// not know the setting omits the key, and a declared `safe_state` is then
+    /// not in force.
+    #[tokio::test]
+    async fn health_reports_the_alarm_supervision_policy_in_force() {
+        use project::{SupervisionAction, SupervisionConfig};
+
+        let handle = spawn_main("x := x + 1;");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let tap = crate::tap::TapStatus::new().health();
+
+        let report =
+            serde_json::to_value(health_of(&handle, 0, 1, tap.clone(), default_policy())).unwrap();
+        assert_eq!(report["supervision"]["on_loss"], "report", "{report}");
+        assert_eq!(report["supervision"]["grace_secs"], 30);
+
+        let safe = crate::supervisor::Policy::from(&SupervisionConfig {
+            on_loss: SupervisionAction::SafeState,
+            grace_secs: 45,
+        })
+        .in_force();
+        let body = serde_json::to_value(health_of(&handle, 0, 1, tap, safe)).unwrap();
+        assert_eq!(body["supervision"]["on_loss"], "safe_state", "{body}");
+        assert_eq!(body["supervision"]["grace_secs"], 45);
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
     /// The latch is one flag, `watchdog_tripped`, whoever set it. `/health`
     /// says why, so a reader does not blame the scan watchdog for a latch the
     /// project's supervision policy asked for.
@@ -1832,7 +1885,9 @@ mod tests {
         let handle = spawn_main("x := x + 1;");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let healthy = crate::tap::TapStatus::new().health();
-        let before = serde_json::to_value(health_of(&handle, 0, 1, healthy.clone())).unwrap();
+        let before =
+            serde_json::to_value(health_of(&handle, 0, 1, healthy.clone(), default_policy()))
+                .unwrap();
         assert_eq!(before["watchdog_tripped"], false);
         assert!(
             before["latch_reason"].is_null(),
@@ -1843,7 +1898,8 @@ mod tests {
             .latch_outputs_off("alarm supervision lost for 30 s")
             .await
             .unwrap());
-        let after = serde_json::to_value(health_of(&handle, 0, 1, healthy)).unwrap();
+        let after =
+            serde_json::to_value(health_of(&handle, 0, 1, healthy, default_policy())).unwrap();
         assert_eq!(after["watchdog_tripped"], true);
         assert_eq!(after["latch_reason"], "alarm supervision lost for 30 s");
         tokio::time::timeout(std::time::Duration::from_secs(5), handle.shutdown())
@@ -1866,7 +1922,7 @@ mod tests {
             stalled_for_ms: Some(2500),
             last_fault_age_ms: Some(300),
         };
-        let body = serde_json::to_value(health_of(&handle, 12, 1, tap)).unwrap();
+        let body = serde_json::to_value(health_of(&handle, 12, 1, tap, default_policy())).unwrap();
         assert_eq!(body["status"], "ok", "the process still answers");
         assert_eq!(body["snapshot_tap"]["running"], false);
         assert_eq!(body["snapshot_tap"]["faults"], 7);
@@ -1877,7 +1933,8 @@ mod tests {
             .is_some_and(|t| t.contains("alarms stage panicked")));
 
         let healthy = crate::tap::TapStatus::new().health();
-        let body = serde_json::to_value(health_of(&handle, 0, 1, healthy)).unwrap();
+        let body =
+            serde_json::to_value(health_of(&handle, 0, 1, healthy, default_policy())).unwrap();
         assert_eq!(body["snapshot_tap"]["running"], true);
         assert!(body["snapshot_tap"]["last_fault"].is_null(), "{body}");
         assert!(body["snapshot_tap"]["stalled_for_ms"].is_null(), "{body}");

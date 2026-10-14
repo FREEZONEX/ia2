@@ -154,6 +154,7 @@ function Editor({
         latch_reason: null,
         fault: null,
         snapshot_tap: null,
+        supervision: null,
         error: String(e),
       })
     } finally {

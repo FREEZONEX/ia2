@@ -99,6 +99,30 @@ pub struct SnapshotTapHealth {
     pub last_fault_age_ms: Option<u64>,
 }
 
+/// The alarm-supervision policy a running edge runtime is ACTUALLY enforcing,
+/// as served on its `/health` and `/status`.
+///
+/// This is what the process read at startup, not what `alarms.toml` says now
+/// (edits apply on the next restart). It exists so a reader can tell whether a
+/// declared `[supervision]` is in force: a deploy that carries an older runtime
+/// binary forward ignores the table without a word, and the project then runs
+/// without the protection it declared.
+///
+/// Deliberately lenient where `project::SupervisionConfig` is strict: that one
+/// refuses unknown keys and unknown modes so a typo in a protective setting
+/// fails the deploy, but a reader of `/health` must not fail to parse the WHOLE
+/// body (and report the edge unreachable) because a newer runtime reports a
+/// mode it has never heard of. So `on_loss` is the mode's name as text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SupervisionInForce {
+    /// `"report"` or `"safe_state"`.
+    pub on_loss: String,
+    /// Seconds alarm evaluation may stay lost before `on_loss` is carried out.
+    #[ts(type = "number")]
+    pub grace_secs: u64,
+}
+
 /// Wall-clock microseconds since the UNIX epoch — the human-facing
 /// time base for alarm journals and ack stamps.
 pub fn wall_now_us() -> u64 {

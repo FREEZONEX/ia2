@@ -15,6 +15,7 @@ function probe(patch: Partial<EdgeProbe> = {}): EdgeProbe {
     fault: null,
     latch_reason: null,
     snapshot_tap: null,
+    supervision: null,
     error: null,
     ...patch,
   }

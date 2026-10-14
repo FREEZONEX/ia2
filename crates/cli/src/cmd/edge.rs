@@ -178,7 +178,36 @@ fn reachable_report(name: &str, value: &serde_json::Value) -> Vec<String> {
                 .unwrap_or_default()
         ));
     }
+    // What the runtime will DO about it is what an operator needs next to the
+    // warning, so it is said here and not on a healthy edge.
+    if !tap_running || tap_stalled_ms.is_some() || tap_faults > 0 {
+        lines.push(supervision_line(value.get("supervision")));
+    }
     lines
+}
+
+/// The alarm-supervision policy the runtime is enforcing, as one line.
+fn supervision_line(policy: Option<&serde_json::Value>) -> String {
+    let policy = policy.filter(|p| p.is_object());
+    let mode = policy
+        .and_then(|p| p.get("on_loss"))
+        .and_then(|v| v.as_str());
+    let grace = policy
+        .and_then(|p| p.get("grace_secs"))
+        .and_then(|v| v.as_u64());
+    match (mode, grace) {
+        (Some("safe_state"), Some(grace)) => format!(
+            "  policy: on_loss = safe_state — the outputs are latched off if alarm \
+             evaluation stays lost for {grace} s"
+        ),
+        (Some("report"), _) => {
+            "  policy: on_loss = report — nothing is stopped automatically".to_string()
+        }
+        (Some(other), _) => format!("  policy: on_loss = {other}"),
+        (None, _) => "  policy: not reported — this runtime predates `[supervision]`, so a \
+                      declared safe_state is NOT in force on this edge"
+            .to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -191,7 +220,7 @@ mod tests {
             "reachable": true, "scan_count": 12, "uptime_secs": 30,
             "runtime_version": null, "fieldbus_healthy": true,
             "unhealthy_devices": [], "watchdog_tripped": false,
-            "fault": null, "snapshot_tap": null, "error": null,
+            "fault": null, "snapshot_tap": null, "supervision": null, "error": null,
         });
         v.as_object_mut()
             .unwrap()
@@ -264,6 +293,43 @@ mod tests {
         assert!(lines[0].starts_with('⚠'), "{lines:?}");
         assert!(lines[1].contains("SNAPSHOT TAP STALLED"), "{lines:?}");
         assert!(lines[1].contains("4.2s"), "{lines:?}");
+    }
+
+    /// A warning about alarm evaluation is only half the story: what the runtime
+    /// will do about it is the other half, and an older runtime silently ignores
+    /// a declared `safe_state`.
+    #[test]
+    fn a_tap_warning_says_what_the_runtime_will_do_about_it() {
+        let stopped = |extra: serde_json::Value| {
+            let mut tap = json!({"running": false, "faults": 0, "last_fault": null});
+            tap.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            json!({"snapshot_tap": tap})
+        };
+        let with = |policy: serde_json::Value| {
+            let mut v = stopped(json!({}));
+            v["supervision"] = policy;
+            reachable_report("pi", &probe(v))
+        };
+        let safe = with(json!({"on_loss": "safe_state", "grace_secs": 45}));
+        assert!(
+            safe.last().unwrap().contains("safe_state") && safe.last().unwrap().contains("45 s"),
+            "{safe:?}"
+        );
+        let report = with(json!({"on_loss": "report", "grace_secs": 30}));
+        assert!(
+            report
+                .last()
+                .unwrap()
+                .contains("nothing is stopped automatically"),
+            "{report:?}"
+        );
+        let older = reachable_report("pi", &probe(stopped(json!({}))));
+        assert!(older.last().unwrap().contains("NOT in force"), "{older:?}");
+        // A healthy edge says nothing about it.
+        let healthy = reachable_report("pi", &probe(json!({})));
+        assert_eq!(healthy.len(), 1, "{healthy:?}");
     }
 
     /// An edge build that predates the field, or a tap that never faulted,
