@@ -225,8 +225,10 @@ from the scan loop can end (or fail on every snapshot) while the program runs
 fine, so the edge is reachable, fieldbus-healthy and scanning while it records
 no history and evaluates no alarms — `alarms_standing: 0` then means "nothing
 is evaluating", not "no alarms". `probe` prints `SNAPSHOT TAP STOPPED` when
-`snapshot_tap.running` is `false` (only a restart clears it) and
-`snapshot tap FAULTED N×` when `faults` is above zero; a count that climbs
+`snapshot_tap.running` is `false` (only a restart clears it),
+`SNAPSHOT TAP STALLED` when `stalled_for_ms` is set (a stage blocked inside one
+snapshot, usually a write that does not return: `running` stays true and
+`faults` stays 0) and `snapshot tap FAULTED N×` when `faults` is above zero; a count that climbs
 between two probes is failing now. It is `null` for an edge build that
 predates the field.
 
@@ -248,8 +250,8 @@ runtimes without an identity use the weaker counter/uptime evidence. Equal
 counts are waited for (long-cycle tasks). The entire check, including SSH
 reads and sleeps, is bounded to 30 s. `health.state` is `faulted` for a fault
 or watchdog, `not_running` for paused/step, `unmonitored` when the runtime's
-snapshot task (history, process alarms, the scan counter) has stopped or its
-`snapshot_tap.faults` is rising — the program may scan but no alarm can be
+snapshot task (history, process alarms, the scan counter) has stopped, is stuck
+on one snapshot or its `snapshot_tap.faults` is rising — the program may scan but no alarm can be
 raised, and the deploy says so instead of "program not running" — or `unknown`
 when progress cannot be confirmed by the deadline; all are `ok:false` (exit 1). **Unknown does not
 prove stopped or safe.** A task longer than the window can remain unknown.

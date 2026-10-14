@@ -110,8 +110,19 @@ fn reachable_report(name: &str, value: &serde_json::Value) -> Vec<String> {
     let tap_last = tap
         .and_then(|t| t.get("last_fault"))
         .and_then(|v| v.as_str());
+    // Inside one snapshot for longer than a healthy stage takes: a stage is
+    // blocked. `running` stays true and `faults` stays 0 then.
+    let tap_stalled_ms = tap
+        .and_then(|t| t.get("stalled_for_ms"))
+        .and_then(|v| v.as_u64());
     let summary = format!("{name} reachable · v{version} · {scans} scans · up {uptime}");
-    if down.is_empty() && !latched && fault.is_none() && tap_running && tap_faults == 0 {
+    if down.is_empty()
+        && !latched
+        && fault.is_none()
+        && tap_running
+        && tap_faults == 0
+        && tap_stalled_ms.is_none()
+    {
         return vec![format!("✓ {summary}")];
     }
     let mut lines = vec![format!("⚠ {summary}")];
@@ -140,6 +151,14 @@ fn reachable_report(name: &str, value: &serde_json::Value) -> Vec<String> {
              being evaluated and the scan count is frozen (the program itself keeps \
              running); restart the runtime{}",
             tap_last.map(|t| format!(". Last: {t}")).unwrap_or_default()
+        ));
+    } else if let Some(ms) = tap_stalled_ms {
+        lines.push(format!(
+            "  SNAPSHOT TAP STALLED — stuck on one snapshot for {}.{}s: history, process \
+             alarms, the scan count and the live feed are not updating (the program itself \
+             keeps running); a blocked write is the usual cause",
+            ms / 1000,
+            (ms % 1000) / 100
         ));
     } else if tap_faults > 0 {
         lines.push(format!(
@@ -222,6 +241,21 @@ mod tests {
         assert!(lines[0].starts_with('⚠'), "{lines:?}");
         assert!(lines[1].contains("snapshot tap FAULTED 5×"), "{lines:?}");
         assert!(lines[1].contains("alarms stage panicked"), "{lines:?}");
+    }
+
+    /// A stage that blocks neither panics nor lags, so only `stalled_for_ms`
+    /// says the tap is stuck; `running` is true and `faults` is 0.
+    #[test]
+    fn an_edge_whose_snapshot_tap_is_stuck_warns() {
+        let lines = reachable_report(
+            "pi",
+            &probe(json!({"snapshot_tap": {
+                "running": true, "faults": 0, "last_fault": null, "stalled_for_ms": 4200
+            }})),
+        );
+        assert!(lines[0].starts_with('⚠'), "{lines:?}");
+        assert!(lines[1].contains("SNAPSHOT TAP STALLED"), "{lines:?}");
+        assert!(lines[1].contains("4.2s"), "{lines:?}");
     }
 
     /// An edge build that predates the field, or a tap that never faulted,

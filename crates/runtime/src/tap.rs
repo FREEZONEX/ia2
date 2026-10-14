@@ -19,11 +19,18 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use ironplc_bridge::monitor::{self, AlarmEngine, Historian, SnapshotTapHealth};
 use ironplc_bridge::VarSnapshot;
 use parking_lot::Mutex;
 use tokio::sync::broadcast::{self, error::RecvError};
+
+/// How long the tap may sit inside one snapshot before it is called stalled.
+/// The scan loop emits a snapshot every 100 ms and a healthy stage takes
+/// microseconds to a few milliseconds; two seconds is twenty periods of slack
+/// for a slow disk and still short enough to matter to an operator.
+const STALL_AFTER: Duration = Duration::from_secs(2);
 
 /// One consumer of the snapshot stream, named for the fault report.
 pub type Stage = (&'static str, Box<dyn Fn(&VarSnapshot) + Send>);
@@ -33,6 +40,9 @@ pub struct TapStatus {
     running: AtomicBool,
     faults: AtomicU64,
     last_fault: Mutex<Option<String>>,
+    /// When the snapshot now being processed began; `None` between snapshots.
+    busy_since: Mutex<Option<Instant>>,
+    stall_after: Duration,
 }
 
 impl TapStatus {
@@ -42,15 +52,36 @@ impl TapStatus {
             running: AtomicBool::new(true),
             faults: AtomicU64::new(0),
             last_fault: Mutex::new(None),
+            busy_since: Mutex::new(None),
+            stall_after: STALL_AFTER,
         })
     }
 
     pub fn health(&self) -> SnapshotTapHealth {
+        self.health_at(Instant::now())
+    }
+
+    /// [`Self::health`] as of `now`, so the stall threshold is testable.
+    fn health_at(&self, now: Instant) -> SnapshotTapHealth {
+        let stalled_for = self
+            .busy_since
+            .lock()
+            .map(|since| now.saturating_duration_since(since))
+            .filter(|busy| *busy >= self.stall_after);
         SnapshotTapHealth {
             running: self.running.load(Ordering::Relaxed),
             faults: self.faults.load(Ordering::Relaxed),
             last_fault: self.last_fault.lock().clone(),
+            stalled_for_ms: stalled_for.map(|d| d.as_millis() as u64),
         }
+    }
+
+    fn begin_snapshot(&self, now: Instant) {
+        *self.busy_since.lock() = Some(now);
+    }
+
+    fn end_snapshot(&self) {
+        *self.busy_since.lock() = None;
     }
 
     fn record_fault(&self, what: String) {
@@ -134,7 +165,11 @@ pub async fn run(
     let _ended = EndGuard(status.clone());
     loop {
         match rx.recv().await {
-            Ok(snap) => feed(&stages, &snap, &status),
+            Ok(snap) => {
+                status.begin_snapshot(Instant::now());
+                feed(&stages, &snap, &status);
+                status.end_snapshot();
+            }
             Err(RecvError::Lagged(skipped)) => status.record_fault(format!(
                 "fell behind the scan loop: {skipped} snapshots were skipped"
             )),
@@ -189,9 +224,92 @@ mod tests {
         let h = TapStatus::new().health();
         assert_eq!(
             serde_json::to_value(&h).unwrap(),
-            serde_json::json!({"running": true, "faults": 0, "last_fault": null}),
+            serde_json::json!(
+                {"running": true, "faults": 0, "last_fault": null, "stalled_for_ms": null}
+            ),
             "present and null, so clients can rely on the keys"
         );
+    }
+
+    /// The threshold itself, with the clock handed in: a snapshot that has
+    /// been in progress for less than the limit is a busy tap, not a stalled
+    /// one; at the limit it is stalled, and says for how long; between
+    /// snapshots it is neither.
+    #[test]
+    fn stalled_for_ms_appears_at_the_threshold_and_clears_between_snapshots() {
+        let status = TapStatus::new();
+        let t0 = Instant::now();
+        assert_eq!(
+            status.health_at(t0).stalled_for_ms,
+            None,
+            "nothing in progress"
+        );
+
+        status.begin_snapshot(t0);
+        let just_under = t0 + STALL_AFTER - Duration::from_millis(1);
+        assert_eq!(status.health_at(just_under).stalled_for_ms, None);
+        assert_eq!(
+            status.health_at(t0 + STALL_AFTER).stalled_for_ms,
+            Some(STALL_AFTER.as_millis() as u64)
+        );
+        assert_eq!(
+            status
+                .health_at(t0 + Duration::from_secs(30))
+                .stalled_for_ms,
+            Some(30_000),
+            "it keeps counting while it stays stuck"
+        );
+
+        status.end_snapshot();
+        assert_eq!(
+            status
+                .health_at(t0 + Duration::from_secs(30))
+                .stalled_for_ms,
+            None,
+            "finishing the snapshot clears it"
+        );
+    }
+
+    /// The case the fault count cannot see: a stage that blocks. It neither
+    /// panics nor lags, so `running` stays true and `faults` stays 0 — but the
+    /// state is readable from another thread while the stage is stuck, and
+    /// clears once it returns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_blocked_stage_is_reported_stalled_from_another_thread() {
+        let (tx, rx) = broadcast::channel(8);
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let stages: Vec<Stage> = vec![(
+            "disk",
+            Box::new(move |_| {
+                // Stands in for a write that does not return.
+                let _ = release_rx.lock().unwrap().recv();
+            }),
+        )];
+        let mut status = TapStatus::new();
+        Arc::get_mut(&mut status).unwrap().stall_after = Duration::from_millis(50);
+        let task = tokio::spawn(run(rx, stages, status.clone()));
+
+        tx.send(snap(1)).unwrap();
+        until("the tap to be reported stalled", || {
+            status.health().stalled_for_ms.is_some()
+        })
+        .await;
+        let h = status.health();
+        assert!(h.running, "stuck is not ended");
+        assert_eq!(
+            h.faults, 0,
+            "stuck is not a fault: nothing panicked or lagged"
+        );
+
+        release_tx.send(()).unwrap();
+        until("the stall to clear", || {
+            status.health().stalled_for_ms.is_none()
+        })
+        .await;
+        drop(tx);
+        drop(release_tx);
+        task.await.unwrap();
     }
 
     #[tokio::test]

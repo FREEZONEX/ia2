@@ -1570,11 +1570,13 @@ mod tests {
             running: false,
             faults: 7,
             last_fault: Some("the alarms stage panicked on scan 12: boom".into()),
+            stalled_for_ms: Some(2500),
         };
         let body = serde_json::to_value(health_of(&handle, 12, 1, tap)).unwrap();
         assert_eq!(body["status"], "ok", "the process still answers");
         assert_eq!(body["snapshot_tap"]["running"], false);
         assert_eq!(body["snapshot_tap"]["faults"], 7);
+        assert_eq!(body["snapshot_tap"]["stalled_for_ms"], 2500);
         assert!(body["snapshot_tap"]["last_fault"]
             .as_str()
             .is_some_and(|t| t.contains("alarms stage panicked")));
@@ -1583,6 +1585,7 @@ mod tests {
         let body = serde_json::to_value(health_of(&handle, 0, 1, healthy)).unwrap();
         assert_eq!(body["snapshot_tap"]["running"], true);
         assert!(body["snapshot_tap"]["last_fault"].is_null(), "{body}");
+        assert!(body["snapshot_tap"]["stalled_for_ms"].is_null(), "{body}");
         tokio::time::timeout(std::time::Duration::from_secs(5), handle.shutdown())
             .await
             .expect("shutdown");

@@ -85,9 +85,10 @@ prompts — the IDE runs `ssh -o BatchMode=yes`).
    the status grid, for the reason. A red `outputs locked` badge means the
    scan watchdog tripped: every output is zeroed and held off until the
    program is restarted. An ochre `degraded` badge also covers a runtime
-   whose snapshot task has ended: the program and the buses are fine, but
-   history is not recording and process alarms are not being evaluated
-   (`/health`'s `snapshot_tap.running` is `false`; restart the runtime). The
+   whose snapshot task has ended or is stuck on one snapshot: the program and
+   the buses are fine, but history is not recording and process alarms are not
+   being evaluated (`/health`'s `snapshot_tap.running` is `false`, or
+   `stalled_for_ms` is set; restart the runtime). The
    badge only judges that persistent state; whether `snapshot_tap.faults` is
    still climbing is for `cs probe` and a second look.
 
@@ -155,8 +156,8 @@ prompts — the IDE runs `ssh -o BatchMode=yes`).
    - the entire check, including SSH reads and poll sleeps, has a 30 s deadline.
      A fault/watchdog is `faulted`, paused/single-step mode is `not_running`, and
      failure to confirm progress before the deadline is `unknown`. A runtime whose
-     snapshot task has stopped, or whose `snapshot_tap.faults` rose between two
-     reads, is `unmonitored`: nothing is recorded, no process alarm can be raised,
+     snapshot task has stopped, is stuck on one snapshot (`snapshot_tap.stalled_for_ms`),
+     or whose `snapshot_tap.faults` rose between two reads, is `unmonitored`: nothing is recorded, no process alarm can be raised,
      and `scan_count` freezes with the task, so progress cannot be confirmed
      either. A fault count that is steady does not change the verdict but is
      named in it. `faulted`, `not_running`, `unmonitored` and `unknown` all fail
