@@ -163,6 +163,11 @@ prompts — the IDE runs `ssh -o BatchMode=yes`).
      either. A fault count that is steady does not change the verdict but is
      named in it. `faulted`, `not_running`, `unmonitored` and `unknown` all fail
      the deploy (`ok:false`). **Unknown does not prove stopped or physically safe.**
+     A project that declares `[supervision] on_loss = "safe_state"` is also held
+     to it: the check compares the declaration with the `supervision` the
+     runtime reports it is enforcing, and `unprotected` (also `ok:false`) means
+     they differ, typically because the edge runs an older runtime that ignores
+     the table.
      A task with a period longer than the observation window may remain unknown;
    - the new version stays installed and current. No automatic rollback or
      restart of the previous program occurs after a failed health check. Inspect

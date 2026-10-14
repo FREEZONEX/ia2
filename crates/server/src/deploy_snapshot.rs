@@ -7,6 +7,10 @@ use std::path::{Path, PathBuf};
 pub(crate) struct DeploySnapshot {
     _directory: tempfile::TempDir,
     project_dir: PathBuf,
+    /// The alarm-supervision policy this project declares, read by the same
+    /// preflight that validated it. The post-restart check compares it with the
+    /// policy the edge's runtime reports it is enforcing.
+    supervision: project::SupervisionConfig,
 }
 
 impl DeploySnapshot {
@@ -19,11 +23,16 @@ impl DeploySnapshot {
         copy_tree(source, &project_dir).map_err(|e| format!("copying deploy snapshot: {e}"))?;
         // Concurrent edits can affect the copy while it is being created, but
         // from here on validation and upload use these same independent bytes.
-        ironplc_bridge::load_edge_project(&project_dir)?;
+        let loaded = ironplc_bridge::load_edge_project(&project_dir)?;
         Ok(Self {
             _directory: directory,
             project_dir,
+            supervision: loaded.supervision,
         })
+    }
+
+    pub(crate) fn supervision(&self) -> &project::SupervisionConfig {
+        &self.supervision
     }
 
     pub(crate) fn project_dir(&self) -> &Path {
@@ -100,6 +109,32 @@ mod tests {
             checked_source
         );
         assert!(ironplc_bridge::load_edge_project(&uploaded).is_ok());
+    }
+
+    /// The post-restart check compares the edge's reported policy with the one
+    /// the project declares; it can only do so if the preflight that already
+    /// read the project hands that policy on.
+    #[test]
+    fn the_snapshot_carries_the_policy_the_project_declares() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProjectStore::create(dir.path().join("source"), "source").unwrap();
+        let snapshot = DeploySnapshot::prepare(store.root()).unwrap();
+        assert_eq!(
+            snapshot.supervision(),
+            &project::SupervisionConfig::default()
+        );
+
+        std::fs::write(
+            store.root().join("alarms.toml"),
+            "[supervision]\non_loss = \"safe_state\"\ngrace_secs = 45\n",
+        )
+        .unwrap();
+        let snapshot = DeploySnapshot::prepare(store.root()).unwrap();
+        assert_eq!(
+            snapshot.supervision().on_loss,
+            project::SupervisionAction::SafeState
+        );
+        assert_eq!(snapshot.supervision().grace_secs, 45);
     }
 
     #[test]

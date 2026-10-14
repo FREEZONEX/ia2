@@ -546,6 +546,13 @@ pub enum DeployHealthState {
     Faulted,
     /// The runtime explicitly reports paused or single-step mode.
     NotRunning,
+    /// The program may well be running, but the alarm-supervision policy the
+    /// project declares (`[supervision] on_loss = "safe_state"`) is NOT the one
+    /// the edge's runtime is enforcing: most often a runtime built before the
+    /// setting, which ignores it without a word (a deploy that ships no binary
+    /// keeps the edge's own). The declared protection does not exist. Fails
+    /// the deploy.
+    Unprotected,
     /// The runtime answers, but the task that feeds its history, its process
     /// alarms and the scan counter this check reads has stopped, or is
     /// failing right now. Nothing is recorded and no alarm is evaluated, and
@@ -800,6 +807,7 @@ pub async fn deploy_to_edge(
             || fetch_edge_json(edge, "/status"),
             HEALTH_WINDOW,
             HEALTH_POLL,
+            snapshot.supervision(),
         )
         .await
     };
@@ -857,6 +865,9 @@ struct StatusReading {
     tap_stalled_ms: Option<u64>,
     /// Why the outputs are latched off (`latch_reason`), when they are.
     latch_reason: Option<String>,
+    /// The alarm-supervision policy the runtime says it is enforcing:
+    /// (`on_loss`, `grace_secs`). `None` for a runtime that predates the field.
+    supervision: Option<(String, u64)>,
 }
 
 fn status_reading(v: &serde_json::Value) -> StatusReading {
@@ -893,10 +904,62 @@ fn status_reading(v: &serde_json::Value) -> StatusReading {
             .get("latch_reason")
             .and_then(|r| r.as_str())
             .map(String::from),
+        supervision: v.get("supervision").and_then(|s| {
+            Some((
+                s.get("on_loss")?.as_str()?.to_string(),
+                s.get("grace_secs")?.as_u64()?,
+            ))
+        }),
         tap_last_fault: v
             .pointer("/snapshot_tap/last_fault")
             .and_then(|t| t.as_str())
             .map(String::from),
+    }
+}
+
+/// Whether the policy the project declares is the one the runtime reports it is
+/// enforcing; `Some(why not)` when it is not.
+///
+/// A runtime that reports nothing is an older build that ignores `[supervision]`:
+/// that is only a problem for a project that declares something other than the
+/// default (`report` asks for nothing to be enforced). For `report` the grace is
+/// irrelevant and not compared.
+fn supervision_not_in_force(
+    declared: &project::SupervisionConfig,
+    reported: Option<&(String, u64)>,
+) -> Option<String> {
+    use project::SupervisionAction::{Report, SafeState};
+    let want = match declared.on_loss {
+        Report => "report",
+        SafeState => "safe_state",
+    };
+    match reported {
+        None => (declared.on_loss == SafeState).then(|| {
+            format!(
+                "the project declares `[supervision] on_loss = \"safe_state\"` (grace {} s), but \
+                 the runtime on this edge does not report an alarm-supervision policy: it \
+                 predates the setting and ignores it, so the declared protection is NOT in \
+                 force. Deploy a runtime built from this version (a deploy that ships no \
+                 binary keeps the edge's own)",
+                declared.grace_secs
+            )
+        }),
+        Some((mode, grace)) => {
+            let same = mode == want
+                && (declared.on_loss != SafeState || *grace == u64::from(declared.grace_secs));
+            (!same).then(|| {
+                format!(
+                    "the project declares on_loss = {want}{}, but the runtime on this edge \
+                     reports on_loss = {mode}, grace {grace} s: the declared policy is NOT the \
+                     one in force",
+                    if declared.on_loss == SafeState {
+                        format!(", grace_secs = {}", declared.grace_secs)
+                    } else {
+                        String::new()
+                    }
+                )
+            })
+        }
     }
 }
 
@@ -924,6 +987,7 @@ async fn watch_restarted_program<F, Fut>(
     mut read: F,
     window: Duration,
     poll: Duration,
+    declared: &project::SupervisionConfig,
 ) -> DeployHealth
 where
     F: FnMut() -> Fut,
@@ -961,6 +1025,13 @@ where
                         None => "the scan watchdog latched the runtime's output phase off".into(),
                     };
                     return verdict(DeployHealthState::Faulted, detail, r.unhealthy_devices);
+                }
+                // The declared policy must be the one in force, whatever else is
+                // true: a project that asked for `safe_state` and runs under a
+                // runtime that ignores it is unprotected, and nothing else here
+                // would say so.
+                if let Some(detail) = supervision_not_in_force(declared, r.supervision.as_ref()) {
+                    return verdict(DeployHealthState::Unprotected, detail, r.unhealthy_devices);
                 }
                 // Before the mode and progress checks: a stopped tap freezes
                 // the very `scan_count` they read, and the specific cause
@@ -2004,6 +2075,14 @@ mod tests {
     /// last one repeats), in a short window so a check that never settles
     /// ends quickly.
     async fn watch(reads: Vec<Result<serde_json::Value, String>>) -> DeployHealth {
+        watch_declaring(reads, &project::SupervisionConfig::default()).await
+    }
+
+    /// The same, for a project that declares `declared`.
+    async fn watch_declaring(
+        reads: Vec<Result<serde_json::Value, String>>,
+        declared: &project::SupervisionConfig,
+    ) -> DeployHealth {
         let mut queue = std::collections::VecDeque::from(reads);
         watch_restarted_program(
             move || {
@@ -2017,6 +2096,7 @@ mod tests {
             },
             Duration::from_millis(200),
             Duration::from_millis(5),
+            declared,
         )
         .await
     }
@@ -2172,6 +2252,107 @@ mod tests {
             "{health:?}"
         );
         assert!(!health.state.deploy_ok());
+    }
+
+    /// A running-mode `/status` read where the runtime reports the policy it
+    /// is enforcing (`None` = a runtime that predates the field).
+    fn with_policy(
+        scan_count: u64,
+        policy: Option<(&str, u64)>,
+    ) -> Result<serde_json::Value, String> {
+        let mut v = status(scan_count, None).unwrap();
+        if let Some((on_loss, grace_secs)) = policy {
+            v["supervision"] = serde_json::json!({"on_loss": on_loss, "grace_secs": grace_secs});
+        }
+        Ok(v)
+    }
+
+    fn declares(
+        on_loss: project::SupervisionAction,
+        grace_secs: u32,
+    ) -> project::SupervisionConfig {
+        project::SupervisionConfig {
+            on_loss,
+            grace_secs,
+        }
+    }
+
+    /// The deploy carried an older runtime forward; the project declares
+    /// `safe_state`; the older runtime ignores the table. Every other signal is
+    /// green (reachable, scanning, no fault), and the protection the project
+    /// asked for does not exist. The check must say so and fail the deploy.
+    #[tokio::test]
+    async fn a_declared_safe_state_that_an_older_runtime_ignores_fails_the_deploy() {
+        use project::SupervisionAction::SafeState;
+        let declared = declares(SafeState, 45);
+        let health =
+            watch_declaring(vec![with_policy(1, None), with_policy(5, None)], &declared).await;
+        assert_eq!(health.state, DeployHealthState::Unprotected, "{health:?}");
+        assert!(!health.state.deploy_ok());
+        assert!(health.detail.contains("predates the setting"), "{health:?}");
+        assert!(health.detail.contains("NOT in force"), "{health:?}");
+        assert!(health.detail.contains("45 s"), "{health:?}");
+    }
+
+    #[tokio::test]
+    async fn a_runtime_enforcing_a_different_policy_than_declared_fails_the_deploy() {
+        use project::SupervisionAction::{Report, SafeState};
+        for (declared, reported, expect) in [
+            // reports report, declared safe_state
+            (
+                declares(SafeState, 45),
+                ("report", 30),
+                "reports on_loss = report",
+            ),
+            // right mode, wrong grace
+            (declares(SafeState, 45), ("safe_state", 30), "grace 30 s"),
+            // declared report but the runtime is enforcing safe_state
+            (
+                declares(Report, 30),
+                ("safe_state", 30),
+                "reports on_loss = safe_state",
+            ),
+        ] {
+            let health = watch_declaring(
+                vec![
+                    with_policy(1, Some(reported)),
+                    with_policy(5, Some(reported)),
+                ],
+                &declared,
+            )
+            .await;
+            assert_eq!(
+                health.state,
+                DeployHealthState::Unprotected,
+                "{declared:?} vs {reported:?}: {health:?}"
+            );
+            assert!(health.detail.contains(expect), "{health:?}");
+        }
+    }
+
+    /// The check must not cry wolf: matching policies, a project that asks for
+    /// nothing (`report`) on a runtime that reports nothing, and a grace that
+    /// does not matter under `report`, all pass as before.
+    #[tokio::test]
+    async fn a_matching_or_unneeded_policy_does_not_change_the_verdict() {
+        use project::SupervisionAction::{Report, SafeState};
+        for (declared, reported) in [
+            (declares(SafeState, 45), Some(("safe_state", 45))),
+            (declares(Report, 30), Some(("report", 30))),
+            (declares(Report, 30), Some(("report", 99))), // grace is irrelevant to report
+            (declares(Report, 30), None),                 // older runtime, nothing to enforce
+        ] {
+            let health = watch_declaring(
+                vec![with_policy(1, reported), with_policy(5, reported)],
+                &declared,
+            )
+            .await;
+            assert_eq!(
+                health.state,
+                DeployHealthState::Running,
+                "{declared:?} vs {reported:?}: {health:?}"
+            );
+        }
     }
 
     /// A running-mode `/status` read with the runtime's `snapshot_tap`.
@@ -2400,6 +2581,7 @@ mod tests {
                 },
                 Duration::from_millis(10),
                 Duration::from_millis(1),
+                &project::SupervisionConfig::default(),
             ),
         )
         .await
@@ -2420,6 +2602,7 @@ mod tests {
                 || async { status(0, None) },
                 Duration::from_millis(10),
                 Duration::from_secs(60),
+                &project::SupervisionConfig::default(),
             ),
         )
         .await
