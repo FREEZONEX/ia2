@@ -12,7 +12,8 @@
        - the commanded position and the limit feedback disagree (open valve without zso /
          close valve without zsc) for travel_timeout_s (manual dt_s accumulation) ->
          travel-timeout fault;
-       - external fault fault_in -> fault. All latched; cleared by reset with fault_in cleared.
+       - external fault fault_in -> fault. All latched; reset requires fault_in
+         cleared and the dual-limit contradiction absent.
     2) Command latch: cmd_open sets out_open when remote and fault-free;
        cmd_close or fault resets it (fail-safe-close on fault, close takes priority).
     3) Status word status: 0 closed / 1 traveling / 2 open / 3 faulted.
@@ -72,7 +73,7 @@ FUNCTION_BLOCK FB_VALVE
   IF fault_in THEN
     fault := TRUE;
   END_IF;
-  IF reset AND NOT fault_in THEN
+  IF reset AND NOT fault_in AND NOT (zso AND zsc) THEN
     fault    := FALSE;
     travel_t := 0.0;
   END_IF;

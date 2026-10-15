@@ -3,5 +3,5 @@
 # project.toml [libraries] table, which is how the IDE knows to offer
 # an update.
 name = "process-control"
-version = "0.3.1"
+version = "0.3.2"
 description = "Engineering-essential process-control blocks: signal conditioning, PID loops (velocity/position/3-step), setpoint programming & gain scheduling, alarms, device control, dosing, math/dynamics (44 FBs + demo)"

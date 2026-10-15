@@ -167,7 +167,9 @@ pub fn step(handle: &ProgramHandle, cycles: u32) -> ModeResponse {
 /// One-shot variable write with the OPTIONAL momentary-pulse contract:
 /// after `pulse_ms` the RUNTIME writes 0 back, so a closed operator tab
 /// or suspended tablet can't leave a momentary command latched.
-/// Overlapping pulses on one variable are latest-write-wins.
+/// A later accepted write (pulse or plain) or force supersedes the old reset,
+/// including bare/qualified aliases of the same variable. Rejected writes do
+/// not supersede it. Ownership is checked atomically in the scan command queue.
 ///
 /// This is the single implementation of that safety guarantee — the
 /// IDE server and the edge runtime both call it.
@@ -183,13 +185,14 @@ pub async fn write_with_pulse(
     value: i32,
     pulse_ms: Option<u32>,
 ) -> Result<WriteOutcome, RuntimeWriteError> {
-    let v = handle.write_variable(name, value).await?;
     if let Some(ms) = pulse_ms {
+        let (v, token) = handle.start_pulse(name, value).await?;
         let h = handle.clone();
         let n = name.to_string();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(ms as u64);
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(ms as u64)).await;
-            match h.write_variable_ungoverned(&n, 0).await {
+            tokio::time::sleep_until(deadline).await;
+            match h.reset_pulse(token).await {
                 // The program may have stopped in the window — that also
                 // clears the variable, so a failed reset is benign then;
                 // log it so a live-program failure is still visible.
@@ -204,7 +207,8 @@ pub async fn write_with_pulse(
                 // current VM value every scan, so the 0 lands when the link
                 // returns. What is lost without this line is any record that
                 // the plant held the command in between.
-                Ok(o) => {
+                Ok(None) => {} // A later accepted command owns the slot.
+                Ok(Some(o)) => {
                     if let Some(device) = o.undelivered_device {
                         tracing::warn!(
                             variable = %n,
@@ -217,8 +221,10 @@ pub async fn write_with_pulse(
                 }
             }
         });
+        Ok(v)
+    } else {
+        handle.write_variable(name, value).await
     }
-    Ok(v)
 }
 
 /// Decode a variable's raw 64-bit slot into a typed JSON value, given
