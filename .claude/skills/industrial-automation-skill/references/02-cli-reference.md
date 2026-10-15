@@ -129,7 +129,8 @@ cs run [--program NAME [--file path.st]]  # tasks.toml schedule, or one PROGRAM
 cs stop                                    # returns when the stop is requested, not when devices are safe
 cs runtime status [--edge NAME]      # mode + forces (no variable values)
 cs runtime snapshot [--vars a,b] [--edge NAME]   # LIVE VALUES — the read you want
-cs runtime pause | resume | step [N] [--edge NAME]
+cs runtime pause | resume | step [N] [--edge NAME]   # pause halts the PROGRAM only: adapters keep sending the
+                                     # last outputs — not a safe state; stopping the program runs the failsafe pass
 cs runtime force <var> <value> [--edge NAME]     # pinned every scan; type-aware encoding
 cs runtime unforce <var> [--edge NAME]
 cs runtime write <var> <value> [--edge NAME]     # one-shot (program may overwrite)
