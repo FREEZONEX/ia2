@@ -43,7 +43,7 @@ demo's cross-file FB references resolve) and a full `cs project check` compile
 | `pous/fb_alarm_roc.st` | `FB_ALARM_ROC` | Rate-of-change alarm: the derivative is denoised by an internal PT1 (3*dt_s), |roc| over limit trips after a delay + latch, the roc output is usable for trend |
 | `pous/fb_debounce.st` | `FB_DEBOUNCE` | DI debounce: u continuously held for t_on_s sets / t_off_s resets (independent bidirectional confirmation) |
 | `pous/fb_motor.st` | `FB_MOTOR` | Motor start/stop wrapper: remote-gated start, stop priority, feedback-timeout-mismatch fault latch, status word 0/1/2/3 |
-| `pous/fb_valve.st` | `FB_VALVE` | On/off valve wrapper: ZSO/ZSC feedback, travel timeout and dual-limit fault, fail-safe-close, status word 0/1/2/3 |
+| `pous/fb_valve.st` | `FB_VALVE` | On/off valve wrapper: ZSO/ZSC feedback, travel timeout and dual-limit fault, fail-safe-close, status word 0/1/2/3. Reset cannot clear an active dual-limit or external fault; after the cause clears, reset accepts a held open request. |
 | `pous/fb_motor_rev.st` | `FB_MOTOR_REV` | Bidirectional motor: forward/reverse/stop (stop priority), a reversal forces a full-stop interlock for reversal_delay_s, feedback-timeout / dual-feedback fault latch, status word 0..4 |
 | `pous/fb_mov.st` | `FB_MOV` | Motor-operated valve (open/stop/close + ZSO/ZSC dual limits): auto-stop at position, mid-stop allowed, travel timeout and dual-limit fault latch, status word 0..4 |
 | `pous/fb_dose.st` | `FB_DOSE` | Batch dosing: coarse/fine two stages + early in-flight cutoff of the fine valve, flow-integral metering, done + overshoot after settling; abort stops the valves and retains the quantity, reset begins the next batch |

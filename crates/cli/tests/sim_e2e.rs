@@ -250,6 +250,75 @@ fn sim_run_proves_and_refutes_against_a_real_server() {
 }
 
 #[test]
+fn valve_reset_cannot_clear_active_dual_limits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("valve_reset");
+    std::fs::create_dir_all(proj.join("pous")).unwrap();
+    std::fs::write(
+        proj.join("project.toml"),
+        "name = \"valve_reset\"\nversion = \"0.1\"\n",
+    )
+    .unwrap();
+    std::fs::write(proj.join("tasks.toml"), "[[tasks]]\nname = \"fast\"\ninterval_ms = 10\npriority = 1\n[[programs]]\ninstance = \"main\"\nprogram = \"main\"\ntask = \"fast\"\n").unwrap();
+    // Compile the actual library block, never a copy of its fault logic.
+    std::fs::copy(
+        repo_root().join("library/process-control/pous/fb_valve.st"),
+        proj.join("pous/fb_valve.st"),
+    )
+    .unwrap();
+    std::fs::write(
+        proj.join("pous/main.st"),
+        r#"
+PROGRAM main
+VAR
+    valve : FB_VALVE;
+    open_request : BOOL;
+    close_request : BOOL;
+    open_limit : BOOL;
+    close_limit : BOOL;
+    external_fault : BOOL;
+    reset_request : BOOL;
+    valve_open : BOOL;
+    valve_fault : BOOL;
+    valve_status : INT;
+END_VAR
+valve(cmd_open := open_request, cmd_close := close_request, remote := TRUE,
+      zso := open_limit, zsc := close_limit, fault_in := external_fault, reset := reset_request,
+      travel_timeout_s := 0.0, dt_s := 0.01);
+valve_open := valve.out_open;
+valve_fault := valve.fault;
+valve_status := valve.status;
+END_PROGRAM
+"#,
+    )
+    .unwrap();
+    let server = spawn_server(tmp.path());
+    server.open_project(&proj);
+    cs(&server.base)
+        .args(["project", "check"])
+        .arg(&proj)
+        .assert()
+        .success();
+    let trace = tmp.path().join("valve-reset.jsonl");
+    let result = cs(&server.base)
+        .args(["--project", "valve_reset", "sim", "run"])
+        .arg(repo_root().join("library/process-control/scenarios/valve-reset.toml"))
+        .arg("--trace")
+        .arg(&trace)
+        .timeout(std::time::Duration::from_secs(20))
+        .assert();
+    if !result.get_output().status.success() {
+        eprintln!(
+            "valve reset trace: {}",
+            std::fs::read_to_string(trace).unwrap_or_default()
+        );
+    }
+    result
+        .success()
+        .stderr(predicates::str::contains("scenario passed"));
+}
+
+#[test]
 fn infinite_loop_scenario_reports_a_fault_and_rejects_a_healthy_run() {
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("execution_budget");

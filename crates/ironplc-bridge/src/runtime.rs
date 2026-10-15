@@ -159,6 +159,14 @@ pub struct WriteOutcome {
     pub undelivered_device: Option<String>,
 }
 
+/// Identity of one accepted pulse. The scan thread records it against the
+/// resolved VM slot, so bare/qualified aliases share ownership. Arc identity
+/// avoids wrapping generations and is private to this run's command queue.
+pub(crate) struct PulseToken {
+    name: String,
+    owner: Arc<()>,
+}
+
 /// Reasons a variable write can't be honoured.
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeWriteError {
@@ -186,14 +194,18 @@ pub enum RuntimeWriteError {
 enum RuntimeCommand {
     /// One-shot variable write — applied once, may be overwritten by
     /// the program in subsequent scans. Use `ForceVariable` to keep a
-    /// value pinned. `governed: false` marks the runtime's OWN internal
-    /// writes (the monitor's pulse reset), which bypass the project's
-    /// write governance — see `ProgramHandle::write_variable_ungoverned`.
+    /// value pinned. A successful write replaces any earlier pulse owner.
     WriteVariable {
         name: String,
         value: i32,
-        governed: bool,
+        pulse_owner: Option<Arc<()>>,
         ack: tokio::sync::oneshot::Sender<Result<WriteOutcome, RuntimeWriteError>>,
+    },
+    /// Runtime-owned write-zero, conditional on this pulse still owning the
+    /// slot. Validation and application happen together on the scan thread.
+    ResetPulse {
+        token: PulseToken,
+        ack: tokio::sync::oneshot::Sender<Result<Option<WriteOutcome>, RuntimeWriteError>>,
     },
     /// Pin a variable's value: every scan begins by writing `value`
     /// into the VM after the input phase but before `run_round`, so the
@@ -439,37 +451,50 @@ impl ProgramHandle {
         name: &str,
         value: i32,
     ) -> Result<WriteOutcome, RuntimeWriteError> {
-        self.send_write(name, value, true).await
+        self.send_write(name, value, None).await
     }
 
-    /// One-shot write that BYPASSES the project's write governance.
-    /// For the runtime's OWN internal semantics only — today that is
-    /// the monitor's pulse reset, whose write-0-back is the safety half
-    /// of the `pulse_ms` contract and must land even when a rule's
-    /// `min` would clamp 0 away. Same rationale as the force bypass
-    /// (ADR-0002): a runtime-internal action is not an external write.
-    /// Deliberately `pub(crate)` — never wired to any HTTP or
-    /// northbound surface.
-    pub(crate) async fn write_variable_ungoverned(
+    /// Register ownership only after a governed write succeeds in the VM.
+    pub(crate) async fn start_pulse(
         &self,
         name: &str,
         value: i32,
-    ) -> Result<WriteOutcome, RuntimeWriteError> {
-        self.send_write(name, value, false).await
+    ) -> Result<(WriteOutcome, PulseToken), RuntimeWriteError> {
+        let token = PulseToken {
+            name: name.to_string(),
+            owner: Arc::new(()),
+        };
+        let outcome = self
+            .send_write(name, value, Some(token.owner.clone()))
+            .await?;
+        Ok((outcome, token))
+    }
+
+    /// Bypass governance for the runtime's own reset (ADR-0002), but never
+    /// overwrite a later accepted write or force. None means superseded.
+    pub(crate) async fn reset_pulse(
+        &self,
+        token: PulseToken,
+    ) -> Result<Option<WriteOutcome>, RuntimeWriteError> {
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(RuntimeCommand::ResetPulse { token, ack: ack_tx })
+            .map_err(|_| RuntimeWriteError::Disconnected)?;
+        ack_rx.await.map_err(|_| RuntimeWriteError::Disconnected)?
     }
 
     async fn send_write(
         &self,
         name: &str,
         value: i32,
-        governed: bool,
+        pulse_owner: Option<Arc<()>>,
     ) -> Result<WriteOutcome, RuntimeWriteError> {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
             .send(RuntimeCommand::WriteVariable {
                 name: name.to_string(),
                 value,
-                governed,
+                pulse_owner,
                 ack: ack_tx,
             })
             .map_err(|_| RuntimeWriteError::Disconnected)?;
@@ -1874,6 +1899,29 @@ fn resolve_var(
     var_index_by_name[i].get(rest).map(|&idx| (i, idx))
 }
 
+/// A value has already landed in the VM; report its own transport only.
+fn mapped_write_outcome(
+    value: i32,
+    idx: u16,
+    outputs: &[ResolvedMapping],
+    parked: &HashMap<u16, String>,
+    devices: &[Box<dyn IoDevice>],
+) -> WriteOutcome {
+    WriteOutcome {
+        value,
+        undelivered_device: outputs.iter().find(|rm| rm.var_index == idx).map_or_else(
+            // No live mapping: internal variable or device never connected.
+            || parked.get(&idx).cloned(),
+            |rm| {
+                devices
+                    .get(rm.device_index)
+                    .filter(|dev| !dev.is_healthy())
+                    .map(|dev| dev.name().to_string())
+            },
+        ),
+    }
+}
+
 /// Apply the project's write governance to a resolved `/write`. Returns
 /// the value to actually write — clamped to the matching rule's
 /// min/max when declared — or a governance denial.
@@ -1893,7 +1941,7 @@ fn resolve_var(
 /// decision; a governed force would no longer be a debug override, and
 /// an ungoverned exported force would be a hole — so force is simply
 /// never exported on any northbound surface). The monitor's pulse
-/// reset bypasses too, via `write_variable_ungoverned`: it is the
+/// reset bypasses too, via `reset_pulse`: it is the
 /// runtime's own safety action, not an external write.
 fn enforce_write_governance(
     governance: &WriteGovernance,
@@ -2379,6 +2427,7 @@ async fn run_loop_async(
     }
 
     // ---- Scan loop ----
+    let mut pulse_owners: HashMap<(usize, u16), Arc<()>> = HashMap::new();
     let start = Instant::now();
     let mut last_snapshot = Instant::now() - Duration::from_secs(1);
     let mut last_retain_flush = Instant::now();
@@ -2512,58 +2561,38 @@ async fn run_loop_async(
                 RuntimeCommand::WriteVariable {
                     name,
                     value,
-                    governed,
+                    pulse_owner,
                     ack,
                 } => {
                     let result = match resolve_var(&name, &instances, &var_index_by_name) {
                         Some((u, idx)) => {
-                            // Internal runtime writes (the pulse reset)
-                            // bypass governance by design — see
-                            // `write_variable_ungoverned`.
-                            let allowed = if governed {
-                                enforce_write_governance(
-                                    &governance,
-                                    &name,
-                                    u,
-                                    idx,
-                                    value,
-                                    &instances,
-                                    &debug_maps,
-                                )
-                            } else {
-                                Ok(value)
-                            };
+                            let allowed = enforce_write_governance(
+                                &governance,
+                                &name,
+                                u,
+                                idx,
+                                value,
+                                &instances,
+                                &debug_maps,
+                            );
                             match allowed {
                                 Ok(v) => match runnings[u].write_variable(VarIndex::new(idx), v) {
-                                    // The value is in the VM either way. Report
-                                    // — do not refuse — when its own device
-                                    // cannot carry it out: scoped to THIS
-                                    // variable's device, so an unrelated island
-                                    // going down never costs the operator a
-                                    // control it could still have used.
-                                    Ok(()) => Ok(WriteOutcome {
-                                        value: v,
-                                        undelivered_device: unit_outputs[u]
-                                            .iter()
-                                            .find(|rm| rm.var_index == idx)
-                                            .map_or_else(
-                                                // Nothing bound: either this
-                                                // variable has no Output
-                                                // mapping at all (nothing to
-                                                // deliver, correctly silent),
-                                                // or its device never
-                                                // connected — which is
-                                                // undelivered without needing
-                                                // to ask anyone's health.
-                                                || parked_output_device[u].get(&idx).cloned(),
-                                                |rm| {
-                                                    devices
-                                                        .get(rm.device_index)
-                                                        .filter(|dev| !dev.is_healthy())
-                                                        .map(|dev| dev.name().to_string())
-                                                },
-                                            ),
-                                    }),
+                                    Ok(()) => {
+                                        // Only an accepted write supersedes a pulse;
+                                        // governance/VM failures leave its reset live.
+                                        if let Some(owner) = pulse_owner {
+                                            pulse_owners.insert((u, idx), owner);
+                                        } else {
+                                            pulse_owners.remove(&(u, idx));
+                                        }
+                                        Ok(mapped_write_outcome(
+                                            v,
+                                            idx,
+                                            &unit_outputs[u],
+                                            &parked_output_device[u],
+                                            devices,
+                                        ))
+                                    }
                                     Err(trap) => Err(RuntimeWriteError::Vm(format!("{trap:?}"))),
                                 },
                                 Err(e) => Err(e),
@@ -2573,17 +2602,50 @@ async fn run_loop_async(
                     };
                     let _ = ack.send(result);
                 }
+                RuntimeCommand::ResetPulse { token, ack } => {
+                    let result = match resolve_var(&token.name, &instances, &var_index_by_name) {
+                        Some((u, idx)) => {
+                            if pulse_owners
+                                .get(&(u, idx))
+                                .is_some_and(|owner| Arc::ptr_eq(owner, &token.owner))
+                            {
+                                // No await between ownership validation and the
+                                // write: a queued later write cannot be erased.
+                                let result = runnings[u]
+                                    .write_variable(VarIndex::new(idx), 0)
+                                    .map(|()| {
+                                        Some(mapped_write_outcome(
+                                            0,
+                                            idx,
+                                            &unit_outputs[u],
+                                            &parked_output_device[u],
+                                            devices,
+                                        ))
+                                    })
+                                    .map_err(|trap| RuntimeWriteError::Vm(format!("{trap:?}")));
+                                pulse_owners.remove(&(u, idx));
+                                result
+                            } else {
+                                Ok(None)
+                            }
+                        }
+                        None => Err(RuntimeWriteError::UnknownVariable(token.name)),
+                    };
+                    let _ = ack.send(result);
+                }
                 RuntimeCommand::ForceVariable { name, value, ack } => {
                     // Reject unknown names early so the caller gets
                     // immediate feedback instead of a silent no-op.
-                    let result = if resolve_var(&name, &instances, &var_index_by_name).is_some() {
-                        if let Ok(mut f) = forces.lock() {
-                            f.insert(name.clone(), value);
-                        }
-                        Ok(value)
-                    } else {
-                        Err(RuntimeWriteError::UnknownVariable(name))
-                    };
+                    let result =
+                        if let Some(slot) = resolve_var(&name, &instances, &var_index_by_name) {
+                            if let Ok(mut f) = forces.lock() {
+                                f.insert(name.clone(), value);
+                                pulse_owners.remove(&slot);
+                            }
+                            Ok(value)
+                        } else {
+                            Err(RuntimeWriteError::UnknownVariable(name))
+                        };
                     let _ = ack.send(result);
                 }
                 RuntimeCommand::UnforceVariable { name, ack } => {
@@ -3220,6 +3282,7 @@ mod tests {
     use iocore::IoError;
 
     include!("runtime_regressions.rs");
+    include!("runtime_pulse_tests.rs");
 
     /// Records the order of the safety-critical shutdown callbacks so a
     /// test can assert `enter_failsafe` runs before `shutdown` — the

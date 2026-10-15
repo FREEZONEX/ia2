@@ -140,6 +140,15 @@ Value encoding for force/write: human notation — `TRUE`/`FALSE`/`1`/`0`
 for BOOL, `50.0` for REAL (the CLI bit-packs by the variable's live
 type). Negative numbers after `--`: `cs runtime force setpoint -- -5`.
 
+HTTP variable writes also accept `pulse_ms` (via `cs api` or HMI): the
+runtime resets the value to zero after the delay, even while paused. A later
+accepted pulse, plain write (including MQTT), or force supersedes that reset
+for the same resolved variable, including bare/qualified aliases. A rejected
+write leaves the reset active. Reset bypasses governance bounds; if delivery
+is impossible, it still clears the VM and logs the undelivered device.
+The current VM value is sent on normal link recovery; no new start edge is
+introduced by this pulse contract.
+
 A timed-out or cancelled `cs run` does not abandon the previous run's
 cleanup. Retry waits for the same teardown before starting anything.
 

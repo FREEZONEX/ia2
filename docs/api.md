@@ -289,6 +289,16 @@ Online debugging of the locally-running program (the IDE-side bridge). For
 the *deployed* edge runtime, proxy the same ops through
 `POST /api/edges/{name}/runtime/{op}`. All return `409` when nothing is running.
 
+Variable writes accept optional `pulse_ms: <u32>`: the runtime writes zero
+after that delay, including while paused. A later accepted pulse, ordinary
+write (including MQTT), or force to the same resolved variable supersedes
+the earlier reset; bare and qualified names share ownership. Rejected writes
+leave the existing reset active. The current reset bypasses write governance
+so a positive minimum cannot prevent zero. If its device is disconnected,
+zero still lands in the VM and the runtime logs the failed delivery; normal
+output synchronization sends the current value when the link returns.
+This contract is shared by the IDE server and the edge runtime's `/write`.
+
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/api/runtime/pause` | Freeze the scan loop (last outputs hold). Returns `ModeResponse { mode }`. |
