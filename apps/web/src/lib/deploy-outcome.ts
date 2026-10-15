@@ -5,6 +5,7 @@ export type DeployOutcome =
   | { kind: "live"; version: string; detail: string }
   | { kind: "not_running"; version: string; detail: string }
   | { kind: "unmonitored"; version: string; detail: string }
+  | { kind: "unprotected"; version: string; detail: string }
   | { kind: "unconfirmed"; version: string; detail: string }
   | { kind: "failed" }
 
@@ -19,6 +20,12 @@ export function deployOutcome(report: DeployReport): DeployOutcome {
     }
     // The program may be scanning, but the runtime's history and alarm task is
     // gone: nothing is recorded and no alarm can be raised.
+    // The program may run, but the alarm-supervision policy the project declares
+    // is not the one the edge's runtime enforces (often an older runtime that
+    // ignores the setting).
+    if (health.state === "unprotected") {
+      return { kind: "unprotected", version: report.version, detail: health.detail }
+    }
     if (health.state === "unmonitored") {
       return { kind: "unmonitored", version: report.version, detail: health.detail }
     }

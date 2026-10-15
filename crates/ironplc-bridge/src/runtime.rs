@@ -211,6 +211,17 @@ enum RuntimeCommand {
         name: String,
         ack: tokio::sync::oneshot::Sender<Result<(), RuntimeWriteError>>,
     },
+    /// Latch the outputs off, exactly as the scan watchdog does on a trip:
+    /// every device is put into failsafe and the output phase stops running
+    /// until the program is restarted. For a caller that has decided the run
+    /// must not drive the plant any more (the runtime's alarm-supervision
+    /// policy); `reason` is kept for whoever asks why. Answers `true` if this
+    /// call did the latching, `false` if the outputs were already latched
+    /// (the first reason stands).
+    LatchOutputsOff {
+        reason: String,
+        ack: tokio::sync::oneshot::Sender<bool>,
+    },
     /// Fault injection: stall each of the next `scans` **ticks** by
     /// `stall_ms` of real wall-clock time. The stall happens INSIDE the
     /// measured scan window, so the cadence check at the bottom of the
@@ -312,6 +323,12 @@ pub struct ProgramHandle {
     /// stopped being driven. Without this flag a UI cannot tell a healthy
     /// run from a latched one.
     watchdog_tripped: Arc<AtomicBool>,
+    /// Why the outputs are latched off, once they are: the scan watchdog
+    /// (with the unit and the streak), an execution-budget trap, or an
+    /// explicit [`ProgramHandle::latch_outputs_off`] request. Written BEFORE
+    /// `watchdog_tripped` is set, so a reader that sees the latch sees its
+    /// reason; the first reason stands.
+    latch_reason: Arc<std::sync::Mutex<Option<String>>>,
     /// Why the scan loop died, if it died: set exactly once — to the trap
     /// message when a VM trap stops the plant, or to the panic payload if
     /// the loop panicked — and never on a clean stop. A `watch` channel
@@ -610,8 +627,37 @@ impl ProgramHandle {
         self.consecutive_scan_overruns.load(Ordering::Relaxed)
     }
 
+    /// `true` once the outputs are latched off, whatever latched them: the
+    /// scan watchdog, an execution-budget trap, or [`Self::latch_outputs_off`].
+    /// [`Self::latch_reason`] says which.
     pub fn watchdog_tripped(&self) -> bool {
         self.watchdog_tripped.load(Ordering::Relaxed)
+    }
+
+    /// Why the outputs are latched off; `None` while they are not. The first
+    /// reason stands.
+    pub fn latch_reason(&self) -> Option<String> {
+        self.latch_reason.lock().ok().and_then(|r| r.clone())
+    }
+
+    /// Latch the outputs off on request: every device goes into failsafe and
+    /// the output phase stops until the program is restarted, exactly as on a
+    /// scan-watchdog trip (the loop keeps scanning so the live state stays
+    /// visible). Never undone from here: leaving the latched state is for a
+    /// person, by restarting. `Ok(true)` if this call latched, `Ok(false)` if
+    /// it already was.
+    pub async fn latch_outputs_off(
+        &self,
+        reason: impl Into<String>,
+    ) -> Result<bool, RuntimeWriteError> {
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(RuntimeCommand::LatchOutputsOff {
+                reason: reason.into(),
+                ack: ack_tx,
+            })
+            .map_err(|_| RuntimeWriteError::Disconnected)?;
+        ack_rx.await.map_err(|_| RuntimeWriteError::Disconnected)
     }
 
     /// Why the scan loop died, if it died: `Some(message)` after a VM trap,
@@ -803,6 +849,7 @@ fn spawn_units_with_grace(
     let device_reports = Arc::new(std::sync::Mutex::new(Vec::<DeviceReport>::new()));
     let device_health = Arc::new(std::sync::Mutex::new(Vec::<DeviceHealth>::new()));
     let watchdog_tripped = Arc::new(AtomicBool::new(false));
+    let latch_reason = Arc::new(std::sync::Mutex::new(None::<String>));
     let (fault_tx, fault_rx) = tokio::sync::watch::channel(None::<String>);
     let (reconnect_done_tx, reconnect_done_rx) = tokio::sync::watch::channel(());
 
@@ -815,6 +862,7 @@ fn spawn_units_with_grace(
     let device_reports_clone = device_reports.clone();
     let device_health_clone = device_health.clone();
     let watchdog_tripped_clone = watchdog_tripped.clone();
+    let latch_reason_clone = latch_reason.clone();
     let scan_overruns_clone = scan_overruns.clone();
     let consecutive_overruns_clone = consecutive_scan_overruns.clone();
     let device_reports_reconnect = device_reports.clone();
@@ -947,6 +995,7 @@ fn spawn_units_with_grace(
                 forces_clone,
                 device_health_clone,
                 watchdog_tripped_clone,
+                latch_reason_clone,
                 scan_overruns_clone,
                 consecutive_overruns_clone,
                 fault_tx,
@@ -1108,6 +1157,7 @@ fn spawn_units_with_grace(
         device_reports,
         device_health,
         watchdog_tripped,
+        latch_reason,
         fault: fault_rx,
         thread: Arc::new(std::sync::Mutex::new(Some(join_handle))),
         reconnect_done: reconnect_done_rx,
@@ -1170,6 +1220,15 @@ fn classify_scan_end(
         ScanEnd::ReconnectUnconfirmed
     } else {
         ScanEnd::Clean
+    }
+}
+
+/// Record why the outputs are being latched off; the first reason stands.
+fn note_latch_reason(slot: &std::sync::Mutex<Option<String>>, reason: String) {
+    if let Ok(mut r) = slot.lock() {
+        if r.is_none() {
+            *r = Some(reason);
+        }
     }
 }
 
@@ -2025,6 +2084,8 @@ async fn run_loop_async(
     // tell a latched run from a healthy one — see the field docs on
     // `ProgramHandle::watchdog_tripped`.
     watchdog_tripped: Arc<AtomicBool>,
+    // Why it is latched; see `ProgramHandle::latch_reason`.
+    latch_reason: Arc<std::sync::Mutex<Option<String>>>,
     // Achieved-cadence counters for /status: deadlines missed since start and
     // the longest current streak. The overrun log line fires once per unit and
     // then suppresses itself, so it cannot answer "still overrunning?".
@@ -2531,6 +2592,24 @@ async fn run_loop_async(
                     }
                     let _ = ack.send(Ok(()));
                 }
+                RuntimeCommand::LatchOutputsOff { reason, ack } => {
+                    let newly = !watchdog_tripped.load(Ordering::Relaxed);
+                    if newly {
+                        tracing::error!(
+                            %reason,
+                            "outputs latched off on request — engaging failsafe (outputs \
+                             zeroed and held off; restart the program to re-arm)"
+                        );
+                        for dev in devices.iter_mut() {
+                            if let Err(e) = dev.enter_failsafe().await {
+                                tracing::warn!(device = %dev.name(), %e, "latch-off failsafe call failed");
+                            }
+                        }
+                        note_latch_reason(&latch_reason, reason);
+                        watchdog_tripped.store(true, Ordering::Relaxed);
+                    }
+                    let _ = ack.send(newly);
+                }
                 RuntimeCommand::InjectScanStall {
                     stall_ms,
                     scans,
@@ -2712,6 +2791,14 @@ async fn run_loop_async(
                     break;
                 }
                 Ok(ScanOutcome::BudgetExceeded(budget)) => {
+                    note_latch_reason(
+                        &latch_reason,
+                        format!(
+                            "VM execution budget exceeded in {}: {}",
+                            instances[i],
+                            budget.describe()
+                        ),
+                    );
                     watchdog_tripped.store(true, Ordering::Relaxed);
                     record_fault(
                         fault,
@@ -2828,6 +2915,13 @@ async fn run_loop_async(
                     }
                     // Latch: from here on the output phase is skipped, so the
                     // zeros just written stay on the bus until a restart.
+                    note_latch_reason(
+                        &latch_reason,
+                        format!(
+                            "scan watchdog: {} consecutive overruns on {}",
+                            clocks[i].consecutive_overruns, instances[i]
+                        ),
+                    );
                     watchdog_tripped.store(true, Ordering::Relaxed);
                 }
                 clocks[i].next_due = after + clocks[i].interval;
@@ -4518,6 +4612,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(300)).await;
         let tripped = handle.watchdog_tripped();
+        let reason = handle.latch_reason();
 
         tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
             .await
@@ -4528,6 +4623,105 @@ mod tests {
             "the latch must be visible through the handle, or a UI cannot \
              tell a latched run from a healthy one"
         );
+        let reason = reason.expect("a latched run says why");
+        assert!(
+            reason.starts_with("scan watchdog:") && reason.contains("overruns on main"),
+            "{reason}"
+        );
+    }
+
+    /// The caller has decided the run must not drive the plant any more (the
+    /// runtime's alarm-supervision policy). It must land exactly like a
+    /// watchdog trip — devices in failsafe, no further output writes — while
+    /// the loop keeps scanning so the live state stays visible, the first
+    /// reason stands, and nothing here ever un-latches it.
+    #[tokio::test]
+    async fn latch_outputs_off_on_request_failsafes_devices_and_stops_the_output_phase() {
+        let container = crate::compile(
+            "PROGRAM main\n\
+                VAR n : INT := 0; END_VAR\n\
+                n := n + 1;\n\
+            END_PROGRAM",
+        )
+        .expect("counter program compiles");
+        let failsafe_engaged = Arc::new(AtomicBool::new(false));
+        let writes_after_failsafe = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dev = StallingDevice {
+            name: "mock".into(),
+            stall: Duration::ZERO,
+            failsafe_engaged: failsafe_engaged.clone(),
+            writes_after_failsafe: writes_after_failsafe.clone(),
+        };
+        let devices: Vec<Box<dyn IoDevice>> = vec![Box::new(dev)];
+        let mappings = vec![project::Mapping {
+            application: "main".into(),
+            variable: "n".into(),
+            direction: project::Direction::Output,
+            device: "mock".into(),
+            channel: "aout".into(),
+            unit: None,
+            min: None,
+            max: None,
+            description: None,
+        }];
+        let handle = spawn_units_inner(
+            vec![single_unit(container, 5)],
+            DeviceSource::Prebuilt(devices),
+            mappings,
+            None,
+            WriteGovernance::default(),
+        );
+        let mut snapshots = handle.subscribe();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!handle.watchdog_tripped(), "a healthy run is not latched");
+        assert_eq!(handle.latch_reason(), None);
+
+        let first = handle
+            .latch_outputs_off("alarm supervision lost for 30 s")
+            .await
+            .expect("the loop answers");
+        assert!(first, "this call did the latching");
+        assert!(
+            failsafe_engaged.load(Ordering::Relaxed),
+            "devices were failsafed"
+        );
+        assert!(handle.watchdog_tripped(), "the one latch flag answers");
+        assert_eq!(
+            handle.latch_reason().as_deref(),
+            Some("alarm supervision lost for 30 s")
+        );
+
+        let second = handle
+            .latch_outputs_off("something else")
+            .await
+            .expect("the loop answers");
+        assert!(!second, "already latched");
+        assert_eq!(
+            handle.latch_reason().as_deref(),
+            Some("alarm supervision lost for 30 s"),
+            "the first reason stands"
+        );
+
+        // The loop keeps scanning, and nothing more reaches the bus.
+        let before = snapshots.recv().await.map(|s| s.scan_count).unwrap_or(0);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let mut after = before;
+        while let Ok(s) = snapshots.try_recv() {
+            after = after.max(s.scan_count);
+        }
+        assert!(
+            after > before,
+            "scans continue after the latch: {before} -> {after}"
+        );
+        assert_eq!(
+            writes_after_failsafe.load(Ordering::Relaxed),
+            0,
+            "no output write may follow the failsafe"
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown joins");
     }
 
     /// The injection primitive must trip the watchdog through the real

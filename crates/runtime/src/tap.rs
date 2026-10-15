@@ -114,7 +114,7 @@ struct EndGuard(Arc<TapStatus>);
 impl Drop for EndGuard {
     fn drop(&mut self) {
         self.0.running.store(false, Ordering::Relaxed);
-        tracing::warn!(
+        tracing::error!(
             "snapshot tap ended: history, process alarms and /status are no longer being fed"
         );
     }

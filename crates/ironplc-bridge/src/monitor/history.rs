@@ -12,6 +12,10 @@
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -27,6 +31,13 @@ pub const DEFAULT_CAPACITY: usize = 7200;
 /// Rotate the JSONL segment past this size; keep this many old ones.
 const SEGMENT_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const SEGMENTS_KEPT: usize = 3;
+/// Persisted lines that may wait for the disk. At the default 1 Hz that is
+/// about eight minutes of a stalled disk before samples stop being persisted
+/// (they stay in memory and keep being served).
+const PERSIST_QUEUE_LINES: usize = 512;
+/// How long dropping a historian waits for the writer to flush before it lets a
+/// stuck disk go, so exiting the process never hangs on one.
+const PERSIST_FLUSH_WAIT: Duration = Duration::from_secs(2);
 
 /// One downsampled bucket of a variable's history.
 #[derive(Debug, Clone, Serialize, TS)]
@@ -65,13 +76,101 @@ pub struct HistoryResponse {
 struct Inner {
     series: HashMap<String, Vec<(u64, f64, bool)>>, // ring via rotate-trim
     last_sample_us: u64,
-    persist: Option<Persist>,
 }
 
+/// The segment files the writer thread appends to.
 struct Persist {
     dir: PathBuf,
     file: Option<std::fs::File>,
     written: u64,
+}
+
+/// Disk persistence lives on its own thread behind a bounded queue.
+///
+/// The write used to happen inside `note_snapshot`, under the lock the
+/// readers also take, on whichever thread fed the historian. On the edge that
+/// is the one task feeding the alarm engine and the live feed: a disk that
+/// stalls (a bad SD card, a full journal) held the historian's lock and froze
+/// that task, and with it alarms, `scan_count` and `/events`, while queries
+/// piled up behind the same lock. Now the feeder only enqueues a line: a full
+/// queue (or a dead writer) drops that line from the DISK, counts it, and
+/// leaves memory (and `/history`) untouched.
+struct PersistQueue {
+    tx: Option<SyncSender<String>>,
+    thread: Option<JoinHandle<()>>,
+    /// Lines that did not reach the writer: the queue was full or it is gone.
+    dropped: AtomicU64,
+    flush_wait: Duration,
+}
+
+impl PersistQueue {
+    fn spawn(
+        queue_lines: usize,
+        flush_wait: Duration,
+        mut sink: Box<dyn FnMut(&str) + Send>,
+    ) -> Self {
+        let (tx, rx) = sync_channel::<String>(queue_lines);
+        let thread = std::thread::Builder::new()
+            .name("history-writer".into())
+            .spawn(move || {
+                while let Ok(line) = rx.recv() {
+                    sink(&line);
+                }
+            })
+            .map_err(|e| tracing::warn!(%e, "history writer thread did not start — memory only"))
+            .ok();
+        Self {
+            tx: thread.is_some().then_some(tx),
+            thread,
+            dropped: AtomicU64::new(0),
+            flush_wait,
+        }
+    }
+
+    /// Never blocks.
+    fn offer(&self, line: String) {
+        let Some(tx) = &self.tx else {
+            self.note_dropped();
+            return;
+        };
+        match tx.try_send(line) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => self.note_dropped(),
+        }
+    }
+
+    fn note_dropped(&self) {
+        let n = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+        // 1st, 2nd, 4th, 8th ... so a stalled disk is one line, not a stream.
+        if n.is_power_of_two() {
+            tracing::warn!(
+                dropped = n,
+                "history persistence is not keeping up (disk stalled?): samples stay in \
+                 memory and are served by /history, but are not being written to disk"
+            );
+        }
+    }
+}
+
+impl Drop for PersistQueue {
+    fn drop(&mut self) {
+        // Closing the queue lets the writer drain what is queued and exit.
+        drop(self.tx.take());
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        let deadline = Instant::now() + self.flush_wait;
+        while !thread.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if thread.is_finished() {
+            let _ = thread.join();
+        } else {
+            tracing::warn!(
+                "history writer did not finish flushing (disk stalled?); not waiting for it"
+            );
+        }
+    }
 }
 
 /// Thread-safe historian handle; cheap to share behind an Arc.
@@ -86,6 +185,8 @@ pub struct Historian {
     inner: Mutex<Inner>,
     capacity: usize,
     sample_interval_us: u64,
+    /// `None` for an in-memory historian (the IDE server's).
+    persist: Option<PersistQueue>,
 }
 
 impl Historian {
@@ -93,25 +194,61 @@ impl Historian {
         let mut inner = Inner {
             series: HashMap::new(),
             last_sample_us: 0,
-            persist: None,
         };
+        let mut persist = None;
         if let Some(dir) = persist_dir {
             if let Err(e) = std::fs::create_dir_all(&dir) {
                 tracing::warn!(%e, dir = %dir.display(), "history dir unavailable — memory only");
             } else {
                 preload(&mut inner.series, &dir, capacity);
-                inner.persist = Some(Persist {
+                let mut files = Persist {
                     dir,
                     file: None,
                     written: 0,
-                });
+                };
+                persist = Some(PersistQueue::spawn(
+                    PERSIST_QUEUE_LINES,
+                    PERSIST_FLUSH_WAIT,
+                    Box::new(move |line| persist_line(&mut files, line)),
+                ));
             }
         }
         Self {
             inner: Mutex::new(inner),
             capacity,
             sample_interval_us: sample_interval_us.max(100_000),
+            persist,
         }
+    }
+
+    /// A historian whose persistence goes to `sink` instead of segment files,
+    /// to exercise the queue (a sink that blocks stands in for a stalled disk).
+    #[cfg(test)]
+    fn with_sink(
+        sample_interval_us: u64,
+        capacity: usize,
+        queue_lines: usize,
+        flush_wait: Duration,
+        sink: Box<dyn FnMut(&str) + Send>,
+    ) -> Self {
+        Self {
+            inner: Mutex::new(Inner {
+                series: HashMap::new(),
+                last_sample_us: 0,
+            }),
+            capacity,
+            sample_interval_us: sample_interval_us.max(100_000),
+            persist: Some(PersistQueue::spawn(queue_lines, flush_wait, sink)),
+        }
+    }
+
+    /// Persisted lines that never reached the disk writer because it was not
+    /// keeping up (a stalled disk): they are still in memory and served by
+    /// `query`. 0 for an in-memory historian.
+    pub fn persist_dropped(&self) -> u64 {
+        self.persist
+            .as_ref()
+            .map_or(0, |p| p.dropped.load(Ordering::Relaxed))
     }
 
     /// Zero-config in-memory historian (IDE-side default).
@@ -179,8 +316,11 @@ impl Historian {
             line.insert(var.name.clone(), serde_json::json!(v));
         }
 
-        if let Some(persist) = inner.persist.as_mut() {
-            persist_line(persist, snap.timestamp_us, &line, &stale_vars);
+        if let Some(persist) = &self.persist {
+            persist.offer(
+                serde_json::json!({ "t": snap.timestamp_us, "v": line, "stale": stale_vars })
+                    .to_string(),
+            );
         }
     }
 
@@ -253,18 +393,12 @@ impl Historian {
 
 /// Append one JSONL line, rotating segments as they grow. Failures
 /// degrade to memory-only with one warning — history must never take
-/// the scan loop down.
-fn persist_line(
-    p: &mut Persist,
-    t_us: u64,
-    values: &serde_json::Map<String, serde_json::Value>,
-    stale: &[&str],
-) {
+/// the scan loop down. Runs on the writer thread only.
+fn persist_line(p: &mut Persist, line: &str) {
     if p.file.is_none() || p.written > SEGMENT_MAX_BYTES {
         rotate(p);
     }
     let Some(file) = p.file.as_mut() else { return };
-    let line = serde_json::json!({ "t": t_us, "v": values, "stale": stale }).to_string();
     match writeln!(file, "{line}") {
         Ok(()) => p.written += line.len() as u64 + 1,
         Err(e) => {
@@ -541,6 +675,82 @@ mod tests {
         assert_eq!(pts.len(), 5, "history survives and keeps recording");
         h.clear();
         assert!(h.query(&[], 0, 0, 1_000).series.is_empty());
+    }
+
+    /// A disk that stalls must not stall the feeder or the readers. The write
+    /// used to run inside `note_snapshot` under the lock `query` takes, so one
+    /// stuck write froze the task feeding alarms and the live feed, with every
+    /// history request queued behind it.
+    #[test]
+    fn a_stalled_disk_does_not_block_recording_or_queries() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let delivered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let delivered_in = delivered.clone();
+        let h = std::sync::Arc::new(Historian::with_sink(
+            1_000_000,
+            1000,
+            4,
+            Duration::from_secs(5),
+            Box::new(move |_line| {
+                // Stands in for a write that does not return.
+                let _ = release_rx.recv();
+                delivered_in.fetch_add(1, Ordering::Relaxed);
+            }),
+        ));
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let feeder = {
+            let h = h.clone();
+            std::thread::spawn(move || {
+                for i in 1..=50u64 {
+                    h.note_snapshot(&snap(i * 1_000_000, i as f32));
+                }
+                let points = h.query(&["flow".into()], 0, 0, 1000).series[0].points.len();
+                done_tx.send(points).unwrap();
+            })
+        };
+        let points = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("recording and querying finish while the disk is stuck");
+        feeder.join().unwrap();
+
+        assert_eq!(points, 50, "every sample is in memory and served");
+        let dropped = h.persist_dropped();
+        assert!(
+            dropped >= 45,
+            "all but the queue's worth miss the disk: {dropped}"
+        );
+
+        // The disk comes back: what was queued is written, in order.
+        for _ in 0..8 {
+            let _ = release_tx.send(());
+        }
+        drop(h);
+        let written = delivered.load(Ordering::Relaxed) as u64;
+        assert_eq!(written + dropped, 50, "nothing is lost silently");
+    }
+
+    /// Dropping a historian must not hang the process on a stuck disk.
+    #[test]
+    fn dropping_does_not_wait_for_a_stuck_disk() {
+        let (_release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let h = Historian::with_sink(
+            1_000_000,
+            100,
+            4,
+            Duration::from_millis(100),
+            Box::new(move |_line| {
+                let _ = release_rx.recv();
+            }),
+        );
+        h.note_snapshot(&snap(1_000_000, 1.0));
+        let started = Instant::now();
+        drop(h);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "took {:?}: a stuck disk held up the drop",
+            started.elapsed()
+        );
     }
 
     #[test]

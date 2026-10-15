@@ -43,6 +43,7 @@ use tracing_subscriber::EnvFilter;
 
 mod northbound;
 mod panic_guard;
+mod supervisor;
 mod tap;
 
 const DEFAULT_BIND: &str = "127.0.0.1:13001";
@@ -308,6 +309,9 @@ struct AppState {
     /// The task feeding history, alarms and `latest` — reported on /health
     /// and /status so its failure is not silent.
     tap: Arc<tap::TapStatus>,
+    /// The alarm-supervision policy this process is enforcing, and where its
+    /// supervisor says alarm evaluation stands.
+    supervision: Arc<supervisor::SupervisionStatus>,
 }
 
 #[tokio::main]
@@ -331,6 +335,7 @@ async fn main() -> Result<()> {
         devices,
         iomap,
         units,
+        supervision,
     } = ironplc_bridge::load_edge_project(&args.project_dir).map_err(|e| anyhow!(e))?;
     let project_name = store.name().to_string();
     let program_instances: Vec<String> =
@@ -445,6 +450,15 @@ async fn main() -> Result<()> {
     let shutdown = Arc::new(tokio::sync::Notify::new());
 
     let tap = tap::TapStatus::new();
+    let supervision = supervisor::Policy::from(&supervision);
+    tracing::info!(policy = %supervision.describe(), "alarm supervision policy");
+    let supervision = supervisor::SupervisionStatus::new(supervision);
+    tokio::spawn(supervisor::supervise(
+        tap.clone(),
+        handle.clone(),
+        alarms.clone(),
+        supervision.clone(),
+    ));
     tokio::spawn(tap::run(
         handle.subscribe(),
         tap::standard_stages(
@@ -472,6 +486,7 @@ async fn main() -> Result<()> {
         alarms,
         audit: AuditLog::default(),
         tap,
+        supervision,
     };
 
     // ---- Northbound (MQTT -> supOS/Tier0) ----
@@ -484,6 +499,7 @@ async fn main() -> Result<()> {
                     latest: state.latest.clone(),
                     handle: handle.clone(),
                     audit: state.audit.clone(),
+                    tap: state.tap.clone(),
                 });
             } else {
                 tracing::info!("northbound disabled (no enabled [mqtt] in northbound.toml)");
@@ -690,6 +706,11 @@ struct Health {
     /// does: without this field a probe of `/health` called such an edge
     /// healthy while it ran nothing.
     fault: Option<String>,
+    /// Why the outputs are latched off, once `watchdog_tripped` is true: the
+    /// scan watchdog, an execution-budget trap, or the project's
+    /// alarm-supervision policy (see `alarms.toml`). `null` while they are
+    /// not latched.
+    latch_reason: Option<String>,
     /// Whether history, process alarms and `scan_count` are still being fed
     /// from the scan loop. The scan loop is a separate thread: when this
     /// task stops, or fails on every snapshot, the program keeps running and
@@ -698,6 +719,12 @@ struct Health {
     /// the task ended; a `faults` count that climbs between two polls means a
     /// stage is failing now.
     snapshot_tap: monitor::SnapshotTapHealth,
+    /// The alarm-supervision policy this process is enforcing (what it read at
+    /// startup, not what `alarms.toml` says now): what happens if alarm
+    /// evaluation is lost. A reader compares it with what the project declares;
+    /// a runtime built before the field omits it, which for a project that
+    /// declares `safe_state` means that protection is NOT in force.
+    supervision: monitor::SupervisionInForce,
 }
 
 async fn health(State(state): State<AppState>) -> Json<Health> {
@@ -712,6 +739,7 @@ async fn health(State(state): State<AppState>) -> Json<Health> {
         scan_count,
         state.start_time.elapsed().as_secs(),
         state.tap.health(),
+        state.supervision.in_force(),
     ))
 }
 
@@ -722,6 +750,7 @@ fn health_of(
     scan_count: u64,
     uptime_secs: u64,
     snapshot_tap: monitor::SnapshotTapHealth,
+    supervision: monitor::SupervisionInForce,
 ) -> Health {
     let devices = handle.device_health();
     Health {
@@ -732,7 +761,9 @@ fn health_of(
         devices,
         watchdog_tripped: handle.watchdog_tripped(),
         fault: handle.fault(),
+        latch_reason: handle.latch_reason(),
         snapshot_tap,
+        supervision,
     }
 }
 
@@ -978,6 +1009,10 @@ struct Status {
     /// The full list is one GET /alarms away; the count rides on
     /// /status so panels see it on their existing poll.
     alarms_standing: usize,
+    /// Why the outputs are latched off; see `/health`.
+    latch_reason: Option<String>,
+    /// The alarm-supervision policy in force; see `/health`.
+    supervision: monitor::SupervisionInForce,
     /// Same as `/health`'s `snapshot_tap`. Read it before trusting
     /// `last_snapshot`, `scan_count` and `alarms_standing`: if the tap has
     /// ended they stop moving, and `alarms_standing: 0` then means "nothing
@@ -1015,6 +1050,8 @@ async fn status(State(state): State<AppState>) -> Json<Status> {
         forces: monitor::force_entries(&state.handle),
         fault: state.handle.fault(),
         alarms_standing,
+        latch_reason: state.handle.latch_reason(),
+        supervision: state.supervision.in_force(),
         snapshot_tap: state.tap.health(),
     })
 }
@@ -1602,6 +1639,11 @@ mod tests {
         RuntimeWriteError, StatusCode, AUDIT_CAP,
     };
 
+    /// The policy a project that declares nothing runs with.
+    fn default_policy() -> ironplc_bridge::monitor::SupervisionInForce {
+        crate::supervisor::Policy::from(&project::SupervisionConfig::default()).in_force()
+    }
+
     /// Spawn a one-unit run of `body` (the statements of PROGRAM main,
     /// which declares `x` and `z : INT`).
     fn spawn_main(body: &str) -> ironplc_bridge::ProgramHandle {
@@ -1644,6 +1686,7 @@ mod tests {
             0,
             1,
             crate::tap::TapStatus::new().health(),
+            default_policy(),
         ))
         .unwrap();
         assert_eq!(body["status"], "ok", "the process still answers");
@@ -1660,6 +1703,7 @@ mod tests {
             0,
             1,
             crate::tap::TapStatus::new().health(),
+            default_policy(),
         ))
         .unwrap();
         assert_eq!(body["status"], "ok");
@@ -1667,6 +1711,335 @@ mod tests {
             body.get("fault").is_some_and(|f| f.is_null()),
             "present and null, so clients can rely on the key: {body}"
         );
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
+    /// A snapshot task that has ended, watched by the real supervisor against a
+    /// real run: under `safe_state` the outputs are latched off once the grace
+    /// runs out, and say why; under `report` (the default) nothing is stopped,
+    /// however long it stays lost.
+    #[tokio::test]
+    async fn the_supervisor_latches_the_outputs_only_when_the_project_asks_for_it() {
+        use ironplc_bridge::monitor::SnapshotTapHealth;
+        use project::SupervisionAction;
+        use std::time::Duration;
+
+        async fn lost_tap() -> std::sync::Arc<crate::tap::TapStatus> {
+            // A tap that ended: `run` clears `running` as it goes away.
+            let (tx, rx) = tokio::sync::broadcast::channel::<ironplc_bridge::VarSnapshot>(2);
+            let status = crate::tap::TapStatus::new();
+            let task = tokio::spawn(crate::tap::run(rx, vec![], status.clone()));
+            tokio::task::yield_now().await;
+            task.abort();
+            let _ = task.await;
+            drop(tx);
+            let health: SnapshotTapHealth = status.health();
+            assert!(!health.running, "the tap is lost");
+            status
+        }
+
+        for (on_loss, expect_latched) in [
+            (SupervisionAction::SafeState, true),
+            (SupervisionAction::Report, false),
+        ] {
+            let handle = spawn_main("x := x + 1;");
+            let tap = lost_tap().await;
+            let alarms = std::sync::Arc::new(parking_lot::Mutex::new(
+                ironplc_bridge::monitor::AlarmEngine::default(),
+            ));
+            let supervisor = tokio::spawn(crate::supervisor::supervise_every(
+                Duration::from_millis(20),
+                tap,
+                handle.clone(),
+                alarms.clone(),
+                crate::supervisor::SupervisionStatus::new(crate::supervisor::Policy {
+                    on_loss,
+                    grace: Duration::from_millis(100),
+                }),
+            ));
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert_eq!(handle.watchdog_tripped(), expect_latched, "{on_loss:?}");
+            // Whatever the policy, the loss is a standing alarm in the list.
+            let listed = alarms.lock().states();
+            let sup = listed
+                .iter()
+                .find(|a| a.id == project::SUPERVISION_ALARM_ID)
+                .unwrap_or_else(|| panic!("{on_loss:?}: not in the alarm list: {listed:?}"));
+            assert!(sup.active && sup.standing(), "{on_loss:?}: {sup:?}");
+            assert!(sup.message.contains("has stopped"), "{sup:?}");
+            if expect_latched {
+                let reason = handle.latch_reason().expect("a latched run says why");
+                assert!(
+                    reason.contains("alarm supervision lost") && reason.contains("has stopped"),
+                    "{reason}"
+                );
+            } else {
+                assert_eq!(handle.latch_reason(), None, "report stops nothing");
+            }
+            supervisor.abort();
+            tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+                .await
+                .expect("shutdown");
+        }
+    }
+
+    /// The alarm engine being wedged is one way alarm evaluation gets lost, and
+    /// the supervisor must not be taken down with it: the policy still acts on
+    /// time while the engine's lock is held elsewhere, and the alarm appears as
+    /// soon as the lock is free.
+    #[tokio::test]
+    async fn a_wedged_alarm_engine_does_not_stop_the_supervisor_or_its_policy() {
+        use std::time::Duration;
+
+        let handle = spawn_main("x := x + 1;");
+        let (tx, rx) = tokio::sync::broadcast::channel::<ironplc_bridge::VarSnapshot>(2);
+        let tap = crate::tap::TapStatus::new();
+        let task = tokio::spawn(crate::tap::run(rx, vec![], tap.clone()));
+        tokio::task::yield_now().await;
+        task.abort();
+        let _ = task.await;
+        drop(tx);
+
+        let alarms = std::sync::Arc::new(parking_lot::Mutex::new(
+            ironplc_bridge::monitor::AlarmEngine::default(),
+        ));
+        // Another thread holds the engine's lock for 700 ms, as if it were stuck.
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let wedge = {
+            let alarms = alarms.clone();
+            std::thread::spawn(move || {
+                let _guard = alarms.lock();
+                held_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(700));
+            })
+        };
+        held_rx.recv().expect("the other thread holds the lock");
+        let supervisor = tokio::spawn(crate::supervisor::supervise_every(
+            Duration::from_millis(20),
+            tap,
+            handle.clone(),
+            alarms.clone(),
+            crate::supervisor::SupervisionStatus::new(crate::supervisor::Policy {
+                on_loss: project::SupervisionAction::SafeState,
+                grace: Duration::from_millis(100),
+            }),
+        ));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            handle.watchdog_tripped(),
+            "the policy must act even though the alarm engine cannot be locked"
+        );
+
+        wedge.join().unwrap(); // the lock is free again
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            alarms
+                .lock()
+                .states()
+                .iter()
+                .any(|a| a.id == project::SUPERVISION_ALARM_ID && a.active),
+            "and the alarm appears once the engine is free"
+        );
+        supervisor.abort();
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
+    /// While alarm evaluation is lost, `/health` says for how long and, under
+    /// `safe_state`, how long is left before the outputs are latched; both are
+    /// `null` while nothing is lost, and after the latch (the latch itself, and
+    /// its reason, are then the answer). A panel shows these to the operator.
+    #[tokio::test]
+    async fn health_says_how_long_alarms_have_been_lost_and_when_the_policy_acts() {
+        use crate::supervisor::{Policy, SupervisionStatus};
+        use project::SupervisionAction;
+        use std::time::Duration;
+
+        async fn lost_tap() -> std::sync::Arc<crate::tap::TapStatus> {
+            let (tx, rx) = tokio::sync::broadcast::channel::<ironplc_bridge::VarSnapshot>(2);
+            let status = crate::tap::TapStatus::new();
+            let task = tokio::spawn(crate::tap::run(rx, vec![], status.clone()));
+            tokio::task::yield_now().await;
+            task.abort();
+            let _ = task.await;
+            drop(tx);
+            status
+        }
+        let alarms = || {
+            std::sync::Arc::new(parking_lot::Mutex::new(
+                ironplc_bridge::monitor::AlarmEngine::default(),
+            ))
+        };
+
+        // safe_state with a long grace: lost, and a countdown that has not run out.
+        let handle = spawn_main("x := x + 1;");
+        let status = SupervisionStatus::new(Policy {
+            on_loss: SupervisionAction::SafeState,
+            grace: Duration::from_secs(60),
+        });
+        let nothing = status.in_force();
+        assert_eq!((nothing.lost_for_ms, nothing.latch_in_ms), (None, None));
+        let supervisor = tokio::spawn(crate::supervisor::supervise_every(
+            Duration::from_millis(20),
+            lost_tap().await,
+            handle.clone(),
+            alarms(),
+            status.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let body = serde_json::to_value(health_of(
+            &handle,
+            0,
+            1,
+            crate::tap::TapStatus::new().health(),
+            status.in_force(),
+        ))
+        .unwrap();
+        let lost_for = body["supervision"]["lost_for_ms"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("lost_for_ms: {body}"));
+        let latch_in = body["supervision"]["latch_in_ms"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("latch_in_ms: {body}"));
+        assert!((100..5_000).contains(&lost_for), "{body}");
+        assert!(
+            (55_000..60_000).contains(&latch_in),
+            "60 s grace, a fraction of a second used: {body}"
+        );
+        assert!(!handle.watchdog_tripped(), "the grace has not run out");
+        supervisor.abort();
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+
+        // The same loss under `report`: how long, and nothing pending. Then a
+        // short-grace `safe_state`: once it has latched there is nothing pending
+        // either, while it is still lost.
+        for (on_loss, grace) in [
+            (SupervisionAction::Report, Duration::from_secs(30)),
+            (SupervisionAction::SafeState, Duration::from_millis(100)),
+        ] {
+            let handle = spawn_main("x := x + 1;");
+            let status = SupervisionStatus::new(Policy { on_loss, grace });
+            let supervisor = tokio::spawn(crate::supervisor::supervise_every(
+                Duration::from_millis(20),
+                lost_tap().await,
+                handle.clone(),
+                alarms(),
+                status.clone(),
+            ));
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let now = status.in_force();
+            assert!(
+                now.lost_for_ms.is_some(),
+                "{on_loss:?}: still lost: {now:?}"
+            );
+            assert_eq!(
+                now.latch_in_ms, None,
+                "{on_loss:?}: nothing pending: {now:?}"
+            );
+            assert_eq!(
+                handle.watchdog_tripped(),
+                on_loss == SupervisionAction::SafeState
+            );
+            supervisor.abort();
+            tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+                .await
+                .expect("shutdown");
+        }
+
+        // Latched by someone else already (the scan watchdog, say): alarm
+        // evaluation is lost, but there is nothing left for the policy to do.
+        let handle = spawn_main("x := x + 1;");
+        assert!(handle.latch_outputs_off("scan watchdog").await.unwrap());
+        let status = SupervisionStatus::new(Policy {
+            on_loss: SupervisionAction::SafeState,
+            grace: Duration::from_secs(60),
+        });
+        let supervisor = tokio::spawn(crate::supervisor::supervise_every(
+            Duration::from_millis(20),
+            lost_tap().await,
+            handle.clone(),
+            alarms(),
+            status.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let now = status.in_force();
+        assert!(now.lost_for_ms.is_some(), "still lost: {now:?}");
+        assert_eq!(now.latch_in_ms, None, "already latched: {now:?}");
+        assert_eq!(handle.latch_reason().as_deref(), Some("scan watchdog"));
+        supervisor.abort();
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
+    /// `/health` says which alarm-supervision policy this process is enforcing.
+    /// A reader compares it with what the project declares: a runtime that does
+    /// not know the setting omits the key, and a declared `safe_state` is then
+    /// not in force.
+    #[tokio::test]
+    async fn health_reports_the_alarm_supervision_policy_in_force() {
+        use project::{SupervisionAction, SupervisionConfig};
+
+        let handle = spawn_main("x := x + 1;");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let tap = crate::tap::TapStatus::new().health();
+
+        let report =
+            serde_json::to_value(health_of(&handle, 0, 1, tap.clone(), default_policy())).unwrap();
+        assert_eq!(report["supervision"]["on_loss"], "report", "{report}");
+        assert_eq!(report["supervision"]["grace_secs"], 30);
+        // Present and null while nothing is lost: absent would read as a runtime
+        // that predates the fields.
+        for key in ["lost_for_ms", "latch_in_ms"] {
+            assert!(
+                report["supervision"].get(key).is_some_and(|v| v.is_null()),
+                "{key}: {report}"
+            );
+        }
+
+        let safe = crate::supervisor::Policy::from(&SupervisionConfig {
+            on_loss: SupervisionAction::SafeState,
+            grace_secs: 45,
+        })
+        .in_force();
+        let body = serde_json::to_value(health_of(&handle, 0, 1, tap, safe)).unwrap();
+        assert_eq!(body["supervision"]["on_loss"], "safe_state", "{body}");
+        assert_eq!(body["supervision"]["grace_secs"], 45);
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
+    /// The latch is one flag, `watchdog_tripped`, whoever set it. `/health`
+    /// says why, so a reader does not blame the scan watchdog for a latch the
+    /// project's supervision policy asked for.
+    #[tokio::test]
+    async fn health_says_why_the_outputs_are_latched() {
+        let handle = spawn_main("x := x + 1;");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let healthy = crate::tap::TapStatus::new().health();
+        let before =
+            serde_json::to_value(health_of(&handle, 0, 1, healthy.clone(), default_policy()))
+                .unwrap();
+        assert_eq!(before["watchdog_tripped"], false);
+        assert!(
+            before["latch_reason"].is_null(),
+            "present and null: {before}"
+        );
+
+        assert!(handle
+            .latch_outputs_off("alarm supervision lost for 30 s")
+            .await
+            .unwrap());
+        let after =
+            serde_json::to_value(health_of(&handle, 0, 1, healthy, default_policy())).unwrap();
+        assert_eq!(after["watchdog_tripped"], true);
+        assert_eq!(after["latch_reason"], "alarm supervision lost for 30 s");
         tokio::time::timeout(std::time::Duration::from_secs(5), handle.shutdown())
             .await
             .expect("shutdown");
@@ -1687,7 +2060,7 @@ mod tests {
             stalled_for_ms: Some(2500),
             last_fault_age_ms: Some(300),
         };
-        let body = serde_json::to_value(health_of(&handle, 12, 1, tap)).unwrap();
+        let body = serde_json::to_value(health_of(&handle, 12, 1, tap, default_policy())).unwrap();
         assert_eq!(body["status"], "ok", "the process still answers");
         assert_eq!(body["snapshot_tap"]["running"], false);
         assert_eq!(body["snapshot_tap"]["faults"], 7);
@@ -1698,7 +2071,8 @@ mod tests {
             .is_some_and(|t| t.contains("alarms stage panicked")));
 
         let healthy = crate::tap::TapStatus::new().health();
-        let body = serde_json::to_value(health_of(&handle, 0, 1, healthy)).unwrap();
+        let body =
+            serde_json::to_value(health_of(&handle, 0, 1, healthy, default_policy())).unwrap();
         assert_eq!(body["snapshot_tap"]["running"], true);
         assert!(body["snapshot_tap"]["last_fault"].is_null(), "{body}");
         assert!(body["snapshot_tap"]["stalled_for_ms"].is_null(), "{body}");

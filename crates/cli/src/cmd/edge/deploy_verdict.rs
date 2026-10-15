@@ -32,6 +32,10 @@ pub(super) fn deploy_verdict(name: &str, value: &serde_json::Value) -> Vec<Strin
         (false, Some(v)) if health.is_some() => {
             let outcome = if matches!(state, Some("faulted" | "not_running")) {
                 "its program is not running"
+            } else if state == Some("unprotected") {
+                // The program may well be running; what is missing is the
+                // protection the project declared.
+                "the alarm-supervision policy the project declares is not in force"
             } else if state == Some("unmonitored") {
                 // The program may well be scanning; what is gone is the
                 // task that records history and evaluates alarms.
@@ -146,6 +150,26 @@ mod tests {
             lines[1].contains("inspect runtime and plant state"),
             "{lines:?}"
         );
+    }
+
+    /// The project declares `safe_state`, the edge's runtime ignores it. The
+    /// program runs, so the line must not say it does not; it must say the
+    /// declared protection is missing.
+    #[test]
+    fn a_declared_policy_the_runtime_does_not_enforce_fails_with_the_reason() {
+        let lines = deploy_verdict(
+            "pi",
+            &report(json!({"ok": false, "health": {"state": "unprotected",
+                "detail": "the project declares safe_state, but the runtime predates the setting",
+                "unhealthy_devices": []}})),
+        );
+        assert!(lines[0].starts_with('✗'), "{lines:?}");
+        assert!(
+            lines[0].contains("alarm-supervision policy the project declares is not in force"),
+            "{lines:?}"
+        );
+        assert!(lines[0].contains("predates the setting"), "{lines:?}");
+        assert!(!lines[0].contains("not running"), "{lines:?}");
     }
 
     #[test]

@@ -1209,7 +1209,42 @@ fn validate_edge_target(edge: &Edge) -> Result<(), StoreError> {
     validate_ssh_target("ssh_user", &edge.ssh_user, true)
 }
 
+/// `[supervision] grace_secs` must be a duration someone can mean: at least
+/// a second, at most an hour. Zero would latch on the first lost reading;
+/// a huge value is a protection that never acts.
+fn validate_supervision(config: &crate::types::AlarmConfig) -> Result<(), StoreError> {
+    if let Some(s) = &config.supervision {
+        if !(1..=3600).contains(&s.grace_secs) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "[supervision] grace_secs = {} is out of range (1..=3600 seconds)",
+                    s.grace_secs
+                ),
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 fn validate_alarm_ids(config: &crate::types::AlarmConfig) -> Result<(), StoreError> {
+    validate_supervision(config)?;
+    if let Some(def) = config
+        .alarms
+        .iter()
+        .find(|d| d.id.starts_with(crate::SUPERVISION_ALARM_PREFIX))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "alarm id '{}' uses the reserved supervision prefix '{}'",
+                def.id,
+                crate::SUPERVISION_ALARM_PREFIX
+            ),
+        )
+        .into());
+    }
     if let Some(def) = config
         .alarms
         .iter()
@@ -1722,6 +1757,25 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("reserved"));
+    }
+
+    #[test]
+    fn alarm_store_refuses_the_supervision_id_on_read_and_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProjectStore::create(dir.path().join("project"), "test").unwrap();
+        let text = "[[alarms]]\nid = '__supervision/snapshot_tap'\nvariable = 'x'\ncondition = 'is_true'\nmessage = 'shadow'\n";
+        let config = toml::from_str(text).unwrap();
+        assert!(store
+            .write_alarms(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("reserved supervision prefix"));
+        fs::write(store.root.join("alarms.toml"), text).unwrap();
+        assert!(store
+            .read_alarms()
+            .unwrap_err()
+            .to_string()
+            .contains("reserved supervision prefix"));
     }
 
     // ---- crash-safe saves ----------------------------------------------

@@ -83,8 +83,9 @@ prompts — the IDE runs `ssh -o BatchMode=yes`).
    and its outputs are dropped. A red `faulted` badge means the runtime
    answers but its program stopped (a VM trap, say) — hover it, or read
    the status grid, for the reason. A red `outputs locked` badge means the
-   scan watchdog tripped: every output is zeroed and held off until the
-   program is restarted. An ochre `degraded` badge also covers a runtime
+   outputs are latched off, by the scan watchdog or by the project's
+   alarm-supervision policy (the badge says which): every output is zeroed and
+   held off until the program is restarted. An ochre `degraded` badge also covers a runtime
    whose snapshot task has ended or is stuck on one snapshot: the program and
    the buses are fine, but history is not recording and process alarms are not
    being evaluated (`/health`'s `snapshot_tap.running` is `false`, or
@@ -162,6 +163,11 @@ prompts — the IDE runs `ssh -o BatchMode=yes`).
      either. A fault count that is steady does not change the verdict but is
      named in it. `faulted`, `not_running`, `unmonitored` and `unknown` all fail
      the deploy (`ok:false`). **Unknown does not prove stopped or physically safe.**
+     A project that declares `[supervision] on_loss = "safe_state"` is also held
+     to it: the check compares the declaration with the `supervision` the
+     runtime reports it is enforcing, and `unprotected` (also `ok:false`) means
+     they differ, typically because the edge runs an older runtime that ignores
+     the table.
      A task with a period longer than the observation window may remain unknown;
    - the new version stays installed and current. No automatic rollback or
      restart of the previous program occurs after a failed health check. Inspect
@@ -341,6 +347,82 @@ one carrying your SSH / management traffic.
   still required for an unacknowledged occurrence. The existing `/alarms`,
   `/alarms-journal`, and encoded-id ack endpoint expose it. Process alarms do
   not evaluate stale field inputs, and persisted history marks stale buckets.
+
+### Alarm supervision
+
+The alarm engine, the history and the live feed all hang off one task in the
+edge runtime. When it stops, is stuck inside one snapshot, or keeps failing,
+the alarm list is quiet because nothing is looking, which on a panel reads as
+"nothing is wrong". The runtime reports that state (`snapshot_tap` in
+`/health` and `/status`, `cs probe`, the edge badge, the operator panel's
+`ALARMS OFF`, and a failed `unmonitored` post-restart check), and the project
+says what the runtime does about it in `alarms.toml`:
+
+```toml
+[supervision]
+on_loss = "report"      # default: report it and keep running
+# on_loss = "safe_state"  # latch the outputs off if alarm evaluation stays lost
+grace_secs = 30         # 1..=3600; ignored for "report"
+```
+
+- **`report` is the default, and stops nothing.** Whether stopping is the safe
+  direction depends on the plant (an unplanned stop can itself be the
+  hazard), so the runtime does not decide it. Choose `safe_state` only where
+  losing alarm evaluation is the more dangerous of the two.
+- **`safe_state`** latches the outputs off once alarm evaluation has been lost
+  for `grace_secs` in a row, exactly like a scan-watchdog trip: every device
+  goes into failsafe and no further output is written, while the loop keeps
+  scanning so the live state stays visible. `/health` and `/status` say why
+  (`latch_reason`). It is never undone automatically and never done by
+  restarting the process: a person restarts the program to re-arm.
+  A loss that clears inside the grace starts the clock over.
+- **Deploy refuses an `alarms.toml` it cannot read**, and a `[supervision]`
+  table with an unknown key (`on_los`), an unknown `on_loss` or a `grace_secs`
+  outside 1..=3600: a misspelt protective setting must not deploy and protect
+  nothing. (An unreadable `alarms.toml` used to deploy, with the runtime
+  logging a warning and running without alarms.)
+- **The runtime refuses to start on one too.** It reads the project through the
+  same loader as the deploy preflight, so an `alarms.toml` it cannot read makes
+  `ia2-runtime` exit at startup with the reason, instead of running without
+  alarms as it used to. The case that can surface this is an edge whose project
+  was deployed by an older server and whose runtime is then upgraded. The
+  service retries a few times (`Restart=on-failure`, `StartLimitBurst=5` in 60 s)
+  and then stays `failed`, with the reason in the journal; the program does not
+  run, and what the outputs do meanwhile is the I/O side's own failsafe, as for
+  any stopped runtime. Fix the file and redeploy.
+- **Logging is not proportional to time.** Losing alarm evaluation is logged
+  at ERROR the moment it is seen, with the policy in the line; reminders then
+  back off (1, 2, 4, 8 ... minutes into the episode, at most hourly), and
+  recovery is one INFO line. A task that flaps is announced at the 1st, 2nd,
+  4th, 8th ... episode. The state itself is always in `snapshot_tap`.
+- **The runtime says which policy it is enforcing** (`supervision` on `/health`
+  and `/status`, and in `cs probe` beside any alarm-evaluation warning). It is
+  what the process read at startup, so a later edit of `alarms.toml` shows up
+  only after a restart. A runtime built before `[supervision]` ignores the table
+  and omits the key.
+- **While it is lost, the same object says how long and how long is left**
+  (`lost_for_ms`, and under `safe_state` `latch_in_ms` until a latch is requested).
+  `cs probe` prints both on the policy line. While the loss continues,
+  `lost_for_ms` remains available under `report` and after a latch; only
+  `latch_in_ms` is `null` under `report`, once a latch is requested, or when
+  outputs are already latched (`latch_reason` explains a completed latch).
+  Both are `null` when nothing is lost or the supervisor has not looked for
+  several seconds, so an old countdown is never shown as a live one.
+- **It is also a standing alarm.** While alarm evaluation is lost, `GET /alarms`
+  lists `__supervision/snapshot_tap` (Critical) beside the process alarms,
+  `alarms_standing` counts it, the journal records it, and after it returns it
+  stays standing until an operator acknowledges it, so the alarm list is not
+  quiet in exactly the case it must not be. The supervisor raises it, not a
+  snapshot, so it works when snapshots have stopped. If the alarm engine's own
+  lock is wedged it cannot be listed (that is logged, and the policy, the log,
+  `/health`, the panel and MQTT carry on). The id is reserved like `__device/`.
+- **The northbound MQTT feed follows it.** While alarm evaluation is lost the
+  runtime's latest snapshot is frozen, so publishing it would hand the platform
+  the same old values every interval next to a retained `online`. Instead the
+  retained `<prefix>/status` becomes `degraded` (once, logged) and no snapshot is
+  published until it recovers, when `online` is asserted again; a broker
+  reconnect re-asserts whichever is current.
+- Edge runtime only: the IDE server's local run has no such task to supervise.
 
 - **No EtherCAT hardware on the dev machine**: leave `nic = "_sim"`. The
   IDE will let you configure PDOs and the bridge will respond in sim

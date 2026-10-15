@@ -27,8 +27,9 @@ export function edgeReach(probe: EdgeProbe): EdgeReach {
   if (probe.watchdog_tripped) {
     return {
       kind: "locked",
-      detail:
-        "Scan watchdog tripped: outputs are zeroed and held off until the program is restarted",
+      detail: probe.latch_reason
+        ? `Outputs latched off: ${probe.latch_reason}. They are zeroed and held off until the program is restarted`
+        : "Scan watchdog tripped: outputs are zeroed and held off until the program is restarted",
     }
   }
   const down = probe.unhealthy_devices

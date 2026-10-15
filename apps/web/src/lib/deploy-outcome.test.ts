@@ -53,6 +53,26 @@ describe("deployOutcome", () => {
     })
   })
 
+  // The program runs, but the protection the project declared is not in force
+  // on this edge (an older runtime ignores `[supervision]`). Not live.
+  it("shows a declared policy the runtime does not enforce as unprotected, not live", () => {
+    const outcome = deployOutcome(
+      report({
+        ok: false,
+        health: {
+          state: "unprotected",
+          detail: "the project declares safe_state, but the runtime predates the setting",
+          unhealthy_devices: [],
+        },
+      }),
+    )
+    expect(outcome).toEqual({
+      kind: "unprotected",
+      version: "2026-09-24T02-00-00Z.abc",
+      detail: "the project declares safe_state, but the runtime predates the setting",
+    })
+  })
+
   // The restart succeeded and the program trapped at once: not live.
   it("shows an installed version whose program faulted as not running", () => {
     const outcome = deployOutcome(

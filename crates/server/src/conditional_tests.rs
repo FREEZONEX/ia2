@@ -75,6 +75,102 @@ async fn built_in_alarm_ids_cannot_be_shadowed_by_project_definitions() {
     assert!(String::from_utf8_lossy(&body).contains("reserved"));
 }
 
+/// `[supervision]` is a protective setting: an edit that only touches the alarm
+/// definitions must not silently remove it. Omitting it keeps what the project
+/// declared; writing it, even as the default `report`, is what changes it.
+#[tokio::test]
+async fn an_alarms_only_edit_keeps_the_declared_supervision_policy() {
+    let (_dir, app) = setup();
+    let alarm = serde_json::json!({
+        "id": "level_high", "variable": "level", "condition": "gt",
+        "limit": 90.0, "message": "Tank level high"
+    });
+    let send = |body: serde_json::Value| {
+        let app = app.clone();
+        async move {
+            let response = app
+                .oneshot(put("/api/alarms", &body.to_string(), None))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{body}");
+        }
+    };
+
+    send(serde_json::json!({
+        "alarms": [alarm.clone()],
+        "supervision": {"on_loss": "safe_state", "grace_secs": 45}
+    }))
+    .await;
+    let (_, declared) = read(&app, "/api/alarms").await;
+    assert_eq!(declared["supervision"]["on_loss"], "safe_state");
+
+    // An alarms-only body: the policy survives.
+    send(serde_json::json!({"alarms": [alarm.clone(), {
+        "id": "level_low", "variable": "level", "condition": "lt",
+        "limit": 5.0, "message": "Tank level low"
+    }]}))
+    .await;
+    let (_, kept) = read(&app, "/api/alarms").await;
+    assert_eq!(kept["alarms"].as_array().unwrap().len(), 2);
+    assert_eq!(kept["supervision"]["on_loss"], "safe_state", "{kept}");
+    assert_eq!(kept["supervision"]["grace_secs"], 45);
+
+    // Saying so is how to change it.
+    send(serde_json::json!({
+        "alarms": [alarm],
+        "supervision": {"on_loss": "report"}
+    }))
+    .await;
+    let (_, changed) = read(&app, "/api/alarms").await;
+    assert_eq!(changed["supervision"]["on_loss"], "report", "{changed}");
+}
+
+#[tokio::test]
+async fn a_supervision_table_with_a_typo_or_a_bad_grace_is_refused() {
+    let (_dir, app) = setup();
+    for body in [
+        // The key a person mistypes in a protective setting.
+        serde_json::json!({"alarms": [], "supervision": {"on_los": "safe_state"}}),
+        serde_json::json!({"alarms": [], "supervision": {"on_loss": "safe-state"}}),
+        serde_json::json!({"alarms": [], "supervision": {"on_loss": "safe_state", "grace_secs": 0}}),
+        serde_json::json!({"alarms": [], "supervision": {"on_loss": "safe_state", "grace_secs": 99999}}),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(put("/api/alarms", &body.to_string(), None))
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_client_error() || response.status().is_server_error(),
+            "{body} was accepted: {}",
+            response.status()
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_supervision_alarm_id_cannot_be_shadowed_by_project_definitions() {
+    let (_dir, app) = setup();
+    let response = app
+        .oneshot(
+            Request::put("/api/alarms")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"alarms": [{
+                        "id": "__supervision/snapshot_tap", "variable": "x",
+                        "condition": "is_true", "message": "shadow"
+                    }]})
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(response.status().is_client_error());
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("reserved supervision prefix"));
+}
+
 fn put(url: &str, body: &str, etag: Option<&str>) -> Request<Body> {
     let mut request = Request::put(url).header("Content-Type", "application/json");
     if let Some(etag) = etag {

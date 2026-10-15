@@ -93,6 +93,7 @@ fn reachable_report(name: &str, value: &serde_json::Value) -> Vec<String> {
         .get("watchdog_tripped")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let latch_reason = value.get("latch_reason").and_then(|v| v.as_str());
     // Harsher still: the program itself is gone, and only the reason says so.
     let fault = value.get("fault").and_then(|v| v.as_str());
     // The task that feeds history and process alarms from the scan loop. The
@@ -132,11 +133,18 @@ fn reachable_report(name: &str, value: &serde_json::Value) -> Vec<String> {
         ));
     }
     if latched {
-        lines.push(
-            "  WATCHDOG LATCHED — scan deadline lost; outputs zeroed and \
-             held off until the program is restarted"
+        // One latch flag, whoever set it. When the runtime says why, say that:
+        // calling every latch a lost scan deadline sends people to the wrong
+        // fault.
+        lines.push(match latch_reason {
+            Some(why) => format!(
+                "  OUTPUTS LATCHED OFF — {why}; zeroed and held off until the \
+                 program is restarted"
+            ),
+            None => "  WATCHDOG LATCHED — scan deadline lost; outputs zeroed and \
+                     held off until the program is restarted"
                 .into(),
-        );
+        });
     }
     if !down.is_empty() {
         lines.push(format!(
@@ -170,7 +178,57 @@ fn reachable_report(name: &str, value: &serde_json::Value) -> Vec<String> {
                 .unwrap_or_default()
         ));
     }
+    // What the runtime will DO about it is what an operator needs next to the
+    // warning, so it is said here and not on a healthy edge.
+    if !tap_running || tap_stalled_ms.is_some() || tap_faults > 0 {
+        lines.push(supervision_line(value.get("supervision")));
+    }
     lines
+}
+
+/// The alarm-supervision policy the runtime is enforcing, as one line.
+fn supervision_line(policy: Option<&serde_json::Value>) -> String {
+    let policy = policy.filter(|p| p.is_object());
+    let mode = policy
+        .and_then(|p| p.get("on_loss"))
+        .and_then(|v| v.as_str());
+    let grace = policy
+        .and_then(|p| p.get("grace_secs"))
+        .and_then(|v| v.as_u64());
+    // Where it stands now, from the same object: how long it has been lost and,
+    // under safe_state, how long is left. `null` is not lost / nothing pending.
+    let lost_for = policy
+        .and_then(|p| p.get("lost_for_ms"))
+        .and_then(|v| v.as_u64());
+    let latch_in = policy
+        .and_then(|p| p.get("latch_in_ms"))
+        .and_then(|v| v.as_u64());
+    let standing = match (lost_for, latch_in) {
+        (Some(lost), Some(0)) => format!(
+            "; lost for {} s, and the outputs are due to be latched off now",
+            lost / 1000
+        ),
+        (Some(lost), Some(left)) => format!(
+            "; lost for {} s, the outputs are latched off in {} s unless it comes back",
+            lost / 1000,
+            left / 1000
+        ),
+        (Some(lost), None) => format!("; lost for {} s", lost / 1000),
+        (None, _) => String::new(),
+    };
+    match (mode, grace) {
+        (Some("safe_state"), Some(grace)) => format!(
+            "  policy: on_loss = safe_state — the outputs are latched off if alarm \
+             evaluation stays lost for {grace} s{standing}"
+        ),
+        (Some("report"), _) => {
+            format!("  policy: on_loss = report — nothing is stopped automatically{standing}")
+        }
+        (Some(other), _) => format!("  policy: on_loss = {other}{standing}"),
+        (None, _) => "  policy: not reported — this runtime predates `[supervision]`, so a \
+                      declared safe_state is NOT in force on this edge"
+            .to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -183,7 +241,7 @@ mod tests {
             "reachable": true, "scan_count": 12, "uptime_secs": 30,
             "runtime_version": null, "fieldbus_healthy": true,
             "unhealthy_devices": [], "watchdog_tripped": false,
-            "fault": null, "snapshot_tap": null, "error": null,
+            "fault": null, "snapshot_tap": null, "supervision": null, "error": null,
         });
         v.as_object_mut()
             .unwrap()
@@ -258,6 +316,69 @@ mod tests {
         assert!(lines[1].contains("4.2s"), "{lines:?}");
     }
 
+    /// A warning about alarm evaluation is only half the story: what the runtime
+    /// will do about it is the other half, and an older runtime silently ignores
+    /// a declared `safe_state`.
+    #[test]
+    fn a_tap_warning_says_what_the_runtime_will_do_about_it() {
+        let stopped = |extra: serde_json::Value| {
+            let mut tap = json!({"running": false, "faults": 0, "last_fault": null});
+            tap.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            json!({"snapshot_tap": tap})
+        };
+        let with = |policy: serde_json::Value| {
+            let mut v = stopped(json!({}));
+            v["supervision"] = policy;
+            reachable_report("pi", &probe(v))
+        };
+        let safe = with(json!({"on_loss": "safe_state", "grace_secs": 45}));
+        assert!(
+            safe.last().unwrap().contains("safe_state") && safe.last().unwrap().contains("45 s"),
+            "{safe:?}"
+        );
+        let report = with(json!({"on_loss": "report", "grace_secs": 30}));
+        assert!(
+            report
+                .last()
+                .unwrap()
+                .contains("nothing is stopped automatically"),
+            "{report:?}"
+        );
+        // And how long it has been lost and what is still ahead, when it says.
+        let counting = with(json!({
+            "on_loss": "safe_state", "grace_secs": 45,
+            "lost_for_ms": 12_400, "latch_in_ms": 32_600
+        }));
+        assert!(
+            counting.last().unwrap().contains("lost for 12 s")
+                && counting.last().unwrap().contains("latched off in 32 s"),
+            "{counting:?}"
+        );
+        let due = with(json!({
+            "on_loss": "safe_state", "grace_secs": 45,
+            "lost_for_ms": 45_100, "latch_in_ms": 0
+        }));
+        assert!(
+            due.last().unwrap().contains("due to be latched off now"),
+            "{due:?}"
+        );
+        let reporting = with(json!({
+            "on_loss": "report", "grace_secs": 30, "lost_for_ms": 90_000, "latch_in_ms": null
+        }));
+        assert!(
+            reporting.last().unwrap().contains("lost for 90 s")
+                && !reporting.last().unwrap().contains("latched off in"),
+            "{reporting:?}"
+        );
+        let older = reachable_report("pi", &probe(stopped(json!({}))));
+        assert!(older.last().unwrap().contains("NOT in force"), "{older:?}");
+        // A healthy edge says nothing about it.
+        let healthy = reachable_report("pi", &probe(json!({})));
+        assert_eq!(healthy.len(), 1, "{healthy:?}");
+    }
+
     /// An edge build that predates the field, or a tap that never faulted,
     /// is not a warning.
     #[test]
@@ -270,6 +391,25 @@ mod tests {
             let lines = reachable_report("pi", &probe(extra.clone()));
             assert!(lines[0].starts_with('✓'), "{extra}: {lines:?}");
         }
+    }
+
+    /// The supervision policy can latch the outputs; it is not a lost scan
+    /// deadline, and the probe must not say it is.
+    #[test]
+    fn a_latch_the_runtime_explains_is_not_called_a_watchdog_trip() {
+        let lines = reachable_report(
+            "pi",
+            &probe(json!({
+                "watchdog_tripped": true,
+                "latch_reason": "alarm supervision lost for 30 s: the snapshot task has stopped"
+            })),
+        );
+        assert!(lines[0].starts_with('⚠'), "{lines:?}");
+        assert!(
+            lines[1].contains("OUTPUTS LATCHED OFF — alarm supervision lost"),
+            "{lines:?}"
+        );
+        assert!(!lines[1].contains("WATCHDOG"), "{lines:?}");
     }
 
     #[test]

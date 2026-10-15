@@ -13,7 +13,9 @@ function probe(patch: Partial<EdgeProbe> = {}): EdgeProbe {
     unhealthy_devices: [],
     watchdog_tripped: false,
     fault: null,
+    latch_reason: null,
     snapshot_tap: null,
+    supervision: null,
     error: null,
     ...patch,
   }
@@ -34,6 +36,22 @@ describe("edgeReach", () => {
   // A latched watchdog showed green too: reachable, buses up, driving nothing.
   it("calls a latched edge locked", () => {
     expect(edgeReach(probe({ watchdog_tripped: true })).kind).toBe("locked")
+  })
+
+  // The latch is one flag; the reason says who set it. Blaming the scan
+  // watchdog for a latch the supervision policy made sends people to the
+  // wrong fault.
+  it("says why an edge is locked when the runtime says so", () => {
+    const reach = edgeReach(
+      probe({
+        watchdog_tripped: true,
+        latch_reason: "alarm supervision lost for 30 s: the snapshot task has stopped",
+      }),
+    )
+    expect(reach.kind).toBe("locked")
+    expect(reach.detail).toContain("alarm supervision lost for 30 s")
+    expect(reach.detail).not.toContain("Scan watchdog")
+    expect(edgeReach(probe({ watchdog_tripped: true })).detail).toContain("Scan watchdog")
   })
 
   it("names the down devices of a degraded edge", () => {

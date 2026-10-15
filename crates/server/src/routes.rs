@@ -1839,6 +1839,13 @@ pub async fn put_alarms(
                 project::DEVICE_ALARM_PREFIX
             )));
         }
+        if def.id.starts_with(project::SUPERVISION_ALARM_PREFIX) {
+            return Err(ApiError::BadRequest(format!(
+                "alarm id '{}' uses the reserved supervision prefix '{}'",
+                def.id,
+                project::SUPERVISION_ALARM_PREFIX
+            )));
+        }
         if !seen.insert(def.id.as_str()) {
             return Err(ApiError::BadRequest(format!(
                 "duplicate alarm id '{}'",
@@ -1859,6 +1866,14 @@ pub async fn put_alarms(
     let response = with_project(&state, &project, |store| {
         let file = conditional::file(store, "alarms", "")?;
         conditional::check(&file, &headers)?;
+        // The body replaces the alarm DEFINITIONS. A body that does not
+        // mention `supervision` (an agent editing only `alarms`) must not
+        // silently remove a protective `safe_state` the project declared;
+        // writing `{"supervision": {"on_loss": "report"}}` is how to drop it.
+        let mut config = config.clone();
+        if config.supervision.is_none() {
+            config.supervision = store.read_alarms().ok().and_then(|c| c.supervision);
+        }
         store.write_alarms(&config)?;
         conditional::written(&file, RunResponse { ok: true })
     })?;

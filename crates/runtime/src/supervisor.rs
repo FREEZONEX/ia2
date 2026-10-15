@@ -1,0 +1,780 @@
+//! Alarm supervision: what the runtime does when it can no longer evaluate
+//! alarms.
+//!
+//! The alarm engine, the history and the live feed all hang off one task
+//! (`tap`). When it stops, is stuck, or keeps failing, the alarm list goes
+//! quiet because nothing is looking, and a quiet list reads as "nothing is
+//! wrong". `tap` reports that state (`snapshot_tap` on `/health` and
+//! `/status`); this module watches it and acts on the project's declared
+//! policy (`[supervision]` in `alarms.toml`):
+//!
+//! - `report` (the default): say so, and keep running. Stopping a plant is not
+//!   always the safe direction, so the runtime never decides to on its own.
+//! - `safe_state`: once alarm evaluation has been lost for the grace period,
+//!   latch the outputs off exactly as the scan watchdog does (every device into
+//!   failsafe, no more output writes) until a person restarts the program.
+//!   Never undone automatically, and never done by restarting the process.
+//!
+//! Logging is deliberately not proportional to time. Losing alarm evaluation is
+//! logged at ERROR the moment it is seen; reminders then back off
+//! exponentially (1, 2, 4, 8 ... minutes into the episode, at most hourly), so
+//! a day-long outage is a dozen lines, not one a minute. The state itself is
+//! always in `snapshot_tap`, for whoever is not reading the journal.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use ironplc_bridge::monitor::{self, AlarmEngine, SnapshotTapHealth};
+use ironplc_bridge::ProgramHandle;
+use parking_lot::Mutex;
+use project::{SupervisionAction, SupervisionConfig};
+
+use crate::tap::TapStatus;
+
+/// A fault of the snapshot task this recent still counts as "failing now". Keep
+/// in step with `ALARM_FAULT_RECENT_MS` in the operator panel
+/// (`apps/web/src/components/hmi/panel-health.ts`).
+const RECENT_FAULT_MS: u64 = 10_000;
+/// How often the task is looked at.
+const TICK: Duration = Duration::from_secs(1);
+/// Into an episode, when the first reminder is due.
+const FIRST_REMINDER: Duration = Duration::from_secs(60);
+/// The longest gap between reminders.
+const MAX_REMINDER_GAP: Duration = Duration::from_secs(3600);
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Policy {
+    pub on_loss: SupervisionAction,
+    pub grace: Duration,
+}
+
+impl From<&SupervisionConfig> for Policy {
+    fn from(c: &SupervisionConfig) -> Self {
+        Self {
+            on_loss: c.on_loss,
+            grace: Duration::from_secs(u64::from(c.grace_secs)),
+        }
+    }
+}
+
+impl Policy {
+    /// The policy this process is enforcing, without where it stands right now
+    /// (see [`SupervisionStatus::in_force`] for that).
+    pub fn in_force(&self) -> monitor::SupervisionInForce {
+        monitor::SupervisionInForce {
+            on_loss: match self.on_loss {
+                SupervisionAction::Report => "report",
+                SupervisionAction::SafeState => "safe_state",
+            }
+            .to_string(),
+            grace_secs: self.grace.as_secs(),
+            lost_for_ms: None,
+            latch_in_ms: None,
+        }
+    }
+
+    /// One line for the startup log and for the loss message, so the journal
+    /// says what will happen without a trip to the project files.
+    pub fn describe(&self) -> String {
+        match self.on_loss {
+            SupervisionAction::Report => {
+                "on_loss = report: no automatic action is configured".to_string()
+            }
+            SupervisionAction::SafeState => format!(
+                "on_loss = safe_state: the outputs are latched off if alarm evaluation \
+                 stays lost for {} s",
+                self.grace.as_secs()
+            ),
+        }
+    }
+}
+
+/// Why alarm evaluation is lost right now; `None` while it is not.
+pub fn assess(h: &SnapshotTapHealth) -> Option<String> {
+    if !h.running {
+        return Some("the snapshot task has stopped".to_string());
+    }
+    if let Some(ms) = h.stalled_for_ms {
+        return Some(format!(
+            "the snapshot task has been stuck inside one snapshot for {}.{} s",
+            ms / 1000,
+            (ms % 1000) / 100
+        ));
+    }
+    match h.last_fault_age_ms {
+        Some(age) if age < RECENT_FAULT_MS => Some(format!(
+            "the snapshot task faulted {} s ago{}",
+            (age / 1000).max(1),
+            h.last_fault
+                .as_deref()
+                .map(|t| format!(" ({t})"))
+                .unwrap_or_default()
+        )),
+        _ => None,
+    }
+}
+
+/// What a step of the supervisor asks its caller to do.
+#[derive(Debug, PartialEq)]
+pub enum Action {
+    /// Alarm evaluation was just lost: ERROR, immediately.
+    Lost { why: String },
+    /// Still lost, at one of the exponentially spaced reminders.
+    StillLost { why: String, for_secs: u64 },
+    /// It is back.
+    Restored { after_secs: u64 },
+    /// `safe_state` and the grace ran out: latch the outputs off.
+    LatchOff { reason: String },
+}
+
+/// The supervisor's memory between looks. Pure: the caller passes the time and
+/// what it saw, so the grace period and the log schedule are testable.
+pub struct Supervisor {
+    policy: Policy,
+    lost_since: Option<Instant>,
+    /// Lost episodes so far. Only the 1st, 2nd, 4th, 8th ... are announced, so
+    /// a task that flaps cannot flood the journal.
+    episodes: u64,
+    announced: bool,
+    next_reminder: Duration,
+    latch_requested: bool,
+}
+
+impl Supervisor {
+    pub fn new(policy: Policy) -> Self {
+        Self {
+            policy,
+            lost_since: None,
+            episodes: 0,
+            announced: false,
+            next_reminder: FIRST_REMINDER,
+            latch_requested: false,
+        }
+    }
+
+    /// Where the current episode stands after the last [`Supervisor::step`], for
+    /// whoever reads `/health`. `outputs_latched` is what was passed to that
+    /// step.
+    pub fn episode(&self, outputs_latched: bool) -> Episode {
+        let latch_at = self.lost_since.filter(|_| {
+            self.policy.on_loss == SupervisionAction::SafeState
+                && !self.latch_requested
+                && !outputs_latched
+        });
+        Episode {
+            lost_since: self.lost_since,
+            latch_at: latch_at.map(|since| since + self.policy.grace),
+        }
+    }
+
+    /// One look. `lost` is [`assess`]'s answer; `outputs_latched` is whether the
+    /// outputs are already latched off (by the scan watchdog, say), in which
+    /// case there is nothing left to ask for.
+    pub fn step(
+        &mut self,
+        now: Instant,
+        lost: Option<String>,
+        outputs_latched: bool,
+    ) -> Vec<Action> {
+        let mut actions = Vec::new();
+        match lost {
+            Some(why) => {
+                let since = *self.lost_since.get_or_insert_with(|| {
+                    self.episodes += 1;
+                    self.announced = self.episodes.is_power_of_two();
+                    self.next_reminder = FIRST_REMINDER;
+                    if self.announced {
+                        actions.push(Action::Lost { why: why.clone() });
+                    }
+                    now
+                });
+                let elapsed = now.saturating_duration_since(since);
+                if self.announced && elapsed >= self.next_reminder && elapsed > Duration::ZERO {
+                    actions.push(Action::StillLost {
+                        why: why.clone(),
+                        for_secs: elapsed.as_secs(),
+                    });
+                    self.next_reminder = (elapsed * 2).min(elapsed + MAX_REMINDER_GAP);
+                }
+                if self.policy.on_loss == SupervisionAction::SafeState
+                    && !self.latch_requested
+                    && !outputs_latched
+                    && elapsed >= self.policy.grace
+                {
+                    self.latch_requested = true;
+                    actions.push(Action::LatchOff {
+                        reason: format!(
+                            "alarm supervision lost for {} s: {why}",
+                            self.policy.grace.as_secs()
+                        ),
+                    });
+                }
+            }
+            None => {
+                if let Some(since) = self.lost_since.take() {
+                    if self.announced {
+                        actions.push(Action::Restored {
+                            after_secs: now.saturating_duration_since(since).as_secs(),
+                        });
+                    }
+                    self.announced = false;
+                }
+            }
+        }
+        actions
+    }
+}
+
+/// Where an episode of lost alarm evaluation stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Episode {
+    /// When the supervisor first saw it lost; `None` while it is not.
+    pub lost_since: Option<Instant>,
+    /// When `safe_state` will latch the outputs off; `None` when nothing is
+    /// pending (not lost, mode `report`, already requested, already latched).
+    pub latch_at: Option<Instant>,
+}
+
+/// The supervisor looks this many times before a reader stops trusting what it
+/// last published.
+const STALE_AFTER_TICKS: u32 = 5;
+
+/// What `/health` and `/status` say about alarm supervision: the policy in
+/// force, and, while alarm evaluation is lost, how long and how long until the
+/// policy acts. Written by the supervisor loop, read by the HTTP handlers.
+pub struct SupervisionStatus {
+    policy: Policy,
+    seen: Mutex<Seen>,
+}
+
+#[derive(Clone, Copy)]
+struct Seen {
+    episode: Episode,
+    /// After this, the supervisor has not looked for long enough that what it
+    /// published says nothing about now.
+    good_until: Instant,
+}
+
+impl SupervisionStatus {
+    pub fn new(policy: Policy) -> Arc<Self> {
+        Arc::new(Self {
+            policy,
+            // Nothing seen yet: not lost, and not trusted past the first look.
+            seen: Mutex::new(Seen {
+                episode: Episode {
+                    lost_since: None,
+                    latch_at: None,
+                },
+                good_until: Instant::now(),
+            }),
+        })
+    }
+
+    pub fn policy(&self) -> &Policy {
+        &self.policy
+    }
+
+    fn publish(&self, now: Instant, tick: Duration, episode: Episode) {
+        *self.seen.lock() = Seen {
+            episode,
+            good_until: now + tick * STALE_AFTER_TICKS,
+        };
+    }
+
+    /// The wire answer now.
+    pub fn in_force(&self) -> monitor::SupervisionInForce {
+        self.in_force_at(Instant::now())
+    }
+
+    /// The wire answer at `now`. Durations are measured here, not at the last
+    /// look, so they are current between looks. A supervisor that has stopped
+    /// looking (its task is stuck, say on a scan loop that never answers) is
+    /// not believed: an old "latch in 12 s" would otherwise read "now" for ever
+    /// while nothing happens, so the pending state goes back to unknown (`null`).
+    pub fn in_force_at(&self, now: Instant) -> monitor::SupervisionInForce {
+        let mut report = self.policy.in_force();
+        let seen = *self.seen.lock();
+        if now <= seen.good_until {
+            let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+            report.lost_for_ms = seen
+                .episode
+                .lost_since
+                .map(|since| ms(now.saturating_duration_since(since)));
+            report.latch_in_ms = seen
+                .episode
+                .latch_at
+                .map(|at| ms(at.saturating_duration_since(now)));
+        }
+        report
+    }
+}
+
+/// How long the supervisor waits for the alarm engine's lock before it gives
+/// up on this tick's alarm update. The policy must never depend on it.
+const ALARM_LOCK_WAIT: Duration = Duration::from_millis(50);
+
+/// Keep the built-in "alarm evaluation is lost" alarm in step with the
+/// assessment, every tick (idempotent): it must follow EVERY state change, not
+/// only the logged ones. If the engine's lock cannot be had, the alarm is left
+/// as it is and that is reported (1st, 2nd, 4th ...): the engine being wedged is
+/// itself one way alarm evaluation gets lost, and the supervisor, the policy
+/// and the other channels (log, `/health`, the panel, MQTT) carry on without it.
+fn note_alarm(alarms: &Mutex<AlarmEngine>, lost: Option<&str>, lock_misses: &mut u64) {
+    match alarms.try_lock_for(ALARM_LOCK_WAIT) {
+        Some(mut engine) => {
+            engine.note_supervision(lost, monitor::wall_now_us());
+        }
+        None => {
+            *lock_misses += 1;
+            if lock_misses.is_power_of_two() {
+                tracing::error!(
+                    misses = *lock_misses,
+                    "the alarm engine's lock could not be had: the supervision alarm is \
+                     not being updated (the engine may be wedged); the policy is unaffected"
+                );
+            }
+        }
+    }
+}
+
+/// Watch the snapshot task for the life of the process.
+pub async fn supervise(
+    tap: Arc<TapStatus>,
+    handle: ProgramHandle,
+    alarms: Arc<Mutex<AlarmEngine>>,
+    status: Arc<SupervisionStatus>,
+) {
+    supervise_every(TICK, tap, handle, alarms, status).await
+}
+
+pub async fn supervise_every(
+    tick: Duration,
+    tap: Arc<TapStatus>,
+    handle: ProgramHandle,
+    alarms: Arc<Mutex<AlarmEngine>>,
+    status: Arc<SupervisionStatus>,
+) {
+    let policy = status.policy().clone();
+    let mut supervisor = Supervisor::new(policy.clone());
+    let mut lock_misses = 0u64;
+    let mut interval = tokio::time::interval(tick);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        let lost = assess(&tap.health());
+        note_alarm(&alarms, lost.as_deref(), &mut lock_misses);
+        let now = Instant::now();
+        let latched = handle.watchdog_tripped();
+        let actions = supervisor.step(now, lost, latched);
+        // Published BEFORE the actions are carried out: asking the scan loop to
+        // latch waits for its answer, and what is published must not still say
+        // "latch in 0 s" while that wait goes on.
+        status.publish(now, tick, supervisor.episode(latched));
+        for action in actions {
+            carry_out(action, &policy, &handle).await;
+        }
+    }
+}
+
+async fn carry_out(action: Action, policy: &Policy, handle: &ProgramHandle) {
+    match action {
+        Action::Lost { why } => tracing::error!(
+            %why,
+            policy = %policy.describe(),
+            "alarm supervision LOST: {why}. Process alarms are not being evaluated and \
+             history and the live feed may have stopped; a quiet alarm list is not an \
+             all-clear. {}",
+            policy.describe()
+        ),
+        Action::StillLost { why, for_secs } => tracing::error!(
+            %why,
+            for_secs,
+            "alarm supervision still lost after {for_secs} s: {why} (reminders back off \
+             exponentially; the state is in /health and /status `snapshot_tap`)"
+        ),
+        Action::Restored { after_secs } => {
+            tracing::info!(
+                after_secs,
+                "alarm supervision restored after {after_secs} s"
+            )
+        }
+        Action::LatchOff { reason } => match handle.latch_outputs_off(reason.clone()).await {
+            Ok(true) => tracing::error!(
+                %reason,
+                "alarm supervision policy latched the outputs off; restart the program \
+                 to re-arm"
+            ),
+            Ok(false) => tracing::warn!("outputs were already latched off"),
+            Err(e) => tracing::error!(
+                %reason, %e,
+                "alarm supervision policy could not latch the outputs off: the scan loop \
+                 is gone"
+            ),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn health() -> SnapshotTapHealth {
+        SnapshotTapHealth {
+            running: true,
+            faults: 0,
+            last_fault: None,
+            stalled_for_ms: None,
+            last_fault_age_ms: None,
+        }
+    }
+
+    fn policy(on_loss: SupervisionAction, grace_secs: u64) -> Policy {
+        Policy {
+            on_loss,
+            grace: Duration::from_secs(grace_secs),
+        }
+    }
+
+    fn lost() -> Option<String> {
+        Some("the snapshot task has stopped".to_string())
+    }
+
+    #[test]
+    fn assess_names_a_stopped_a_stuck_and_a_recently_faulting_task() {
+        assert_eq!(assess(&health()), None);
+        assert!(assess(&SnapshotTapHealth {
+            running: false,
+            ..health()
+        })
+        .unwrap()
+        .contains("has stopped"));
+        let stuck = assess(&SnapshotTapHealth {
+            stalled_for_ms: Some(4200),
+            ..health()
+        })
+        .unwrap();
+        assert!(stuck.contains("4.2 s"), "{stuck}");
+        let recent = assess(&SnapshotTapHealth {
+            faults: 3,
+            last_fault: Some("the alarms stage panicked on scan 9".into()),
+            last_fault_age_ms: Some(1500),
+            ..health()
+        })
+        .unwrap();
+        assert!(
+            recent.contains("faulted 1 s ago") && recent.contains("alarms stage"),
+            "{recent}"
+        );
+    }
+
+    #[test]
+    fn assess_ignores_an_old_fault() {
+        let old = SnapshotTapHealth {
+            faults: 1,
+            last_fault: Some("x".into()),
+            last_fault_age_ms: Some(RECENT_FAULT_MS),
+            ..health()
+        };
+        assert_eq!(
+            assess(&old),
+            None,
+            "history, not a task that is failing now"
+        );
+    }
+
+    /// The journal is not proportional to time: ERROR the moment it is lost,
+    /// reminders at 1, 2, 4, 8 ... minutes into the episode and at most hourly
+    /// after that, one line when it is back.
+    #[test]
+    fn the_log_schedule_backs_off_instead_of_repeating_every_minute() {
+        let mut s = Supervisor::new(policy(SupervisionAction::Report, 30));
+        let t0 = Instant::now();
+        let mut reminders = Vec::new();
+        let first = s.step(t0, lost(), false);
+        assert_eq!(
+            first,
+            vec![Action::Lost {
+                why: "the snapshot task has stopped".into()
+            }]
+        );
+        // A full day, looked at once a second.
+        let mut lines = 1;
+        for sec in 1..=86_400u64 {
+            for a in s.step(t0 + Duration::from_secs(sec), lost(), false) {
+                if let Action::StillLost { for_secs, .. } = a {
+                    reminders.push(for_secs);
+                    lines += 1;
+                }
+            }
+        }
+        assert_eq!(&reminders[..4], &[60, 120, 240, 480], "{reminders:?}");
+        assert!(
+            lines <= 30,
+            "a day-long outage must be a handful of lines, not {lines}: {reminders:?}"
+        );
+        // Never closer together than the cap allows once it is hourly.
+        assert!(reminders
+            .windows(2)
+            .rev()
+            .take(5)
+            .all(|w| w[1] - w[0] <= 3600 + 1));
+        let back = s.step(t0 + Duration::from_secs(86_401), None, false);
+        assert_eq!(back, vec![Action::Restored { after_secs: 86_401 }]);
+    }
+
+    #[test]
+    fn report_never_asks_for_the_outputs_to_be_latched() {
+        let mut s = Supervisor::new(policy(SupervisionAction::Report, 30));
+        let t0 = Instant::now();
+        for sec in 0..=3600u64 {
+            let acts = s.step(t0 + Duration::from_secs(sec), lost(), false);
+            assert!(
+                !acts.iter().any(|a| matches!(a, Action::LatchOff { .. })),
+                "report must never latch: {acts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn safe_state_latches_once_when_the_grace_runs_out_and_never_again() {
+        let mut s = Supervisor::new(policy(SupervisionAction::SafeState, 30));
+        let t0 = Instant::now();
+        let mut latch_at = Vec::new();
+        for sec in 0..=120u64 {
+            for a in s.step(t0 + Duration::from_secs(sec), lost(), false) {
+                if let Action::LatchOff { reason } = a {
+                    assert!(reason.contains("lost for 30 s"), "{reason}");
+                    latch_at.push(sec);
+                }
+            }
+        }
+        assert_eq!(latch_at, vec![30], "exactly once, at the end of the grace");
+
+        // Recovering afterwards announces it and asks for nothing: leaving the
+        // latched state is for a person, not for the supervisor.
+        let back = s.step(t0 + Duration::from_secs(121), None, true);
+        assert!(
+            back.iter().all(|a| matches!(a, Action::Restored { .. })),
+            "{back:?}"
+        );
+        let again = s.step(t0 + Duration::from_secs(300), lost(), true);
+        assert!(
+            !again.iter().any(|a| matches!(a, Action::LatchOff { .. })),
+            "{again:?}"
+        );
+    }
+
+    /// A tap that comes back inside the grace is a hiccup, and the clock starts
+    /// over for the next loss.
+    #[test]
+    fn a_recovery_inside_the_grace_resets_it() {
+        let mut s = Supervisor::new(policy(SupervisionAction::SafeState, 30));
+        let t0 = Instant::now();
+        let mut latched = false;
+        let mut look = |sec: u64, lost: Option<String>| {
+            for a in s.step(t0 + Duration::from_secs(sec), lost, false) {
+                latched |= matches!(a, Action::LatchOff { .. });
+            }
+        };
+        for sec in 0..=20 {
+            look(sec, lost());
+        }
+        look(21, None);
+        for sec in 22..=45 {
+            look(sec, lost());
+        }
+        assert!(
+            !latched,
+            "20 s lost, a good look, then 24 s lost is never 30 s in a row"
+        );
+    }
+
+    #[test]
+    fn nothing_is_asked_when_the_scan_watchdog_already_latched_the_outputs() {
+        let mut s = Supervisor::new(policy(SupervisionAction::SafeState, 5));
+        let t0 = Instant::now();
+        for sec in 0..=60 {
+            let acts = s.step(t0 + Duration::from_secs(sec), lost(), true);
+            assert!(
+                !acts.iter().any(|a| matches!(a, Action::LatchOff { .. })),
+                "{acts:?}"
+            );
+        }
+    }
+
+    /// A task that flaps must not flood the journal: only the 1st, 2nd, 4th,
+    /// 8th ... episode is announced (and only an announced one is closed with
+    /// a "restored" line).
+    #[test]
+    fn a_flapping_task_is_announced_logarithmically() {
+        let mut s = Supervisor::new(policy(SupervisionAction::Report, 30));
+        let t0 = Instant::now();
+        let (mut lost_lines, mut restored_lines) = (0, 0);
+        for episode in 0..64u64 {
+            let at = |sec: u64| t0 + Duration::from_secs(episode * 10 + sec);
+            for a in s.step(at(0), lost(), false) {
+                lost_lines += matches!(a, Action::Lost { .. }) as u32;
+            }
+            for a in s.step(at(5), None, false) {
+                restored_lines += matches!(a, Action::Restored { .. }) as u32;
+            }
+        }
+        assert_eq!(lost_lines, 7, "episodes 1, 2, 4, 8, 16, 32, 64");
+        assert_eq!(restored_lines, lost_lines, "every announced loss is closed");
+    }
+
+    fn episode_after(
+        s: &mut Supervisor,
+        t0: Instant,
+        sec: u64,
+        lost: Option<String>,
+        outputs_latched: bool,
+    ) -> Episode {
+        s.step(t0 + Duration::from_secs(sec), lost, outputs_latched);
+        s.episode(outputs_latched)
+    }
+
+    /// What a reader is told about an episode: since when, and under
+    /// `safe_state` until when, and nothing pending once the latch has been
+    /// asked for, was done by someone else, or is not this project's policy.
+    #[test]
+    fn the_episode_says_since_when_and_until_when_and_then_nothing_is_pending() {
+        let t0 = Instant::now();
+        let at = |sec: u64| t0 + Duration::from_secs(sec);
+
+        let mut s = Supervisor::new(policy(SupervisionAction::SafeState, 30));
+        let calm = episode_after(&mut s, t0, 0, None, false);
+        assert_eq!((calm.lost_since, calm.latch_at), (None, None));
+        let lost_now = episode_after(&mut s, t0, 5, lost(), false);
+        assert_eq!(lost_now.lost_since, Some(at(5)));
+        assert_eq!(lost_now.latch_at, Some(at(35)), "the grace counts from 5");
+        let later = episode_after(&mut s, t0, 20, lost(), false);
+        assert_eq!(later, lost_now, "a longer loss does not move either");
+        let asked = episode_after(&mut s, t0, 35, lost(), false);
+        assert_eq!(asked.lost_since, Some(at(5)));
+        assert_eq!(asked.latch_at, None, "asked for: nothing is pending");
+        let back = episode_after(&mut s, t0, 40, None, true);
+        assert_eq!((back.lost_since, back.latch_at), (None, None));
+
+        // A hiccup inside the grace starts the count over.
+        let mut s = Supervisor::new(policy(SupervisionAction::SafeState, 30));
+        episode_after(&mut s, t0, 0, lost(), false);
+        episode_after(&mut s, t0, 10, None, false);
+        let again = episode_after(&mut s, t0, 12, lost(), false);
+        assert_eq!(again.latch_at, Some(at(42)));
+
+        // `report` is lost but has nothing pending; so is an already-latched run.
+        let mut s = Supervisor::new(policy(SupervisionAction::Report, 30));
+        let report = episode_after(&mut s, t0, 3, lost(), false);
+        assert_eq!((report.lost_since, report.latch_at), (Some(at(3)), None));
+        let mut s = Supervisor::new(policy(SupervisionAction::SafeState, 30));
+        let latched = episode_after(&mut s, t0, 3, lost(), true);
+        assert_eq!((latched.lost_since, latched.latch_at), (Some(at(3)), None));
+    }
+
+    fn published(
+        status: &SupervisionStatus,
+        now: Instant,
+        tick: Duration,
+        lost_since: Option<Instant>,
+        latch_at: Option<Instant>,
+    ) {
+        status.publish(
+            now,
+            tick,
+            Episode {
+                lost_since,
+                latch_at,
+            },
+        );
+    }
+
+    /// The durations are worked out when asked, so they are current between the
+    /// supervisor's looks, and `0` is "due" rather than a negative number.
+    #[test]
+    fn the_durations_are_measured_when_asked_and_a_due_latch_reads_zero() {
+        let t0 = Instant::now();
+        let tick = Duration::from_secs(1);
+        let status = SupervisionStatus::new(policy(SupervisionAction::SafeState, 30));
+        published(
+            &status,
+            t0,
+            tick,
+            Some(t0),
+            Some(t0 + Duration::from_secs(30)),
+        );
+        let a = status.in_force_at(t0 + Duration::from_millis(2500));
+        assert_eq!(a.lost_for_ms, Some(2500));
+        assert_eq!(a.latch_in_ms, Some(27_500));
+        assert_eq!((a.on_loss.as_str(), a.grace_secs), ("safe_state", 30));
+
+        // Due, but the supervisor has not looked yet.
+        let due_tick = Duration::from_secs(60);
+        published(
+            &status,
+            t0,
+            due_tick,
+            Some(t0),
+            Some(t0 + Duration::from_secs(30)),
+        );
+        let due = status.in_force_at(t0 + Duration::from_secs(31));
+        assert_eq!(due.latch_in_ms, Some(0));
+        assert_eq!(due.lost_for_ms, Some(31_000));
+    }
+
+    /// A supervisor that has stopped looking cannot vouch for "latch in 12 s":
+    /// it would read "due" for ever while nothing happens. The policy is still
+    /// reported; what is pending is not.
+    #[test]
+    fn a_supervisor_that_has_stopped_looking_is_not_believed() {
+        let t0 = Instant::now();
+        let tick = Duration::from_secs(1);
+        let status = SupervisionStatus::new(policy(SupervisionAction::SafeState, 30));
+        published(
+            &status,
+            t0,
+            tick,
+            Some(t0),
+            Some(t0 + Duration::from_secs(30)),
+        );
+        let fresh = status.in_force_at(t0 + Duration::from_secs(4));
+        assert!(fresh.lost_for_ms.is_some() && fresh.latch_in_ms.is_some());
+        let stale = status.in_force_at(t0 + Duration::from_secs(6));
+        assert_eq!((stale.lost_for_ms, stale.latch_in_ms), (None, None));
+        assert_eq!(
+            (stale.on_loss.as_str(), stale.grace_secs),
+            ("safe_state", 30)
+        );
+        // And a supervisor that never looked has nothing to say either.
+        let never = SupervisionStatus::new(policy(SupervisionAction::SafeState, 30));
+        let r = never.in_force_at(Instant::now() + Duration::from_secs(1));
+        assert_eq!((r.lost_for_ms, r.latch_in_ms), (None, None));
+    }
+
+    #[test]
+    fn the_policy_in_force_is_reported_by_name_and_grace() {
+        let report = Policy::from(&SupervisionConfig::default()).in_force();
+        assert_eq!((report.on_loss.as_str(), report.grace_secs), ("report", 30));
+        let safe = Policy::from(&SupervisionConfig {
+            on_loss: SupervisionAction::SafeState,
+            grace_secs: 45,
+        })
+        .in_force();
+        assert_eq!((safe.on_loss.as_str(), safe.grace_secs), ("safe_state", 45));
+    }
+
+    #[test]
+    fn the_policy_comes_from_the_project_and_defaults_to_stopping_nothing() {
+        let default = Policy::from(&SupervisionConfig::default());
+        assert_eq!(default.on_loss, SupervisionAction::Report);
+        assert!(default.describe().contains("no automatic action"));
+        let declared = Policy::from(&SupervisionConfig {
+            on_loss: SupervisionAction::SafeState,
+            grace_secs: 45,
+        });
+        assert_eq!(declared.grace, Duration::from_secs(45));
+        assert!(
+            declared.describe().contains("latched off") && declared.describe().contains("45 s")
+        );
+    }
+}

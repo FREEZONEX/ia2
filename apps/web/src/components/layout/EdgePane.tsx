@@ -151,8 +151,10 @@ function Editor({
         fieldbus_healthy: null,
         unhealthy_devices: [],
         watchdog_tripped: null,
+        latch_reason: null,
         fault: null,
         snapshot_tap: null,
+        supervision: null,
         error: String(e),
       })
     } finally {
@@ -876,6 +878,13 @@ function DeployVerdict({ report }: { report: DeployReport }) {
             before restarting or rolling back.
           </span>
         </div>
+      ) : outcome.kind === "unprotected" ? (
+        <ErrorBox className="max-w-full whitespace-pre-wrap break-words p-2 text-xs">
+          Version <span className="font-mono">{outcome.version}</span> is installed and
+          current, but the alarm-supervision policy the project declares is not in force on
+          this edge: {outcome.detail}. Inspect runtime and plant state before restarting or
+          rolling back — the log names the previous version.
+        </ErrorBox>
       ) : outcome.kind === "unmonitored" ? (
         <ErrorBox className="max-w-full whitespace-pre-wrap break-words p-2 text-xs">
           Version <span className="font-mono">{outcome.version}</span> is installed and

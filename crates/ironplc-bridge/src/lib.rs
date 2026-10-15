@@ -224,6 +224,9 @@ pub struct EdgeProject {
     pub devices: Vec<project::Device>,
     pub iomap: project::IoMap,
     pub units: Vec<ProgramUnit>,
+    /// What the project says the runtime does when it can no longer evaluate
+    /// alarms (`[supervision]` in `alarms.toml`); `report` unless declared.
+    pub supervision: project::SupervisionConfig,
 }
 
 /// Load and compile the project at `project_dir` the way `ia2-runtime`
@@ -254,6 +257,15 @@ pub fn load_edge_project(project_dir: &std::path::Path) -> Result<EdgeProject, S
         .read_iomap()
         .map_err(|e| format!("reading iomap: {e}"))?;
     reject_shared_globals(&store, &tasks).map_err(|msg| format!("{msg} Then redeploy."))?;
+    // alarms.toml is read here, not only by the runtime afterwards, because
+    // the runtime tolerates an unreadable file (it logs and runs without
+    // alarms). That is the wrong answer for a project whose `[supervision]`
+    // asks for protection: a misspelt key or a bad value would deploy fine and
+    // protect nothing. An unreadable file is refused BEFORE it reaches the edge.
+    let alarms = store
+        .read_alarms()
+        .map_err(|e| format!("reading alarms.toml: {e}"))?;
+    let supervision = alarms.supervision.unwrap_or_default();
     let units =
         compile_project_units(&store, &tasks).map_err(|e| format!("compiling project: {e}"))?;
     Ok(EdgeProject {
@@ -262,6 +274,7 @@ pub fn load_edge_project(project_dir: &std::path::Path) -> Result<EdgeProject, S
         devices,
         iomap,
         units,
+        supervision,
     })
 }
 
@@ -2001,6 +2014,50 @@ mod edge_project_tests {
         let loaded = load_edge_project(dir.path()).expect("the seeded project loads");
         assert_eq!(loaded.units.len(), 1);
         assert_eq!(loaded.tasks.programs[0].instance, "main_inst");
+    }
+
+    /// The policy is declared by the project and read before anything runs. A
+    /// project that does not say gets the one that stops nothing.
+    #[test]
+    fn the_supervision_policy_is_read_from_alarms_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        project(dir.path());
+        let loaded = load_edge_project(dir.path()).unwrap();
+        assert_eq!(loaded.supervision, project::SupervisionConfig::default());
+        assert_eq!(
+            loaded.supervision.on_loss,
+            project::SupervisionAction::Report
+        );
+
+        std::fs::write(
+            dir.path().join("alarms.toml"),
+            "[supervision]\non_loss = \"safe_state\"\ngrace_secs = 45\n",
+        )
+        .unwrap();
+        let loaded = load_edge_project(dir.path()).unwrap();
+        assert_eq!(
+            loaded.supervision.on_loss,
+            project::SupervisionAction::SafeState
+        );
+        assert_eq!(loaded.supervision.grace_secs, 45);
+    }
+
+    /// A protective setting that does not parse must fail the deploy; it must
+    /// not deploy, log a warning on the edge, and protect nothing.
+    #[test]
+    fn an_alarms_file_the_runtime_could_not_read_is_refused() {
+        for bad in [
+            "[supervision]\non_los = \"safe_state\"\n",
+            "[supervision]\non_loss = \"safe-state\"\n",
+            "[supervision]\non_loss = \"safe_state\"\ngrace_secs = 0\n",
+            "this is not toml [",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            project(dir.path());
+            std::fs::write(dir.path().join("alarms.toml"), bad).unwrap();
+            let err = load_edge_project(dir.path()).err().expect("refused");
+            assert!(err.starts_with("reading alarms.toml:"), "{bad:?}: {err}");
+        }
     }
 
     #[test]

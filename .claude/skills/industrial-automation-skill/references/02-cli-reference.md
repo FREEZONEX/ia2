@@ -212,7 +212,9 @@ gate on health must read `fieldbus_healthy` / `unhealthy_devices` from
 `watchdog_tripped` is the third field such a gate must read, and the
 nastiest: a latched runtime is reachable AND fieldbus-healthy AND its scan
 count keeps climbing, while it drives nothing. `probe` prints
-`WATCHDOG LATCHED` for it; only a restart clears it.
+`WATCHDOG LATCHED` for it, or `OUTPUTS LATCHED OFF — <reason>` when the runtime says
+something else latched them (the project's `[supervision] safe_state` policy, an
+execution-budget trap): `latch_reason` in `cs probe --json`. Only a restart clears it.
 
 `fault` is the fourth: the edge's program stopped (a VM trap, say), and the
 runtime answers while running nothing. `probe` prints `PROGRAM FAULTED —
@@ -228,7 +230,7 @@ is evaluating", not "no alarms". `probe` prints `SNAPSHOT TAP STOPPED` when
 `snapshot_tap.running` is `false` (only a restart clears it),
 `SNAPSHOT TAP STALLED` when `stalled_for_ms` is set (a stage blocked inside one
 snapshot, usually a write that does not return: `running` stays true and
-`faults` stays 0) and `snapshot tap FAULTED N×` when `faults` is above zero; a count that climbs
+`faults` stays 0) and `snapshot tap FAULTED N×` when `faults` is above zero, each followed by a `policy:` line (the `supervision` the runtime is enforcing; "not reported" means an older runtime that IGNORES a declared `[supervision]`); a count that climbs
 between two probes is failing now. It is `null` for an edge build that
 predates the field.
 
@@ -249,7 +251,7 @@ A changed `runtime_id` or reset counter/uptime restarts that observation; older
 runtimes without an identity use the weaker counter/uptime evidence. Equal
 counts are waited for (long-cycle tasks). The entire check, including SSH
 reads and sleeps, is bounded to 30 s. `health.state` is `faulted` for a fault
-or watchdog, `not_running` for paused/step, `unmonitored` when the runtime's
+or watchdog, `not_running` for paused/step, `unprotected` when the project declares a `[supervision]` the edge's runtime does not enforce (an older runtime ignores it), `unmonitored` when the runtime's
 snapshot task (history, process alarms, the scan counter) has stopped, is stuck
 on one snapshot or its `snapshot_tap.faults` is rising — the program may scan but no alarm can be
 raised, and the deploy says so instead of "program not running" — or `unknown`

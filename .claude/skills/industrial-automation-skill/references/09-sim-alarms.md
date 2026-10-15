@@ -123,8 +123,13 @@ Device loss also has a zero-config alarm: `__device/<device-name>` raises at
 high severity after 1 s continuously unhealthy, including a device that never
 connected. It uses the same alarm journal and acknowledgement commands;
 recovery alone does not dismiss an unacknowledged occurrence. Do not define
-ids beginning `__device/` in `alarms.toml` (reserved). These alerts do not change
+ids beginning `__device/` or `__supervision/` in `alarms.toml` (reserved). These alerts do not change
 the scan program or failsafe policy.
+
+The edge runtime also raises `__supervision/snapshot_tap` (Critical, at once) when ITS OWN alarm
+evaluation is lost: the task behind the alarm list, history and live feed stopped, stuck or failing. A
+quiet alarm list is then not an all-clear, and this alarm says so in the list itself. It counts in
+`alarms_standing`, is journalled, and stays standing after it returns until acknowledged.
 
 Inspect `snapshot.vars[].input` for mapped field inputs: `{device, channel,
 stale}`. A stale value is last-known, not live; a link recovering while paused
@@ -133,6 +138,24 @@ all configured devices. Internal/output values do not inherit this metadata.
 Process alarms neither raise nor clear on stale inputs; debounce restarts on
 valid input. History buckets containing stale samples carry `stale: true`,
 including persisted edge history: graph them as gaps, not healthy flat lines.
+
+**`[supervision]` (edge only) is a hazard decision, not a tuning knob.** The
+edge runtime's alarm evaluation can stop (its snapshot task ends, sticks or
+keeps failing); a quiet alarm list then means nothing is looking. `alarms.toml`
+may declare what the runtime does about it:
+
+```toml
+[supervision]
+on_loss = "report"        # default: report it, keep running
+# on_loss = "safe_state"  # latch the outputs off after grace_secs of lost alarm evaluation
+grace_secs = 30
+```
+
+Leave it at `report` unless you know the plant: an unplanned stop can be the
+more dangerous direction. `safe_state` latches like a scan-watchdog trip and only
+a person restarting the program re-arms it. A body for `cs set alarms` that
+omits `supervision` KEEPS the declared one; say `report` explicitly to drop it.
+A misspelt key or bad value fails the deploy, and an `alarms.toml` the runtime cannot read also stops `ia2-runtime` from starting (it no longer runs without alarms). See `docs/edge-deploy.md`.
 
 Definitions are project config (`alarms.toml`), authored like any other
 doc — and YOU should author them alongside the control logic; a program
