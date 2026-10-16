@@ -333,7 +333,7 @@ pub(crate) enum Command {
 pub(crate) enum RuntimeCmd {
     /// Halt the scan loop: the program stops and no new outputs are pushed,
     /// but devices keep the last values they were sent (not a safe state).
-    /// Writes/forces still apply to the program.
+    /// Writes still update the program; forces apply on the next scan.
     Pause {
         /// Target this edge runtime instead of the local server.
         #[arg(long)]

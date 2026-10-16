@@ -260,10 +260,10 @@ pub enum RuntimeMode {
     Running,
     /// Halt scan execution: no inputs are read into the program, the
     /// program does NOT advance, and the scan loop pushes no new
-    /// outputs. Variable writes / force commands still take effect on
-    /// the program's variables (they're delivered between rounds, not
-    /// inside a round), so an operator can stage a state while paused;
-    /// it reaches the devices on the first round after `resume` / `step`.
+    /// outputs. Variable writes still update the VM between rounds.
+    /// Force commands register overrides while paused; those overrides
+    /// are applied to the VM on the next scan. Output synchronization
+    /// resumes on the first round after `resume` / `step`.
     ///
     /// This is NOT a safe state and does not stop the plant. Only the scan
     /// loop pauses: each adapter's own worker (the EtherCAT cyclic thread
