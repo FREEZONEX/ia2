@@ -97,7 +97,7 @@ SRV="'"$SRV"'"
 cs --project tank_ctrl run --program main --server "$SRV"; sleep 3
 cs --project tank_ctrl runtime snapshot --vars level,setpoint,valve_open --server "$SRV"  # LIVE values (status has none)
 cs --project tank_ctrl runtime force setpoint 200 --server "$SRV"; sleep 3   # tank drains
-cs --project tank_ctrl runtime pause  --server "$SRV"; sleep 1              # freeze
+cs --project tank_ctrl runtime pause  --server "$SRV"; sleep 1              # halt the program (devices keep the last outputs)
 cs --project tank_ctrl runtime step 20 --server "$SRV"; sleep 2            # advance exactly 20
 cs --project tank_ctrl runtime resume --server "$SRV"; sleep 2
 cs --project tank_ctrl runtime unforce setpoint --server "$SRV"           # release — IMPORTANT

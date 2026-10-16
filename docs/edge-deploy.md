@@ -19,6 +19,17 @@ port to one directly — every interaction goes through SSH. You add an
 and the IDE bundles the project + a runtime binary, scp's it over,
 atomically swaps the live version, and restarts the systemd unit.
 
+The runtime claims its HTTP listening socket before starting device connections
+or creating its state directory. If the address cannot be bound (for example,
+another instance already holds the port), it exits with a `binding ...` error
+without touching devices. Binding successfully is not proof of healthy devices;
+check `/health` and `/status` after startup.
+
+Pause stops program scans, not adapter workers or physical motion. Variable
+writes still update the VM while paused; force commands register overrides
+that apply on the next scan. Output synchronization resumes with `resume` or
+`step`. Stopping the program runs the failsafe pass; pause does not.
+
 ## One-time edge setup
 
 You need a Linux box reachable over SSH with key-based auth (no password

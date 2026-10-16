@@ -258,17 +258,50 @@ enum RuntimeCommand {
 pub enum RuntimeMode {
     /// Default — run continuously at the configured cycle rate.
     Running,
-    /// Halt scan execution. IO inputs are NOT read, outputs are NOT
-    /// written, the program does NOT advance. Variable writes /
-    /// force commands still take effect (they're delivered between
-    /// rounds, not inside a round), so an operator can manually
-    /// stage a state while paused. This is "freeze the plant"
-    /// semantics — safer than "freeze the program but keep the bus
-    /// running".
+    /// Halt scan execution: no inputs are read into the program, the
+    /// program does NOT advance, and the scan loop pushes no new
+    /// outputs. Variable writes still update the VM between rounds.
+    /// Force commands register overrides while paused; those overrides
+    /// are applied to the VM on the next scan. Output synchronization
+    /// resumes on the first round after `resume` / `step`.
+    ///
+    /// This is NOT a safe state and does not stop the plant. Only the scan
+    /// loop pauses: each adapter's own worker (the EtherCAT cyclic thread
+    /// with its gear tick, the Modbus poll task) keeps running and keeps
+    /// sending whatever it was last given, so a drive that was moving keeps
+    /// the last target it had. To de-energise, latch the outputs off.
     Paused,
     /// Run `remaining` scan cycles then automatically transition to
     /// `Paused`. Decremented atomically at the bottom of each cycle.
     Step { remaining: u32 },
+}
+
+/// Lock the execution mode. A thread that panicked while holding the lock
+/// cannot have left the value half-written — every writer replaces a `Copy`
+/// enum in one assignment — so a poisoned lock still holds the last mode
+/// anyone set, and taking it anyway keeps `mode()` truthful and `pause`
+/// effective. Reading a poisoned lock as `Running` instead would turn a
+/// requested pause into a running program, and skipping the write would drop
+/// the request without a word.
+fn lock_mode(mode: &std::sync::Mutex<RuntimeMode>) -> std::sync::MutexGuard<'_, RuntimeMode> {
+    mode.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Book one finished scheduler tick against a `Step` request. Decides from the
+/// mode as it is NOW, not as the tick began: a `pause` or `resume` that
+/// arrived during the tick stands, instead of being overwritten with a stale
+/// `Step { remaining - 1 }` that would keep a paused program stepping.
+fn finish_step_tick(mode: &std::sync::Mutex<RuntimeMode>) {
+    let mut m = lock_mode(mode);
+    if let RuntimeMode::Step { remaining } = *m {
+        *m = if remaining <= 1 {
+            RuntimeMode::Paused
+        } else {
+            RuntimeMode::Step {
+                remaining: remaining - 1,
+            }
+        };
+    }
 }
 
 /// Cheap-to-clone handle to a running scan loop. Multiple clones share the
@@ -284,7 +317,7 @@ pub struct ProgramHandle {
     /// it once per cycle and the HTTP layer writes to it from an
     /// arbitrary tokio thread — a Mutex is cheap relative to a scan
     /// round, and atomicity over the `Step { remaining }` payload
-    /// matters.
+    /// matters. Always take it through [`lock_mode`].
     mode: Arc<std::sync::Mutex<RuntimeMode>>,
     /// Currently-forced variables: name → pinned i32 value. The scan
     /// loop applies these in order on every cycle (after input read,
@@ -577,37 +610,31 @@ impl ProgramHandle {
 
     /// Read the current execution mode (Running / Paused / Step{N}).
     pub fn mode(&self) -> RuntimeMode {
-        self.mode.lock().map(|m| *m).unwrap_or(RuntimeMode::Running)
+        *lock_mode(&self.mode)
     }
 
     /// Halt the scan loop. The current round finishes first; subsequent
-    /// rounds are skipped until `resume` or `step` is called. IO is
-    /// frozen (no inputs read, no outputs written) — `Paused` semantics
-    /// match a "freeze the plant" debug stop, not "VM still ticking,
-    /// outputs still flapping".
+    /// rounds are skipped until `resume` or `step` is called. The program
+    /// stops advancing and no new outputs are pushed, but adapters keep
+    /// sending what they were last given — see [`RuntimeMode::Paused`]; this
+    /// is a debug stop, not a way to de-energise.
     pub fn pause(&self) {
-        if let Ok(mut m) = self.mode.lock() {
-            *m = RuntimeMode::Paused;
-        }
+        *lock_mode(&self.mode) = RuntimeMode::Paused;
     }
 
     /// Resume normal continuous scanning. No-op if already running.
     pub fn resume(&self) {
-        if let Ok(mut m) = self.mode.lock() {
-            *m = RuntimeMode::Running;
-        }
+        *lock_mode(&self.mode) = RuntimeMode::Running;
     }
 
     /// Run `cycles` scan rounds then auto-pause. Calling `step` while
     /// in Step mode resets the remaining count.
     pub fn step(&self, cycles: u32) {
-        if let Ok(mut m) = self.mode.lock() {
-            *m = if cycles == 0 {
-                RuntimeMode::Paused
-            } else {
-                RuntimeMode::Step { remaining: cycles }
-            };
-        }
+        *lock_mode(&self.mode) = if cycles == 0 {
+            RuntimeMode::Paused
+        } else {
+            RuntimeMode::Step { remaining: cycles }
+        };
     }
 
     /// Snapshot of per-device connect reports (connected/failed + EtherCAT
@@ -2703,13 +2730,14 @@ async fn run_loop_async(
             }
         }
 
-        // Mode check. Paused → skip every unit's cycle (no IO, no run,
-        // no output) — the whole plant freezes together. Step{remaining}
+        // Mode check. Paused → skip every unit's cycle (no input read, no
+        // run, no output push); adapter workers keep running, see
+        // `RuntimeMode::Paused`. Step{remaining}
         // → execute this tick, decrement at the bottom; when remaining
         // hits 0 transition to Paused. Snapshots still go out while
         // paused (at the regular 10 Hz cadence) so Monitor keeps
         // showing the frozen state.
-        let current_mode = mode.lock().map(|m| *m).unwrap_or(RuntimeMode::Running);
+        let current_mode = *lock_mode(&mode);
         if matches!(current_mode, RuntimeMode::Paused) {
             prev_paused = true;
             if last_snapshot.elapsed() >= SNAPSHOT_PERIOD {
@@ -3007,18 +3035,8 @@ async fn run_loop_async(
         // one unit ran, and auto-pause at 0. Done AFTER the tick so
         // `step(1)` means "advance by exactly one scheduler tick"
         // (from pause, that's one scan of every unit).
-        if ran_any {
-            if let RuntimeMode::Step { remaining } = current_mode {
-                if let Ok(mut m) = mode.lock() {
-                    *m = if remaining <= 1 {
-                        RuntimeMode::Paused
-                    } else {
-                        RuntimeMode::Step {
-                            remaining: remaining - 1,
-                        }
-                    };
-                }
-            }
+        if ran_any && matches!(current_mode, RuntimeMode::Step { .. }) {
+            finish_step_tick(&mode);
         }
 
         // Snapshot at ~10 Hz (also when no unit was due this tick —
@@ -4049,6 +4067,91 @@ mod tests {
             "successful input read restores freshness"
         );
         handle.shutdown().await;
+    }
+
+    /// Poison the handle's mode lock the way a panicking holder would.
+    fn poison_mode(handle: &ProgramHandle) {
+        let mode = handle.mode.clone();
+        let poisoner = std::thread::spawn(move || {
+            let _held = mode.lock().unwrap();
+            panic!("test: panic while holding the mode lock");
+        });
+        assert!(poisoner.join().is_err());
+        assert!(handle.mode.is_poisoned(), "fixture must poison the lock");
+    }
+
+    /// Scans completed in `window`, read off the snapshot counter.
+    async fn scans_in(handle: &ProgramHandle, window: Duration) -> u64 {
+        let mut rx = handle.subscribe();
+        let first = last_snapshot_within(&mut rx, Duration::from_millis(150)).await;
+        let last = last_snapshot_within(&mut rx, window).await;
+        last.scan_count - first.scan_count
+    }
+
+    /// The failure direction of the mode lock. A poisoned lock used to read
+    /// as `Running` and silently swallow `pause`, so a program an operator had
+    /// stopped kept scanning (and writing) while the API still answered
+    /// success.
+    #[tokio::test]
+    async fn a_poisoned_mode_lock_still_pauses_and_reports_the_truth() {
+        let handle = spawn_units_inner(
+            vec![single_unit(trivial_container(), 5)],
+            DeviceSource::Prebuilt(vec![]),
+            Vec::new(),
+            None,
+            WriteGovernance::default(),
+        );
+        // Negative control: the fixture scans at all.
+        assert!(scans_in(&handle, Duration::from_millis(200)).await > 5);
+
+        poison_mode(&handle);
+        assert_eq!(handle.mode(), RuntimeMode::Running, "last value survives");
+
+        handle.pause();
+        assert_eq!(handle.mode(), RuntimeMode::Paused);
+        tokio::time::sleep(Duration::from_millis(100)).await; // a round may be mid-flight
+        assert_eq!(
+            scans_in(&handle, Duration::from_millis(250)).await,
+            0,
+            "a pause that was acknowledged must stop the scan loop"
+        );
+
+        handle.step(3);
+        assert_eq!(handle.mode(), RuntimeMode::Step { remaining: 3 });
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            handle.mode(),
+            RuntimeMode::Paused,
+            "the scan loop still finishes a step on a poisoned lock"
+        );
+
+        handle.resume();
+        assert_eq!(handle.mode(), RuntimeMode::Running);
+        assert!(scans_in(&handle, Duration::from_millis(200)).await > 5);
+        handle.shutdown().await;
+    }
+
+    /// A `pause` that arrives while a stepped tick is running must outlive that
+    /// tick's bookkeeping. The old code decremented from the mode it had read
+    /// at the top of the tick and so rewrote `Paused` as `Step`.
+    #[test]
+    fn finishing_a_step_tick_decides_from_the_mode_as_it_is_now() {
+        let at = |m: RuntimeMode| std::sync::Mutex::new(m);
+
+        let m = at(RuntimeMode::Step { remaining: 3 });
+        finish_step_tick(&m);
+        assert_eq!(*m.lock().unwrap(), RuntimeMode::Step { remaining: 2 });
+        finish_step_tick(&m);
+        finish_step_tick(&m);
+        assert_eq!(*m.lock().unwrap(), RuntimeMode::Paused, "last step pauses");
+
+        let m = at(RuntimeMode::Paused);
+        finish_step_tick(&m); // pause() landed during the tick
+        assert_eq!(*m.lock().unwrap(), RuntimeMode::Paused);
+
+        let m = at(RuntimeMode::Running);
+        finish_step_tick(&m); // resume() landed during the tick
+        assert_eq!(*m.lock().unwrap(), RuntimeMode::Running);
     }
 
     /// Overruns short of the watchdog threshold are invisible today: the log

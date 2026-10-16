@@ -301,7 +301,7 @@ This contract is shared by the IDE server and the edge runtime's `/write`.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/api/runtime/pause` | Freeze the scan loop (last outputs hold). Returns `ModeResponse { mode }`. |
+| `POST` | `/api/runtime/pause` | Halt the scan loop: the program stops advancing and no new outputs are pushed, but adapter workers (the EtherCAT cyclic thread, Modbus polling) keep running and keep sending the last values — a debug stop, not a safe state; stopping the program runs the failsafe pass. Returns `ModeResponse { mode }`. |
 | `POST` | `/api/runtime/resume` | Resume free-running. Returns `ModeResponse`. |
 | `POST` | `/api/runtime/step` | Advance N cycles while paused. Body: `StepRequest { cycles }` (default 1). Returns `ModeResponse`. |
 | `GET` | `/api/runtime/forces` | List currently-forced variables. Returns `ForceEntry[]` (`[]` when not running). |
@@ -463,7 +463,7 @@ panel's static files (`/hmi`, `--static-dir`) are not behind that guard.
 | `GET` | `/logs/stream` | SSE stream of log lines as they're emitted (no backlog; pair with `/logs` for history). |
 | `GET` | `/discover` | Per-device connect reports + discovered EtherCAT topology. Powers `cs get edges/<n>/scan`. |
 | `GET` | `/system` | Edge NICs / serial ports / arch, for authoring device configs against real edge facts. Powers `cs get edges/<n>/system`. |
-| `POST` | `/pause` | Freeze the scan loop (last outputs hold). Returns `{ mode }`. |
+| `POST` | `/pause` | Halt the scan loop: the program stops advancing and no new outputs are pushed, but adapter workers (the EtherCAT cyclic thread, Modbus polling) keep running and keep sending the last values — a debug stop, not a safe state; stopping the program runs the failsafe pass. Returns `{ mode }`. |
 | `POST` | `/resume` | Resume free-running. Returns `{ mode }`. |
 | `POST` | `/step` | Advance N cycles while paused. Body: `{ cycles }`. Returns `{ mode }`. |
 | `POST` | `/write` | One-shot write of a variable. Body: `{ name, value }`. Returns the applied value. Subject to the deployed project's `[governance]` (project.toml): `write_mode = "allowlist"` rejects writes to variables with no matching `[[governance.rules]]` entry (403), and a rule's `min`/`max` clamp the value (the response echoes the clamped value — a clamp is also logged and lands in `/audit` as `result: "clamped"` with both `requested` and `applied`, never silent). A write no honest clamp exists for is denied 403 instead: `NaN` to a min/max-ruled REAL, or a rule range containing no representable value of the variable's type. The response also carries `undelivered_device`: when the variable has an Output mapping onto a device whose transport is down, the write is still applied (a Stop that flushes when the link returns beats one never commanded) and this names that device, so a caller must not report a bare success. `null` on a healthy link or an internal variable — and it is transport health only, never proof that the value took effect. |

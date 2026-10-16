@@ -407,6 +407,19 @@ async fn main() -> Result<()> {
         Some(p)
     };
 
+    // ---- Claim the API socket before anything touches a field device ----
+    // `spawn_units` starts the thread that connects the devices and begins
+    // driving outputs. If the bind fails after that (the port is held, the
+    // address is not ours), `main` returns an error straight past the safety
+    // shutdown below: no failsafe pass, and a fieldbus thread that may be
+    // mid-bring-up is simply killed with the process. Binding first means a
+    // runtime that cannot be reached never starts driving the plant — and a
+    // second instance started over a live one (say, a system unit and a user
+    // unit on the same port) fails here instead of contending for the bus.
+    let listener = tokio::net::TcpListener::bind(args.bind)
+        .await
+        .with_context(|| format!("binding {}", args.bind))?;
+
     // ---- Spawn the bridge ----
     let handle: ProgramHandle = ironplc_bridge::spawn_units(
         units,
@@ -589,9 +602,6 @@ async fn main() -> Result<()> {
         app
     };
 
-    let listener = tokio::net::TcpListener::bind(args.bind)
-        .await
-        .with_context(|| format!("binding {}", args.bind))?;
     tracing::info!(addr = %args.bind, "monitor server listening");
 
     // Run the HTTP server as a background task. We deliberately do NOT gate
