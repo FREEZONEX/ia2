@@ -1470,6 +1470,9 @@ fn first_line(s: &str) -> &str {
 mod tests {
     use super::*;
 
+    #[path = "r11_fixture_export.rs"]
+    mod r11_fixture_export;
+
     /// `ExitOnForwardFailure=yes` must stay on the attach command line: it
     /// is what turns a lost local-port race into an ssh exit instead of a
     /// live tunnel that forwards nothing while the readiness probe talks to
