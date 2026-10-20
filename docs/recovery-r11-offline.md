@@ -1,7 +1,7 @@
 # R11 offline systemd verification fixture
 
 **Status: V — pending real systemd evidence.** Preparing this fixture,
-passing its offline tests, and verifying its hashes do not reproduce or
+passing its offline smoke check, and verifying its hashes do not reproduce or
 close R11. No production deploy/recovery behavior changes in this branch.
 Normal automatic restarts and reconnections remain allowed by their
 existing contracts.
@@ -37,7 +37,17 @@ From a checkout with the pinned `vendor/ironplc` submodule and the Rust
 toolchain/dependencies available:
 
 ```bash
-python3 -m unittest discover -s scripts/r11-systemd -p 'test_*.py' -v
+python3 scripts/r11-systemd/smoke.py
+```
+
+This runs two offline flows without mocks: real export, portable verification
+and refusal of unsafe/corrupt inputs; then real witness start, crash, relaunch
+and SIGTERM exit. It uses a temporary directory and never executes the deploy
+shell or invokes a systemd manager. These are not systemd results.
+
+When a bundle is needed for a later guest run, retain a separate export:
+
+```bash
 python3 scripts/r11-systemd/fixture.py prepare --output "$PWD/target/r11-bundle"
 python3 target/r11-bundle/fixture.py verify --bundle "$PWD/target/r11-bundle"
 tar -czf target/r11-bundle.tar.gz -C target r11-bundle
@@ -77,8 +87,8 @@ monotonic time, manager, and systemd invocation ID, then waits for SIGTERM.
 It never opens sockets, runs PLC code, starts subprocesses, or accesses a
 fieldbus. Its crash-once variant exits 23 once, then stays running when the
 manager restarts it. A missing-interpreter payload separately tests exec
-failure. Offline tests check these witnesses and the runner guards; mocks
-in those tests are not systemd results.
+failure. The offline smoke check exercises these witness processes and the
+CLI guards; actual manager behavior and cleanup are checked only on the guest.
 
 ## Real execution later: disposable guest only
 

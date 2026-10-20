@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Prepare a portable R11 witness; real systemd execution is a separate opt-in.
 
-Only prepare/verify and ordinary unit tests are intended on macOS. There is
+Only prepare/verify and the offline smoke check are intended on macOS. There is
 no SSH, edge address, production runtime, or production service operation.
 """
 
