@@ -156,7 +156,12 @@ prompts — the IDE runs `ssh -o BatchMode=yes`).
      install; staged files remain for inspection. Unique version directories
      keep same-second deployments from overwriting the rollback payload.
      Runtime state is unconfirmed: a failed restart may already have stopped
-     the old process. File rollback does not prove that it is running;
+     the old process. File rollback does not prove that it is running.
+     Whether an automatic restart that systemd had already scheduled can
+     later start the version the link was restored to (R11) is **pending real
+     systemd verification**; a device-free, opt-in fixture and its execution
+     instructions are in [R11 offline verification](recovery-r11-offline.md).
+     Preparing it does not change deploy behavior or establish a reproduction;
    - a missing `VERSION=` line from the remote script fails the deploy
      (script drift = state unknown);
    - a restart systemd accepted is not a running program: the check requires
