@@ -24,6 +24,7 @@ thiserror.workspace = true
 sha2 = "0.10"
 clap.workspace = true
 
+ia2-http-guard = { path = "../http-guard" }
 ironplc-bridge = { path = "../ironplc-bridge" }
 iomap-ethercat = { path = "../iomap-ethercat" }
 project = { path = "../project" }

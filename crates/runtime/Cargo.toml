@@ -13,6 +13,7 @@ path = "src/main.rs"
 tokio.workspace = true
 tokio-stream.workspace = true
 axum.workspace = true
+ia2-http-guard = { path = "../http-guard" }
 tower-http.workspace = true
 # Locks that do not poison: see the comment on `parking_lot` in the workspace
 # Cargo.toml. A panic under one of these frees it instead of failing every

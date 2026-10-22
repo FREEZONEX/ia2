@@ -161,6 +161,10 @@ struct Args {
     /// sibling `web/` is auto-served if it holds the built panel — see
     /// `sibling_web_dir`.
     static_dir: Option<PathBuf>,
+    /// Extra origins (`http://host[:port]`) whose pages may call the API, for a
+    /// panel reached through a reverse proxy whose public name differs from the
+    /// `Host` it forwards. Same-origin pages need nothing; see `panic_guard.rs`.
+    allow_origins: Vec<String>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -168,6 +172,7 @@ fn parse_args() -> Result<Args> {
     let mut bind = DEFAULT_BIND.to_string();
     let mut state_dir: Option<PathBuf> = None;
     let mut static_dir: Option<PathBuf> = None;
+    let mut allow_origins: Vec<String> = Vec::new();
 
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -189,6 +194,9 @@ fn parse_args() -> Result<Args> {
                 static_dir = Some(PathBuf::from(
                     iter.next().context("--static-dir requires a value")?,
                 ));
+            }
+            "--allow-origin" => {
+                allow_origins.push(iter.next().context("--allow-origin requires a value")?);
             }
             // Legacy flag from the pre-tasks-refactor builds. Accept but
             // ignore so existing systemd unit files keep launching.
@@ -229,6 +237,7 @@ fn parse_args() -> Result<Args> {
         bind,
         state_dir,
         static_dir,
+        allow_origins,
     })
 }
 
@@ -236,7 +245,8 @@ fn print_help() {
     eprintln!(
         "ia2-runtime — headless edge runtime\n\n\
          USAGE:\n  \
-         ia2-runtime --project-dir <path> [--bind <addr>] [--state-dir <path>] [--static-dir <path>]\n\n\
+         ia2-runtime --project-dir <path> [--bind <addr>] [--state-dir <path>] [--static-dir <path>]\n  \
+         [--allow-origin <origin>]...\n\n\
          FLAGS:\n  \
          --project-dir <path>   Path to the project directory (containing project.toml).\n  \
          --bind <addr>          Local socket for the monitor server (default {DEFAULT_BIND}).\n  \
@@ -245,7 +255,10 @@ fn print_help() {
          --static-dir <path>    Built web assets. When set, operator clients can open the\n                         \
          project's HMI screens at http://<edge>:<port>/hmi/<screen>.\n                         \
          Default: web/ next to the project dir, when it holds the\n                         \
-         built panel (the deploy layout).\n\n\
+         built panel (the deploy layout).\n  \
+         --allow-origin <o>     Also let pages served from this origin (http://host[:port]) call\n                         \
+         the API; repeatable, or comma-separated in IA2_ALLOWED_ORIGINS. Only\n                         \
+         for a panel behind a reverse proxy; same-origin pages need nothing.\n\n\
          The runtime exposes:\n  \
          GET  /health           Liveness check.\n  \
          GET  /status           Project + runtime metadata + last-known scan count.\n  \
@@ -522,10 +535,12 @@ async fn main() -> Result<()> {
     }
 
     // ---- HTTP server ----
-    // Permissive CORS: the only path to this socket on a real edge box is
-    // through an SSH port-forward we (the dev) opened. The audience here
-    // is "whatever dev tool is on the other end of the tunnel" — making
-    // the IDE / curl / browser direct EventSource all work is the goal.
+    // No CORS opening: the only path to this socket on a real edge box is an
+    // SSH port-forward the developer opened, but a forwarded loopback port is
+    // also reachable by every web page in that developer's browser. The guard
+    // (below, around the finished router) answers same-origin requests and
+    // loopback `Host` names only; the one cross-origin door is the web IDE's
+    // `EventSource` on `/events`. See `panic_guard.rs` and `ia2-http-guard`.
     let app = panic_guard::with_api_layers(
         Router::new()
             .route("/health", get(health))
@@ -601,6 +616,15 @@ async fn main() -> Result<()> {
     } else {
         app
     };
+
+    // Around everything, the standalone panel and its static files included.
+    let allowed_origins = ia2_http_guard::configured_origins(
+        &args.allow_origins,
+        std::env::var(ia2_http_guard::ALLOWED_ORIGINS_ENV)
+            .ok()
+            .as_deref(),
+    );
+    let app = panic_guard::guard_browsers(app, args.bind, &allowed_origins)?;
 
     tracing::info!(addr = %args.bind, "monitor server listening");
 
@@ -1385,7 +1409,17 @@ struct VarNameReq {
 struct AuditEntry {
     /// Seconds since UNIX epoch (wall clock, like the historian).
     ts_unix_secs: u64,
+    /// What the caller SAYS it is (`X-IA2-Origin`: `gui`, `cs`, …, or
+    /// `anonymous`). Anyone who can reach the socket can claim any label;
+    /// read it as a label, not as proof.
     origin: String,
+    /// The HTTP `Origin` header the request actually carried, when it had
+    /// one. A browser sets it and a page cannot change it, so it says which
+    /// page a browser-made write came from (the operator panel served by this
+    /// runtime shows up as its own address); curl, `cs` and the IDE server's
+    /// proxy send none. Absent for MQTT northbound writes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    http_origin: Option<String>,
     op: String,
     name: String,
     /// What the caller asked to write, as bit-packed i32 (REAL =
@@ -1415,23 +1449,69 @@ fn record_audit(
     applied: Option<i32>,
     result: &str,
 ) {
+    push_audit(
+        log,
+        audit_entry(origin, None, op, name, requested, applied, result),
+    );
+}
+
+/// [`record_audit`] for a request that came in over HTTP: the self-declared
+/// label from `X-IA2-Origin` plus the real `Origin` header, if any.
+fn record_audit_http(
+    log: &AuditLog,
+    headers: &axum::http::HeaderMap,
+    op: &str,
+    name: &str,
+    requested: Option<i32>,
+    applied: Option<i32>,
+    result: &str,
+) {
+    let http_origin = http_origin_of(headers);
+    push_audit(
+        log,
+        audit_entry(
+            origin_of(headers),
+            http_origin.as_deref(),
+            op,
+            name,
+            requested,
+            applied,
+            result,
+        ),
+    );
+}
+
+fn audit_entry(
+    origin: &str,
+    http_origin: Option<&str>,
+    op: &str,
+    name: &str,
+    requested: Option<i32>,
+    applied: Option<i32>,
+    result: &str,
+) -> AuditEntry {
     let ts_unix_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let mut g = log.lock();
-    if g.len() >= AUDIT_CAP {
-        g.pop_front();
-    }
-    g.push_back(AuditEntry {
+    AuditEntry {
         ts_unix_secs,
         origin: origin.to_string(),
+        http_origin: http_origin.map(str::to_string),
         op: op.to_string(),
         name: name.to_string(),
         requested,
         applied,
         result: result.to_string(),
-    });
+    }
+}
+
+fn push_audit(log: &AuditLog, entry: AuditEntry) {
+    let mut g = log.lock();
+    if g.len() >= AUDIT_CAP {
+        g.pop_front();
+    }
+    g.push_back(entry);
 }
 
 /// Audit outcome for one write/force attempt: `(applied, result)`
@@ -1485,6 +1565,19 @@ fn origin_of(headers: &axum::http::HeaderMap) -> &str {
         .unwrap_or("anonymous")
 }
 
+/// The HTTP `Origin` header of a request, for the audit ring: only text, with
+/// anything that is not printable ASCII replaced, and cut at 200 characters
+/// (a header can be 8 KB; the ring keeps 256 entries).
+fn http_origin_of(headers: &axum::http::HeaderMap) -> Option<String> {
+    let raw = headers.get(axum::http::header::ORIGIN)?.to_str().ok()?;
+    Some(
+        raw.chars()
+            .take(200)
+            .map(|c| if c.is_ascii_graphic() { c } else { '?' })
+            .collect(),
+    )
+}
+
 fn write_err(e: RuntimeWriteError) -> (StatusCode, String) {
     match e {
         RuntimeWriteError::UnknownVariable(n) => {
@@ -1527,12 +1620,11 @@ async fn rt_write(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // The momentary-pulse reset guarantee lives in the shared monitor
     // core — one implementation for IDE server and edge runtime.
-    let origin = origin_of(&headers).to_string();
     let result = monitor::write_with_pulse(&state.handle, &req.name, req.value, req.pulse_ms).await;
     let (applied, outcome) = write_audit_outcome(req.value, &result);
-    record_audit(
+    record_audit_http(
         &state.audit,
-        &origin,
+        &headers,
         "write",
         &req.name,
         Some(req.value),
@@ -1548,15 +1640,14 @@ async fn rt_force(
     headers: axum::http::HeaderMap,
     Json(req): Json<VarWriteReq>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let origin = origin_of(&headers).to_string();
     let result = state.handle.force_variable(&req.name, req.value).await;
     // Forces bypass governance (ADR-0002), so `applied == requested`
     // on success — audit_outcome would still expose a regression that
     // ever clamped a force, as a "clamped" entry.
     let (applied, outcome) = audit_outcome(req.value, &result);
-    record_audit(
+    record_audit_http(
         &state.audit,
-        &origin,
+        &headers,
         "force",
         &req.name,
         Some(req.value),
@@ -1574,21 +1665,20 @@ async fn rt_unforce(
     headers: axum::http::HeaderMap,
     Json(req): Json<VarNameReq>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let origin = origin_of(&headers).to_string();
     let result = state.handle.unforce_variable(&req.name).await;
     match &result {
-        Ok(()) => record_audit(
+        Ok(()) => record_audit_http(
             &state.audit,
-            &origin,
+            &headers,
             "unforce",
             &req.name,
             None,
             None,
             "ok",
         ),
-        Err(e) => record_audit(
+        Err(e) => record_audit_http(
             &state.audit,
-            &origin,
+            &headers,
             "unforce",
             &req.name,
             None,
@@ -1645,8 +1735,8 @@ async fn stop_handler(State(state): State<AppState>) -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        audit_outcome, health_of, origin_of, record_audit, sibling_web_dir, write_err, AuditLog,
-        RuntimeWriteError, StatusCode, AUDIT_CAP,
+        audit_outcome, health_of, http_origin_of, origin_of, record_audit, record_audit_http,
+        sibling_web_dir, write_err, AuditLog, RuntimeWriteError, StatusCode, AUDIT_CAP,
     };
 
     /// The policy a project that declares nothing runs with.
@@ -2236,6 +2326,53 @@ mod tests {
         assert_eq!(origin_of(&headers), "my-bridge");
         headers.insert("x-ia2-origin", "".parse().unwrap());
         assert_eq!(origin_of(&headers), "anonymous");
+    }
+
+    /// The audit's `origin` is whatever the caller wrote in `X-IA2-Origin`; the
+    /// `Origin` header a browser sets is recorded beside it, so a write a page
+    /// made while claiming to be `gui` is told apart from one the IDE made.
+    #[test]
+    fn audit_records_the_real_http_origin_next_to_the_claimed_label() {
+        let log = AuditLog::default();
+        let mut forged = axum::http::HeaderMap::new();
+        forged.insert("x-ia2-origin", "gui".parse().unwrap());
+        forged.insert("origin", "http://edge-1.plant.local:13001".parse().unwrap());
+        record_audit_http(&log, &forged, "force", "valve", Some(1), Some(1), "ok");
+        // curl, `cs` and the IDE server's proxy send no Origin.
+        let mut cli = axum::http::HeaderMap::new();
+        cli.insert("x-ia2-origin", "cs".parse().unwrap());
+        record_audit_http(&log, &cli, "write", "valve", Some(0), Some(0), "ok");
+        // MQTT northbound writes have no HTTP request at all.
+        record_audit(&log, "mqtt", "write", "sp", Some(5), Some(5), "ok");
+
+        let json = serde_json::to_value(log.lock().iter().cloned().collect::<Vec<_>>()).unwrap();
+        assert_eq!(json[0]["origin"], "gui");
+        assert_eq!(json[0]["http_origin"], "http://edge-1.plant.local:13001");
+        assert_eq!(json[1]["origin"], "cs");
+        assert!(json[1].get("http_origin").is_none(), "{}", json[1]);
+        assert!(json[2].get("http_origin").is_none(), "{}", json[2]);
+    }
+
+    #[test]
+    fn http_origin_is_bounded_printable_text_or_nothing() {
+        let mut headers = axum::http::HeaderMap::new();
+        assert_eq!(http_origin_of(&headers), None);
+        headers.insert("origin", "https://evil.example".parse().unwrap());
+        assert_eq!(
+            http_origin_of(&headers).as_deref(),
+            Some("https://evil.example")
+        );
+        headers.insert("origin", "x".repeat(5000).parse().unwrap());
+        assert_eq!(http_origin_of(&headers).unwrap().len(), 200);
+        headers.insert(
+            "origin",
+            axum::http::HeaderValue::from_bytes(b"http://a\xffb").unwrap(),
+        );
+        assert_eq!(
+            http_origin_of(&headers),
+            None,
+            "not text: nothing is better than a guess"
+        );
     }
 
     #[test]

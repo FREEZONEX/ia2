@@ -6,6 +6,7 @@ mod deploy_snapshot;
 mod edges;
 mod error;
 mod events;
+mod guard;
 mod hmi_routes;
 mod library;
 #[cfg(test)]
@@ -28,9 +29,7 @@ use axum::{
 use clap::Parser;
 use iomap_modbus::{run_demo_slave, DemoSlave};
 use project::{load_last_opened, migrate_legacy_dirs, ProjectStore};
-use tower_http::{
-    catch_panic::CatchPanicLayer, cors::CorsLayer, services::ServeDir, trace::TraceLayer,
-};
+use tower_http::{services::ServeDir, trace::TraceLayer};
 use tracing_subscriber::EnvFilter;
 
 use crate::state::AppState;
@@ -85,6 +84,14 @@ struct Cli {
     /// root). Without a registry, /api/library lists nothing.
     #[arg(long, value_name = "DIR")]
     library_dir: Option<PathBuf>,
+
+    /// Let pages served from this origin (`http://host[:port]`) call the API,
+    /// in addition to the UI this server hosts itself. Repeatable; also read
+    /// from the comma-separated `IA2_ALLOWED_ORIGINS` env var when no flag is
+    /// given. The server answers same-origin requests only otherwise: it has
+    /// no authentication, so a page on any other origin could drive it.
+    #[arg(long = "allow-origin", value_name = "ORIGIN")]
+    allow_origin: Vec<String>,
 }
 
 #[tokio::main]
@@ -433,18 +440,26 @@ async fn main() -> anyhow::Result<()> {
     // same Arc<Mutex<...>> with the request handlers is correct.
     let state_for_watchdog = state.clone();
 
-    // Innermost, so the 500 it produces still gets the CORS headers and
-    // shows up in the request trace like any other answer.
-    let app = app
-        .layer(CatchPanicLayer::custom(error::handler_panic_response))
-        .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http())
-        .with_state(state);
-
     let bind_addr: SocketAddr = cli
         .bind
         .parse()
         .map_err(|e| anyhow::anyhow!("--bind {:?} is not a SocketAddr: {e}", cli.bind))?;
+    let allowed_origins = ia2_http_guard::configured_origins(
+        &cli.allow_origin,
+        std::env::var(ia2_http_guard::ALLOWED_ORIGINS_ENV)
+            .ok()
+            .as_deref(),
+    );
+
+    // Same-origin requests only (plus any `--allow-origin`), and loopback
+    // `Host` names only when bound to loopback: see `guard.rs`. The panic
+    // catcher sits inside the guard so the 500 it produces still carries the
+    // headers an allowed cross-origin page needs to read it, and the request
+    // trace sits outside both.
+    let app = guard::secure(app, bind_addr, &allowed_origins)?
+        .layer(TraceLayer::new_for_http())
+        .with_state(state);
+
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     let local = listener.local_addr()?;
     tracing::info!(addr = %local, "server listening");
