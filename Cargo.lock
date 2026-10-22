@@ -2079,6 +2079,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ia2-http-guard"
+version = "0.0.1"
+dependencies = [
+ "axum 0.8.9",
+ "tokio",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "ia2-runtime"
 version = "0.0.1"
 dependencies = [
