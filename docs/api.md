@@ -23,6 +23,11 @@ user's browser, so both HTTP services enforce these rules:
   (`Sec-Fetch-Mode: navigate`, `Sec-Fetch-Dest: document`) may open the IDE's
   `/`, `/index.html` or `/hmi.html`. API navigations, frames and cross-origin
   subresources are refused. Responses vary by the three Fetch Metadata headers.
+- The IDE frontend treats `/index.html` as an alias for `/` on both the
+  static server and Vite. It replaces the browser history entry, preserving
+  query parameters (including `project`) and the URL fragment. This is a
+  client-side redirect after the HTML request passes the guard; it does not
+  widen the list of allowed HTML entries or API access.
 - Tools with neither `Origin` nor Fetch Metadata (`cs`, curl, the SSH/curl
   proxy) still work. Legacy browsers that send neither header cannot be
   distinguished from these tools: their blind GET requests remain a residual
