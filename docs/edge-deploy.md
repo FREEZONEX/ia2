@@ -262,6 +262,15 @@ rollback is just "point `current` at an older version and restart".
 - The runtime binds **127.0.0.1** on the edge — only ever reachable via
   the SSH tunnel the IDE sets up. Don't poke a hole in the firewall to
   expose `:13001` directly.
+- A forwarded port is also reachable by every web page open in the browser on
+  the dev machine, so the runtime refuses any request that names a foreign
+  `Origin` or (while bound to loopback) a non-loopback `Host`, and answers a
+  cross-origin page only for the IDE's `GET /events`. Requests without an
+  `Origin` (curl, `cs`, the IDE server) are unaffected. Details in the **Auth**
+  notes of `docs/api.md` (an operator panel behind a reverse proxy needs
+  `--allow-origin <its public origin>` on the unit's `ExecStart`). Don't paste
+  the forwarded address into pages you don't trust; the guard is the backstop,
+  not the plan.
 - The systemd unit grants `CAP_NET_RAW` so that EtherCAT (when wired)
   works. If you only use Modbus, you can drop it and run as a dedicated
   user; see the comments in `ia2.service`.

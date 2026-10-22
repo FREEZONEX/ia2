@@ -7,6 +7,21 @@ serves a smaller subset on its own port — see `docs/edge-deploy.md`.
 
 **Auth:** none (localhost-only). Remote access via SSH port-forward.
 
+**Web pages cannot call it.** "Localhost-only" keeps the network out, not the
+browser: every page the user has open can send requests to `127.0.0.1`. So the
+server answers only requests that are **same-origin** (the UI it hosts itself,
+or `vite dev`, which forwards `Host` and `Origin` unchanged) or carry **no
+`Origin` header** (`cs`, curl, scripts). A request naming any other `Origin`
+— including a CORS preflight, and a WebSocket handshake to `/api/lsp` — gets
+`403` with the reason in the body and no CORS headers. When bound to a
+loopback address (the default), a request whose `Host` is not a loopback name
+(`localhost`, `127.0.0.0/8`, `[::1]`) is refused too, which is what stops DNS
+rebinding. A front-end served from some other origin (a native shell that
+does not load the UI from this server, a second dev server) is named with
+`--allow-origin http://host:port` (repeatable) or `IA2_ALLOWED_ORIGINS`
+(comma-separated). Binding beyond loopback (`--bind 0.0.0.0:…`) turns the
+`Host` check off and logs a warning: the API still has no authentication.
+
 **Conventions:**
 - Resources are plural nouns under `/api/<resource>`.
 - Names with `/` (folder-nested POUs, devices, edges) are URL-encoded — the
@@ -454,6 +469,16 @@ closed connection; the handler may have got part of the way first, so after
 such a `500` on a write, re-read the resource before retrying. The standalone
 panel's static files (`/hmi`, `--static-dir`) are not behind that guard.
 
+The runtime applies the same browser rule as the IDE server (see **Auth**
+above), to the panel and its static files as well: same-origin or no `Origin`,
+and loopback `Host` names only while bound to loopback. There is one
+cross-origin exception, because the web IDE streams a runtime through the SSH
+forward's loopback port: `GET`/`HEAD /events` from a page whose own origin is a
+loopback name gets `Access-Control-Allow-Origin` for that origin. A page on any
+other origin cannot read or write anything, `/write`·`/force`·`/stop` included.
+A panel published through a reverse proxy, whose public name the runtime never sees (the proxy forwards its own `Host`), is named with
+`--allow-origin https://hmi.example` (repeatable) or `IA2_ALLOWED_ORIGINS`, as on the IDE server.
+
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/health` | Liveness: status, uptime, scan count, plus `fieldbus_healthy` (true only when every configured device's transport is live), a per-device `devices` health breakdown, and `watchdog_tripped` (the scan watchdog latched the outputs off — a probe that only checks `status: "ok"` would otherwise call a latched runtime healthy, since it keeps serving HTTP and keeps scanning). `fault` is the same message as `/status`'s: why the program stopped, `null` while it runs. `status` stays `"ok"` for a faulted runtime — it only says the process answers. `watchdog_tripped` is `true` once the outputs are latched off, whoever latched them (the scan watchdog, an execution-budget trap, or the project's alarm-supervision policy); `latch_reason` says which, `null` while they are not latched. `supervision` (`{ on_loss, grace_secs, lost_for_ms, latch_in_ms }`) is the alarm-supervision policy this process is ENFORCING: what it read from `alarms.toml` at startup, not what the file says now (edits apply on the next restart). `on_loss` is the mode's name as text (`report` or `safe_state`), so a reader does not fail on a mode it does not know. A runtime built before the field omits it, and for a project that declares `safe_state` that means the declared protection is NOT in force: such a runtime ignores the table. While alarm evaluation is lost, `lost_for_ms` is how long (since the runtime's supervisor first saw it lost) and, under `safe_state`, `latch_in_ms` is how long is left before a latch is requested (`0` once due). While the loss continues, `lost_for_ms` remains available under `report` and after a latch; only `latch_in_ms` is `null` under `report`, once a latch is requested, or when outputs are already latched (`latch_reason` explains a completed latch). Both are `null` when nothing is lost or the supervisor has not looked for several seconds, so an old countdown is not read as a live one. An older runtime omits both. `snapshot_tap` (`{ running, faults, last_fault }`) says whether history, process alarms and `scan_count` are still being fed from the scan loop: that is a separate task, so when it ends, or fails on every snapshot, the program keeps running and `status` stays `"ok"` while history stops recording and process alarms stop being evaluated. `running: false` means the task ended and stays so until the runtime restarts; `faults` counts incidents since start (a stage panicked on a snapshot, or snapshots were skipped because the tap fell behind the scan loop) and a count that climbs between two polls means it is failing now; `last_fault` is the latest in words, `null` when there has been none, and `last_fault_age_ms` is how long ago it happened (`faults` only grows, so on its own it cannot say whether the task is failing now). `stalled_for_ms` is how long the task has been stuck inside ONE snapshot once that exceeds 2 s (the scan loop emits one every 100 ms), `null` while it keeps up: a stage that blocks, a stalled disk under the historian say, neither panics nor lags, so `running` stays `true` and `faults` stays `0`, yet history, alarms, `scan_count` and `/events` stop moving; measured inside the task, so a program that has stopped (and emits no snapshots) is not mistaken for a stuck task. An edge build predating the field omits it. |
@@ -470,7 +495,7 @@ panel's static files (`/hmi`, `--static-dir`) are not behind that guard.
 | `POST` | `/force` | Pin a variable every cycle until released. Body: `{ name, value }`. Same precedence as the server route: applied before the program runs, so a program-written variable is overwritten by the program and the force never reaches the field. Force is the debug override: it **bypasses governance** by explicit decision (ADR-0002) and is never exported on any northbound surface. |
 | `POST` | `/unforce` | Release a forced variable. Body: `{ name }`. |
 | `POST` | `/inject-scan-stall` | Fault injection (test primitive): same contract as the server's `/api/runtime/inject-scan-stall` — stall `scans` scans by `stall_ms` each and trip the watchdog for real. Body: `{ stall_ms, scans? }`. |
-| `GET` | `/audit` | The write-audit ring (bounded at 256, oldest first): every `/write`·`/force`·`/unforce` and MQTT northbound write with `ts_unix_secs`, `origin` (`X-IA2-Origin` header, `mqtt`, or `anonymous`), `op`, `name`, bit-packed `requested` and `applied` values (an `unforce` entry carries neither — there is no value to release to), and `result` — `ok`, `clamped` (governance altered the value; `requested`/`applied` show both sides), or the error text (denied writes are recorded too, with the denial reason; `applied` is then absent). In-memory only — cleared when the runtime process restarts (a redeploy restarts it), and under steady write traffic the 256-entry window covers only the recent past; `/history` is the surface that survives restarts. Also readable through the IDE as `GET /api/edges/{name}/audit` / `cs get edges/<n>/audit`. |
+| `GET` | `/audit` | The write-audit ring (bounded at 256, oldest first): every `/write`·`/force`·`/unforce` and MQTT northbound write with `ts_unix_secs`, `origin` (the self-declared `X-IA2-Origin` label, `mqtt`, or `anonymous` — a label anyone who reaches the socket can claim), `http_origin` (the real HTTP `Origin` header of a browser-made request, e.g. the operator panel's own address; absent for curl, `cs`, the IDE server's proxy and MQTT), `op`, `name`, bit-packed `requested` and `applied` values (an `unforce` entry carries neither — there is no value to release to), and `result` — `ok`, `clamped` (governance altered the value; `requested`/`applied` show both sides), or the error text (denied writes are recorded too, with the denial reason; `applied` is then absent). In-memory only — cleared when the runtime process restarts (a redeploy restarts it), and under steady write traffic the 256-entry window covers only the recent past; `/history` is the surface that survives restarts. Also readable through the IDE as `GET /api/edges/{name}/audit` / `cs get edges/<n>/audit`. |
 | `GET` | `/history` | Downsampled history, same query/response shape as `/api/runtime/history`. Backed by JSONL segments under the edge's state dir — survives restarts AND deploys (state/ sits beside `current`). The disk is written on its own thread behind a bounded queue (about eight minutes at 1 Hz): a stalled disk cannot freeze the alarm engine, `/status` or `/events`, and cannot block this endpoint; if it stays stalled past the queue, new samples are still held in memory and served here but are not persisted, which is logged (at the 1st, 2nd, 4th ... dropped sample) as `history persistence is not keeping up`. |
 | `GET` | `/alarms` | Live `AlarmState[]` for the deployed `alarms.toml`, standing-first. `/status` carries the `alarms_standing` count on the panel's existing poll. |
 | `POST` | `/alarms/{id}/ack` | Acknowledge one alarm (operator action from the panel). 404 unknown id. |
