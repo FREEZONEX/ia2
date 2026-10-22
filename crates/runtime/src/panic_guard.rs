@@ -55,16 +55,12 @@ where
 /// only when `bind` is a loopback address, and the one cross-origin door is a
 /// loopback page reading [`CROSS_ORIGIN_READS`]. `extra_origins` names pages
 /// that may call it in full (a panel behind a reverse proxy). Requests with no
-/// `Origin` (curl, `cs`, the IDE server's proxy) are untouched.
-pub(crate) fn guard_browsers<S>(
-    app: Router<S>,
-    bind: SocketAddr,
-    extra_origins: &[String],
-) -> anyhow::Result<Router<S>>
-where
-    S: Clone + Send + Sync + 'static,
-{
-    let guard = browser_guard(bind)
+/// `Origin` are checked with Fetch Metadata when available. Configure this
+/// BEFORE loading the project or starting any field-device/scan threads.
+pub(crate) fn browser_guard(bind: SocketAddr, extra_origins: &[String]) -> anyhow::Result<Guard> {
+    let guard = Guard::for_listener(bind)
+        .allow_loopback_reads(CROSS_ORIGIN_READS)
+        .allow_document_navigations(&["/", "/hmi", "/hmi.html"], &["/hmi/"])
         .allow_origins(extra_origins)
         .map_err(|e| {
             anyhow::anyhow!(
@@ -79,11 +75,15 @@ where
              have no authentication — anyone who can reach this address can drive the plant"
         );
     }
-    Ok(guarded(app, &guard))
+    Ok(guard)
 }
 
-fn browser_guard(bind: SocketAddr) -> Guard {
-    Guard::for_listener(bind).allow_loopback_reads(CROSS_ORIGIN_READS)
+/// Apply the policy validated before any project or device was started.
+pub(crate) fn guard_browsers<S>(app: Router<S>, guard: &Guard) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    guarded(app, guard)
 }
 
 #[cfg(test)]
@@ -106,6 +106,7 @@ mod tests {
 
     fn app_with(bind: &str, origins: &[&str]) -> Router {
         let origins: Vec<String> = origins.iter().map(|s| s.to_string()).collect();
+        let guard = browser_guard(bind.parse().unwrap(), &origins).unwrap();
         guard_browsers(
             with_api_layers(
                 Router::new()
@@ -116,10 +117,8 @@ mod tests {
                     .route("/stop", post(|| async { "stopping" })),
             )
             .fallback(|| async { "panel" }),
-            bind.parse().unwrap(),
-            &origins,
+            &guard,
         )
-        .unwrap()
     }
 
     async fn ask(
@@ -309,13 +308,9 @@ mod tests {
 
     #[test]
     fn a_bad_origin_in_the_config_stops_the_runtime_at_startup() {
-        let err = guard_browsers(
-            Router::<()>::new(),
-            "127.0.0.1:13001".parse().unwrap(),
-            &["*".to_string()],
-        )
-        .map(|_| ())
-        .unwrap_err();
+        let err = browser_guard("127.0.0.1:13001".parse().unwrap(), &["*".to_string()])
+            .map(|_| ())
+            .unwrap_err();
         assert!(err.to_string().contains("--allow-origin"), "{err}");
     }
 }

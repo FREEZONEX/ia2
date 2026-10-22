@@ -22,6 +22,17 @@ name); malformed explicit encoding returns 400, never the active-project
 fallback. The CLI encodes `--project` names automatically, preserving
 Unicode and literal percent signs.
 
+Browser access: `cs` and the IDE server's SSH/curl proxy send neither HTTP
+`Origin` nor Fetch Metadata and remain supported. The servers validate Origin
+when present; otherwise cross-site/same-site browser API requests are refused
+using `Sec-Fetch-Site`, even on GET. Only named HTML entry pages accept
+top-level navigation from another site. Loopback Host checks include mapped
+IPv6 listeners, and equivalent IPv6 Origin spellings compare equally.
+`--allow-origin` / `IA2_ALLOWED_ORIGINS` names a separate front-end; invalid
+runtime values fail before project compilation or device/scan startup. Older
+browsers sending neither header remain a blind-GET limitation, not authenticated
+clients. Full contract: `docs/api.md`, **Auth**.
+
 Exit codes (uniform, enforced): `0` success · `1` problems in YOUR
 content (check diagnostics, failed probe, remote deploy failure, sim
 expectation failed) · `2` bad request — usage errors AND HTTP 4xx, with

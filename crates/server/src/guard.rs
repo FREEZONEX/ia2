@@ -32,6 +32,7 @@ where
     S: Clone + Send + Sync + 'static,
 {
     let guard = Guard::for_listener(bind)
+        .allow_document_navigations(&["/", "/index.html", "/hmi.html"], &[])
         .allow_origins(extra_origins)
         .map_err(|e| anyhow::anyhow!("--allow-origin / {ALLOWED_ORIGINS_ENV}: {e}"))?;
     if !guard.is_loopback_only() {

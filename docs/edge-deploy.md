@@ -265,12 +265,23 @@ rollback is just "point `current` at an older version and restart".
 - A forwarded port is also reachable by every web page open in the browser on
   the dev machine, so the runtime refuses any request that names a foreign
   `Origin` or (while bound to loopback) a non-loopback `Host`, and answers a
-  cross-origin page only for the IDE's `GET /events`. Requests without an
-  `Origin` (curl, `cs`, the IDE server) are unaffected. Details in the **Auth**
+  cross-origin page only for the IDE's `GET /events` (or an explicitly named
+  origin). Without `Origin`, Fetch Metadata blocks requests from another
+  origin, including GET/HEAD; only top-level navigations to the panel's HTML
+  entries are excepted, never API navigations or frames. Tools with neither
+  header (curl, `cs`, the IDE server) still work; older browsers sending neither
+  remain a residual blind-GET exposure. Mapped IPv6 loopback binds enforce the
+  same Host restriction. Details in the **Auth**
   notes of `docs/api.md` (an operator panel behind a reverse proxy needs
   `--allow-origin <its public origin>` on the unit's `ExecStart`). Don't paste
   the forwarded address into pages you don't trust; the guard is the backstop,
   not the plan.
+- The runtime validates `--allow-origin` / `IA2_ALLOWED_ORIGINS` before it loads
+  or compiles the project, claims the socket, connects devices or starts scans.
+  A malformed value therefore cannot briefly drive outputs and then skip the
+  normal shutdown drain. IPv6 origin literals are compared in normalized form.
+  Browser local-network permission requirements are independent of this guard;
+  the former PNA preflight response header alone does not determine access.
 - The systemd unit grants `CAP_NET_RAW` so that EtherCAT (when wired)
   works. If you only use Modbus, you can drop it and run as a dedicated
   user; see the comments in `ia2.service`.

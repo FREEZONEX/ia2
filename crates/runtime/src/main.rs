@@ -332,6 +332,17 @@ async fn main() -> Result<()> {
     let log_capture = init_logging();
     let args = parse_args()?;
 
+    // Invalid browser-access configuration must fail before compilation,
+    // binding, device connections, scan threads or northbound tasks. A `?`
+    // after spawn_units would bypass the safety-critical shutdown below.
+    let allowed_origins = ia2_http_guard::configured_origins(
+        &args.allow_origins,
+        std::env::var(ia2_http_guard::ALLOWED_ORIGINS_ENV)
+            .ok()
+            .as_deref(),
+    );
+    let browser_guard = panic_guard::browser_guard(args.bind, &allowed_origins)?;
+
     tracing::info!(
         project_dir = %args.project_dir.display(),
         bind = %args.bind,
@@ -618,13 +629,7 @@ async fn main() -> Result<()> {
     };
 
     // Around everything, the standalone panel and its static files included.
-    let allowed_origins = ia2_http_guard::configured_origins(
-        &args.allow_origins,
-        std::env::var(ia2_http_guard::ALLOWED_ORIGINS_ENV)
-            .ok()
-            .as_deref(),
-    );
-    let app = panic_guard::guard_browsers(app, args.bind, &allowed_origins)?;
+    let app = panic_guard::guard_browsers(app, &browser_guard);
 
     tracing::info!(addr = %args.bind, "monitor server listening");
 

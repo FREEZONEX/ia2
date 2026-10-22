@@ -7,20 +7,47 @@ serves a smaller subset on its own port — see `docs/edge-deploy.md`.
 
 **Auth:** none (localhost-only). Remote access via SSH port-forward.
 
-**Web pages cannot call it.** "Localhost-only" keeps the network out, not the
-browser: every page the user has open can send requests to `127.0.0.1`. So the
-server answers only requests that are **same-origin** (the UI it hosts itself,
-or `vite dev`, which forwards `Host` and `Origin` unchanged) or carry **no
-`Origin` header** (`cs`, curl, scripts). A request naming any other `Origin`
-— including a CORS preflight, and a WebSocket handshake to `/api/lsp` — gets
-`403` with the reason in the body and no CORS headers. When bound to a
-loopback address (the default), a request whose `Host` is not a loopback name
-(`localhost`, `127.0.0.0/8`, `[::1]`) is refused too, which is what stops DNS
-rebinding. A front-end served from some other origin (a native shell that
-does not load the UI from this server, a second dev server) is named with
-`--allow-origin http://host:port` (repeatable) or `IA2_ALLOWED_ORIGINS`
-(comma-separated). Binding beyond loopback (`--bind 0.0.0.0:…`) turns the
-`Host` check off and logs a warning: the API still has no authentication.
+**Browser access guard.** A loopback port is reachable by pages open in the
+user's browser, so both HTTP services enforce these rules:
+
+- A request with `Origin` must match the request's `Host` name and effective
+  port, or an explicitly allowed origin. This covers reads, CORS preflights
+  and WebSocket handshakes. Refusals return `403` with a reason and no CORS
+  headers. The hosted UI and `vite dev` (which forwards `Host` and `Origin`
+  unchanged) work without configuration. The Host comparison deliberately
+  does not compare schemes, because a proxy may terminate TLS; this is a
+  host/port check, not the browser's strict scheme/host/port origin comparison.
+- Without `Origin`, a present `Sec-Fetch-Site` must be `same-origin` or `none`.
+  `cross-site` and `same-site` requests are refused even for GET/HEAD: edge
+  reads can launch SSH commands. Only GET/HEAD top-level HTML navigations
+  (`Sec-Fetch-Mode: navigate`, `Sec-Fetch-Dest: document`) may open the IDE's
+  `/`, `/index.html` or `/hmi.html`. API navigations, frames and cross-origin
+  subresources are refused. Responses vary by the three Fetch Metadata headers.
+- Tools with neither `Origin` nor Fetch Metadata (`cs`, curl, the SSH/curl
+  proxy) still work. Legacy browsers that send neither header cannot be
+  distinguished from these tools: their blind GET requests remain a residual
+  exposure. This guard is not authentication.
+- While bound to loopback, including IPv4-mapped IPv6 loopback, `Host` must
+  also name loopback: `localhost`, `*.localhost`, `127.0.0.0/8`, `[::1]` or a
+  mapped loopback literal. This stops DNS rebinding. IPv6 literals in Host,
+  Origin and the allowed-origin configuration are normalized before comparison.
+
+Name a separately hosted front-end with `--allow-origin http://host:port`
+(repeatable) or `IA2_ALLOWED_ORIGINS` (comma-separated; flags take precedence).
+These explicit origins include their scheme, host and port; wildcards and
+`null` are refused. On the runtime, invalid configuration fails **before
+project loading, compilation or device/scan startup**. A named front-end must
+use CORS requests so its Origin identifies it; an originless cross-site GET
+does not inherit this permission.
+
+Binding beyond loopback (`--bind 0.0.0.0:…`) disables the Host restriction and
+logs a warning: the API still has no authentication. Browser local-network
+permissions are an additional client-side check, independent of this guard.
+Chrome's Local Network Access permission mechanism supersedes the former PNA
+preflight proposal; absence of `Access-Control-Allow-Private-Network` alone
+does not mean a named public origin cannot connect. See the
+[Chrome 142 release notes](https://developer.chrome.com/release-notes/142#local_network_access_restrictions)
+and [LNA proposal](https://wicg.github.io/local-network-access/).
 
 **Conventions:**
 - Resources are plural nouns under `/api/<resource>`.
@@ -469,15 +496,19 @@ closed connection; the handler may have got part of the way first, so after
 such a `500` on a write, re-read the resource before retrying. The standalone
 panel's static files (`/hmi`, `--static-dir`) are not behind that guard.
 
-The runtime applies the same browser rule as the IDE server (see **Auth**
-above), to the panel and its static files as well: same-origin or no `Origin`,
-and loopback `Host` names only while bound to loopback. There is one
+The runtime applies the same browser guard as the IDE server (see **Auth**
+above), to the panel and its static files as well. Its allowed top-level HTML
+navigation paths are `/`, `/hmi`, `/hmi.html` and descendants of `/hmi/`;
+the root redirects to `/hmi`. API paths never get that navigation exception.
+There is one
 cross-origin exception, because the web IDE streams a runtime through the SSH
 forward's loopback port: `GET`/`HEAD /events` from a page whose own origin is a
-loopback name gets `Access-Control-Allow-Origin` for that origin. A page on any
-other origin cannot read or write anything, `/write`·`/force`·`/stop` included.
-A panel published through a reverse proxy, whose public name the runtime never sees (the proxy forwards its own `Host`), is named with
-`--allow-origin https://hmi.example` (repeatable) or `IA2_ALLOWED_ORIGINS`, as on the IDE server.
+loopback name gets `Access-Control-Allow-Origin` for that origin. This exposes
+process snapshots to any page on a loopback origin; it grants no write access.
+A panel published through a reverse proxy, whose public name the runtime never
+sees (the proxy forwards its own `Host`), is named with
+`--allow-origin https://hmi.example` (repeatable) or `IA2_ALLOWED_ORIGINS`, as on
+the IDE server. The legacy-browser limitation above also applies here.
 
 | Method | Path | Purpose |
 |---|---|---|

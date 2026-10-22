@@ -18,10 +18,12 @@
 //!   to a loopback address therefore answers only requests whose `Host` is a
 //!   loopback name.
 //!
-//! A request without an `Origin` header (curl, the `cs` CLI, the IDE server
-//! talking to a runtime, a browser fetching a page it navigated to) is not
-//! affected by the first rule: browsers always send `Origin` on the requests
-//! that can change state.
+//! Browsers can omit `Origin` on GET/HEAD, including a blind cross-site GET
+//! that makes the IDE issue SSH commands. Without `Origin`, Fetch Metadata
+//! must therefore say same-origin or user-initiated (`none`), if present.
+//! Cross-site and same-site top-level navigations are allowed only to named
+//! HTML entry paths, never to API paths. Tools without either header still
+//! work; older browsers that send neither cannot be distinguished from tools.
 //!
 //! One narrow door stays open for the edge runtime: the web IDE reads
 //! `GET /events` from the runtime through an SSH-forwarded loopback port, which
@@ -78,6 +80,9 @@ struct Policy {
     allowed: Vec<Origin>,
     /// Paths a loopback origin may `GET` cross-origin.
     loopback_reads: Vec<&'static str>,
+    /// HTML entry paths that may be opened from another site, without Origin.
+    document_paths: Vec<&'static str>,
+    document_prefixes: Vec<&'static str>,
 }
 
 impl Guard {
@@ -87,9 +92,11 @@ impl Guard {
     pub fn for_listener(addr: SocketAddr) -> Self {
         Self {
             policy: Arc::new(Policy {
-                loopback_only: addr.ip().is_loopback(),
+                loopback_only: is_loopback_ip(addr.ip()),
                 allowed: Vec::new(),
                 loopback_reads: Vec::new(),
+                document_paths: Vec::new(),
+                document_prefixes: Vec::new(),
             }),
         }
     }
@@ -133,6 +140,23 @@ impl Guard {
         }
     }
 
+    /// Permit GET/HEAD navigations from another site to these HTML entry
+    /// paths (exact matches) or prefixes. Only `navigate` + `document` is
+    /// allowed: frames, subresources and API navigations stay blocked.
+    /// Prefixes should end in `/`, e.g. `/hmi/`, and must not contain APIs.
+    pub fn allow_document_navigations(
+        self,
+        paths: &[&'static str],
+        prefixes: &[&'static str],
+    ) -> Self {
+        let mut policy = (*self.policy).clone();
+        policy.document_paths.extend_from_slice(paths);
+        policy.document_prefixes.extend_from_slice(prefixes);
+        Self {
+            policy: Arc::new(policy),
+        }
+    }
+
     /// Whether `Host` names are being restricted to loopback ones.
     pub fn is_loopback_only(&self) -> bool {
         self.policy.loopback_only
@@ -162,7 +186,7 @@ async fn enforce(State(policy): State<Arc<Policy>>, request: Request, next: Next
         request.headers(),
         request.uri().authority().map(|a| a.as_str()),
     );
-    match verdict {
+    let mut response = match verdict {
         Verdict::Pass => next.run(request).await,
         Verdict::CrossOrigin(origin) => {
             let mut response = next.run(request).await;
@@ -183,7 +207,13 @@ async fn enforce(State(policy): State<Arc<Policy>>, request: Request, next: Next
             )
                 .into_response()
         }
-    }
+    };
+    // A cache must not reuse an answer for a different browser context.
+    response.headers_mut().append(
+        header::VARY,
+        HeaderValue::from_static("sec-fetch-site, sec-fetch-mode, sec-fetch-dest"),
+    );
+    response
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -239,7 +269,7 @@ fn decide(
     // --- Origin -----------------------------------------------------------
     let mut origins = headers.get_all(header::ORIGIN).iter();
     let origin_value = match (origins.next(), origins.next()) {
-        (None, _) => return Verdict::Pass,
+        (None, _) => return without_origin(policy, method, path, headers),
         (Some(_), Some(_)) => return Verdict::Reject("more than one Origin header".into()),
         (Some(value), None) => value,
     };
@@ -282,6 +312,40 @@ fn decide(
          (start it with --allow-origin to name another page)",
         shown(origin_raw)
     ))
+}
+
+fn without_origin(policy: &Policy, method: &Method, path: &str, headers: &HeaderMap) -> Verdict {
+    let mut sites = headers.get_all("sec-fetch-site").iter();
+    let site = match (sites.next(), sites.next()) {
+        (None, _) => return Verdict::Pass, // CLI, proxies, or a legacy browser.
+        (Some(site), None) => site,
+        _ => return Verdict::Reject("more than one Sec-Fetch-Site header".into()),
+    };
+    match site.to_str().ok() {
+        Some("same-origin" | "none") => Verdict::Pass,
+        Some("cross-site" | "same-site") => {
+            let one_header_is = |name, expected| {
+                let mut values = headers.get_all(name).iter();
+                matches!((values.next(), values.next()), (Some(value), None) if value == expected)
+            };
+            let document_path = policy.document_paths.contains(&path)
+                || policy.document_prefixes.iter().any(|p| path.starts_with(p));
+            if (method == Method::GET || method == Method::HEAD)
+                && document_path
+                && one_header_is("sec-fetch-mode", "navigate")
+                && one_header_is("sec-fetch-dest", "document")
+            {
+                Verdict::Pass
+            } else {
+                Verdict::Reject(
+                    "a browser request without Origin from another origin may only navigate \
+                     to an HTML entry page, not call the API or load a subresource"
+                        .into(),
+                )
+            }
+        }
+        _ => Verdict::Reject("malformed Sec-Fetch-Site header".into()),
+    }
 }
 
 fn add_cors_headers(headers: &mut HeaderMap, origin: &HeaderValue) {
@@ -382,7 +446,7 @@ fn parse_authority(raw: &str) -> Option<Authority> {
     if raw.is_empty()
         || raw
             .bytes()
-            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control() || b"/\\@?#%".contains(&b))
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control() || b"/\\@?#%*".contains(&b))
     {
         return None;
     }
@@ -417,7 +481,10 @@ fn parse_authority(raw: &str) -> Option<Authority> {
         return None;
     }
     Some(Authority {
-        host: host.to_string(),
+        host: host
+            .parse::<std::net::Ipv6Addr>()
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|_| host.to_string()),
         port,
     })
 }
@@ -428,12 +495,15 @@ fn is_loopback_host(host: &str) -> bool {
     if host == "localhost" || host.ends_with(".localhost") {
         return true;
     }
-    match host.parse::<IpAddr>() {
-        Ok(IpAddr::V4(ip)) => ip.is_loopback(),
-        Ok(IpAddr::V6(ip)) => {
+    host.parse::<IpAddr>().is_ok_and(is_loopback_ip)
+}
+
+fn is_loopback_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_loopback(),
+        IpAddr::V6(ip) => {
             ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
         }
-        Err(_) => false,
     }
 }
 

@@ -29,6 +29,8 @@ fn authority_accepts_the_forms_a_host_header_takes() {
     ok("127.0.0.1:3001", "127.0.0.1", Some(3001));
     ok("[::1]:3001", "::1", Some(3001));
     ok("[::1]", "::1", None);
+    ok("[0:0:0:0:0:0:0:1]:1420", "::1", Some(1420));
+    ok("[::ffff:127.0.0.1]:1420", "::ffff:127.0.0.1", Some(1420));
     ok("localhost.:80", "localhost", Some(80));
     ok("a.b-c.example", "a.b-c.example", None);
 }
@@ -56,6 +58,7 @@ fn authority_refuses_everything_else() {
         "ho%73t",
         "host\t",
         ".",
+        "*.example",
     ] {
         assert_eq!(parse_authority(raw), None, "{raw:?}");
     }
@@ -92,6 +95,7 @@ fn origin_is_a_scheme_and_an_authority_and_nothing_else() {
         "http://host/",
         "http://host/path",
         "http://user@host",
+        "http://*.example",
         "localhost:3001",
         "*",
     ] {
@@ -762,4 +766,297 @@ fn allow_origins_stops_at_the_first_bad_entry() {
         .allow_origins(&["http://a:1".to_string(), "*".to_string()])
         .unwrap_err();
     assert!(err.contains('*'), "{err}");
+}
+
+#[test]
+fn mapped_loopback_listeners_reject_rebinding_just_like_ipv4() {
+    for bind in ["127.0.0.1:3001", "[::1]:3001", "[::ffff:127.0.0.1]:3001"] {
+        let g = Guard::for_listener(addr(bind));
+        assert!(g.is_loopback_only(), "{bind}");
+        for origin in [None, Some("http://rebind.example:3001")] {
+            let mut pairs = vec![("host", "rebind.example:3001")];
+            if let Some(origin) = origin {
+                pairs.push(("origin", origin));
+            }
+            assert_eq!(kind(&run(&g, Method::POST, "/force", &pairs)), Kind::Reject);
+        }
+    }
+    // Mapped routable addresses are still not loopback.
+    assert!(!Guard::for_listener(addr("[::ffff:192.0.2.1]:3001")).is_loopback_only());
+}
+
+#[test]
+fn an_allowed_ipv6_origin_matches_the_browser_serialization() {
+    for (configured, wire) in [
+        ("http://[0:0:0:0:0:0:0:1]:1420", "http://[::1]:1420"),
+        (
+            "http://[::ffff:127.0.0.1]:1420",
+            "http://[::ffff:7f00:1]:1420",
+        ),
+    ] {
+        let g = Guard::for_listener(addr("127.0.0.1:3001"))
+            .allow_origin(configured)
+            .unwrap();
+        let pairs = [("host", "127.0.0.1:3001"), ("origin", wire)];
+        assert_eq!(
+            kind(&run(&g, Method::GET, "/api/project", &pairs)),
+            Kind::Cross
+        );
+        let mut preflight = pairs.to_vec();
+        preflight.push(("access-control-request-method", "POST"));
+        assert_eq!(
+            kind(&run(&g, Method::OPTIONS, "/api/check", &preflight)),
+            Kind::Preflight
+        );
+        let wrong_port = wire.replace(":1420", ":1421");
+        assert_eq!(
+            kind(&run(
+                &g,
+                Method::GET,
+                "/api/project",
+                &[pairs[0], ("origin", wrong_port.as_str()),]
+            )),
+            Kind::Reject
+        );
+    }
+    let g = Guard::for_listener(addr("[::1]:3001"));
+    assert_eq!(
+        kind(&run(
+            &g,
+            Method::POST,
+            "/write",
+            &[
+                ("host", "[0:0:0:0:0:0:0:1]:3001"),
+                ("origin", "http://[::1]:3001"),
+            ]
+        )),
+        Kind::Pass
+    );
+}
+
+#[test]
+fn originless_browser_requests_cannot_call_apis_from_other_origins() {
+    let g = Guard::for_listener(addr("127.0.0.1:3001"))
+        .allow_document_navigations(&["/", "/index.html"], &["/hmi/"]);
+    for site in ["cross-site", "same-site"] {
+        for method in [Method::GET, Method::HEAD, Method::POST, Method::OPTIONS] {
+            for path in [
+                "/api/edges/dummy/probe",
+                "/api/fs/browse",
+                "/events",
+                "/health",
+            ] {
+                // Navigating to an API is not an HTML-page exception.
+                let pairs = [
+                    ("host", "127.0.0.1:3001"),
+                    ("sec-fetch-site", site),
+                    ("sec-fetch-mode", "navigate"),
+                    ("sec-fetch-dest", "document"),
+                ];
+                assert_eq!(
+                    kind(&run(&g, method.clone(), path, &pairs)),
+                    Kind::Reject,
+                    "{site} {method} {path}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn only_top_level_read_navigations_may_open_named_html_entries() {
+    let g = Guard::for_listener(addr("127.0.0.1:3001"))
+        .allow_document_navigations(&["/", "/index.html", "/hmi"], &["/hmi/"]);
+    for site in ["cross-site", "same-site"] {
+        for path in ["/", "/index.html", "/hmi", "/hmi/operator"] {
+            for method in [Method::GET, Method::HEAD] {
+                assert_eq!(
+                    kind(&run(
+                        &g,
+                        method,
+                        path,
+                        &[
+                            ("sec-fetch-site", site),
+                            ("sec-fetch-mode", "navigate"),
+                            ("sec-fetch-dest", "document"),
+                        ]
+                    )),
+                    Kind::Pass,
+                    "{site} {path}"
+                );
+            }
+            for (mode, dest) in [
+                ("no-cors", "image"),
+                ("no-cors", "script"),
+                ("navigate", "iframe"),
+                ("navigate", "frame"),
+                ("cors", "empty"),
+            ] {
+                assert_eq!(
+                    kind(&run(
+                        &g,
+                        Method::GET,
+                        path,
+                        &[
+                            ("sec-fetch-site", site),
+                            ("sec-fetch-mode", mode),
+                            ("sec-fetch-dest", dest),
+                        ]
+                    )),
+                    Kind::Reject,
+                    "{path} {mode} {dest}"
+                );
+            }
+            assert_eq!(
+                kind(&run(
+                    &g,
+                    Method::POST,
+                    path,
+                    &[
+                        ("sec-fetch-site", site),
+                        ("sec-fetch-mode", "navigate"),
+                        ("sec-fetch-dest", "document"),
+                    ]
+                )),
+                Kind::Reject
+            );
+        }
+    }
+    assert_eq!(
+        kind(&run(
+            &g,
+            Method::GET,
+            "/hmi-other",
+            &[
+                ("sec-fetch-site", "cross-site"),
+                ("sec-fetch-mode", "navigate"),
+                ("sec-fetch-dest", "document"),
+            ]
+        )),
+        Kind::Reject
+    );
+    // A policy without HTML exceptions never enables navigation by itself.
+    let strict = Guard::for_listener(addr("127.0.0.1:3001"));
+    assert_eq!(
+        kind(&run(
+            &strict,
+            Method::GET,
+            "/",
+            &[
+                ("sec-fetch-site", "cross-site"),
+                ("sec-fetch-mode", "navigate"),
+                ("sec-fetch-dest", "document"),
+            ]
+        )),
+        Kind::Reject
+    );
+}
+
+#[test]
+fn originless_tools_same_origin_ui_and_address_bar_navigation_still_work() {
+    let g = Guard::for_listener(addr("127.0.0.1:3001"));
+    for site in [None, Some("same-origin"), Some("none")] {
+        let mut pairs = vec![("host", "127.0.0.1:3001")];
+        if let Some(site) = site {
+            pairs.push(("sec-fetch-site", site));
+        }
+        for method in [Method::GET, Method::POST] {
+            assert_eq!(kind(&run(&g, method, "/api/project", &pairs)), Kind::Pass);
+        }
+    }
+}
+
+#[test]
+fn malformed_metadata_cannot_claim_a_navigation_exception() {
+    let g = Guard::for_listener(addr("127.0.0.1:3001")).allow_document_navigations(&["/"], &[]);
+    for pairs in [
+        vec![("sec-fetch-site", "")],
+        vec![("sec-fetch-site", "unknown")],
+        vec![("sec-fetch-site", "cross-site, same-origin")],
+        vec![
+            ("sec-fetch-site", "same-origin"),
+            ("sec-fetch-site", "cross-site"),
+        ],
+        vec![("sec-fetch-site", "cross-site")],
+        vec![
+            ("sec-fetch-site", "cross-site"),
+            ("sec-fetch-mode", "navigate"),
+        ],
+        vec![
+            ("sec-fetch-site", "cross-site"),
+            ("sec-fetch-mode", "navigate"),
+            ("sec-fetch-mode", "no-cors"),
+            ("sec-fetch-dest", "document"),
+        ],
+        vec![
+            ("sec-fetch-site", "cross-site"),
+            ("sec-fetch-mode", "navigate"),
+            ("sec-fetch-dest", "document"),
+            ("sec-fetch-dest", "iframe"),
+        ],
+    ] {
+        assert_eq!(
+            kind(&run(&g, Method::GET, "/", &pairs)),
+            Kind::Reject,
+            "{pairs:?}"
+        );
+    }
+}
+
+#[test]
+fn explicit_origins_keep_their_rules_even_with_fetch_metadata() {
+    let g = Guard::for_listener(addr("127.0.0.1:13001"))
+        .allow_origin("https://hmi.example")
+        .unwrap()
+        .allow_loopback_reads(&["/events"]);
+    for site in ["cross-site", "same-site", "same-origin"] {
+        let base = [("host", "127.0.0.1:13001"), ("sec-fetch-site", site)];
+        for (origin, path, expect) in [
+            ("https://hmi.example", "/write", Kind::Cross),
+            ("http://localhost:3001", "/events", Kind::Cross),
+            ("http://127.0.0.1:13001", "/status", Kind::Pass),
+            ("https://evil.example", "/status", Kind::Reject),
+        ] {
+            let mut pairs = base.to_vec();
+            pairs.push(("origin", origin));
+            assert_eq!(kind(&run(&g, Method::GET, path, &pairs)), expect);
+        }
+    }
+}
+
+#[tokio::test]
+async fn metadata_refusals_are_403_without_cors_and_responses_vary_by_context() {
+    let router = app(&Guard::for_listener(addr("127.0.0.1:3001")));
+    for site in ["cross-site", "same-origin"] {
+        let (status, headers, _) = call(
+            &router,
+            "GET",
+            "/api/x",
+            &[
+                ("host", "127.0.0.1:3001"),
+                ("sec-fetch-site", site),
+                ("sec-fetch-mode", "no-cors"),
+                ("sec-fetch-dest", "image"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status,
+            if site == "cross-site" {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::OK
+            }
+        );
+        assert!(!headers.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
+        let vary = headers
+            .get_all(header::VARY)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect::<Vec<_>>()
+            .join(",");
+        for field in ["sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest"] {
+            assert!(vary.split(',').any(|v| v.trim() == field), "{vary}");
+        }
+    }
 }

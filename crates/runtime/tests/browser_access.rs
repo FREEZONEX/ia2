@@ -52,10 +52,14 @@ fn start(dir: &Path) -> Runtime {
 }
 
 fn start_with(dir: &Path, extra_args: &[&str]) -> Runtime {
+    start_on(dir, "127.0.0.1", extra_args)
+}
+
+fn start_on(dir: &Path, bind_ip: &str, extra_args: &[&str]) -> Runtime {
     let project = dir.join("project");
     write_project(&project);
     let port = {
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let l = TcpListener::bind((bind_ip, 0)).unwrap();
         l.local_addr().unwrap().port()
     };
     let child = Command::new(env!("CARGO_BIN_EXE_ia2-runtime"))
@@ -64,8 +68,12 @@ fn start_with(dir: &Path, extra_args: &[&str]) -> Runtime {
         .arg("--state-dir")
         .arg(dir.join("state"))
         .arg("--bind")
-        .arg(format!("127.0.0.1:{port}"))
+        .arg(std::net::SocketAddr::new(bind_ip.parse().unwrap(), port).to_string())
         .args(extra_args)
+        .env_remove("IA2_ALLOWED_ORIGINS")
+        .env("HOME", dir)
+        .env("XDG_CONFIG_HOME", dir.join("config"))
+        .current_dir(dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -314,36 +322,207 @@ fn a_panel_behind_a_proxy_works_once_its_origin_is_named() {
 }
 
 #[test]
-fn a_malformed_allow_origin_stops_the_runtime_before_it_serves() {
+fn a_malformed_origin_is_refused_before_project_loading_or_scan_startup() {
     let dir = tempfile::tempdir().unwrap();
     write_project(&dir.path().join("project"));
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ia2-runtime"))
-        .arg("--project-dir")
-        .arg(dir.path().join("project"))
-        .arg("--state-dir")
-        .arg(dir.path().join("state"))
-        .arg("--bind")
-        .arg("127.0.0.1:0")
-        .args(["--allow-origin", "*"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("start ia2-runtime");
-    // A runtime that accepted the wildcard would serve forever: bound the wait
-    // so that failure is a test failure, not a hang.
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break Some(status);
+    for by_env in [false, true] {
+        for project in [
+            dir.path().join("project"),
+            dir.path().join("missing-project"),
+        ] {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_ia2-runtime"));
+            command
+                .arg("--project-dir")
+                .arg(project)
+                .arg("--state-dir")
+                .arg(dir.path().join("state"))
+                .arg("--bind")
+                .arg("127.0.0.1:0")
+                .env_remove("IA2_ALLOWED_ORIGINS")
+                .env("HOME", dir.path())
+                .env("XDG_CONFIG_HOME", dir.path().join("config"))
+                .env("RUST_LOG", "info")
+                .current_dir(dir.path())
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            if by_env {
+                command.env("IA2_ALLOWED_ORIGINS", "*");
+            } else {
+                command.args(["--allow-origin", "*"]);
+            }
+            let mut child = command.spawn().expect("start ia2-runtime");
+            // A runtime that accepted the wildcard would serve forever: bound the wait
+            // so that failure is a test failure, not a hang.
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break Some(status);
+                }
+                if Instant::now() >= deadline {
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            if status.is_none() {
+                let _ = child.kill();
+            }
+            let output = child.wait_with_output().unwrap();
+            let status = status.expect("the runtime kept running with a wildcard --allow-origin");
+            assert!(!status.success(), "a wildcard origin must be refused");
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                text.contains("--allow-origin / IA2_ALLOWED_ORIGINS"),
+                "{text}"
+            );
+            assert!(
+                !text.contains("compiled"),
+                "invalid config must fail before compiling: {text}"
+            );
+            assert!(
+                !text.contains("scan loop ready"),
+                "invalid config must never start scanning: {text}"
+            );
+            assert!(
+                !dir.path().join("state").exists(),
+                "invalid config must not start persistence"
+            );
         }
-        if Instant::now() >= deadline {
-            break None;
+    }
+}
+
+#[test]
+fn a_mapped_ipv6_loopback_listener_still_rejects_rebinding() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = start_on(dir.path(), "::ffff:127.0.0.1", &[]);
+    let name = format!("rebind.example:{}", rt.port);
+    let reply = send(
+        rt.port,
+        "POST",
+        "/force",
+        &[
+            ("host", name.clone()),
+            ("origin", format!("http://{name}")),
+            ("content-type", "application/json".into()),
+        ],
+        FORCE,
+    )
+    .expect("reply");
+    assert_eq!(reply.status, 403, "{} {}", reply.head, reply.body);
+    assert_eq!(audit(rt.port), serde_json::json!([]));
+}
+
+#[test]
+fn originless_browser_requests_are_blocked_but_same_origin_reads_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = start(dir.path());
+    for site in ["cross-site", "same-site"] {
+        for (method, path, body) in [
+            ("GET", "/status", ""),
+            ("HEAD", "/status", ""),
+            ("GET", "/events", ""),
+            ("POST", "/force", FORCE),
+        ] {
+            let reply = send(
+                rt.port,
+                method,
+                path,
+                &[
+                    host(rt.port),
+                    ("sec-fetch-site", site.into()),
+                    ("sec-fetch-mode", "navigate".into()),
+                    ("sec-fetch-dest", "document".into()),
+                    ("content-type", "application/json".into()),
+                ],
+                body,
+            )
+            .expect("reply");
+            assert_eq!(reply.status, 403, "{site} {method} {path}");
+            assert_eq!(reply.header("access-control-allow-origin"), None);
         }
-        std::thread::sleep(Duration::from_millis(50));
-    };
-    let _ = child.kill();
-    let _ = child.wait();
-    let status = status.expect("the runtime kept running with a wildcard --allow-origin");
-    assert!(!status.success(), "a wildcard origin must be refused");
+    }
+    for site in ["same-origin", "none"] {
+        assert_eq!(
+            send(
+                rt.port,
+                "GET",
+                "/status",
+                &[host(rt.port), ("sec-fetch-site", site.into()),],
+                ""
+            )
+            .expect("reply")
+            .status,
+            200
+        );
+    }
+    assert_eq!(audit(rt.port), serde_json::json!([]));
+}
+
+#[test]
+fn an_ipv6_origin_config_matches_the_browser_canonical_origin() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = start_with(
+        dir.path(),
+        &["--allow-origin", "http://[0:0:0:0:0:0:0:1]:1420"],
+    );
+    let origin = "http://[::1]:1420";
+    let reply = send(
+        rt.port,
+        "POST",
+        "/write",
+        &[
+            host(rt.port),
+            ("origin", origin.into()),
+            ("sec-fetch-site", "cross-site".into()),
+            ("content-type", "application/json".into()),
+        ],
+        FORCE,
+    )
+    .expect("reply");
+    assert_eq!(reply.status, 200, "{} {}", reply.head, reply.body);
+    assert_eq!(reply.header("access-control-allow-origin"), Some(origin));
+}
+
+#[test]
+fn only_top_level_navigations_can_open_the_standalone_panel() {
+    let dir = tempfile::tempdir().unwrap();
+    let web = dir.path().join("web");
+    fs::create_dir(&web).unwrap();
+    fs::write(
+        web.join("hmi.html"),
+        "<!doctype html><title>fixture panel</title>",
+    )
+    .unwrap();
+    let rt = start_with(dir.path(), &["--static-dir", web.to_str().unwrap()]);
+    for path in ["/hmi", "/hmi/operator", "/hmi.html"] {
+        let navigation = [
+            host(rt.port),
+            ("sec-fetch-site", "cross-site".into()),
+            ("sec-fetch-mode", "navigate".into()),
+            ("sec-fetch-dest", "document".into()),
+        ];
+        let reply = send(rt.port, "GET", path, &navigation, "").expect("reply");
+        assert_eq!(reply.status, 200, "{path}: {} {}", reply.head, reply.body);
+        assert!(reply.body.contains("fixture panel"));
+        for (mode, dest) in [("navigate", "iframe"), ("no-cors", "image")] {
+            let reply = send(
+                rt.port,
+                "GET",
+                path,
+                &[
+                    host(rt.port),
+                    ("sec-fetch-site", "cross-site".into()),
+                    ("sec-fetch-mode", mode.into()),
+                    ("sec-fetch-dest", dest.into()),
+                ],
+                "",
+            )
+            .expect("reply");
+            assert_eq!(reply.status, 403, "{path} {dest}");
+        }
+    }
 }
