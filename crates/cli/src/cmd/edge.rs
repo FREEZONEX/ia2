@@ -86,14 +86,14 @@ fn reachable_report(name: &str, value: &serde_json::Value) -> Vec<String> {
         .and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|d| d.as_str()).collect())
         .unwrap_or_default();
-    // A latched watchdog is the harsher version of the same trap: the
-    // runtime answers, every bus is healthy, the scan count climbs —
-    // and not one output is being driven.
+    // The runtime may answer and keep scanning while its normal output phase is
+    // inhibited. This latch flag alone says nothing about device confirmation.
     let latched = value
         .get("watchdog_tripped")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let latch_reason = value.get("latch_reason").and_then(|v| v.as_str());
+    let failsafe = value.get("failsafe_status").filter(|v| v.is_object());
     // Harsher still: the program itself is gone, and only the reason says so.
     let fault = value.get("fault").and_then(|v| v.as_str());
     // The task that feeds history and process alarms from the scan loop. The
@@ -119,6 +119,7 @@ fn reachable_report(name: &str, value: &serde_json::Value) -> Vec<String> {
     let summary = format!("{name} reachable · v{version} · {scans} scans · up {uptime}");
     if down.is_empty()
         && !latched
+        && failsafe.is_none()
         && fault.is_none()
         && tap_running
         && tap_faults == 0
@@ -138,13 +139,16 @@ fn reachable_report(name: &str, value: &serde_json::Value) -> Vec<String> {
         // fault.
         lines.push(match latch_reason {
             Some(why) => format!(
-                "  OUTPUTS LATCHED OFF — {why}; zeroed and held off until the \
-                 program is restarted"
+                "  OUTPUT PHASE INHIBITED — {why}; the normal output phase remains \
+                 inhibited until the program is restarted"
             ),
-            None => "  WATCHDOG LATCHED — scan deadline lost; outputs zeroed and \
-                     held off until the program is restarted"
+            None => "  WATCHDOG LATCHED — normal output phase inhibited until the \
+                     program is restarted"
                 .into(),
         });
+    }
+    if latched || failsafe.is_some() {
+        lines.extend(failsafe_lines(failsafe));
     }
     if !down.is_empty() {
         lines.push(format!(
@@ -186,6 +190,54 @@ fn reachable_report(name: &str, value: &serde_json::Value) -> Vec<String> {
     lines
 }
 
+/// Adapter acknowledgement is narrower than a frame or physical output state.
+fn failsafe_lines(report: Option<&serde_json::Value>) -> Vec<String> {
+    let Some(report) = report else {
+        return vec![
+            "  FAILSAFE UNCONFIRMED — acknowledgement unavailable; output state is unknown".into(),
+        ];
+    };
+    let names = |key| {
+        report
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    let mut lines = Vec::new();
+    let pending = names("pending");
+    if !pending.is_empty() {
+        lines.push(format!("  FAILSAFE PENDING — {}", pending.join(", ")));
+    }
+    if let Some(unconfirmed) = report.get("unconfirmed").and_then(|v| v.as_array()) {
+        for failure in unconfirmed {
+            lines.push(format!(
+                "  FAILSAFE UNCONFIRMED — {}: {}",
+                failure
+                    .get("device")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown device"),
+                failure
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("no error reported")
+            ));
+        }
+    }
+    let acknowledged = names("acknowledged");
+    if !acknowledged.is_empty() {
+        lines.push(format!(
+            "  FAILSAFE adapter acknowledgements — {}",
+            acknowledged.join(", ")
+        ));
+    }
+    if lines.is_empty() {
+        lines.push("  FAILSAFE — no device acknowledgements in the report".into());
+    }
+    lines.push("  Adapter acknowledgements do not confirm wire or physical outputs".into());
+    lines
+}
+
 /// The alarm-supervision policy the runtime is enforcing, as one line.
 fn supervision_line(policy: Option<&serde_json::Value>) -> String {
     let policy = policy.filter(|p| p.is_object());
@@ -205,11 +257,11 @@ fn supervision_line(policy: Option<&serde_json::Value>) -> String {
         .and_then(|v| v.as_u64());
     let standing = match (lost_for, latch_in) {
         (Some(lost), Some(0)) => format!(
-            "; lost for {} s, and the outputs are due to be latched off now",
+            "; lost for {} s, and the normal output phase is due to be inhibited now",
             lost / 1000
         ),
         (Some(lost), Some(left)) => format!(
-            "; lost for {} s, the outputs are latched off in {} s unless it comes back",
+            "; lost for {} s, the normal output phase is inhibited in {} s unless it comes back",
             lost / 1000,
             left / 1000
         ),
@@ -218,7 +270,7 @@ fn supervision_line(policy: Option<&serde_json::Value>) -> String {
     };
     match (mode, grace) {
         (Some("safe_state"), Some(grace)) => format!(
-            "  policy: on_loss = safe_state — the outputs are latched off if alarm \
+            "  policy: on_loss = safe_state — the normal output phase is inhibited if alarm \
              evaluation stays lost for {grace} s{standing}"
         ),
         (Some("report"), _) => {
@@ -353,7 +405,10 @@ mod tests {
         }));
         assert!(
             counting.last().unwrap().contains("lost for 12 s")
-                && counting.last().unwrap().contains("latched off in 32 s"),
+                && counting
+                    .last()
+                    .unwrap()
+                    .contains("phase is inhibited in 32 s"),
             "{counting:?}"
         );
         let due = with(json!({
@@ -361,7 +416,7 @@ mod tests {
             "lost_for_ms": 45_100, "latch_in_ms": 0
         }));
         assert!(
-            due.last().unwrap().contains("due to be latched off now"),
+            due.last().unwrap().contains("due to be inhibited now"),
             "{due:?}"
         );
         let reporting = with(json!({
@@ -369,7 +424,7 @@ mod tests {
         }));
         assert!(
             reporting.last().unwrap().contains("lost for 90 s")
-                && !reporting.last().unwrap().contains("latched off in"),
+                && !reporting.last().unwrap().contains("phase is inhibited in"),
             "{reporting:?}"
         );
         let older = reachable_report("pi", &probe(stopped(json!({}))));
@@ -406,7 +461,7 @@ mod tests {
         );
         assert!(lines[0].starts_with('⚠'), "{lines:?}");
         assert!(
-            lines[1].contains("OUTPUTS LATCHED OFF — alarm supervision lost"),
+            lines[1].contains("OUTPUT PHASE INHIBITED — alarm supervision lost"),
             "{lines:?}"
         );
         assert!(!lines[1].contains("WATCHDOG"), "{lines:?}");
@@ -420,6 +475,94 @@ mod tests {
         );
         assert!(lines[0].starts_with('⚠'), "{lines:?}");
         assert!(lines[1].contains("WATCHDOG LATCHED"), "{lines:?}");
-        assert!(lines[2].contains("fieldbus DEGRADED — 1 down"), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("fieldbus DEGRADED — 1 down")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn pending_and_rejected_failsafes_warn_even_with_healthy_transport() {
+        let lines = reachable_report(
+            "pi",
+            &probe(json!({
+                "watchdog_tripped": true,
+                "failsafe_status": {
+                    "pending": ["coupler"], "acknowledged": ["io"],
+                    "unconfirmed": [{"device": "drive", "error": "failsafe rejected"}]
+                }
+            })),
+        );
+        assert!(lines[0].starts_with('⚠'), "{lines:?}");
+        let text = lines.join("\n");
+        assert!(text.contains("FAILSAFE PENDING — coupler"), "{text}");
+        assert!(
+            text.contains("FAILSAFE UNCONFIRMED — drive: failsafe rejected"),
+            "{text}"
+        );
+        assert!(text.contains("adapter acknowledgements — io"), "{text}");
+        assert!(!text.contains("zeroed"), "{text}");
+    }
+
+    #[test]
+    fn an_acknowledged_adapter_does_not_confirm_physical_outputs() {
+        let text = reachable_report(
+            "pi",
+            &probe(json!({
+                "watchdog_tripped": true,
+                "failsafe_status": {"pending": [], "acknowledged": ["drive"], "unconfirmed": []}
+            })),
+        )
+        .join("\n");
+        assert!(text.contains("adapter acknowledgements — drive"), "{text}");
+        assert!(
+            text.contains("do not confirm wire or physical outputs"),
+            "{text}"
+        );
+        assert!(!text.contains("zeroed"), "{text}");
+    }
+
+    #[test]
+    fn a_legacy_latch_reports_confirmation_as_unavailable() {
+        for extra in [
+            json!({"watchdog_tripped": true}),
+            json!({"watchdog_tripped": true, "failsafe_status": null}),
+        ] {
+            let text = reachable_report("pi", &probe(extra)).join("\n");
+            assert!(text.contains("acknowledgement unavailable"), "{text}");
+            assert!(!text.contains("zeroed"), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_program_fault_stays_first_without_hiding_failsafe_failures() {
+        let lines = reachable_report(
+            "pi",
+            &probe(json!({
+                "fault": "VM trap: DivideByZero", "watchdog_tripped": true,
+                "unhealthy_devices": ["io"],
+                "failsafe_status": {"pending": ["drive"], "acknowledged": [], "unconfirmed": []}
+            })),
+        );
+        assert!(lines[1].contains("PROGRAM FAULTED"), "{lines:?}");
+        assert!(lines[3].contains("FAILSAFE PENDING — drive"), "{lines:?}");
+        assert!(
+            lines.last().unwrap().contains("fieldbus DEGRADED"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_failsafe_report_does_not_get_hidden_by_a_missing_latch_flag() {
+        let lines = reachable_report(
+            "pi",
+            &probe(json!({
+                "failsafe_status": {"pending": ["drive"], "acknowledged": [], "unconfirmed": []}
+            })),
+        );
+        assert!(lines[0].starts_with('⚠'), "{lines:?}");
+        assert!(lines[1].contains("FAILSAFE PENDING — drive"), "{lines:?}");
     }
 }

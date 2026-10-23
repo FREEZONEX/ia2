@@ -15,7 +15,7 @@ vi.mock("@/state/live-feed", () => ({ useLastSnapshot: mocks.snapshot }))
 vi.mock("@/lib/api", () => mocks)
 
 const level = { name: "level", type_name: "REAL", value: "2.5", bits: 1075838976 }
-const runningStatus = () => ({ mode: { kind: "running" }, forces: [], device_health: [], watchdog_tripped: false, last_error: null })
+const runningStatus = () => ({ mode: { kind: "running" }, forces: [], device_health: [], watchdog_tripped: false, latch_reason: null, failsafe_status: null, last_error: null })
 beforeEach(() => {
   vi.resetAllMocks()
   mocks.runtime.mockReturnValue({ isRunning: true, currentPou: { path: "main" }, running: null, attached: null })
@@ -31,6 +31,59 @@ function mountMonitor(collapsed = false) {
 }
 
 describe("confirmed Monitor controls", () => {
+  it("shows failsafe failures despite healthy transport and preserves the latch reason", async () => {
+    mocks.fetchRuntimeStatus.mockResolvedValue({
+      ...runningStatus(),
+      watchdog_tripped: true,
+      latch_reason: "alarm supervision lost",
+      device_health: [{ name: "drive", healthy: true }],
+      failsafe_status: {
+        pending: ["coupler"], acknowledged: [],
+        unconfirmed: [{ device: "drive", error: "failsafe rejected" }],
+      },
+    })
+    mountMonitor()
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toContain("alarm supervision lost")
+    expect(alert.textContent).toContain("Pending: coupler")
+    expect(alert.textContent).toContain("Unconfirmed: drive (failsafe rejected)")
+    expect(alert.textContent).not.toContain("zeroed")
+  })
+
+  it("keeps the program error first and the failsafe caveat visible", async () => {
+    mocks.fetchRuntimeStatus.mockResolvedValue({
+      ...runningStatus(), watchdog_tripped: true, last_error: "VM trap: DivideByZero",
+    })
+    mountMonitor()
+    expect((await screen.findByRole("alert")).textContent).toMatch(/^VM trap: DivideByZero\./)
+    expect(screen.getByRole("alert").textContent).toContain("acknowledgement unavailable")
+  })
+
+  it("does not let a retained command failure hide a later failsafe report", async () => {
+    mocks.pauseRuntime.mockRejectedValue(new Error("pause denied"))
+    mountMonitor()
+    const pause = await screen.findByRole("button", { name: "Pause" })
+    await waitFor(() => expect((pause as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(pause)
+    expect(await screen.findByRole("alert")).toHaveProperty("textContent", expect.stringContaining("pause denied"))
+
+    // The next normal status poll sees a latch. The failed command remains
+    // relevant, but must not suppress either pending or rejected adapters.
+    mocks.fetchRuntimeStatus.mockResolvedValue({
+      ...runningStatus(), watchdog_tripped: true, latch_reason: "alarm supervision lost",
+      failsafe_status: {
+        pending: ["coupler"], acknowledged: [],
+        unconfirmed: [{ device: "drive", error: "failsafe rejected" }],
+      },
+    })
+    await waitFor(() => {
+      const text = screen.getByRole("alert").textContent ?? ""
+      expect(text).toMatch(/^Pause failed: Error: pause denied\./)
+      expect(text).toContain("Pending: coupler")
+      expect(text).toContain("Unconfirmed: drive (failsafe rejected)")
+    }, { timeout: 2500 })
+  })
+
   it("still permits releasing an existing force on a stale input", async () => {
     mocks.snapshot.mockReturnValue({ timestamp_us: 1000000n, scan_count: 1n,
       vars: [{ ...level, input: { device: "io", channel: "level", stale: true } }] })

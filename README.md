@@ -123,6 +123,11 @@ cs agent run --label "build my_line" -- bash -c 'cs project create my_line; cs s
 Every command's `--help` explains when to call it and
 what to call next — written for agent readers.
 
+After an output latch, inspect `cs get runtime/status` or `cs probe <edge>`:
+normal output publication is inhibited, while `failsafe_status` separately
+reports pending, acknowledged and unconfirmed adapter safe-value attempts.
+An adapter acknowledgement does not confirm wire delivery or physical outputs.
+
 Existing documents require the ETag from the original read, or explicit
 `cs set --force` for an intentional full replacement. A stale version gets
 HTTP 412 / CLI exit 2: re-read and reapply your edit, without discarding the

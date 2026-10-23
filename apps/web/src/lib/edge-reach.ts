@@ -1,4 +1,5 @@
 import type { EdgeProbe } from "@/types/generated/EdgeProbe"
+import { outputLatchMessage } from "./output-latch"
 
 /** What the edge pane's badge says about a probe, most severe first. */
 export type EdgeReach =
@@ -11,25 +12,24 @@ export type EdgeReach =
 /**
  * Reachable is not the same as working. A runtime answers `/health` and may
  * keep scanning while its program has died (`fault`), while its watchdog
- * holds every output off (`watchdog_tripped`), or while a fieldbus is down
+ * inhibits its normal output phase (`watchdog_tripped`), or while a fieldbus is down
  * (`unhealthy_devices`). Each of those used to show the same green
  * `running` as a healthy edge, except a down bus. The root cause wins:
  * a faulted program explains a latch or a silent bus, not the reverse.
  */
 export function edgeReach(probe: EdgeProbe): EdgeReach {
   if (!probe.reachable) return { kind: "unreachable", detail: probe.error ?? "" }
+  const latch = outputLatchMessage(probe)
   if (probe.fault) {
     return {
       kind: "faulted",
-      detail: `The runtime answers, but its program stopped: ${probe.fault}`,
+      detail: `The runtime answers, but its program stopped: ${probe.fault}${latch ? `. ${latch}` : ""}`,
     }
   }
-  if (probe.watchdog_tripped) {
+  if (latch) {
     return {
-      kind: "locked",
-      detail: probe.latch_reason
-        ? `Outputs latched off: ${probe.latch_reason}. They are zeroed and held off until the program is restarted`
-        : "Scan watchdog tripped: outputs are zeroed and held off until the program is restarted",
+      kind: probe.watchdog_tripped ? "locked" : "degraded",
+      detail: latch,
     }
   }
   const down = probe.unhealthy_devices

@@ -129,16 +129,14 @@ pub struct RuntimeStatus {
     /// healthy plant from one whose bus died — the variable values alone never
     /// reveal it (see `DeviceHealth`).
     pub device_health: Vec<DeviceHealth>,
-    /// `true` once the scan watchdog has tripped: the program lost real-time
-    /// guarantees, `enter_failsafe` zeroed every output and the output phase
-    /// is latched off until an explicit restart.
-    ///
-    /// Read this before trusting any variable value as plant state. After a
-    /// trip the VM keeps computing and `scan_count` keeps advancing, so a UI
-    /// that only watches values sees a perfectly healthy plant while the bus
-    /// is actually holding zeros. `running` also stays `true` — the scan loop
-    /// deliberately keeps going so operators can still inspect live state.
+    /// Normal output publication is inhibited until this run is restarted.
+    /// The VM may keep computing. This flag does not confirm any device's
+    /// safe-value writes; inspect `failsafe_status` separately.
     pub watchdog_tripped: bool,
+    pub latch_reason: Option<String>,
+    /// Latest attempts on owned adapters. Acknowledgement is adapter-scoped,
+    /// not wire delivery or physical readback. None before an attempt.
+    pub failsafe_status: Option<ironplc_bridge::FailsafeStatus>,
     /// Fastest task interval in ms — the cadence at which `scan_count` can
     /// advance, since it is the max across units. A client judging "is this
     /// live data current?" needs this: `interval_ms` has no upper bound, and
@@ -231,6 +229,8 @@ pub async fn runtime_status(
         forces,
         device_health,
         watchdog_tripped,
+        latch_reason,
+        failsafe_status,
         scan_period_ms,
         scan_overruns,
         consecutive_scan_overruns,
@@ -242,11 +242,13 @@ pub async fn runtime_status(
                 ironplc_bridge::monitor::force_entries(&rp.handle),
                 rp.handle.device_health(),
                 rp.handle.watchdog_tripped(),
+                rp.handle.latch_reason(),
+                rp.handle.failsafe_status(),
                 Some(rp.handle.scan_period_ms()),
                 Some(rp.handle.scan_overruns()),
                 Some(rp.handle.consecutive_scan_overruns()),
             ),
-            None => (None, vec![], vec![], false, None, None, None),
+            None => (None, vec![], vec![], false, None, None, None, None, None),
         }
     };
     Json(RuntimeStatus {
@@ -256,6 +258,8 @@ pub async fn runtime_status(
         devices,
         device_health,
         watchdog_tripped,
+        latch_reason,
+        failsafe_status,
         scan_period_ms,
         scan_overruns,
         consecutive_scan_overruns,

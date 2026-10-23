@@ -405,10 +405,15 @@ async fn carry_out(action: Action, policy: &Policy, handle: &ProgramHandle) {
                  to re-arm"
             ),
             Ok(false) => tracing::warn!("outputs were already latched off"),
-            Err(e) => tracing::error!(
+            Err(e @ ironplc_bridge::OutputLatchError::Disconnected) => tracing::error!(
                 %reason, %e,
                 "alarm supervision policy could not latch the outputs off: the scan loop \
                  is gone"
+            ),
+            Err(e) => tracing::error!(
+                %reason, %e,
+                "normal output publication is inhibited, but device failsafe is \
+                 unconfirmed; inspect failsafe_status in /health or /status"
             ),
         },
     }
