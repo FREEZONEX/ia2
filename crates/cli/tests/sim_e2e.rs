@@ -77,10 +77,24 @@ struct TestServer {
 /// so all three point into `sandbox`. On Windows `dirs` uses known folders,
 /// which these variables do not move.
 fn spawn_server(sandbox: &Path) -> TestServer {
+    spawn_server_with(sandbox, &[], &[])
+}
+
+/// [`spawn_server`] with extra command-line arguments and environment variables.
+fn spawn_server_with(sandbox: &Path, args: &[&str], envs: &[(&str, &str)]) -> TestServer {
+    spawn_server_on(sandbox, "127.0.0.1", args, envs)
+}
+
+fn spawn_server_on(
+    sandbox: &Path,
+    bind_ip: &str,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> TestServer {
     let server_bin = server_binary();
 
     // Free port: bind-then-drop; the server grabs it a moment later.
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let l = TcpListener::bind((bind_ip, 0)).unwrap();
     let port = l.local_addr().unwrap().port();
     drop(l);
     let base = format!("http://127.0.0.1:{port}");
@@ -90,11 +104,14 @@ fn spawn_server(sandbox: &Path) -> TestServer {
 
     let child = StdCommand::new(&server_bin)
         .arg("--bind")
-        .arg(format!("127.0.0.1:{port}"))
+        .arg(std::net::SocketAddr::new(bind_ip.parse().unwrap(), port).to_string())
         // No demo slave — keeps the test from fighting over port 5502
         // with a dev server on the same machine.
         .arg("--demo-modbus-addr")
         .arg("")
+        .args(args)
+        .env_remove("IA2_ALLOWED_ORIGINS")
+        .envs(envs.iter().copied())
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .current_dir(sandbox)
@@ -584,4 +601,370 @@ fn unavailable_device_has_stale_inputs_and_an_acknowledgeable_default_alarm() {
         .args(["api", "POST", "/api/stop"])
         .assert()
         .success();
+}
+
+/// One HTTP/1.1 request with exactly the headers given, over a raw socket, so
+/// the `Host` and `Origin` are what a browser (or an attacker's DNS name)
+/// would send. Returns the status code and the response head.
+fn raw_request(
+    base: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> (u16, String) {
+    use std::io::{Read, Write};
+    let addr = base.trim_start_matches("http://");
+    let mut stream = std::net::TcpStream::connect(addr).expect("connect");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    let mut request = format!("{method} {path} HTTP/1.1\r\n");
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str(&format!(
+        "content-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    ));
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&buf[..n]);
+                // A WebSocket upgrade keeps the socket open: the head is the answer.
+                if raw.windows(4).any(|w| w == b"\r\n\r\n") && raw.starts_with(b"HTTP/1.1 101") {
+                    break;
+                }
+            }
+        }
+    }
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let head = text.split("\r\n\r\n").next().unwrap_or("").to_string();
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .expect("status line");
+    (status, head)
+}
+
+/// The IDE server has no authentication, so a web page in the user's browser
+/// must not be able to use it: not by cross-origin `fetch`, not by a
+/// cross-site WebSocket handshake, not through a rebound DNS name. And the
+/// callers that must keep working — `cs` and curl (no `Origin`), the UI the
+/// server hosts itself (same origin) — still do.
+#[test]
+fn a_web_page_cannot_drive_the_real_server_but_cs_and_the_hosted_ui_can() {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("sim_smoke");
+    copy_dir(&repo_root().join("examples/sim_smoke"), &proj);
+    let server = spawn_server(tmp.path());
+    let addr = server.base.trim_start_matches("http://").to_string();
+    let json = ("content-type", "application/json");
+    let open_body = format!("{{\"path\":\"{}\"}}", proj.display());
+
+    // A foreign page: every kind of request is refused, and the refusal carries no CORS headers.
+    let evil = ("origin", "https://evil.example");
+    let host = ("host", addr.as_str());
+    for (method, path, body) in [
+        ("GET", "/api/fs/browse?path=/", String::new()),
+        ("POST", "/api/projects/open", open_body.clone()),
+        ("POST", "/api/stop", String::new()),
+    ] {
+        let (status, head) = raw_request(&server.base, method, path, &[host, evil, json], &body);
+        assert_eq!(status, 403, "{method} {path}: {head}");
+        assert!(
+            !head
+                .to_ascii_lowercase()
+                .contains("access-control-allow-origin"),
+            "{head}"
+        );
+    }
+    let preflight = [
+        host,
+        evil,
+        ("access-control-request-method", "POST"),
+        (
+            "access-control-request-headers",
+            "content-type,x-ia2-project",
+        ),
+    ];
+    let (status, head) = raw_request(
+        &server.base,
+        "OPTIONS",
+        "/api/projects/open",
+        &preflight,
+        "",
+    );
+    assert_eq!(status, 403, "{head}");
+    let upgrade = [
+        host,
+        evil,
+        ("connection", "Upgrade"),
+        ("upgrade", "websocket"),
+        ("sec-websocket-version", "13"),
+        ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+    ];
+    let (status, head) = raw_request(&server.base, "GET", "/api/lsp", &upgrade, "");
+    assert_eq!(
+        status, 403,
+        "a cross-site WebSocket handshake must not be upgraded: {head}"
+    );
+
+    // DNS rebinding: Host and Origin agree, but the name is not a loopback one.
+    let port = addr.rsplit(':').next().unwrap();
+    let name = format!("rebind.evil.example:{port}");
+    let origin = format!("http://{name}");
+    let rebound = [("host", name.as_str()), ("origin", origin.as_str()), json];
+    let (status, head) = raw_request(
+        &server.base,
+        "POST",
+        "/api/projects/open",
+        &rebound,
+        &open_body,
+    );
+    assert_eq!(status, 403, "{head}");
+    let (status, _) = raw_request(
+        &server.base,
+        "GET",
+        "/health",
+        &[("host", name.as_str())],
+        "",
+    );
+    assert_eq!(status, 403, "even a plain read under a rebound name");
+
+    // Nothing above reached a handler: no project was opened.
+    let (status, head) = raw_request(&server.base, "GET", "/api/project", &[host], "");
+    assert_eq!(
+        status, 409,
+        "no project must be open yet (409 = no project): {head}"
+    );
+
+    // The UI served by this server: same origin, with an Origin header, works - including the WebSocket upgrade.
+    let same = format!("http://{addr}");
+    let ui = [host, ("origin", same.as_str()), json];
+    let (status, head) = raw_request(&server.base, "POST", "/api/projects/open", &ui, &open_body);
+    assert_eq!(status, 200, "{head}");
+    let ui_upgrade = [
+        host,
+        ("origin", same.as_str()),
+        ("connection", "Upgrade"),
+        ("upgrade", "websocket"),
+        ("sec-websocket-version", "13"),
+        ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+    ];
+    let (status, head) = raw_request(&server.base, "GET", "/api/lsp", &ui_upgrade, "");
+    assert_eq!(status, 101, "{head}");
+
+    // `cs` (no Origin) keeps working through the real router.
+    cs(&server.base)
+        .args(["api", "GET", "/api/project"])
+        .assert()
+        .success();
+}
+
+/// A shell that loads the UI from some other origin is named on the command
+/// line or in the environment; only that origin gets in, and it is answered
+/// with the headers a page needs to read the reply.
+#[test]
+fn a_named_origin_may_call_the_real_server_and_no_other_page_may() {
+    let tmp = tempfile::tempdir().unwrap();
+    let by_flag = spawn_server_with(
+        tmp.path(),
+        &["--allow-origin", "http://localhost:1420"],
+        &[],
+    );
+    let by_env_dir = tempfile::tempdir().unwrap();
+    let by_env = spawn_server_with(
+        by_env_dir.path(),
+        &[],
+        &[(
+            "IA2_ALLOWED_ORIGINS",
+            "http://localhost:1420, https://shell.example",
+        )],
+    );
+    for (server, named) in [
+        (&by_flag, "http://localhost:1420"),
+        (&by_env, "http://localhost:1420"),
+        (&by_env, "https://shell.example"),
+    ] {
+        let addr = server.base.trim_start_matches("http://");
+        let pairs = [("host", addr), ("origin", named)];
+        let (status, head) = raw_request(&server.base, "GET", "/health", &pairs, "");
+        assert_eq!(status, 200, "{named}: {head}");
+        assert!(
+            head.to_ascii_lowercase()
+                .contains(&format!("access-control-allow-origin: {named}")),
+            "{head}"
+        );
+        let foreign = [("host", addr), ("origin", "https://evil.example")];
+        let (status, _) = raw_request(&server.base, "GET", "/health", &foreign, "");
+        assert_eq!(status, 403, "a page that was not named stays out");
+    }
+}
+
+#[test]
+fn a_mapped_ipv6_listener_does_not_disable_the_real_servers_host_check() {
+    let tmp = tempfile::tempdir().unwrap();
+    let server = spawn_server_on(tmp.path(), "::ffff:127.0.0.1", &[], &[]);
+    let port = server.base.rsplit(':').next().unwrap();
+    let rebound = format!("rebind.example:{port}");
+    let origin = format!("http://{rebound}");
+    for method in ["GET", "POST"] {
+        let (status, head) = raw_request(
+            &server.base,
+            method,
+            "/api/projects/open",
+            &[
+                ("host", &rebound),
+                ("origin", &origin),
+                ("content-type", "application/json"),
+            ],
+            "{}",
+        );
+        assert_eq!(status, 403, "{method}: {head}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_cross_site_originless_get_never_launches_ssh_but_cli_and_ui_reads_still_work() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("sim_smoke");
+    copy_dir(&repo_root().join("examples/sim_smoke"), &proj);
+    std::fs::create_dir_all(proj.join("edges")).unwrap();
+    std::fs::write(
+        proj.join("edges/dummy.toml"),
+        "name = \"dummy\"\nhost = \"must-not-resolve.invalid\"\n",
+    )
+    .unwrap();
+    let mock_bin = tmp.path().join("mock-bin");
+    std::fs::create_dir(&mock_bin).unwrap();
+    let calls = tmp.path().join("ssh-calls");
+    let ssh = mock_bin.join("ssh");
+    std::fs::write(&ssh,
+        "#!/bin/sh\nprintf 'called\\n' >> \"$IA2_TEST_SSH_CALLS\"\nprintf '{\"status\":\"ok\",\"scan_count\":1}\\n'\n",
+    ).unwrap();
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // PATH contains only the stub: even a broken fixture cannot reach real SSH.
+    let server = spawn_server_with(
+        tmp.path(),
+        &[],
+        &[
+            ("PATH", mock_bin.to_str().unwrap()),
+            ("IA2_TEST_SSH_CALLS", calls.to_str().unwrap()),
+        ],
+    );
+    server.open_project(&proj);
+    let host = ("host", server.base.trim_start_matches("http://"));
+    for site in ["cross-site", "same-site"] {
+        for (mode, dest) in [
+            ("no-cors", "image"),
+            ("no-cors", "script"),
+            ("navigate", "document"),
+            ("navigate", "iframe"),
+        ] {
+            let (status, head) = raw_request(
+                &server.base,
+                "GET",
+                "/api/edges/dummy/probe",
+                &[
+                    host,
+                    ("sec-fetch-site", site),
+                    ("sec-fetch-mode", mode),
+                    ("sec-fetch-dest", dest),
+                ],
+                "",
+            );
+            assert_eq!(status, 403, "{site} {mode} {dest}: {head}");
+            assert!(!calls.exists(), "a denied request reached SSH");
+        }
+    }
+    for pairs in [vec![host], vec![host, ("sec-fetch-site", "same-origin")]] {
+        let (status, head) = raw_request(&server.base, "GET", "/api/edges/dummy/probe", &pairs, "");
+        assert_eq!(status, 200, "{head}");
+    }
+    assert_eq!(std::fs::read_to_string(calls).unwrap().lines().count(), 2);
+}
+
+#[test]
+fn a_top_level_link_can_open_the_ide_but_cannot_navigate_to_its_api() {
+    let tmp = tempfile::tempdir().unwrap();
+    let web = tmp.path().join("web");
+    std::fs::create_dir(&web).unwrap();
+    std::fs::write(
+        web.join("index.html"),
+        "<!doctype html><title>fixture IDE</title>",
+    )
+    .unwrap();
+    let server = spawn_server_with(tmp.path(), &["--static-dir", web.to_str().unwrap()], &[]);
+    let host = ("host", server.base.trim_start_matches("http://"));
+    let navigation = [
+        host,
+        ("sec-fetch-site", "cross-site"),
+        ("sec-fetch-mode", "navigate"),
+        ("sec-fetch-dest", "document"),
+    ];
+    for path in ["/", "/index.html"] {
+        assert_eq!(
+            raw_request(&server.base, "GET", path, &navigation, "").0,
+            200,
+            "{path}"
+        );
+    }
+    for path in ["/api/fs/browse", "/api/edges/dummy/probe", "/health"] {
+        assert_eq!(
+            raw_request(&server.base, "GET", path, &navigation, "").0,
+            403,
+            "{path}"
+        );
+    }
+    assert_eq!(
+        raw_request(
+            &server.base,
+            "GET",
+            "/",
+            &[
+                host,
+                ("sec-fetch-site", "cross-site"),
+                ("sec-fetch-mode", "navigate"),
+                ("sec-fetch-dest", "iframe"),
+            ],
+            ""
+        )
+        .0,
+        403
+    );
+}
+
+#[test]
+fn a_named_ipv6_origin_works_with_browser_canonical_headers_and_preflights() {
+    let tmp = tempfile::tempdir().unwrap();
+    let server = spawn_server_with(
+        tmp.path(),
+        &["--allow-origin", "http://[0:0:0:0:0:0:0:1]:1420"],
+        &[],
+    );
+    let host = ("host", server.base.trim_start_matches("http://"));
+    let headers = [
+        host,
+        ("origin", "http://[::1]:1420"),
+        ("sec-fetch-site", "cross-site"),
+    ];
+    let (status, head) = raw_request(&server.base, "GET", "/health", &headers, "");
+    assert_eq!(status, 200, "{head}");
+    assert!(head
+        .to_ascii_lowercase()
+        .contains("access-control-allow-origin: http://[::1]:1420"));
+    let mut preflight = headers.to_vec();
+    preflight.push(("access-control-request-method", "POST"));
+    assert_eq!(
+        raw_request(&server.base, "OPTIONS", "/api/check", &preflight, "").0,
+        204
+    );
 }

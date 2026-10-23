@@ -2079,12 +2079,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ia2-http-guard"
+version = "0.0.1"
+dependencies = [
+ "axum 0.8.9",
+ "tokio",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "ia2-runtime"
 version = "0.0.1"
 dependencies = [
  "anyhow",
  "axum 0.8.9",
  "futures-util",
+ "ia2-http-guard",
  "ironplc-bridge",
  "parking_lot",
  "project",
@@ -4343,6 +4354,7 @@ dependencies = [
  "axum 0.8.9",
  "clap",
  "futures-util",
+ "ia2-http-guard",
  "iomap-ethercat",
  "iomap-modbus",
  "iomap-opcua",
