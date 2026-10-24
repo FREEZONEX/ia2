@@ -151,7 +151,7 @@ pub struct DeviceSpec {
 ///
 /// This is transport health only. A healthy link does NOT prove the value
 /// took effect: a slave can sit in SAFEOP, mask its own outputs, or hold
-/// the failsafe zeros after a watchdog trip. The HMI's Stop is not a
+/// configured safe values after a watchdog trip. The HMI's Stop is not a
 /// safety function under any of these outcomes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteOutcome {
@@ -183,6 +183,38 @@ pub enum RuntimeWriteError {
     #[error("write to '{0}' rejected by project governance")]
     GovernanceDenied(String),
 }
+
+/// One adapter whose requested safe-value operation did not acknowledge success.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DeviceFailsafeError {
+    pub device: String,
+    pub error: String,
+}
+
+/// Safe-value attempts for this run, distinct from its software output inhibit.
+/// An acknowledgement describes the adapter call only: it does not establish
+/// transmission on the wire, physical state, or a universally safe value.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct FailsafeStatus {
+    /// Attempts queued or currently awaiting an adapter response.
+    pub pending: Vec<String>,
+    pub acknowledged: Vec<String>,
+    /// A previous failure remains here while its explicit retry is pending.
+    pub unconfirmed: Vec<DeviceFailsafeError>,
+}
+
+/// The output inhibit remains set even when safe-value calls fail.
+#[derive(Debug, thiserror::Error)]
+pub enum OutputLatchError {
+    #[error("scan loop has stopped — output latch acknowledgement unavailable")]
+    Disconnected,
+    #[error("outputs inhibited, but adapter failsafe acknowledgement failed: {errors:?}")]
+    FailsafeUnconfirmed { errors: Vec<DeviceFailsafeError> },
+}
+
+type SharedFailsafeStatus = Arc<std::sync::Mutex<Option<FailsafeStatus>>>;
 
 /// Out-of-band commands the scan loop drains between rounds. Used so
 /// HTTP handlers (in the server's tokio runtime) can poke the VM (which
@@ -223,16 +255,13 @@ enum RuntimeCommand {
         name: String,
         ack: tokio::sync::oneshot::Sender<Result<(), RuntimeWriteError>>,
     },
-    /// Latch the outputs off, exactly as the scan watchdog does on a trip:
-    /// every device is put into failsafe and the output phase stops running
-    /// until the program is restarted. For a caller that has decided the run
-    /// must not drive the plant any more (the runtime's alarm-supervision
-    /// policy); `reason` is kept for whoever asks why. Answers `true` if this
-    /// call did the latching, `false` if the outputs were already latched
-    /// (the first reason stands).
+    /// Inhibit ordinary outputs, then request adapter safe values. Failure
+    /// leaves inhibition in place and returns per-device errors. An explicit
+    /// repeat retries only unconfirmed adapters; the first reason stands.
+    /// Success says whether this command newly inhibited the outputs.
     LatchOutputsOff {
         reason: String,
-        ack: tokio::sync::oneshot::Sender<bool>,
+        ack: tokio::sync::oneshot::Sender<Result<bool, OutputLatchError>>,
     },
     /// Fault injection: stall each of the next `scans` **ticks** by
     /// `stall_ms` of real wall-clock time. The stall happens INSIDE the
@@ -269,7 +298,9 @@ pub enum RuntimeMode {
     /// loop pauses: each adapter's own worker (the EtherCAT cyclic thread
     /// with its gear tick, the Modbus poll task) keeps running and keeps
     /// sending whatever it was last given, so a drive that was moving keeps
-    /// the last target it had. To de-energise, latch the outputs off.
+    /// the last target it had. Latching inhibits normal output publication
+    /// and requests configured safe values; inspect the acknowledgement
+    /// report rather than treating that request as de-energisation.
     Paused,
     /// Run `remaining` scan cycles then automatically transition to
     /// `Paused`. Decremented atomically at the bottom of each cycle.
@@ -358,9 +389,9 @@ pub struct ProgramHandle {
     /// refreshed by the scan loop each round. Shared so the HTTP layer can
     /// serve health without a scan-loop round-trip.
     device_health: Arc<std::sync::Mutex<Vec<DeviceHealth>>>,
-    /// Latched `true` once the scan watchdog has tripped: outputs are held
-    /// at the zeros `enter_failsafe` wrote and the output phase no longer
-    /// runs. Monotonic — only a restart clears it.
+    /// Latched `true` once output writes are inhibited. This remains true
+    /// even when adapter safe-value calls fail; it does not establish the
+    /// field's actual state. Monotonic — only a restart clears it.
     ///
     /// Shared for the same reason `device_health` is: after a trip the VM
     /// keeps computing, `scan_count` keeps advancing and every variable
@@ -374,6 +405,8 @@ pub struct ProgramHandle {
     /// `watchdog_tripped` is set, so a reader that sees the latch sees its
     /// reason; the first reason stands.
     latch_reason: Arc<std::sync::Mutex<Option<String>>>,
+    /// Adapter acknowledgements are tracked independently of output inhibition.
+    failsafe_status: SharedFailsafeStatus,
     /// Why the scan loop died, if it died: set exactly once — to the trap
     /// message when a VM trap stops the plant, or to the panic payload if
     /// the loop panicked — and never on a clean stop. A `watch` channel
@@ -411,10 +444,10 @@ impl ProgramHandle {
 
     /// Graceful, awaitable stop for a clean process exit. Requests stop,
     /// then JOINS the scan thread — which runs its always-on failsafe pass
-    /// (zero every device's outputs) and each device's `shutdown` (joining
-    /// the EtherCAT cyclic worker so the zeroed controlword is on the wire)
-    /// before it returns. Device failures are logged; completion is not
-    /// a guarantee that physical outputs reached their safe state.
+    /// (request each adapter's configured safe values) and each device's
+    /// `shutdown` before it returns. Safe-value results remain available in
+    /// [`Self::failsafe_status`]; device failures are also logged. Completion
+    /// does not establish transmission or physical output state.
     ///
     /// The scan thread waits at most `RECONNECT_JOIN_GRACE` for the background
     /// reconnect worker, so a device still mid-connect delays this by at most
@@ -657,10 +690,6 @@ impl ProgramHandle {
             .unwrap_or_default()
     }
 
-    /// `true` once the scan watchdog has tripped and latched the outputs
-    /// off. Stays `true` until the program is restarted — a caller seeing
-    /// this must not read live variable values as plant state, because the
-    /// bus is holding zeros while the VM keeps computing.
     /// The fastest task interval in ms — the cadence at which `scan_count`
     /// can advance. See the field docs for why a client needs it.
     pub fn scan_period_ms(&self) -> u32 {
@@ -683,7 +712,7 @@ impl ProgramHandle {
     /// scan watchdog, an execution-budget trap, or [`Self::latch_outputs_off`].
     /// [`Self::latch_reason`] says which.
     pub fn watchdog_tripped(&self) -> bool {
-        self.watchdog_tripped.load(Ordering::Relaxed)
+        self.watchdog_tripped.load(Ordering::Acquire)
     }
 
     /// Why the outputs are latched off; `None` while they are not. The first
@@ -692,24 +721,33 @@ impl ProgramHandle {
         self.latch_reason.lock().ok().and_then(|r| r.clone())
     }
 
-    /// Latch the outputs off on request: every device goes into failsafe and
-    /// the output phase stops until the program is restarted, exactly as on a
-    /// scan-watchdog trip (the loop keeps scanning so the live state stays
-    /// visible). Never undone from here: leaving the latched state is for a
-    /// person, by restarting. `Ok(true)` if this call latched, `Ok(false)` if
-    /// it already was.
+    /// Adapter safe-value results, or `None` before any attempt. Pending
+    /// calls and failures are visible independently of the software inhibit.
+    pub fn failsafe_status(&self) -> Option<FailsafeStatus> {
+        self.failsafe_status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Inhibit ordinary output writes until a program restart, and request
+    /// each adapter's configured safe values. Failures return an error while
+    /// leaving the inhibit and first reason intact. Calling again explicitly
+    /// retries only unconfirmed adapters. `Ok(true)` means newly inhibited;
+    /// `Ok(false)` means already inhibited and all attempts acknowledged.
+    /// Adapter acknowledgement does not prove wire or physical state.
     pub async fn latch_outputs_off(
         &self,
         reason: impl Into<String>,
-    ) -> Result<bool, RuntimeWriteError> {
+    ) -> Result<bool, OutputLatchError> {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
             .send(RuntimeCommand::LatchOutputsOff {
                 reason: reason.into(),
                 ack: ack_tx,
             })
-            .map_err(|_| RuntimeWriteError::Disconnected)?;
-        ack_rx.await.map_err(|_| RuntimeWriteError::Disconnected)
+            .map_err(|_| OutputLatchError::Disconnected)?;
+        ack_rx.await.map_err(|_| OutputLatchError::Disconnected)?
     }
 
     /// Why the scan loop died, if it died: `Some(message)` after a VM trap,
@@ -902,6 +940,7 @@ fn spawn_units_with_grace(
     let device_health = Arc::new(std::sync::Mutex::new(Vec::<DeviceHealth>::new()));
     let watchdog_tripped = Arc::new(AtomicBool::new(false));
     let latch_reason = Arc::new(std::sync::Mutex::new(None::<String>));
+    let failsafe_status = Arc::new(std::sync::Mutex::new(None::<FailsafeStatus>));
     let (fault_tx, fault_rx) = tokio::sync::watch::channel(None::<String>);
     let (reconnect_done_tx, reconnect_done_rx) = tokio::sync::watch::channel(());
 
@@ -915,6 +954,7 @@ fn spawn_units_with_grace(
     let device_health_clone = device_health.clone();
     let watchdog_tripped_clone = watchdog_tripped.clone();
     let latch_reason_clone = latch_reason.clone();
+    let failsafe_status_clone = failsafe_status.clone();
     let scan_overruns_clone = scan_overruns.clone();
     let consecutive_overruns_clone = consecutive_scan_overruns.clone();
     let device_reports_reconnect = device_reports.clone();
@@ -953,8 +993,8 @@ fn spawn_units_with_grace(
         };
         // Connect devices OUTSIDE the panic-guarded run_loop so that,
         // no matter how the loop exits (clean stop, VM trap, or panic),
-        // we still own the `devices` vec and can drive every output to
-        // its safe state.
+        // we still own the `devices` vec and can attempt each adapter's
+        // configured safe values.
         let (mut devices, reports, failed_specs) = io_rt.block_on(acquire_devices(device_source));
 
         let rt = match tokio::runtime::Builder::new_current_thread()
@@ -1048,6 +1088,7 @@ fn spawn_units_with_grace(
                 device_health_clone,
                 watchdog_tripped_clone,
                 latch_reason_clone,
+                failsafe_status_clone.clone(),
                 scan_overruns_clone,
                 consecutive_overruns_clone,
                 fault_tx,
@@ -1070,37 +1111,26 @@ fn spawn_units_with_grace(
                 );
             }
 
-            // Always-run failsafe before the thread dies. Drive every
-            // device's outputs to zero so a hung / panicked / stopped
-            // program doesn't leave actuators energized.
+            // Always attempt each adapter's configured safe values before
+            // teardown, including after a failed or panicking earlier attempt.
             let dev_count = devices.len();
+            begin_failsafe_attempts(
+                &failsafe_status_clone,
+                devices.iter().map(|dev| dev.name()),
+            );
             let mut failsafe_failed = 0usize;
             for dev in devices.iter_mut() {
-                match isolate_device_call(dev.enter_failsafe()).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        failsafe_failed += 1;
-                        tracing::warn!(device = %dev.name(), %e, "failsafe call failed");
-                    }
-                    Err(panic) => {
-                        failsafe_failed += 1;
-                        tracing::error!(
-                            device = %dev.name(),
-                            %panic,
-                            "failsafe call PANICKED; continuing with the remaining devices"
-                        );
-                    }
+                if attempt_device_failsafe(dev.as_mut(), &failsafe_status_clone).await.is_err() {
+                    failsafe_failed += 1;
                 }
             }
-            // Give an async-flush device (real EtherCAT) a cycle or two to
-            // push the zeros onto the bus. Conservative 50 ms covers
-            // cycle_us up to 25 ms; paid once, on shutdown.
+            // Allow an asynchronous adapter worker a brief flush opportunity
+            // before teardown. This delay does not establish transmission or
+            // physical state; paid once, on shutdown.
             tokio::time::sleep(Duration::from_millis(50)).await;
-            // Graceful per-device teardown: signal + JOIN any background
-            // I/O thread (the EtherCAT cyclic worker) so the zeroed
-            // controlword is guaranteed on the wire before we exit — not
-            // left to the drive's own watchdog after the master is gone.
-            // Runs on both the clean and panicked paths (before re-panic).
+            // Graceful per-device teardown: request shutdown and join owned
+            // workers according to each adapter's contract. Runs on both the
+            // clean and panicked paths (before re-panic); errors are recorded.
             let mut shutdown_failed = 0usize;
             for dev in devices.iter_mut() {
                 match isolate_device_call(dev.shutdown()).await {
@@ -1210,6 +1240,7 @@ fn spawn_units_with_grace(
         device_health,
         watchdog_tripped,
         latch_reason,
+        failsafe_status,
         fault: fault_rx,
         thread: Arc::new(std::sync::Mutex::new(Some(join_handle))),
         reconnect_done: reconnect_done_rx,
@@ -1307,6 +1338,67 @@ where
         .catch_unwind()
         .await
         .map_err(|panic| panic_message(panic.as_ref()))
+}
+
+/// Publish the whole target set before awaiting the first adapter. Preserve
+/// failures until an attempt succeeds, including while a retry is pending.
+fn begin_failsafe_attempts<'a>(
+    shared: &SharedFailsafeStatus,
+    names: impl IntoIterator<Item = &'a str>,
+) {
+    let mut slot = shared.lock().unwrap_or_else(|e| e.into_inner());
+    let status = slot.get_or_insert_with(FailsafeStatus::default);
+    for name in names {
+        status
+            .acknowledged
+            .retain(|acknowledged| acknowledged != name);
+        if !status.pending.iter().any(|pending| pending == name) {
+            status.pending.push(name.to_string());
+        }
+    }
+}
+
+/// Every runtime-owned safe-value pass uses the same per-device accounting
+/// and panic boundary. Callers mark the target batch pending first.
+async fn attempt_device_failsafe(
+    device: &mut dyn IoDevice,
+    shared: &SharedFailsafeStatus,
+) -> Result<(), DeviceFailsafeError> {
+    let name = device.name().to_string();
+    let result = match isolate_device_call(device.enter_failsafe()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(DeviceFailsafeError {
+            device: name.clone(),
+            error: error.to_string(),
+        }),
+        Err(panic) => Err(DeviceFailsafeError {
+            device: name.clone(),
+            error: format!("adapter panicked: {panic}"),
+        }),
+    };
+    {
+        let mut slot = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let status = slot.get_or_insert_with(FailsafeStatus::default);
+        status.pending.retain(|pending| pending != &name);
+        status.unconfirmed.retain(|error| error.device != name);
+        match &result {
+            Ok(()) => {
+                if !status.acknowledged.contains(&name) {
+                    status.acknowledged.push(name);
+                }
+            }
+            Err(error) => {
+                status
+                    .acknowledged
+                    .retain(|acknowledged| acknowledged != &name);
+                status.unconfirmed.push(error.clone());
+            }
+        }
+    }
+    if let Err(error) = &result {
+        tracing::error!(device = %error.device, error = %error.error, "adapter safe-value call unconfirmed; ordinary output inhibition is unchanged");
+    }
+    result
 }
 
 /// Connect every `DeviceSpec` into a live `IoDevice` adapter. A
@@ -2161,6 +2253,7 @@ async fn run_loop_async(
     watchdog_tripped: Arc<AtomicBool>,
     // Why it is latched; see `ProgramHandle::latch_reason`.
     latch_reason: Arc<std::sync::Mutex<Option<String>>>,
+    failsafe_status: SharedFailsafeStatus,
     // Achieved-cadence counters for /status: deadlines missed since start and
     // the longest current streak. The overrun log line fires once per unit and
     // then suppresses itself, so it cannot answer "still overrunning?".
@@ -2481,17 +2574,14 @@ async fn run_loop_async(
     // then tasks.toml declaration order.
     let mut exec_order: Vec<usize> = (0..n_units).collect();
     exec_order.sort_by_key(|&i| (units[i].priority, i));
-    // Watchdog: any unit accumulating WATCHDOG_OVERRUN_THRESHOLD
-    // consecutive overruns fires failsafe once and latches — the loop keeps
-    // scanning so operators can see live state, but outputs stay safe until
-    // the program is restarted (industrial convention).
+    // Any unit accumulating WATCHDOG_OVERRUN_THRESHOLD consecutive
+    // overruns inhibits ordinary outputs until restart, and requests each
+    // adapter's safe values once. The loop keeps computing for observation.
     //
-    // `watchdog_tripped` IS the latch, not just a fire-once debounce: the
-    // output phase below runs only while it is clear. Setting it on trip is
-    // what makes the zeros written by `enter_failsafe` stick — otherwise the
-    // very next scan would push freshly computed (non-zero) values back over
-    // them, and the "outputs stay safe" promise above would be a comment
-    // with no code behind it.
+    // The latch guards ordinary output writes even if a safe-value request
+    // fails. Successful requests must not be overwritten on the next scan;
+    // failed requests remain visible in failsafe_status until explicitly
+    // retried or attempted again during cleanup.
     //
     // It is the shared flag rather than a local, so exactly one piece of
     // state answers "are outputs latched off" for both the loop and the
@@ -2552,17 +2642,8 @@ async fn run_loop_async(
             // never be written at all.
             if watchdog_tripped.load(Ordering::Relaxed) {
                 if let Some(dev) = devices.last_mut() {
-                    match dev.enter_failsafe().await {
-                        Ok(()) => tracing::warn!(
-                            device = %name,
-                            "device joined while the watchdog was latched — put \
-                             straight into failsafe instead of going live"
-                        ),
-                        Err(e) => tracing::error!(
-                            device = %name, %e,
-                            "failsafe on a device adopted under a latched watchdog failed"
-                        ),
-                    }
+                    begin_failsafe_attempts(&failsafe_status, [name.as_str()]);
+                    let _ = attempt_device_failsafe(dev.as_mut(), &failsafe_status).await;
                 }
             }
         }
@@ -2683,21 +2764,47 @@ async fn run_loop_async(
                 }
                 RuntimeCommand::LatchOutputsOff { reason, ack } => {
                     let newly = !watchdog_tripped.load(Ordering::Relaxed);
+                    let targets: Vec<String> = if newly {
+                        devices.iter().map(|dev| dev.name().to_string()).collect()
+                    } else {
+                        failsafe_status
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .as_ref()
+                            .map(|status| {
+                                status
+                                    .unconfirmed
+                                    .iter()
+                                    .map(|e| e.device.clone())
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    };
+                    begin_failsafe_attempts(&failsafe_status, targets.iter().map(String::as_str));
                     if newly {
-                        tracing::error!(
-                            %reason,
-                            "outputs latched off on request — engaging failsafe (outputs \
-                             zeroed and held off; restart the program to re-arm)"
-                        );
-                        for dev in devices.iter_mut() {
-                            if let Err(e) = dev.enter_failsafe().await {
-                                tracing::warn!(device = %dev.name(), %e, "latch-off failsafe call failed");
-                            }
-                        }
-                        note_latch_reason(&latch_reason, reason);
-                        watchdog_tripped.store(true, Ordering::Relaxed);
+                        note_latch_reason(&latch_reason, reason.clone());
+                        // Publish inhibition before awaiting any adapter. A
+                        // failed or panicking safe-value call never re-arms it.
+                        watchdog_tripped.store(true, Ordering::Release);
+                        tracing::error!(%reason, "outputs inhibited on request; requesting adapter safe values");
                     }
-                    let _ = ack.send(newly);
+                    for dev in devices.iter_mut() {
+                        if targets.iter().any(|name| name == dev.name()) {
+                            let _ = attempt_device_failsafe(dev.as_mut(), &failsafe_status).await;
+                        }
+                    }
+                    let errors = failsafe_status
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                        .map(|status| status.unconfirmed.clone())
+                        .unwrap_or_default();
+                    let result = if errors.is_empty() {
+                        Ok(newly)
+                    } else {
+                        Err(OutputLatchError::FailsafeUnconfirmed { errors })
+                    };
+                    let _ = ack.send(result);
                 }
                 RuntimeCommand::InjectScanStall {
                     stall_ms,
@@ -2881,6 +2988,7 @@ async fn run_loop_async(
                     break;
                 }
                 Ok(ScanOutcome::BudgetExceeded(budget)) => {
+                    begin_failsafe_attempts(&failsafe_status, devices.iter().map(|dev| dev.name()));
                     note_latch_reason(
                         &latch_reason,
                         format!(
@@ -2889,7 +2997,7 @@ async fn run_loop_async(
                             budget.describe()
                         ),
                     );
-                    watchdog_tripped.store(true, Ordering::Relaxed);
+                    watchdog_tripped.store(true, Ordering::Release);
                     record_fault(
                         fault,
                         format!(
@@ -2912,8 +3020,8 @@ async fn run_loop_async(
                     );
                     // One faulted unit stops the whole plant — consistent
                     // with pause semantics ("the plant freezes together")
-                    // and the safest default; the wrapper's failsafe pass
-                    // then zeroes every output.
+                    // and the safest default; the wrapper then attempts
+                    // each adapter's configured safe values.
                     scan_aborted = true;
                     break;
                 }
@@ -2922,12 +3030,10 @@ async fn run_loop_async(
 
             // Output phase: this unit's VM variables → bus.
             //
-            // Skipped entirely once the watchdog has latched. `enter_failsafe`
-            // zeroed the output mirror; the cyclic bus thread keeps flushing
-            // that mirror every cycle, so leaving it alone is what holds the
-            // outputs safe. Writing here would overwrite the zeros on the very
-            // next scan — which is exactly the bug this guard closes. The scan
-            // itself keeps running so operators still see live state.
+            // Once inhibited, never overwrite an adapter's requested safe
+            // values with normal VM output. This guard also holds when its
+            // safe-value attempt failed; failsafe_status reports that result
+            // separately. Adapter workers retain their own transport behavior.
             if !watchdog_tripped.load(Ordering::Relaxed) {
                 for rm in &unit_outputs[i] {
                     let Ok(raw) = runnings[i].read_variable_raw(VarIndex::new(rm.var_index)) else {
@@ -2995,16 +3101,11 @@ async fn run_loop_async(
                         consecutive = clocks[i].consecutive_overruns,
                         threshold = WATCHDOG_OVERRUN_THRESHOLD,
                         interval_us = clocks[i].interval.as_micros() as u64,
-                        "watchdog tripped — engaging failsafe (outputs zeroed \
-                         and latched off; restart the program to re-arm)"
+                        "watchdog tripped — inhibiting ordinary outputs and requesting \
+                         adapter safe values; restart the program to re-arm"
                     );
-                    for dev in devices.iter_mut() {
-                        if let Err(e) = dev.enter_failsafe().await {
-                            tracing::warn!(device = %dev.name(), %e, "watchdog failsafe call failed");
-                        }
-                    }
-                    // Latch: from here on the output phase is skipped, so the
-                    // zeros just written stay on the bus until a restart.
+                    begin_failsafe_attempts(&failsafe_status, devices.iter().map(|dev| dev.name()));
+                    // Inhibit ordinary writes before any safe-value attempt.
                     note_latch_reason(
                         &latch_reason,
                         format!(
@@ -3012,7 +3113,10 @@ async fn run_loop_async(
                             clocks[i].consecutive_overruns, instances[i]
                         ),
                     );
-                    watchdog_tripped.store(true, Ordering::Relaxed);
+                    watchdog_tripped.store(true, Ordering::Release);
+                    for dev in devices.iter_mut() {
+                        let _ = attempt_device_failsafe(dev.as_mut(), &failsafe_status).await;
+                    }
                 }
                 clocks[i].next_due = after + clocks[i].interval;
             }
@@ -3301,6 +3405,7 @@ mod tests {
 
     include!("runtime_regressions.rs");
     include!("runtime_pulse_tests.rs");
+    include!("runtime_latch_tests.rs");
 
     /// Records the order of the safety-critical shutdown callbacks so a
     /// test can assert `enter_failsafe` runs before `shutdown` — the
@@ -4663,8 +4768,9 @@ mod tests {
         }
     }
 
-    /// P1 power-on gate: once the scan watchdog trips, no non-zero output
-    /// may reach the bus until an explicit restart.
+    /// Regression gate: once the scan watchdog trips, the normal output
+    /// phase must not write again until an explicit restart. This uses
+    /// a local adapter and makes no statement about a physical bus.
     ///
     /// Before the latch existed this failed by design: `enter_failsafe`
     /// zeroed the output mirror exactly once, the trip flag only stopped

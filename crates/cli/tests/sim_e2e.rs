@@ -517,6 +517,72 @@ fn copy_dir(src: &PathBuf, dst: &PathBuf) {
 }
 
 #[test]
+fn watchdog_scenario_reports_adapter_acknowledgement_separately_from_inhibition() {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("watchdog_latch");
+    copy_dir(&repo_root().join("examples/watchdog_latch"), &proj);
+    // A slower task keeps the negative timing control reliable on loaded
+    // development hosts. The injected 25 ms stalls still exceed this interval.
+    let tasks = proj.join("tasks.toml");
+    std::fs::write(
+        &tasks,
+        std::fs::read_to_string(&tasks)
+            .unwrap()
+            .replace("interval_ms = 2", "interval_ms = 10"),
+    )
+    .unwrap();
+    let config: toml::Value =
+        toml::from_str(&std::fs::read_to_string(proj.join("devices/servo.toml")).unwrap()).unwrap();
+    assert_eq!(config["nic"].as_str(), Some("_sim"));
+    let server = spawn_server(tmp.path());
+    server.open_project(&proj);
+    cs(&server.base)
+        .args(["--project", "watchdog_latch", "project", "check"])
+        .arg(&proj)
+        .assert()
+        .success();
+    cs(&server.base)
+        .args(["--project", "watchdog_latch", "sim", "run"])
+        .arg(proj.join("scenarios/acknowledgement.toml"))
+        .arg("--keep-running")
+        .assert()
+        .success();
+    let output = cs(&server.base)
+        .args([
+            "--project",
+            "watchdog_latch",
+            "api",
+            "GET",
+            "/api/runtime/status",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let status: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(status["watchdog_tripped"], true);
+    assert!(status["latch_reason"]
+        .as_str()
+        .unwrap()
+        .starts_with("scan watchdog:"));
+    assert_eq!(status["failsafe_status"]["pending"], serde_json::json!([]));
+    assert_eq!(
+        status["failsafe_status"]["unconfirmed"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        status["failsafe_status"]["acknowledged"],
+        serde_json::json!(["servo"])
+    );
+    // This is an in-memory adapter acknowledgement, not a fieldbus result.
+    cs(&server.base)
+        .args(["--project", "watchdog_latch", "api", "POST", "/api/stop"])
+        .assert()
+        .success();
+}
+
+#[test]
 fn unavailable_device_has_stale_inputs_and_an_acknowledgeable_default_alarm() {
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("device_health");

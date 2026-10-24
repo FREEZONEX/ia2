@@ -79,14 +79,14 @@ describe("derivePanelHealth", () => {
       { ...blind, alarmsLostForMs: 12_900, outputsLatchInMs: 32_600 },
       0,
     )
-    expect(counting.badge).toBe("ALARMS OFF · OUTPUTS OFF IN 32 s")
+    expect(counting.badge).toBe("ALARMS OFF · OUTPUT PHASE INHIBITED IN 32 s")
     expect(counting.text).toContain("(lost for 12 s)")
-    expect(counting.text).toContain("latches the outputs off in 32 s unless alarm evaluation returns")
+    expect(counting.text).toContain("inhibits the normal output phase in 32 s unless alarm evaluation returns")
     expect(counting.kind).toBe("alarms_blind")
 
     const due = derivePanelHealth({ ...blind, alarmsLostForMs: 45_100, outputsLatchInMs: 0 }, 0)
-    expect(due.badge).toBe("ALARMS OFF · OUTPUTS OFF NOW")
-    expect(due.text).toContain("latching the outputs off now")
+    expect(due.badge).toBe("ALARMS OFF · OUTPUT PHASE INHIBITED NOW")
+    expect(due.text).toContain("inhibiting the normal output phase now")
   })
 
   it("rounds the countdown down: a status that is a poll old errs towards sooner", () => {
@@ -197,12 +197,48 @@ describe("edge latch reason", () => {
       latch_reason: "alarm supervision lost for 30 s: the snapshot task has stopped",
     })
     expect(state.running).toBe(false)
-    expect(state.alarm).toBe(
-      "Outputs latched off — alarm supervision lost for 30 s: the snapshot task has stopped",
+    expect(state.alarm).toContain(
+      "Normal output phase inhibited — alarm supervision lost for 30 s: the snapshot task has stopped",
     )
+    expect(state.alarm).toContain("output state is unconfirmed")
     const health = derivePanelHealth(state, 0)
     expect(health.kind).toBe("fault")
     expect(health.text).not.toContain("Watchdog")
+  })
+
+  it("shows pending and rejected failsafes despite healthy transport", () => {
+    const state = edgeRuntimeState({
+      mode: { kind: "running" }, watchdog_tripped: true,
+      device_health: [{ name: "drive", healthy: true }],
+      failsafe_status: {
+        pending: ["coupler"], acknowledged: [],
+        unconfirmed: [{ device: "drive", error: "failsafe rejected" }],
+      },
+    })
+    const health = derivePanelHealth(state, 0)
+    expect(health.tone).toBe("alert")
+    expect(health.text).toContain("Pending: coupler")
+    expect(health.text).toContain("Unconfirmed: drive (failsafe rejected)")
+    expect(health.text).not.toContain("zeroed")
+  })
+
+  it("keeps program faults first without hiding failsafe state", () => {
+    const state = edgeRuntimeState({
+      fault: "VM trap: DivideByZero", watchdog_tripped: true,
+      failsafe_status: { pending: ["drive"], acknowledged: [], unconfirmed: [] },
+    })
+    expect(state.alarm).toMatch(/^VM trap: DivideByZero\./)
+    expect(state.alarm).toContain("Pending: drive")
+  })
+
+  it("describes successful calls as adapter acknowledgements only", () => {
+    const state = edgeRuntimeState({
+      watchdog_tripped: true,
+      failsafe_status: { pending: [], acknowledged: ["drive"], unconfirmed: [] },
+    })
+    expect(state.alarm).toContain("Adapter acknowledgements: drive")
+    expect(state.alarm).toContain("do not confirm wire or physical outputs")
+    expect(derivePanelHealth(state, 0).kind).toBe("fault")
   })
 })
 
@@ -275,7 +311,7 @@ describe("alarmsBlindReason", () => {
     expect(s.alarmsBlind).toContain("runtime reports that alarm evaluation is lost")
     const h = derivePanelHealth(s, 0)
     expect(h.kind).toBe("alarms_blind")
-    expect(h.badge).toBe("ALARMS OFF · OUTPUTS OFF IN 29 s")
+    expect(h.badge).toBe("ALARMS OFF · OUTPUT PHASE INHIBITED IN 29 s")
     // Not lost: `null` is not a banner.
     expect(
       edgeRuntimeState({

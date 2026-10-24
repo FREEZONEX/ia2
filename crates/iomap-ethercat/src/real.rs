@@ -722,10 +722,9 @@ impl IoDevice for RealEthercat {
     }
 
     /// Graceful teardown: signal the cyclic worker to stop and JOIN it.
-    /// By this point `enter_failsafe` has zeroed the output mirror, so the
-    /// worker's final flush (one last `tx_rx`) puts controlword = 0 on the
-    /// wire before it exits. Joining guarantees that frame was sent before
-    /// the master goes away — the whole point of the in-runtime failsafe.
+    /// After `enter_failsafe` clears the output mirror, the worker attempts
+    /// one final `tx_rx` before exiting. Joining confirms worker completion,
+    /// not successful transmission or physical output state.
     /// Bounded so a wedged bus can't stall the process past its kill
     /// timeout. The join runs on a blocking thread so we don't park the
     /// async executor on a std thread join.
@@ -738,7 +737,7 @@ impl IoDevice for RealEthercat {
                 .await
                 .unwrap_or(false);
         if joined {
-            tracing::info!(device = %self.name, "ethercat cyclic worker joined (final failsafe frame flushed)");
+            tracing::info!(device = %self.name, "ethercat cyclic worker joined; final frame delivery is unconfirmed");
         } else {
             tracing::warn!(
                 device = %self.name,
