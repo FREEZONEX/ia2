@@ -684,7 +684,8 @@ impl Drop for RealEthercat {
         // Don't join here — drop can run mid-teardown and must never block
         // the runtime. The worker exits on the next cycle tick. A clean
         // stop goes through `shutdown()` instead, which DOES join (after
-        // failsafe) so the zeroed frame is guaranteed on the wire.
+        // failsafe) and reports whether the worker's final zero-output
+        // exchange was acknowledged; a join alone does not say so.
     }
 }
 
