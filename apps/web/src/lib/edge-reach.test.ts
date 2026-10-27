@@ -14,6 +14,7 @@ function probe(patch: Partial<EdgeProbe> = {}): EdgeProbe {
     watchdog_tripped: false,
     fault: null,
     latch_reason: null,
+    failsafe_status: null,
     snapshot_tap: null,
     supervision: null,
     error: null,
@@ -51,7 +52,7 @@ describe("edgeReach", () => {
     expect(reach.kind).toBe("locked")
     expect(reach.detail).toContain("alarm supervision lost for 30 s")
     expect(reach.detail).not.toContain("Scan watchdog")
-    expect(edgeReach(probe({ watchdog_tripped: true })).detail).toContain("Scan watchdog")
+    expect(edgeReach(probe({ watchdog_tripped: true })).detail).toContain("Watchdog tripped")
   })
 
   it("names the down devices of a degraded edge", () => {
@@ -116,6 +117,42 @@ describe("edgeReach", () => {
       probe({ fault: "VM trap in main_inst: X", watchdog_tripped: true, unhealthy_devices: ["c"] }),
     )
     expect(reach.kind).toBe("faulted")
+    expect(reach.detail).toContain("acknowledgement unavailable")
+  })
+
+  it("keeps pending and rejected failsafe devices visible even when transport is healthy", () => {
+    const reach = edgeReach(probe({
+      watchdog_tripped: true,
+      failsafe_status: {
+        pending: ["coupler"], acknowledged: ["io"],
+        unconfirmed: [{ device: "drive", error: "failsafe rejected" }],
+      },
+    }))
+    expect(reach.kind).toBe("locked")
+    expect(reach.detail).toContain("Pending: coupler")
+    expect(reach.detail).toContain("Unconfirmed: drive (failsafe rejected)")
+    expect(reach.detail).toContain("Adapter acknowledgements: io")
+    expect(reach.detail).not.toContain("zeroed")
+  })
+
+  it("does not hide an unconfirmed report in a poll that has not seen the latch flag", () => {
+    expect(edgeReach(probe({
+      failsafe_status: { pending: ["drive"], acknowledged: [], unconfirmed: [] },
+    })).kind).toBe("degraded")
+  })
+
+  it("bounds acknowledgement to the adapter and treats legacy latch confirmation as unknown", () => {
+    const acknowledged = edgeReach(probe({
+      watchdog_tripped: true,
+      failsafe_status: { pending: [], acknowledged: ["drive"], unconfirmed: [] },
+    }))
+    expect(acknowledged.detail).toContain("Adapter acknowledgements: drive")
+    expect(acknowledged.detail).toContain("do not confirm wire or physical outputs")
+    expect(acknowledged.kind).toBe("locked")
+    const legacy = probe({ watchdog_tripped: true })
+    delete (legacy as Partial<EdgeProbe>).failsafe_status
+    expect(edgeReach(legacy).detail).toContain("output state is unconfirmed")
+    expect(edgeReach(legacy).detail).not.toContain("zeroed")
   })
 
   it("reports an unreachable edge with its error", () => {

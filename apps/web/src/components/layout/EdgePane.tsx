@@ -47,6 +47,7 @@ import { DocumentReloadButton, useDocumentDraft } from "@/lib/use-document-draft
 import type { DeployReport } from "@/types/generated/DeployReport"
 import type { Edge } from "@/types/generated/Edge"
 import type { EdgeProbe } from "@/types/generated/EdgeProbe"
+import { outputLatchMessage } from "@/lib/output-latch"
 import { edgeReach } from "@/lib/edge-reach"
 
 type EdgeTab = "config" | "logs" | "discover" | "system" | "debug"
@@ -152,6 +153,7 @@ function Editor({
         unhealthy_devices: [],
         watchdog_tripped: null,
         latch_reason: null,
+        failsafe_status: null,
         fault: null,
         snapshot_tap: null,
         supervision: null,
@@ -957,13 +959,14 @@ function ReachBadge({
       return (
         <StatusBadge className="bg-destructive/15 text-destructive" title={reach.detail}>
           <AlertCircle className="size-3" />
-          {reach.kind === "locked" ? "outputs locked" : reach.kind}
+          {reach.kind === "locked" ? "output phase inhibited" : reach.kind}
         </StatusBadge>
       )
   }
 }
 
 function StatusGrid({ probe }: { probe: EdgeProbe }) {
+  const latch = outputLatchMessage(probe)
   return (
     <dl className="ia2-field-grid text-[13px]">
       <Stat
@@ -989,6 +992,11 @@ function StatusGrid({ probe }: { probe: EdgeProbe }) {
       {probe.reachable && probe.fault && (
         <div className="col-span-full">
           <ErrorBox>Program stopped: {probe.fault}</ErrorBox>
+        </div>
+      )}
+      {probe.reachable && latch && (
+        <div className="col-span-full">
+          <ErrorBox>{latch}</ErrorBox>
         </div>
       )}
     </dl>

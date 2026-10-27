@@ -14,6 +14,8 @@ import type { DeviceHealth } from "@/types/generated/DeviceHealth"
 import type { RuntimeMode } from "@/types/generated/RuntimeMode"
 import type { SnapshotTapHealth } from "@/types/generated/SnapshotTapHealth"
 import type { SupervisionInForce } from "@/types/generated/SupervisionInForce"
+import type { FailsafeStatus } from "@/types/generated/FailsafeStatus"
+import { outputLatchMessage } from "@/lib/output-latch"
 
 import type { HmiRuntimeState } from "./host"
 
@@ -64,9 +66,9 @@ export function spanText(ms: number): string {
 function latchSentence(latchInMs: number | null | undefined): string {
   if (latchInMs == null) return ""
   if (latchInMs <= 0) {
-    return " The project's policy is latching the outputs off now."
+    return " The project's policy is inhibiting the normal output phase now."
   }
-  return ` The project's policy latches the outputs off in ${spanText(latchInMs)} unless alarm evaluation returns.`
+  return ` The project's policy inhibits the normal output phase in ${spanText(latchInMs)} unless alarm evaluation returns.`
 }
 
 export function derivePanelHealth(
@@ -100,8 +102,8 @@ export function derivePanelHealth(
         latchIn == null
           ? "ALARMS OFF"
           : latchIn <= 0
-            ? "ALARMS OFF · OUTPUTS OFF NOW"
-            : `ALARMS OFF · OUTPUTS OFF IN ${spanText(latchIn)}`,
+            ? "ALARMS OFF · OUTPUT PHASE INHIBITED NOW"
+            : `ALARMS OFF · OUTPUT PHASE INHIBITED IN ${spanText(latchIn)}`,
       text: `ALARMS NOT EVALUATED — ${state.alarmsBlind}${lost}. Treat the alarm list and live values as stale.${latchSentence(latchIn)}`,
     }
   }
@@ -139,9 +141,11 @@ export type EdgeStatus = {
   project?: string | null
   fault?: string | null
   watchdog_tripped?: boolean
-  /** Why the outputs are latched off, when `watchdog_tripped` is true (the
+  /** Why the normal output phase is inhibited, when `watchdog_tripped` is true (the
    *  scan watchdog, or the project's alarm-supervision policy). */
   latch_reason?: string | null
+  /** Adapter acknowledgements, not proof of wire or physical output state. */
+  failsafe_status?: FailsafeStatus | null
   mode?: RuntimeMode | null
   device_health?: DeviceHealth[] | null
   /** Fastest task interval in ms; absent on an older runtime. */
@@ -155,7 +159,7 @@ export type EdgeStatus = {
   snapshot_tap?: Partial<SnapshotTapHealth> | null
   /** The alarm-supervision policy in force and where it stands: how long alarm
    *  evaluation has been lost and, under `safe_state`, how long until the
-   *  outputs are latched off. Absent on a runtime that predates it. */
+   *  normal output phase is inhibited. Absent on a runtime that predates it. */
   supervision?: Partial<SupervisionInForce> | null
 }
 
@@ -183,13 +187,10 @@ export function alarmsBlindReason(
  *  a version skew degrades to the pre-mode behaviour, not to a false
  *  "Stopped". */
 export function edgeRuntimeState(s: EdgeStatus): HmiRuntimeState {
+  const latch = outputLatchMessage(s)
   return {
-    running: !s.watchdog_tripped && s.fault == null && (s.mode == null || s.mode.kind === "running"),
-    alarm: s.watchdog_tripped
-      ? s.latch_reason
-        ? `Outputs latched off — ${s.latch_reason}`
-        : "Watchdog tripped — outputs are locked"
-      : s.fault ?? null,
+    running: !latch && s.fault == null && (s.mode == null || s.mode.kind === "running"),
+    alarm: [s.fault, latch].filter(Boolean).join(". ") || null,
     mode: s.mode?.kind,
     scanPeriodMs: s.scan_period_ms ?? null,
     unhealthyDevices: (s.device_health ?? [])

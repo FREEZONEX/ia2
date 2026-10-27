@@ -232,8 +232,8 @@ gate on health must read `fieldbus_healthy` / `unhealthy_devices` from
 
 `watchdog_tripped` is the third field such a gate must read, and the
 nastiest: a latched runtime is reachable AND fieldbus-healthy AND its scan
-count keeps climbing, while it drives nothing. `probe` prints
-`WATCHDOG LATCHED` for it, or `OUTPUTS LATCHED OFF — <reason>` when the runtime says
+count keeps climbing, while normal output publication is inhibited. `probe` prints
+`WATCHDOG LATCHED` for it, or `OUTPUT PHASE INHIBITED — <reason>` when the runtime says
 something else latched them (the project's `[supervision] safe_state` policy, an
 execution-budget trap): `latch_reason` in `cs probe --json`. Only a restart clears it.
 
@@ -312,3 +312,14 @@ cs project open <path> | close
 cs agent run --label "..." -- bash -c '...'    # REQUIRED wrapper for multi-step work
 cs agent enter --label "..." / cs agent leave  # script-managed session variant
 ```
+
+
+### Output latch confirmation
+
+When reading runtime status or `cs probe`, distinguish `watchdog_tripped`
+(normal output publication inhibited) from `failsafe_status` (per-adapter
+safe-value attempts). Its `pending` names and `unconfirmed` device/error rows
+require attention even when transport health is good. `acknowledged` has the
+adapter's scope, not physical readback; `null` is no report. Check device health
+for configured adapters that never connected. Restart remains the existing
+re-arm boundary. Do not describe a latch flag as proof that every output is zero.

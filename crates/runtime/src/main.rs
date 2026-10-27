@@ -651,12 +651,11 @@ async fn main() -> Result<()> {
     wait_for_shutdown(shutdown).await;
 
     // ---- Safety-critical shutdown ----
-    // Stop the scan loop, drive every device to failsafe (zero outputs —
-    // for a servo that's controlword=0 / Disable Voltage), and JOIN the
-    // EtherCAT cyclic thread so that zeroed frame is actually on the wire
-    // before we exit. `handle.shutdown()` blocks until the scan thread has
-    // done all of that. Bounded so a wedged bus can't hold us past the
-    // service supervisor's kill timeout.
+    // Stop the scan loop, attempt each adapter's configured safe values,
+    // and join its owned workers before exiting. Completion is not wire
+    // delivery or physical readback; failures remain in the report and logs.
+    // Bounded so a wedged bus can't hold us past the service supervisor's
+    // kill timeout.
     tracing::info!(
         "shutdown signalled; draining bridge (stop scan loop -> failsafe -> join fieldbus)"
     );
@@ -750,6 +749,9 @@ struct Health {
     /// alarm-supervision policy (see `alarms.toml`). `null` while they are
     /// not latched.
     latch_reason: Option<String>,
+    /// Per-adapter pending/acknowledged/unconfirmed safe-value attempts.
+    /// Adapter acknowledgement does not establish physical safety.
+    failsafe_status: Option<ironplc_bridge::FailsafeStatus>,
     /// Whether history, process alarms and `scan_count` are still being fed
     /// from the scan loop. The scan loop is a separate thread: when this
     /// task stops, or fails on every snapshot, the program keeps running and
@@ -801,6 +803,7 @@ fn health_of(
         watchdog_tripped: handle.watchdog_tripped(),
         fault: handle.fault(),
         latch_reason: handle.latch_reason(),
+        failsafe_status: handle.failsafe_status(),
         snapshot_tap,
         supervision,
     }
@@ -1001,13 +1004,9 @@ struct Status {
     /// entry means that device's input variables in `last_snapshot` are
     /// frozen at last-known values (link down or connect failed).
     device_health: Vec<DeviceHealth>,
-    /// `true` once the scan watchdog tripped: the program lost real-time
-    /// guarantees, every output was zeroed and the output phase is latched
-    /// off until this process restarts.
-    ///
-    /// Check this before reading `last_snapshot` as plant state. The VM keeps
-    /// computing and `scan_count` keeps climbing after a trip, so a poller
-    /// watching only values sees a healthy plant while the bus holds zeros.
+    /// Normal output publication is inhibited until this run is restarted.
+    /// The VM may keep computing; safe-value attempts are reported separately
+    /// in `failsafe_status` and do not prove physical safety.
     watchdog_tripped: bool,
     /// Fastest task interval in ms — the cadence at which `scan_count` can
     /// advance, since it is the max across units. A client judging "is this
@@ -1050,6 +1049,8 @@ struct Status {
     alarms_standing: usize,
     /// Why the outputs are latched off; see `/health`.
     latch_reason: Option<String>,
+    /// Same per-adapter acknowledgement report as `/health`.
+    failsafe_status: Option<ironplc_bridge::FailsafeStatus>,
     /// The alarm-supervision policy in force; see `/health`.
     supervision: monitor::SupervisionInForce,
     /// Same as `/health`'s `snapshot_tap`. Read it before trusting
@@ -1090,6 +1091,7 @@ async fn status(State(state): State<AppState>) -> Json<Status> {
         fault: state.handle.fault(),
         alarms_standing,
         latch_reason: state.handle.latch_reason(),
+        failsafe_status: state.handle.failsafe_status(),
         supervision: state.supervision.in_force(),
         snapshot_tap: state.tap.health(),
     })
@@ -2132,6 +2134,7 @@ mod tests {
             serde_json::to_value(health_of(&handle, 0, 1, healthy.clone(), default_policy()))
                 .unwrap();
         assert_eq!(before["watchdog_tripped"], false);
+        assert!(before["failsafe_status"].is_null());
         assert!(
             before["latch_reason"].is_null(),
             "present and null: {before}"
@@ -2144,6 +2147,11 @@ mod tests {
         let after =
             serde_json::to_value(health_of(&handle, 0, 1, healthy, default_policy())).unwrap();
         assert_eq!(after["watchdog_tripped"], true);
+        assert_eq!(after["failsafe_status"]["pending"], serde_json::json!([]));
+        assert_eq!(
+            after["failsafe_status"]["unconfirmed"],
+            serde_json::json!([])
+        );
         assert_eq!(after["latch_reason"], "alarm supervision lost for 30 s");
         tokio::time::timeout(std::time::Duration::from_secs(5), handle.shutdown())
             .await

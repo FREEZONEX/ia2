@@ -93,10 +93,12 @@ prompts — the IDE runs `ssh -o BatchMode=yes`).
    updating, but the down device's inputs are frozen at last-known values
    and its outputs are dropped. A red `faulted` badge means the runtime
    answers but its program stopped (a VM trap, say) — hover it, or read
-   the status grid, for the reason. A red `outputs locked` badge means the
+   the status grid, for the reason. A red `output phase inhibited` badge means the
    outputs are latched off, by the scan watchdog or by the project's
-   alarm-supervision policy (the badge says which): every output is zeroed and
-   held off until the program is restarted. An ochre `degraded` badge also covers a runtime
+   alarm-supervision policy (the badge says which): normal output publication is
+   inhibited until restart. The badge also reports pending/unconfirmed device
+   safe-value attempts; adapter acknowledgements do not establish physical safety.
+   An ochre `degraded` badge also covers a runtime
    whose snapshot task has ended or is stuck on one snapshot: the program and
    the buses are fine, but history is not recording and process alarms are not
    being evaluated (`/health`'s `snapshot_tap.running` is `false`, or
@@ -311,6 +313,21 @@ the remaining writes to keep shutdown bounded. A later transport failure
 takes precedence over an earlier protocol rejection. Neither case is
 reported as “outputs in failsafe”.
 
+For a live run, `/health` and `/status` expose `failsafe_status` separately from
+`watchdog_tripped`: `pending` device names, `acknowledged` adapter names, and
+`unconfirmed` entries with `device` and `error`. The probe, CLI and operator
+views carry the same report. `null` means no report, not confirmed safe. Check
+`device_health` for configured devices that never connected. Acknowledgement
+has the adapter's scope: for EtherCAT it confirms mirror preparation for a
+later exchange, not a transmission fence. Safe values for opted-in OPC UA or
+CANopen channels may be nonzero. No physical readback is implied.
+
+A rejected explicit latch request still inhibits normal outputs and returns an
+error. Another explicit request retries only unconfirmed devices, preserving
+the original latch reason. This does not add automatic retries or re-arming.
+The IDE clears its live report when it releases a stopped handle; teardown
+logs remain the evidence for that run.
+
 ## EtherCAT mode selection
 
 `iomap-ethercat` picks between two implementations based on the device
@@ -406,10 +423,11 @@ grace_secs = 30         # 1..=3600; ignored for "report"
   hazard), so the runtime does not decide it. Choose `safe_state` only where
   losing alarm evaluation is the more dangerous of the two.
 - **`safe_state`** latches the outputs off once alarm evaluation has been lost
-  for `grace_secs` in a row, exactly like a scan-watchdog trip: every device
-  goes into failsafe and no further output is written, while the loop keeps
-  scanning so the live state stays visible. `/health` and `/status` say why
-  (`latch_reason`). It is never undone automatically and never done by
+  for `grace_secs` in a row, exactly like a scan-watchdog trip: normal output
+  publication is inhibited and each owned device receives a failsafe attempt,
+  while the loop keeps scanning so the live state stays visible. Safe writes
+  can be pending or rejected; `/health` and `/status` expose `failsafe_status`
+  and say why (`latch_reason`). It is never undone automatically and never done by
   restarting the process: a person restarts the program to re-arm.
   A loss that clears inside the grace starts the clock over.
 - **Deploy refuses an `alarms.toml` it cannot read**, and a `[supervision]`

@@ -241,3 +241,11 @@ max = 100.0
 - **`force` bypasses governance by explicit decision** (ADR-0002): it stays the pure debug override and is never exported on any northbound surface. Mechanically, force only sticks on variables the program *reads* — which includes setpoints (see 02's force-precedence note) — but in a governed project, drive governed setpoints through writes so the clamps apply. Forcing a governed variable is a deliberate ungoverned override: it is attributed on the takeover overlay like any other mutating call, recorded in the edge audit ring, and belongs to commissioning/debug, not to normal operation.
 - Sim scenarios can assert governance directly: a `set` step to an unlisted variable fails the step with the 403 reason, and a `set` past a rule's bound followed by an `expect` reads back the clamped bound (the `set` itself discards the response) — both deterministic offline proofs.
 - Variable `unit`/`min`/`max`/`description` **metadata** (iomap.toml `[[mappings]]`, see `06-devices-iomap-tasks.md`) is documentation for generated surfaces; the `[governance]` rules here are the enforcement. Keep them consistent when both exist.
+
+
+Runtime output-latch status carries `failsafe_status` separately from
+`watchdog_tripped`: pending attempts, adapter acknowledgements, and unconfirmed
+device/error rows. Panels show these results alongside the latch cause; a
+healthy transport or latch flag is not proof of physical safety. Simulated
+acknowledgement verifies the software contract only. An omitted/null report
+means acknowledgement is unavailable, not that every device was confirmed.

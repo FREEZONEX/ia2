@@ -112,9 +112,9 @@ pub struct EdgeProbe {
     /// caller can say *which* bus died without a second round trip.
     pub unhealthy_devices: Vec<String>,
     /// `Some(true)` when the edge's scan watchdog has latched its outputs
-    /// off. Such a runtime is reachable AND `fieldbus_healthy` — it answers
-    /// HTTP and keeps scanning — while driving nothing, so a script that
-    /// gates only on those two would call a dead plant healthy. `None` when
+    /// off. Such a runtime can remain reachable AND `fieldbus_healthy`
+    /// while normal output publication is inhibited. Device safe-value
+    /// acknowledgement is separate in `failsafe_status`. `None` when
     /// unreachable, or when the edge runs a build predating the flag.
     pub watchdog_tripped: Option<bool>,
     /// Why the outputs are latched off, when `watchdog_tripped` is true: the
@@ -124,6 +124,9 @@ pub struct EdgeProbe {
     /// build that predates the field (which could only have latched by the
     /// scan watchdog).
     pub latch_reason: Option<String>,
+    /// Latest per-adapter safe-value attempts; null on older runtimes or
+    /// before an attempt. Does not establish physical safety or wire delivery.
+    pub failsafe_status: Option<ironplc_bridge::FailsafeStatus>,
     /// Why the edge's program stopped (a VM trap, say), when it did. Such a
     /// runtime is reachable — it answers HTTP — while running nothing, so
     /// like `watchdog_tripped` this must be read before calling the edge
@@ -306,6 +309,7 @@ fn unreachable_probe(error: String) -> EdgeProbe {
         unhealthy_devices: vec![],
         watchdog_tripped: None,
         latch_reason: None,
+        failsafe_status: None,
         fault: None,
         snapshot_tap: None,
         supervision: None,
@@ -336,6 +340,8 @@ fn probe_from_health_body(body: &str) -> EdgeProbe {
         /// Absent on an older edge build, which reads as "none reported".
         #[serde(default)]
         latch_reason: Option<String>,
+        #[serde(default)]
+        failsafe_status: Option<ironplc_bridge::FailsafeStatus>,
         /// Absent on an older edge build, which reads as "none reported".
         #[serde(default)]
         fault: Option<String>,
@@ -366,6 +372,7 @@ fn probe_from_health_body(body: &str) -> EdgeProbe {
             .collect(),
         watchdog_tripped: parsed.watchdog_tripped,
         latch_reason: parsed.latch_reason,
+        failsafe_status: parsed.failsafe_status,
         fault: parsed.fault,
         snapshot_tap: parsed.snapshot_tap,
         supervision: parsed.supervision,
@@ -2239,6 +2246,30 @@ mod tests {
             older.latch_reason, None,
             "unknown, and the old wording stands"
         );
+    }
+
+    #[test]
+    fn probe_preserves_unconfirmed_failsafe_on_a_healthy_transport() {
+        let probe = probe_from_health_body(
+            r#"{"status":"ok","uptime_secs":9,"scan_count":4,
+                "fieldbus_healthy":true,"watchdog_tripped":true,
+                "failsafe_status":{"pending":["coupler"],"acknowledged":["sensor"],
+                    "unconfirmed":[{"device":"drive","error":"protocol rejection"}]}}"#,
+        );
+        assert!(probe.reachable);
+        assert_eq!(probe.fieldbus_healthy, Some(true));
+        let report = probe.failsafe_status.unwrap();
+        assert_eq!(report.pending, vec!["coupler"]);
+        assert_eq!(report.acknowledged, vec!["sensor"]);
+        assert_eq!(report.unconfirmed[0].device, "drive");
+        assert_eq!(report.unconfirmed[0].error, "protocol rejection");
+        let older = probe_from_health_body(
+            r#"{"status":"ok","uptime_secs":9,"scan_count":4,"watchdog_tripped":true}"#,
+        );
+        assert!(older.failsafe_status.is_none());
+        assert!(unreachable_probe("offline".into())
+            .failsafe_status
+            .is_none());
     }
 
     #[tokio::test]
