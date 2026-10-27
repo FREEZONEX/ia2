@@ -1129,8 +1129,10 @@ fn spawn_units_with_grace(
             // physical state; paid once, on shutdown.
             tokio::time::sleep(Duration::from_millis(50)).await;
             // Graceful per-device teardown: request shutdown and join owned
-            // workers according to each adapter's contract. Runs on both the
-            // clean and panicked paths (before re-panic); errors are recorded.
+            // workers according to each adapter's contract. An adapter that
+            // closed cleanly but could not confirm its last output returns
+            // an error, which is counted below. Runs on both the clean and
+            // panicked paths (before re-panic); errors are recorded.
             let mut shutdown_failed = 0usize;
             for dev in devices.iter_mut() {
                 match isolate_device_call(dev.shutdown()).await {
