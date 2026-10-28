@@ -108,7 +108,7 @@ def derive(request, entry, events, samples, as_of_ms, registry_sha256=None):
         return _result('unknown', aid, 'no_feedback') if isinstance(deadline_ms, int) and as_of_ms > deadline_ms else _result('accepted', aid)
     lo_us, anchor_ms, target = ev.get('post_scan_us'), ev.get('scan_anchor_ms'), ev.get('requested_value')
     if not (type(lo_us) is int and type(anchor_ms) is int and type(deadline_ms) is int):
-        # e.g. an action concluded after a bridge restart: no scan-clock marker of the write exists, so no proof can be ordered after it
+        # A legacy/incomplete event without a write or recovery marker cannot order feedback after the action.
         return _result('unknown', aid, 'no_proof_by_deadline', detail='the accepted event has no scan-clock marker of the write')
     kind = entry.get('type')
     want, why_not = _requested_number(kind, target)

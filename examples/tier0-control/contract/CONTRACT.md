@@ -237,7 +237,7 @@ trace 使用无缓冲二进制写入，完成全部字节并同步之后才记�
 | 码 | 检查 |
 |---|---|
 | 2 | 注册表不是严格 JSON / 哈希不符 / 有非支持类型 / 有 `enabled` 且 `requires_approval` 的项；**密钥文件对组或其他人可读**；journal 链断了；**状态文件写不出**（P1） |
-| 3 | 工程目录里的 `northbound.toml` 没有明确写 `allow_write = false`（D6） |
+| 3 | 工程目录里的 `northbound.toml` 不可读、不是合法 TOML、`mqtt` 不是表，或显式 `mqtt.allow_write` 不是布尔 false；缺文件、缺表或省略字段沿用运行时 false 默认值（D6） |
 | 4 | 预检：能连上的 runtime 没有 `runtime_id`，或某个目标的反馈变量不在快照里 / 没有 `input.stale`。**不支持没有 `runtime_id` 的旧构建**（连不上则推迟，每个请求的 G8 仍会核） |
 | 5 | 注册表范围超出工程 `project.toml` 的 `[governance]`，或变量不在 allowlist（`--governance-check strict`，默认；`warn` 只记录，`off` 跳过） |
 | 6 | journal 比 trace 里最高的锚短，或同一序号的哈希不一致（journal 被截尾 / 重写） |
@@ -260,7 +260,7 @@ trace 使用无缓冲二进制写入，完成全部字节并同步之后才记�
 | D3 | 是否要人工批准层 | v0 **没有**；注册表预留 `requires_approval` | 现在就做批准层 | 预留字段在 v0 必须 **fail closed**：任何 `enabled` 且 `requires_approval=true` 的注册项使桥拒绝启动（新用例 F5）。阶段 3 的第一个真实目标仍要人工批准（README） |
 | D4 | 读侧合同升 v2 | **升**：新增 rejected / modified / undelivered 与 `claim` / `not_claimed`；v1 消费者按「非成功」处理 | 不升，把新状态折叠进 `unknown` | 读侧 `derive_action` 要**重写**而不是「扩充」：v1 从一条 `verified` 终态事件出发再查引用，v2 必须从 `accepted` 加观测出发，忽略任何 `verified` 声明（`DESIGN-1A.md` §4） |
 | D5 | 桥的部署形态 | grey0 上**独立用户服务**；独立 Tier0 密钥（仍是实例级权限）；CPU 亲和避开 {5,6,7,13,14,15} | 与只读采集器同进程 / 同服务 | 阶段 2 才用；1a 在 Mac 上不涉及 |
-| D6 | 现役工程的 `northbound.toml` 是否启用 `allow_write` | 部署前只读核对；桥启动自检**拒绝**在 `allow_write = true` 的工程上运行 | 不自检 | `1c42df7` 的 runtime 源码里 `/health`、`/status` 不暴露北向状态（核对过 `main.rs`），所以自检只能读部署目录里的 `northbound.toml`，见 `DESIGN-1A.md` §3.6。C10 改为这项自检；新增原因码 `northbound_write_enabled` |
+| D6 | 现役工程的 `northbound.toml` 是否启用 `allow_write` | 部署前只读核对；桥启动及逐请求解析 TOML，**拒绝**显式 `mqtt.allow_write` 不为布尔 false 或无法解析的配置 | 不自检 | `1c42df7` 的 runtime 源码里 `/health`、`/status` 不暴露北向状态（核对过 `main.rs`），所以自检只能读部署目录里的 `northbound.toml`，见 `DESIGN-1A.md` §3.6。缺文件、表或字段按运行时缺省 false 处理；转义键和字符串内 `#` 由完整解析器处理，不作文本匹配。C10 改为这项自检；新增原因码 `northbound_write_enabled` |
 | D7 | 标签里嵌 action 前 8 位 | **嵌**：`tier0.<agent>.<id8>` | 固定标签 | 对账用；代价是 IDE 横幅每个不同标签闪一次（文档已说明） |
 | D8 | 崩溃恢复后，对「有意图、`/audit` 里查无条目」的动作 | (a) **不补发**，保持 `unknown` | (b) deadline 内、实例未变时补发一次 | v0 不实现补发路径；R1 只跑 (a) |
 | D9 | 注册表文件格式 | **JSON**（零依赖；Mac 的 Python 3.9.6 没有 `tomllib`） | TOML | §3.2 已改；解析器拒绝重复键与未知字段 |

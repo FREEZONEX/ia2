@@ -20,6 +20,9 @@ def build(dest):
     os.makedirs(os.path.join(dest, 'bridge'))
     for name in ('bridge_run.py', 'contract_vocab.json'):
         shutil.copy(os.path.join(ROOT, name), os.path.join(dest, name))
+    # Preserve the pinned parser, provenance and license in the standalone copy.
+    shutil.copytree(os.path.join(ROOT, 'bridge', '_vendor'), os.path.join(dest, 'bridge', '_vendor'),
+                    ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
     for name in sorted(os.listdir(os.path.join(ROOT, 'bridge'))):
         if not name.endswith('.py') or name in LAB_ONLY_FILES:
             continue

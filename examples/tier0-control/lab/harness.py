@@ -571,9 +571,11 @@ def tree_hash(paths):
 def code_files():
     out = []
     for base in ('bridge', 'lab'):
-        for name in sorted(os.listdir(os.path.join(ROOT, base))):
-            if name.endswith('.py'):
-                out.append('%s/%s' % (base, name))
+        for directory, dirs, names in os.walk(os.path.join(ROOT, base)):
+            dirs[:] = sorted(d for d in dirs if d != '__pycache__')
+            for name in sorted(names):
+                if name.endswith('.py'):
+                    out.append(os.path.relpath(os.path.join(directory, name), ROOT).replace(os.sep, '/'))
     return out + ['bridge_run.py', 'contract_vocab.json']
 
 

@@ -14,7 +14,7 @@ Trace writes handle short writes, remove an uncommitted suffix before retry, and
 
 ## Run the tests
 
-Python 3.8+ standard library on macOS or Linux; no package installation is required. The recorded acceptance used Python 3.9.6. The process tests use loopback sockets, POSIX file locks and subprocess signals.
+Python 3.8+ on macOS or Linux; no package installation is required. The example bundles the unmodified pure Python [Tomli 2.2.1 parser](https://pypi.org/project/tomli/2.2.1/) under `bridge/_vendor/tomli`, including its MIT license, source archive hash and per-file hashes in `SOURCE.json`. All other imports use the standard library. The recorded acceptance used Python 3.9.6. The process tests use loopback sockets, POSIX file locks and subprocess signals.
 
 From the repository root:
 
@@ -23,7 +23,9 @@ python3 -I -B examples/tier0-control/tools/run_tests.py
 python3 -I -B examples/tier0-control/tools/check_failsafe_controls.py
 ```
 
-The first runner executes each suite in its own interpreter, writes logs under `evidence/unit/`, and fails if any suite fails. It covers 247 tests, including 14 IR03 regressions and 7 nullable-failsafe compatibility regressions. Legacy IR03 tests use a small test-only reproduction of the previous publication semantics; they do not require an archived developer checkout. The original archived engine and process were also exercised during the independent repair acceptance. The second command verifies that three deliberately broken nullable-failsafe variants fail by assertion.
+The first runner executes each suite in its own interpreter, writes logs under `evidence/unit/`, and fails if any suite fails. It covers 253 tests, including 14 IR03 regressions, 7 nullable-failsafe compatibility regressions and 6 D6 TOML/parser/packaging regressions. Legacy IR03 tests use a small test-only reproduction of the previous publication semantics; they do not require an archived developer checkout. The original archived engine and process were also exercised during the independent repair acceptance. The second command verifies that three deliberately broken nullable-failsafe variants fail by assertion.
+
+D6 parses `northbound.toml` using TOML semantics at startup and before each new write. A missing file, omitted `mqtt` table or omitted `mqtt.allow_write` uses the runtime's disabled default. An explicit flag must be the boolean `false`, including when `mqtt.enabled` is false; malformed TOML, an invalid `mqtt` table or a flag of another type fails closed. Quoted/escaped keys, dotted keys, inline tables and `#` inside strings cannot hide enabled writes. Parser diagnostics are not exposed because configuration may contain credentials. The standalone production package includes the same parser and license.
 
 For the full runtime/fake-Modbus suite, build `ia2-runtime` with the repository's Rust toolchain (`cargo build --release -p ia2-runtime`), then run from this directory. The bridge supports current-runtime `failsafe_status: null` (no attempt yet), the older omitted extension, and a report containing exactly the three defined lists. A null report never overrides the other snapshot's report, the watchdog, latch, fault or device-health checks. Nonempty reports still block a write; malformed reports still fail closed.
 

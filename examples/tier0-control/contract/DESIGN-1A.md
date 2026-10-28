@@ -125,7 +125,7 @@ trace 事件由 journal 派生，`event_id` 是 `(action_id, seq)` 的确定性�
 
 `1c42df7` 的 runtime 里，`/health` 和 `/status` 不暴露北向状态（核对过 `main.rs`；`docs/api.md` 的 `/api/northbound` 是 IDE server 的接口，不是 edge runtime 的）。`allow_write` 在 `northbound.toml` 的 `[mqtt]` 表里，缺省 false（`types.rs` 已核）。所以桥只能读部署目录里的这个文件。
 
-Python 3.9 没有 TOML 解析器，**不解析，做保守的逐行检查**：去掉注释后，任何以 `allow_write` 开头的行，其值必须恰为 `false`，否则拒绝；读不了拒绝；文件不存在则通过（runtime 把缺文件当北向关闭）。漏判（以为关其实开）才危险，误判只是多拦一次。
+2026-10-28 D6 复查发现，逐行文本检查会漏判合法的转义键及字符串内 `#`，因此改用随桥携带的固定版本 Tomli 2.2.1 完整解析 TOML。文件不存在、没有 `mqtt` 表或省略 `mqtt.allow_write` 时按运行时缺省 false 处理；显式值必须是布尔 false，即使 `mqtt.enabled` 为 false 也不豁免。TOML 无效、`mqtt` 不是表、写权限字段类型错误或文件不可读均拒绝。启动与每次新请求使用同一检查；错误消息不包含可能泄露凭据的解析器原文。解析器源码、许可证及来源哈希一并进入生产包，不要求额外安装 Python 依赖。
 
 触发时机：启动；`runtime_id` 变化；每次 G8 之前顺手比对文件哈希。
 

@@ -10,8 +10,8 @@ Implementation notes that differ from or sharpen the contract text (see RESULT-S
   * A request with the same action_id but different bytes gets a `conflict_notice` event; it never touches the status
     of the original action.  Unauthenticated lines are journaled only (their claimed action_id is not trusted).
   * Crash recovery never resends (D8).  It concludes an in-flight action from what IA2 recorded (the journal's response
-    record, else /audit by label).  An action concluded from /audit alone has no send marker, so the read side can never
-    verify it: v0 prefers "unknown" to a proof it cannot bound in time.
+    record, else /audit by label). An action concluded from /audit alone has no send timestamp, but can carry a scan-clock
+    marker taken at recovery on the same runtime instance; only feedback after that marker can verify it.
   * Writes that ended `unknown` for a transport/VM reason get `reconcile_note`s (two looks, the second after a pause): landed /
     not seen / unverifiable.  The status itself never changes: terminal states do not upgrade.
   * `accepted` events carry the runtime's own scan clock at the first post-write /status read (`post_scan_us`) and the offset between

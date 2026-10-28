@@ -1,15 +1,16 @@
 """D6: the bridge refuses to run against a project whose northbound.toml enables MQTT writes.
 
-The runtime exposes no northbound state over HTTP, and Python 3.9 has no TOML parser, so this does not parse: it
-looks at every non-comment line that mentions allow_write and demands the literal `false`.  Anything else (true,
-odd spellings, an unreadable file) refuses.  A missing file means northbound is off (as the runtime treats it)."""
+The runtime exposes no northbound state over HTTP. Parse the deployed TOML with
+the bundled TOML 1.0 parser, including quoted keys, strings and inline tables.
+An omitted mqtt/allow_write uses the runtime's disabled default; an explicit
+value must be the boolean false, even if mqtt.enabled is false. Malformed TOML,
+wrong field types and unreadable files refuse. A missing file is northbound off.
+"""
 import hashlib
 import os
-import re
 
 from .errors import Reject
-
-FALSE_FORM = re.compile(r'allow_write["\']?\s*=\s*false\s*(,|\}|$)')
+from ._vendor.tomli import loads, TOMLDecodeError
 
 
 def fingerprint(project_dir):
@@ -33,8 +34,12 @@ def check(project_dir):
         return 'absent'
     except (OSError, UnicodeDecodeError):
         raise Reject('northbound_write_enabled', 'northbound.toml is unreadable') from None
-    for line in text.splitlines():
-        code = line.split('#', 1)[0]
-        if 'allow_write' in code and not FALSE_FORM.search(code):
-            raise Reject('northbound_write_enabled', 'northbound.toml does not say allow_write = false')
+    try:
+        doc = loads(text)
+    except (TOMLDecodeError, RecursionError):
+        # Parser diagnostics may include configuration values (e.g. passwords).
+        raise Reject('northbound_write_enabled', 'northbound.toml is not valid TOML') from None
+    mqtt = doc.get('mqtt', {})
+    if not isinstance(mqtt, dict) or mqtt.get('allow_write', False) is not False:
+        raise Reject('northbound_write_enabled', 'northbound.toml does not disable mqtt.allow_write')
     return hashlib.sha256(data).hexdigest()
