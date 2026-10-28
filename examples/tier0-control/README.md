@@ -20,17 +20,18 @@ From the repository root:
 
 ```sh
 python3 -I -B examples/tier0-control/tools/run_tests.py
+python3 -I -B examples/tier0-control/tools/check_failsafe_controls.py
 ```
 
-The runner executes each suite in its own interpreter, writes logs under `evidence/unit/`, and fails if any suite fails. It covers 240 tests, including 14 IR03 regressions. Legacy IR03 tests use a small test-only reproduction of the previous publication semantics; they do not require an archived developer checkout. The original archived engine and process were also exercised during the independent repair acceptance.
+The first runner executes each suite in its own interpreter, writes logs under `evidence/unit/`, and fails if any suite fails. It covers 247 tests, including 14 IR03 regressions and 7 nullable-failsafe compatibility regressions. Legacy IR03 tests use a small test-only reproduction of the previous publication semantics; they do not require an archived developer checkout. The original archived engine and process were also exercised during the independent repair acceptance. The second command verifies that three deliberately broken nullable-failsafe variants fail by assertion.
 
-For the full runtime/fake-Modbus suite, use the accepted `1c42df70d2581babbf79f0ba96726f61cb8a68f5` runtime listed in VALIDATION.md, then run from this directory. **Current `main` runtime compatibility is blocked:** it exposes `failsafe_status: null` before any failsafe attempt, which this reference's strict evidence schema rejects at startup. The schema adaptation is separate from IR03; do not disable preflight to bypass it.
+For the full runtime/fake-Modbus suite, build `ia2-runtime` with the repository's Rust toolchain (`cargo build --release -p ia2-runtime`), then run from this directory. The bridge supports current-runtime `failsafe_status: null` (no attempt yet), the older omitted extension, and a report containing exactly the three defined lists. A null report never overrides the other snapshot's report, the watchdog, latch, fault or device-health checks. Nonempty reports still block a write; malformed reports still fail closed.
 
 ```sh
-python3 -I -B lab/run_cases.py --bin /path/to/accepted/ia2-runtime --out evidence/e2e \
+python3 -I -B lab/run_cases.py --bin ../../target/release/ia2-runtime --out evidence/e2e \
   --cases A1,B1,B3,C1,A2,B2,B4,B6,B7,B8,B9,B11,C3,C4,C6,C8,E1,E2,E3,R1,R2,R3,F1,F2,PROD,P1F5,P1F6
 python3 -I -B tests/check_p0_crash_evidence.py evidence/e2e
-python3 -I -B lab/p0_bool_acceptance.py --bin /path/to/accepted/ia2-runtime
+python3 -I -B lab/p0_bool_acceptance.py --bin ../../target/release/ia2-runtime
 ```
 
 Use a new output directory for each integration run. Run integration suites serially: they own loopback ports 13501, 13502, 13503, 13511 and 13512. The runner exits nonzero for a FAIL or setup error and records source-tree and binary hashes. See [VALIDATION.md](VALIDATION.md) for the exact tested runtime revision and results; the historical R3 finding remains visible.

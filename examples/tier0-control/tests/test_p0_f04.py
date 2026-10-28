@@ -93,7 +93,7 @@ class Evidence(unittest.TestCase):
     def test_optional_failsafe_absent_clear_malformed_and_unmasked(self):
         for phase in ('pre','post','recovery'):
             for route in ('/status','/health'):
-                for value in (None,False,{},[],dict(CLEAR,pending=False)):
+                for value in (False,{},[],dict(CLEAR,pending=False)):
                     with self.subTest(phase=phase,route=route,value=value):
                         self.check_case(phase,[(route,'failsafe_status',value)])
             for active in ('/status','/health'):
@@ -101,8 +101,9 @@ class Evidence(unittest.TestCase):
                        for route in ('/status','/health')]
                 with self.subTest(phase=phase,active=active):
                     self.check_case(phase,edits,expected='rejected' if phase=='pre' else 'unknown')
-        # Positive controls: extension absent (supported binary) and both explicit empty schemas.
-        for edits in ([],[(r,'failsafe_status',CLEAR) for r in ('/status','/health')]):
+        # Positive controls: older binary omits the extension; current binary may return null.
+        for edits in ([],[(r,'failsafe_status',None) for r in ('/status','/health')],
+                      [(r,'failsafe_status',CLEAR) for r in ('/status','/health')]):
             with tempfile.TemporaryDirectory() as tmp:
                 clock=[1800000000000];client=EvidenceClient(clock,edits)
                 e=engine(tmp,clock,client=client);e.handle_line(envelope(payload(clock[0])))

@@ -144,7 +144,7 @@ Agent ◄── query_action_results   读侧；verified 只在这里由证据�
 | G5 去重 | 查 journal：无 → 继续；有且请求哈希相同 → **返回已记录的结果，不再写**；有但内容不同 → `conflicting_action_id`，以一条 `conflict_notice` 事件回报，**不改变原动作的状态**。**之后**：标签（D7 的 `tier0.<agent>.<id8>`）已被另一个动作使用 → `conflicting_action_id`（detail 说明是标签冲突），发送前拒绝；换一个 `action_id` 重发即可 |
 | G6 节流 | 全桥 ≤ 60 次写/分；目标的 `max_rate_per_min`、`min_interval_ms`；**单飞**：同一目标有未终结动作时拒 `busy`，不替换（未终结＝已发出未结论，或 `accepted` 且仍在 `min(deadline_ms, single_flight_ms)` 之内；`single_flight_ms` 是注册表字段，默认取 `verify.settle_ms`，无反馈通道为 2000，之后读侧已有结论）（`rate_limited` / `busy`） |
 | G7 急停开关 | `hold` 文件存在 → `held`。`hold` 只拒新请求，**不撤销**已发出的写 |
-| G8 IA2 状态 | 读 `/status`、`/health`，再读 `/status` 直到 `scan_count` 前进，最多等 `advance_wait_ms`（默认 600 ms）（任一读失败 → `runtime_unreachable`）：`status == "ok"` 且 `fault == null`；`watchdog_tripped == false` 且 `latch_reason == null`；`snapshot_tap.running == true`；`scan_count` 在该时限内前进（IA2 发布的 `scan_count` 约每 109 ms 才跳一步、一步 10–11 次扫描，不是每次扫描都变——2026-10-28 实测，见 §11.1；固定间隔读两次会随机误拒）；**若字段存在**（PR #96，未合并）`failsafe_status` 必须为 null 或三个列表全空，否则 `latched`。记下运行实例身份：优先 `runtime_id`（origin/main 的 `/status` 有；现役 HMI 试运行版没有），否则退回采集器用的"boot_id + PID + 进程启动时刻" |
+| G8 IA2 状态 | 读 `/status`、`/health`，再读 `/status` 直到 `scan_count` 前进，最多等 `advance_wait_ms`（默认 600 ms）（任一读失败 → `runtime_unreachable`）：`status == "ok"` 且 `fault == null`；`watchdog_tripped == false` 且 `latch_reason == null`；`snapshot_tap.running == true`；`scan_count` 在该时限内前进（IA2 发布的 `scan_count` 约每 109 ms 才跳一步、一步 10–11 次扫描，不是每次扫描都变——2026-10-28 实测，见 §11.1；固定间隔读两次会随机误拒）；**`failsafe_status` 扩展**：旧运行时可以省略；当前运行时在尚无尝试时返回 null；非 null 必须是恰含 `pending`、`acknowledged`、`unconfirmed` 三个列表的对象。格式错误 → `runtime_unreachable`；任一列表非空 → `latched`。null 不构成安全证明，也不覆盖另一份快照或 watchdog、锁存、故障、设备健康等独立检查。三个发送前快照分别检查。记下必需的 `runtime_id`；缺失时拒绝，不回退到其它身份组合 |
 | G9 目标状态 | `mode` 为运行中（`paused`）；目标不在 `forces` 里（`forced`）；`require_devices` 全部 `healthy`（`device_unhealthy`）；若 `require_fieldbus_healthy` 则 `fieldbus_healthy == true`（`fieldbus_unhealthy`） |
 
 **发送后检查**（读 `/status`、`/health`、`/audit`，每次读 2 s；写本身 3 s）：解析响应（见 §6）；再读一次 `/health`——仍未锁存、实例身份未变；按标签在 `/audit` 里找对应条目作**佐证**（找不到不算失败，见 §8）。
@@ -371,3 +371,4 @@ D11–D14 都**只有设计**（`DESIGN-D11-signed-events.md`），实现等独�
 | IR02（独立修复副本） | 2026-10-28 | §8.2 明确同步错误不得降级：接口存在时任何完整同步失败均传播；仅平台没有完整同步接口时用普通 fsync。IR03、D11、其它 P2 未修。 |
 | AR01（独立修复副本） | 2026-10-28 | §5 统一 CRLF／LF 头边界，拒绝完整头块中的裸 CR、解析残留 payload 与 Unix mailbox 分隔行，防止字段被静默丢弃。IR03、D11、其它 P2 未修。 |
 | IR03（独立修复副本） | 2026-10-28 | §8.2 区分终态发布失败与请求处理失败；终态可在同请求重放、启动及后台补发而不重发控制写；trace 修复未确认后缀与撕裂尾行。D11、其它 P2 未修。 |
+| nullable-failsafe 兼容性 | 2026-10-28 | G8 与当前 API 对齐：允许省略／null／合法空报告，拒绝畸形报告；非空报告与其它安全字段仍独立限制写入。启动、发送前、发送后和恢复共用校验；无 journal 或事件格式变化。 |

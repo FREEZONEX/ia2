@@ -1,7 +1,8 @@
 """Phase-specific evidence shapes. Missing safety fields never imply a safe value.
 
-The supplied runtime may omit failsafe_status. When present, its supported schema
-is exactly three lists; both status and health must independently be clear.
+Older runtimes may omit failsafe_status; current runtimes return null before any
+attempt. A non-null report must contain exactly three lists. No report is not a
+safety assertion: all other required fields and each snapshot are still checked.
 """
 from .errors import Reject
 
@@ -34,7 +35,7 @@ def flags(doc, path):
     for key in ('fault', 'latch_reason'):
         if key not in doc or (doc[key] is not None and type(doc[key]) not in (str, dict)):
             fail(path + '.' + key)
-    if 'failsafe_status' in doc:
+    if doc.get('failsafe_status') is not None:
         fs = obj(doc['failsafe_status'], path + '.failsafe_status')
         if set(fs) != {'pending', 'acknowledged', 'unconfirmed'}:
             fail(path + '.failsafe_status')
@@ -91,8 +92,8 @@ def health(doc, require_fieldbus=False):
 
 
 def failsafe_active(*docs):
-    # Call after shape validation. Absence is permitted, explicit null is not.
-    return any(any(doc['failsafe_status'].values()) for doc in docs if 'failsafe_status' in doc)
+    # Call after shape validation. Missing/null means no report, not a cleared latch.
+    return any(any(doc['failsafe_status'].values()) for doc in docs if doc.get('failsafe_status') is not None)
 
 
 def unsafe_after(status_doc, health_doc):
