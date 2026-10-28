@@ -2,7 +2,7 @@
 
 日期：2026-10-28 UTC+8。
 
-IR03、`failsafe_status: null` 兼容性及随后复查发现的 **D6 TOML 检查绕过**均已修复。修复后的完整回环联调通过。[PR #99](https://github.com/FREEZONEX/ia2/pull/99) 待审核，**未合并、未部署**。
+IR03、`failsafe_status: null` 兼容性及随后复查发现的 **D6 TOML 检查绕过**均已修复。修复后的完整回环联调结果为 **26 PASS + 1 个 R3 FINDING**，395 条断言全部通过；**阶段 1a 尚未满足退出条件**。[PR #99](https://github.com/FREEZONEX/ia2/pull/99) 待代码审核，**未合并、未部署**。
 
 ## 交付定位
 
@@ -12,7 +12,7 @@ IR03、`failsafe_status: null` 兼容性及随后复查发现的 **D6 TOML 检�
 | PR 分支 | `codex/tier0-ir03-publication-recovery` |
 | 累计参考实现与 IR03 提交 | `cf4c41273bc91b05202a7483425cebe349f947f2` |
 | 兼容性修复提交 | `24dc9dd61409a8dc4185dc34e9291bed9dce85f8` |
-| D6 修复定位 | 本报告所在提交；`bridge/northbound_guard.py` 与 `tests/test_d6_toml.py` |
+| D6 修复定位 | `fcfd169f7c4e9aa5437f4367e6cbeb91b8c68b7d`；`bridge/northbound_guard.py` 与 `tests/test_d6_toml.py` |
 | 代码入口 | [bridge_run.py](bridge_run.py)、[bridge/](bridge/) |
 | 运行与打包说明 | [README.md](README.md) |
 | 验证详情 / 机器可读结果 | [VALIDATION.md](VALIDATION.md)、[validation-summary.json](validation-summary.json) |
@@ -75,9 +75,20 @@ python3 -I -B examples/tier0-control/tools/check_failsafe_controls.py
 
 完整运行时、崩溃和 BOOL 联调命令见 [README.md](README.md)。这些联调用例共用固定回环端口，应串行执行，并为每次运行指定新的证据目录。
 
+## 验收待办
+
+R3 是 P0 用例：在 runtime 读取写请求之前暂停它，桥约 3 秒超时并关闭连接；恢复后未发现该动作的 `/audit` 记录，与原先“恢复后排队请求会执行”的预期不同。桥的 11 项检查全部通过：保持 `unknown / runtime_unreachable`，不重发，两次对账后补记未发现记录。**尚未覆盖 runtime 已读到请求后才挂起的时序**；超时或未查到审计记录都不能证明没有执行。
+
+[阶段 1a 退出条件](contract/TEST-CASES.md#4-阶段-1a-的退出条件)要求 P0 的 FINDING 经处理并重跑至 PASS；“已知”或“不在本次修复范围”不构成豁免。当前记录允许继续代码审核，不宣称阶段验收完成。待办如下，WP6 / WP9 的既有缺口见 [设计实现状态](contract/DESIGN-1A.md#实现状态2026-10-28p0-用例之后)：
+
+- [ ] **R3 时序覆盖**：保留当前“读取请求前挂起”的复现，增加读取请求后、执行前，以及执行后、返回响应前的受控暂停；核对发送次数、审计、假设备日志与最终状态。
+- [ ] **R3 判据与复跑**：根据新增证据核对运行时行为与契约，修正不成立的预期或实现缺陷；保留 `unknown`、不重发和如实对账的要求，同步契约、用例和断言后重跑受影响用例至 PASS，保存新证据，不覆盖历史 FINDING。
+- [ ] **WP6 通用对账**：实现 journal、`/audit`、假设备日志三方对账，解释审计环回绕、实例重启等差异。
+- [ ] **WP9 浸泡验收**：在本机回环环境完成 2 小时有效／无效／重复／故障注入混合请求浸泡；由对账程序证明不明写入为 0，记录全部差异解释，再逐项核对阶段 1a 退出条件。
+
 ## 剩余边界与当前状态
 
-- **R3 仍保留 FINDING**：运行时暂停期间未应答的写入仍是不确定结果；超时不能证明“没有执行”。
+- **R3 仍保留 FINDING，阶段 1a 尚未退出**；本次文档更正没有改变测试判据或结果。
 - **D11 事件／样本签名未实现**；当前 verifier 依赖可信本地证据。真实面向 Agent 的控制 MCP 仍未实现。
 - **真实硬件和断电持久性未验收**：本次只使用假设备或无设备模拟，不能据此声称实际物理效果、接线正确、硬件时序或断电落盘保证。
 - 测试服务已停止，测试端口已释放。PR 已具备代码审核条件；合并与部署没有执行。

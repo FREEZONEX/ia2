@@ -2,6 +2,8 @@
 
 IR03 result publication recovery, nullable-failsafe compatibility and the D6 TOML guard repair are validated. The prior `failsafe_status: null` startup blocker is resolved. A null report means there is no failsafe-attempt report; it does not override any other safety evidence. Pending, acknowledged or unconfirmed entries still inhibit writes, and malformed reports still fail closed.
 
+The integration result is **26 PASS + 1 R3 FINDING**, with all 395 assertions passing. **Stage 1a has not met its exit criteria.** The results below support code review and do not establish stage acceptance.
+
 | Check | Latest result |
 |---|---|
 | Isolated Python suites in this checkout | 253 tests passed, including 14 IR03, 7 nullable-failsafe and 6 D6 regressions; D6 also passed on Python 3.14.8 |
@@ -23,12 +25,16 @@ The actual-runtime D6 checks used a device-free project with a loopback MQTT add
 
 The nullable-failsafe tests first reproduced 44 assertion failures on the previous code, then passed after repair. They cover startup, pre-write checks, post-write checks, recovery and replay, mixed null/omitted/empty reports, nonempty reports on either endpoint, all three pre-write snapshots, malformed reports and missing required fields. The three mutation controls reintroduce null rejection, ignore another endpoint's nonempty report, or accept malformed falsy values; each is detected.
 
-The earlier pinned runtime `1c42df70d2581babbf79f0ba96726f61cb8a68f5` also passed the 27-case integration set (26 PASS plus the same R3 FINDING), all 395 assertions, crash checks and 21 BOOL checks before the nullable-failsafe follow-up. Its binary SHA-256 is `cf64e6a28d375496fb39664588cde25287d40c70e9bf3f23f0e857acfb7f4b27`. Historical results, including the pre-fix current-main startup failures, are retained separately in the JSON summary rather than presented as current failures.
+The earlier pinned runtime `1c42df70d2581babbf79f0ba96726f61cb8a68f5` also produced 26 PASS plus the same R3 FINDING across the 27-case integration set; all 395 assertions, crash checks and 21 BOOL checks passed before the nullable-failsafe follow-up. Its binary SHA-256 is `cf64e6a28d375496fb39664588cde25287d40c70e9bf3f23f0e857acfb7f4b27`. Historical results, including the pre-fix current-main startup failures, are retained separately in the JSON summary rather than presented as current failures.
 
 During independent IR03 acceptance, the actual archived pre-IR03 engine/process generated a terminal followed by a trace failure and request quarantine. The repaired engine recovered that result after upgrade, including beyond the hot-index horizon and with an empty request file. The original IR03 unit reproduction passed unchanged, 12 copied review checks passed, and all 8 deliberate IR03 mutations were detected. Those are archival acceptance checks; the portable repository suite uses an explicit legacy-behavior fixture instead of shipping the entire old checkout.
 
 Reproduction commands are in [README.md](README.md). The harness returns a nonzero exit status for a FAIL or setup error. The compatibility repair changes neither the journal nor event format and does not disable preflight. Full integration includes the production package with lab hooks removed.
 
-R3 remains a finding about an unanswered write while the runtime is stopped; timeout is not treated as proof of non-execution. D11 event/sample authentication and the real Agent-facing control MCP remain unimplemented. `verified` retains its local evidence limitations and is not proof of physical effect or causation.
+R3 is a P0 finding: the runtime is stopped before reading the write request, and no matching audit entry is observed after it resumes, contrary to the original expectation that the queued write would execute. All 11 checks pass: the bridge preserves `unknown / runtime_unreachable`, sends no retry and records the result of two audit lookups. Pauses after the runtime reads the request remain untested. Neither timeout nor a missing audit entry proves non-execution.
+
+[Stage 1a exit criteria](contract/TEST-CASES.md#4-阶段-1a-的退出条件) require P0 findings to be resolved and the affected cases rerun to PASS. R3 being known or outside this repair does not waive that requirement. Follow-up work is tracked in the [handoff checklist](HANDOFF.md#验收待办): cover the missing R3 timings, align the contract and assertions with the evidence and rerun, implement WP6 general three-way reconciliation, and complete WP9's two-hour loopback soak with zero unexplained writes. This documentation update changes neither the test verdicts nor their criteria.
+
+D11 event/sample authentication and the real Agent-facing control MCP remain unimplemented. `verified` retains its local evidence limitations and is not proof of physical effect or causation.
 
 All runtime work used loopback or device-free simulation. Test services are stopped and their ports released. Hardware timing, wiring, physical effect and actual power-loss durability remain **BENCH PENDING**, requiring measurements on the intended device and storage. No binaries, deployment keys or personal deployment records are committed, and this PR is not a hardware release.

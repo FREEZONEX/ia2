@@ -1,12 +1,14 @@
 # 阶段 1 测试用例：Tier0 ↔ IA2 控制写入联调（草案 v0，2026-10-27）
 
-配套契约：[`CONTRACT.md`](CONTRACT.md)（`ia2.control/v0.7`）。**状态：24 个 P0 用例已全部在 1a 夹具上运行（各 3 遍：23 个 PASS，R3 为 FINDING，无 FAIL；`tier0-ia2-control-1a-20261027/RESULT-P0.md`）；其余 19 个 P1 / P2 未运行；另有 `PROD`（生产打包的桥端到端，3 遍 PASS）。**
+配套契约：[`CONTRACT.md`](CONTRACT.md)（`ia2.control/v0.7`）。**历史 P0 验证记录：24 个 P0 用例已全部在 1a 夹具上运行（各 3 遍：23 个 PASS，R3 为 FINDING，无 FAIL；`tier0-ia2-control-1a-20261027/RESULT-P0.md`）；当时其余 19 个 P1 / P2 未运行；另有 `PROD`（生产打包的桥端到端，3 遍 PASS）。**
+
+**当前 PR #99 状态：** D6 修复后的 27 个回环用例为 **26 PASS + 1 个 R3 FINDING**，395 条断言全部通过，详见 [VALIDATION.md](../VALIDATION.md)。R3 仍是未关闭的 P0 FINDING，**阶段 1a 尚未满足第 4 节退出条件**；R3、通用三方对账与 2 小时浸泡的待办见 [HANDOFF.md](../HANDOFF.md#验收待办)。历史记录与测试判据保留。
 
 ## 0 阶段划分
 
 | 段 | 内容 | 触碰 | 状态 |
 |---|---|---|---|
-| **1a** | Mac 本机：沙箱 IA2 runtime + 假 Modbus TCP 从站 + 桥参考实现 + Tier0 替身（本地 JSONL）。本文第 3 节的全部用例 | 只用本机回环端口；不连 grey0、不连真 Tier0 | 用例已写，夹具与桥未实现 |
+| **1a** | Mac 本机：沙箱 IA2 runtime + 假 Modbus TCP 从站 + 桥参考实现 + Tier0 替身（本地 JSONL）。本文第 3 节的全部用例 | 只用本机回环端口；不连 grey0、不连真 Tier0 | 夹具与桥已实现；当前回环集 26 PASS + 1 R3 FINDING，尚未退出 |
 | **1b** | 真 Tier0（grey0 上已在跑的六个容器）+ grey0 上**另起的**沙箱 runtime。第 5 节只列入口条件和追加用例 | 触碰 grey0 | **需要用户另行授权，本文不授权** |
 
 1a 是 1b 的前置：真 Tier0 只会让问题更难定位，契约本身的错先在本机排掉。
