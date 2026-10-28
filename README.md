@@ -214,6 +214,8 @@ the same playbook. Skim `SKILL.md` to see what an agent is told. Run
 installer; the check never contacts a server, network, or hardware.
 
 
+The [Tier0 control bridge reference](examples/tier0-control/README.md) demonstrates authenticated local setpoint requests, durable result recovery, and loopback fault-injection tests. It is a laboratory example; event/sample authentication and hardware acceptance remain pending.
+
 ## License
 
 IA2 is licensed under [Apache-2.0](LICENSE). Vendored IronPLC carries its own

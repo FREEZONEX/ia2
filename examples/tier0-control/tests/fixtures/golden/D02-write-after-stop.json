@@ -1,0 +1,21 @@
+{
+ "body": null,
+ "headers": {
+  "content-length": "21",
+  "content-type": "text/plain; charset=utf-8",
+  "date": "Tue, 27 Oct 2026 10:06:42 GMT",
+  "vary": "sec-fetch-site, sec-fetch-mode, sec-fetch-dest"
+ },
+ "label": "D02-write-after-stop",
+ "method": "POST",
+ "origin": "tier0.agent.abcd1234",
+ "path": "/write",
+ "raw": "scan loop has stopped",
+ "request": {
+  "name": "sp_flow",
+  "value": 1077936128
+ },
+ "status": 409,
+ "t_recv": 1793095602.223993,
+ "t_send": 1793095602.21478
+}

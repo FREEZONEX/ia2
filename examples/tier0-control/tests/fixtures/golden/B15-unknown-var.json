@@ -1,0 +1,21 @@
+{
+ "body": null,
+ "headers": {
+  "content-length": "35",
+  "content-type": "text/plain; charset=utf-8",
+  "date": "Tue, 27 Oct 2026 10:06:37 GMT",
+  "vary": "sec-fetch-site, sec-fetch-mode, sec-fetch-dest"
+ },
+ "label": "B15-unknown-var",
+ "method": "POST",
+ "origin": "tier0.agent.abcd1234",
+ "path": "/write",
+ "raw": "unknown variable 'no_such_variable'",
+ "request": {
+  "name": "no_such_variable",
+  "value": 1
+ },
+ "status": 404,
+ "t_recv": 1793095597.505441,
+ "t_send": 1793095597.496258
+}

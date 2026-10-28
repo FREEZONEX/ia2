@@ -1,0 +1,180 @@
+{
+ "body": {
+  "alarms_standing": 0,
+  "build_commit": "1c42df70d2581babbf79f0ba96726f61cb8a68f5",
+  "build_rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+  "consecutive_scan_overruns": 0,
+  "device_health": [
+   {
+    "healthy": true,
+    "name": "coupler"
+   },
+   {
+    "healthy": true,
+    "name": "second"
+   }
+  ],
+  "devices": [
+   "coupler",
+   "second"
+  ],
+  "fault": null,
+  "forces": [],
+  "last_snapshot": {
+   "device_health": [
+    {
+     "healthy": true,
+     "name": "coupler"
+    },
+    {
+     "healthy": true,
+     "name": "second"
+    }
+   ],
+   "scan_count": 11,
+   "timestamp_us": 103287,
+   "vars": [
+    {
+     "bits": 11,
+     "name": "ticks",
+     "type_name": "UDINT",
+     "value": "11"
+    },
+    {
+     "bits": 0,
+     "name": "sp_flow",
+     "type_name": "REAL",
+     "value": "0"
+    },
+    {
+     "bits": 0,
+     "input": {
+      "channel": "sp_echo",
+      "device": "coupler",
+      "stale": false
+     },
+     "name": "sp_flow_fb",
+     "type_name": "REAL",
+     "value": "0"
+    },
+    {
+     "bits": 0,
+     "name": "cnt",
+     "type_name": "INT",
+     "value": "0"
+    },
+    {
+     "bits": 0,
+     "input": {
+      "channel": "cnt_echo",
+      "device": "coupler",
+      "stale": false
+     },
+     "name": "cnt_fb",
+     "type_name": "INT",
+     "value": "0"
+    },
+    {
+     "bits": 0,
+     "name": "big",
+     "type_name": "DINT",
+     "value": "0"
+    },
+    {
+     "bits": 0,
+     "input": {
+      "channel": "big_echo",
+      "device": "coupler",
+      "stale": false
+     },
+     "name": "big_fb",
+     "type_name": "DINT",
+     "value": "0"
+    },
+    {
+     "bits": 0,
+     "name": "lamp",
+     "type_name": "BOOL",
+     "value": "FALSE"
+    },
+    {
+     "bits": 0,
+     "input": {
+      "channel": "lamp_in",
+      "device": "coupler",
+      "stale": false
+     },
+     "name": "lamp_fb",
+     "type_name": "BOOL",
+     "value": "FALSE"
+    },
+    {
+     "bits": 0,
+     "name": "d2_sp",
+     "type_name": "REAL",
+     "value": "0"
+    },
+    {
+     "bits": 0,
+     "input": {
+      "channel": "d2_echo",
+      "device": "second",
+      "stale": false
+     },
+     "name": "d2_sp_fb",
+     "type_name": "REAL",
+     "value": "0"
+    },
+    {
+     "bits": 1069547520,
+     "name": "prog_sp",
+     "type_name": "REAL",
+     "value": "1.5"
+    }
+   ]
+  },
+  "latch_reason": null,
+  "mode": {
+   "kind": "running"
+  },
+  "program_instances": [
+   "main_inst"
+  ],
+  "project": "wp0_control_lab",
+  "runtime_id": "40613-1793095592856021000",
+  "scan_count": 11,
+  "scan_overruns": 0,
+  "scan_period_ms": 10,
+  "snapshot_tap": {
+   "faults": 0,
+   "last_fault": null,
+   "last_fault_age_ms": null,
+   "running": true,
+   "stalled_for_ms": null
+  },
+  "supervision": {
+   "grace_secs": 30,
+   "latch_in_ms": null,
+   "lost_for_ms": null,
+   "on_loss": "report"
+  },
+  "uptime_secs": 0,
+  "version": "0.0.1",
+  "watchdog_tripped": false
+ },
+ "headers": {
+  "content-length": "1942",
+  "content-type": "application/json",
+  "date": "Tue, 27 Oct 2026 10:06:32 GMT",
+  "vary": "sec-fetch-site, sec-fetch-mode, sec-fetch-dest"
+ },
+ "label": "A0-status",
+ "method": "GET",
+ "origin": null,
+ "path": "/status",
+ "raw": null,
+ "request": null,
+ "status": 200,
+ "t_recv": 1793095592.856184,
+ "t_send": 1793095592.855728
+}
