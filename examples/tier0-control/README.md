@@ -10,7 +10,13 @@ Previously, a trace write failure after a durable terminal record escaped into r
 
 The engine now keeps failed terminal publications pending. Request replay, startup and periodic housekeeping retry the same saved event without another runtime read, write, classification or journal append. Startup includes old quarantined requests and results outside the hot-index horizon. Genuine request-processing exceptions still quarantine the request. Journal failure still stops processing.
 
-Trace writes handle short writes, remove an uncommitted suffix before retry, and preserve a torn-tail backup on restart. Existing complete lines must sync before their event IDs suppress publication. Consumers must deduplicate by event ID: a reader can observe an unsynced line before recovery. This is not an exactly-once delivery claim.
+Trace writes handle short writes, remove an uncommitted suffix before retry, and preserve a torn-tail backup on restart. Existing complete lines must sync before their event IDs suppress publication. A complete line the bridge could not have written (non-ASCII bytes, JSON that is not an object, a non-string event ID, nesting too deep to parse) is skipped and its line number reported on stderr at startup; it neither suppresses an event nor supplies an anchor. Consumers must deduplicate by event ID: a reader can observe an unsynced line before recovery. This is not an exactly-once delivery claim.
+
+## R3: a missing /audit entry is not proof that a write did not run
+
+When the bridge's POST times out, the runtime may still apply the write. Loopback tests (R3T1, R3T1X) show this: the runtime had already read the request and queued the write when the bridge closed the connection. The write was applied with no `/audit` entry. The current runtime records an audit entry only after the queued write is acknowledged. When the client disconnects, the request handler is dropped.
+
+The bridge's `reconcile_note` therefore reports only what `/audit` shows. `audit_entry` is `found`, `absent` or `unavailable` (the runtime restarted). `landed` is `true` only when an entry was found and `null` otherwise; the bridge never writes `landed: false`. A `landed: false` from an older bridge means `absent`. The action status stays `unknown`, and the bridge never resends. A runtime fix that records the audit entry even after a client disconnect is still pending; it is outside this example.
 
 ## Run the tests
 
@@ -23,7 +29,7 @@ python3 -I -B examples/tier0-control/tools/run_tests.py
 python3 -I -B examples/tier0-control/tools/check_failsafe_controls.py
 ```
 
-The first runner executes each suite in its own interpreter, writes logs under `evidence/unit/`, and fails if any suite fails. It covers 253 tests, including 14 IR03 regressions, 7 nullable-failsafe compatibility regressions and 6 D6 TOML/parser/packaging regressions. Legacy IR03 tests use a small test-only reproduction of the previous publication semantics; they do not require an archived developer checkout. The original archived engine and process were also exercised during the independent repair acceptance. The second command verifies that three deliberately broken nullable-failsafe variants fail by assertion.
+The first runner executes each suite in its own interpreter, writes logs under `evidence/unit/`, and fails if any suite fails. It covers 266 tests, including 14 IR03 regressions, 7 nullable-failsafe compatibility regressions, 6 D6 TOML/parser/packaging regressions, 9 R3 reconcile regressions and 4 trace-reload regressions. Legacy IR03 tests use a small test-only reproduction of the previous publication semantics; they do not require an archived developer checkout. The original archived engine and process were also exercised during the independent repair acceptance. The second command verifies that three deliberately broken nullable-failsafe variants fail by assertion.
 
 D6 parses `northbound.toml` using TOML semantics at startup and before each new write. A missing file, omitted `mqtt` table or omitted `mqtt.allow_write` uses the runtime's disabled default. An explicit flag must be the boolean `false`, including when `mqtt.enabled` is false; malformed TOML, an invalid `mqtt` table or a flag of another type fails closed. Quoted/escaped keys, dotted keys, inline tables and `#` inside strings cannot hide enabled writes. Parser diagnostics are not exposed because configuration may contain credentials. The standalone production package includes the same parser and license.
 
@@ -31,12 +37,12 @@ For the full runtime/fake-Modbus suite, build `ia2-runtime` with the repository'
 
 ```sh
 python3 -I -B lab/run_cases.py --bin ../../target/release/ia2-runtime --out evidence/e2e \
-  --cases A1,B1,B3,C1,A2,B2,B4,B6,B7,B8,B9,B11,C3,C4,C6,C8,E1,E2,E3,R1,R2,R3,F1,F2,PROD,P1F5,P1F6
+  --cases A1,B1,B3,C1,A2,B2,B4,B6,B7,B8,B9,B11,C3,C4,C6,C8,E1,E2,E3,R1,R2,R3,R3T1,R3T1K,R3T1X,R3T2,F1,F2,PROD,P1F5,P1F6
 python3 -I -B tests/check_p0_crash_evidence.py evidence/e2e
 python3 -I -B lab/p0_bool_acceptance.py --bin ../../target/release/ia2-runtime
 ```
 
-Use a new output directory for each integration run. Run integration suites serially: they own loopback ports 13501, 13502, 13503, 13511 and 13512. The runner exits nonzero for a FAIL or setup error and records source-tree and binary hashes. See [VALIDATION.md](VALIDATION.md) for the exact tested runtime revision and results; the historical R3 finding remains visible.
+Use a new output directory for each integration run. Run integration suites serially: they own loopback ports 13501, 13502, 13503, 13511 and 13512. The runner exits nonzero for a FAIL or setup error and records source-tree and binary hashes. See [VALIDATION.md](VALIDATION.md) for the exact tested runtime revision and results; the historical R3 finding remains visible. The R3 timing cases inject a single 1 s scan stall, signal only the harness's own runtime child, and read the runtime socket's receive queue with `netstat` (`-an -p tcp` on macOS, where they were recorded; the Linux `-tan` form is untested). The recording proxy can hold the runtime's `/write` answer, or keep the runtime connection open after the bridge disconnects; neither control is used unless a case enables it.
 
 The harness manages the deliberately paused runtime with `subprocess.Popen` and waits for its exit in a worker thread. This avoids a macOS/Python 3.14.7 `asyncio` child-watcher hang on `SIGSTOP`, reproduced during review. It does not change the bridge or runtime behavior, or turn R3's missing audit evidence into proof of non-execution.
 

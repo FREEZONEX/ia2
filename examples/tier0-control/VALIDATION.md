@@ -1,6 +1,73 @@
 # Validation
 
-## Review follow-up — 2026-10-29 UTC+8
+## R3 timing and audit reconciliation — 2026-10-29 UTC+8
+
+This round covered the missing R3 timings and corrected how the bridge reports reconciliation. Previously the bridge treated a missing `/audit` entry as "not landed"; the timing tests showed that inference is false. The bridge now reports only what `/audit` shows. Afterwards the trace startup read was made consistent, and the IA2 runtime gap itself was fixed on a separate, uncommitted branch (see [Runtime fix](#runtime-fix-separate-branch)). On the final code the integration result is **31 PASS** (the 27 earlier cases plus 4 new R3 timing cases; 471 assertions, none failed), and the R3 family passed all three passes (15/15). **[Stage 1a](contract/TEST-CASES.md#4-阶段-1a-的退出条件) has not met its exit criteria**: WP6 three-way reconciliation and the WP9 soak are still open. This round's changes are uncommitted in the PR worktree on top of `2d68f5b`.
+
+| Check | Latest result |
+|---|---|
+| Isolated Python suites on the final code | 266 tests passed, including 9 new R3 reconcile regressions and 4 new trace-reload regressions (the 14 IR03, 7 nullable-failsafe and 6 D6 regressions are unchanged) |
+| New regressions against the unfixed code | R3 reconcile 9/9 detected on `2d68f5b` (2 assertion failures, 7 errors from the missing `audit_entry` field); trace reload 4/4 detected (the process test's bridge exits with a traceback) |
+| Full runtime/fake-device suite, 31 cases, runtime `52160ab8…` (build `047e7c17ffda`) | 31 PASS; 471 assertions, 0 failed; no setup errors; every verdict has code-tree hash `a0311eb5e8adf1e9877276e7a645f8d0303aca662350a26ea87eccabb56d2e46`, the current tree |
+| R3 family (R3, R3T1, R3T1K, R3T1X, R3T2) × 3 passes, same runtime | 15/15 PASS, 261 assertions; ground truth matched EXPECT in every run; the IA2 audit gap reproduced in all 6 R3T1/R3T1X runs |
+| R3 family × 3 passes, fixed runtime `b7e455d4…`, same code tree | 9 PASS and 6 FINDING (R3T1 and R3T1X: executed **and** audited), 258 assertions, 0 failed — the expected signal to update `R3_EXPECT` once the runtime fix merges |
+| Crash recovery per action | 3 actions passed |
+| BOOL fake-device checks | 21 passed (`evidence/bool-device-6/`) |
+| Nullable-failsafe mutation controls | All 3 detected by assertion failures |
+| Repository gate on the PR worktree (adaptation, format, Clippy, server build, Rust tests, release build, Web build and tests) | All 8 steps passed earlier this round; 8589 Rust tests passed (105 ignored), 423 Web tests passed (39 files). Only Python and docs changed afterwards, so it was not repeated. The release step relinked `target/release/ia2-runtime` (SHA-256 `54df4183…`, kept as `evidence/gate-r3fix-20261029/ia2-runtime.gate-build`); the tested binary `52160ab8…` was restored to that path afterwards |
+| Device-free `cs sim run` | Not repeated: no Rust, project or scenario file changed in this PR |
+
+### R3 timings
+
+The bridge's POST times out after 3 s. Each case pauses the runtime at a different point in handling that write:
+
+- **R3**: stopped before it reads the request. The socket's receive queue still holds the request, which is never executed.
+- **R3T1**: the runtime has read the request and queued the write, then is stopped during a single 1 s injected scan stall. After the bridge disconnects and the runtime continues, the write **is applied**: the VM holds the value and the fake device receives it. **No `/audit` entry is recorded.**
+- **R3T1K** (control): identical, but the proxy keeps the runtime-side connection open. The write is applied and audited.
+- **R3T1X**: the same window, but the bridge is SIGKILLed instead. The write is applied without an audit entry. The restarted bridge concludes `unknown / bridge_restarted` without resending.
+- **R3T2**: the runtime applies and answers, but the answer is held at the proxy while the runtime is stopped. The entry exists, and the first reconcile look finds it.
+
+Each case checks ground truth from three sources: the fake device's write log, the VM value and `/audit`. A case is a FINDING if IA2 executes or audits differently from the recorded EXPECT.
+
+The cause is in the runtime code, and R3T1K confirms it. `rt_write` records the audit entry only after the queued write is acknowledged. hyper's default `h1_half_close = false` drops the handler when the client disconnects mid-request. The same pattern exists in `rt_force` and `rt_unforce`, which were not run. Fixing this belongs in a separate IA2 runtime change.
+
+### Reconcile semantics now
+
+A `reconcile_note` and the journal `reconcile` record carry `audit_entry`: `found`, `absent`, or `unavailable` (the runtime restarted and `/audit` was cleared). `landed` is `true` only for `found` and `null` otherwise; the bridge never writes `false`. The first look's `absent` schedules the second look, as before. An older journal record with `landed: false` still schedules it. The read side reads an older `landed: false` as `absent`; malformed fields claim nothing. The action status never changes, and nothing is resent. Crash recovery without an entry still concludes `unknown`, and its detail says absence does not show non-execution.
+
+The nine new regressions (`tests/test_r3_reconcile.py`) cover:
+
+- two looks that find no entry
+- a found entry
+- a restarted runtime
+- a first look written by an older bridge
+- crash recovery without an entry
+- read-side normalization of legacy and malformed notes
+
+All nine fail against the unfixed bridge. In the pre-fix exploratory run (kept outside the repository), the bridge's final note said `landed: false` for writes that had executed, in all three passes of both R3T1 and R3T1X. One earlier integration attempt this round was stopped on purpose at C4 because a lab file was edited mid-run. Its partial evidence is kept in `evidence/r3fix-20261029-e2e-aborted/` and is not counted. Final evidence: `evidence/r3fix-20261029-final2/` (with `summary.json`), `evidence/r3-reconcile-before/`, `evidence/trace-reload-before/`, `evidence/unit/` and `evidence/bool-device-6/`. The earlier all-pass run `evidence/r3fix-20261029-final/` (code tree `d5ed5fba…`) predates the trace fix and the R3T1X change and is superseded.
+
+R3T1X now asserts the path that `/audit` supports at the restart: with no entry, recovery concludes `unknown / bridge_restarted` and the final note is `absent`; with an entry (a runtime that audits a write whose client went away), recovery concludes `accepted` from it (D8), no reconcile note follows and the read side shows `verified`. Either way there is exactly one POST, and `R3_EXPECT` decides whether the run is a FINDING. Before this, the case only covered the first path and reported FAIL on the fixed runtime.
+
+### Trace startup read
+
+A complete trace line the bridge could not have written used to be handled two ways. A line that was not JSON was skipped silently. A line with non-ASCII bytes, or JSON that was not an object, made startup end with an uncaught exception, which is none of the §8.4 exit codes. Now every such line is skipped: non-ASCII bytes, JSON that is not an object, a non-string event ID, and nesting too deep to parse. A skipped line neither suppresses an event nor supplies an anchor, and startup reports its line number on stderr. An anchor needs a non-negative integer `journal_seq` and a string `journal_hash`. Torn tails are handled as before. `tests/test_trace_reload.py` covers this, including the real bridge process.
+
+### Runtime fix (separate branch)
+
+The audit gap is fixed outside this PR, in worktree `~/Projects/soft-PLC/ia2-control-write-detached-20261029` on branch `fix/control-write-detached`. The branch starts from `origin/main` `e6a38aa` and is **not committed**.
+
+Reading the code turned up a worse sibling of the gap. `monitor::write_with_pulse` awaited `start_pulse` in the caller's future. If the caller was dropped while the pulse write was queued, the write still landed but no reset was ever scheduled, so the value stayed latched. Preventing exactly that is the purpose of `pulse_ms`. The IDE server and the edge runtime share this path.
+
+The fix:
+
+- A pulse write and its reset now run in one task of their own.
+- The runtime's `/write`, `/force` and `/unforce` run the command and its audit entry in their own task (`run_detached`). A handler panic still reaches the panic layer, and a runtime shutdown answers 503.
+
+Two new tests drop the caller while its command is queued behind an injected stall. Before the fix, the value stayed at 1, and `/audit` stayed empty while x was 7. After the fix both tests pass, and both passed 15 repeated runs.
+
+The repository gate passed with all 8589 previous Rust tests plus the 2 new ones (8591, 0 failed, 105 ignored, run with `--no-fail-fast`). In the gate script's first run, `cargo test` stopped on a `sim_e2e` "server did not come up within 5 s"; the full rerun did not reproduce it. On this runtime the R3 family gives the results in the table above. Report: `~/Projects/soft-PLC/pr99-r3-timing-20261029/RESULT-RUNTIME-FIX.md`.
+
+## Review follow-up before the PR #99 merge — 2026-10-29 UTC+8
 
 Review of `2d68f5b6976d35448084a6c922dcd51a83e4ca3c` reproduced a harness hang on macOS 27.0.1 with Python 3.14.7: R3 stopped the runtime, then the asyncio child watcher blocked the event-loop thread in `waitpid`. The bridge had already recorded `unknown / runtime_unreachable`; the harness could not resume the runtime. That run required terminating its test child and is retained as a failed run, not a pass.
 
@@ -10,43 +77,8 @@ Normal writes, duplicate suppression, bridge crash recovery before and after sen
 
 The reused runtime reports build `ab00029af76b`; its Rust sources, dependencies and configuration match `main` at `e6a38aa`. Binary SHA-256: `79bcbe8894aef6221922386c4720b614103a96c0a9174a7cf7c10ec234a2c0d1`. Final bridge/lab source-tree SHA-256: `215bd171447135a6c26e80023b1b33fec20464003dc0e0257a3eec5b06ff375f`. Evidence directories are `evidence/pr99-review-20261029` (including the failed pre-fix run), `evidence/pr99-review-fixed-20261029`, `evidence/pr99-final-20261029`, `evidence/pr99-python39-20261029` and `evidence/pr99-sim-20261029`. No Rust/Web changes required another full repository build or test run. No hardware was contacted.
 
-## Original acceptance record — 2026-10-28 UTC+8
+## Unchanged from the previous round
 
-IR03 result publication recovery, nullable-failsafe compatibility and the D6 TOML guard repair are validated. The prior `failsafe_status: null` startup blocker is resolved. A null report means there is no failsafe-attempt report; it does not override any other safety evidence. Pending, acknowledged or unconfirmed entries still inhibit writes, and malformed reports still fail closed.
+IR03 publication recovery, the nullable-failsafe gate and the D6 TOML guard are unchanged by this round; their earlier evidence (and the pre-fix reproductions: 44 nullable-failsafe assertion failures, 18 D6 assertion failures, 8 IR03 mutations) remains in [validation-summary.json](validation-summary.json) under the `prior_*` sections. The runtime SHA-256 is still `52160ab8ba63cd16852c66b5647f0a16844bdc45f410c48da2c589c2cc2e74de` (build commit `047e7c17ffda`, Rust sources identical to `main` `e6a38aa`); no Rust or Web source changed. The device-free `cs sim run` was not repeated this round.
 
-The integration result is **26 PASS + 1 R3 FINDING**, with all 395 assertions passing. **Stage 1a has not met its exit criteria.** The results below support code review and do not establish stage acceptance.
-
-| Check | Latest result |
-|---|---|
-| Isolated Python suites in this checkout | 253 tests passed, including 14 IR03, 7 nullable-failsafe and 6 D6 regressions; D6 also passed on Python 3.14.8 |
-| Full runtime/fake-device suite on runtime built at `047e7c17ffda1c52ac3d0f68726d9a15889a3cba` (runtime sources identical to main) | 26 PASS, 1 known R3 FINDING; all 395 assertions passed; no setup errors |
-| Crash recovery assertions per action | Passed |
-| BOOL fake-device checks on current runtime | 21 passed |
-| Nullable-failsafe mutation controls | All 3 detected by assertion failures, no test errors |
-| Device-free project compilation and `cs sim run` | Repeated after D6 repair: all 7 steps passed; program stopped, no forces or alarms |
-| Repository agent-adaptation check and formatting check | Passed again after D6 repair |
-| Clippy, server build, full Rust workspace tests, release builds, Web build and Web tests | All rerun successfully after D6 repair; 8589 Rust tests passed (105 ignored), 423 Web tests passed |
-| D6 regression against previous guard | 18 assertion failures, no errors; repaired guard passed |
-| D6 with actual runtime, source and production packages | Both enabled-write fixtures refused with exit 3 in both packages; both disabled-write controls started |
-
-The current runtime SHA-256 is `52160ab8ba63cd16852c66b5647f0a16844bdc45f410c48da2c589c2cc2e74de`. The runtime reports build commit `047e7c17ffda`; its Rust sources and locks are unchanged by this repair. Every integration verdict matches the final bridge/lab source-tree hash `4b79f02cbca51474192941cf17496ca49f2a121451a66158e7ceea2225cb0e2b`. The machine-readable suite results and file hashes are in [validation-summary.json](validation-summary.json). Raw logs and generated projects remain under the gitignored `evidence/` directory.
-
-The D6 review found that literal text matching missed escaped TOML keys and treated `#` inside strings as comments. The guard now parses the actual `mqtt.allow_write` field with bundled, unmodified Tomli 2.2.1. Missing file/table/field follows the runtime false default; explicit values must be boolean false. Invalid TOML, table types and flag types fail closed, and errors do not expose configuration values. Regression vectors cover quoted/escaped/dotted keys, inline tables, basic/literal/multiline strings, duplicate keys and invalid types. Process tests cover startup before any runtime reads, configuration changes before new requests, replay without another send, and the standalone production package including the original parser license and file hashes. The same six tests pass on Python 3.9.6 and 3.14.8.
-
-The actual-runtime D6 checks used a device-free project with a loopback MQTT address and no broker. They confirm that IA2 interprets both bypass fixtures as `allow_write=true` while the repaired bridge refuses them; they do not claim MQTT message delivery or physical effects. The source-tree hash now recursively includes the bundled parser. D6 raw evidence is under `evidence/d6-fix-20261028T223623p0800/`, with process evidence under `evidence/process-d6/`. The prior failing review and compatibility results remain historical evidence in the JSON summary.
-
-The nullable-failsafe tests first reproduced 44 assertion failures on the previous code, then passed after repair. They cover startup, pre-write checks, post-write checks, recovery and replay, mixed null/omitted/empty reports, nonempty reports on either endpoint, all three pre-write snapshots, malformed reports and missing required fields. The three mutation controls reintroduce null rejection, ignore another endpoint's nonempty report, or accept malformed falsy values; each is detected.
-
-The earlier pinned runtime `1c42df70d2581babbf79f0ba96726f61cb8a68f5` also produced 26 PASS plus the same R3 FINDING across the 27-case integration set; all 395 assertions, crash checks and 21 BOOL checks passed before the nullable-failsafe follow-up. Its binary SHA-256 is `cf64e6a28d375496fb39664588cde25287d40c70e9bf3f23f0e857acfb7f4b27`. Historical results, including the pre-fix current-main startup failures, are retained separately in the JSON summary rather than presented as current failures.
-
-During independent IR03 acceptance, the actual archived pre-IR03 engine/process generated a terminal followed by a trace failure and request quarantine. The repaired engine recovered that result after upgrade, including beyond the hot-index horizon and with an empty request file. The original IR03 unit reproduction passed unchanged, 12 copied review checks passed, and all 8 deliberate IR03 mutations were detected. Those are archival acceptance checks; the portable repository suite uses an explicit legacy-behavior fixture instead of shipping the entire old checkout.
-
-Reproduction commands are in [README.md](README.md). The harness returns a nonzero exit status for a FAIL or setup error. The compatibility repair changes neither the journal nor event format and does not disable preflight. Full integration includes the production package with lab hooks removed.
-
-R3 is a P0 finding: the runtime is stopped before reading the write request, and no matching audit entry is observed after it resumes, contrary to the original expectation that the queued write would execute. All 11 checks pass: the bridge preserves `unknown / runtime_unreachable`, sends no retry and records the result of two audit lookups. Pauses after the runtime reads the request remain untested. Neither timeout nor a missing audit entry proves non-execution.
-
-[Stage 1a exit criteria](contract/TEST-CASES.md#4-阶段-1a-的退出条件) require P0 findings to be resolved and the affected cases rerun to PASS. R3 being known or outside this repair does not waive that requirement. Follow-up work is tracked in the [handoff checklist](HANDOFF.md#验收待办): cover the missing R3 timings, align the contract and assertions with the evidence and rerun, implement WP6 general three-way reconciliation, and complete WP9's two-hour loopback soak with zero unexplained writes. This documentation update changes neither the test verdicts nor their criteria.
-
-D11 event/sample authentication and the real Agent-facing control MCP remain unimplemented. `verified` retains its local evidence limitations and is not proof of physical effect or causation.
-
-All runtime work used loopback or device-free simulation. Test services are stopped and their ports released. Hardware timing, wiring, physical effect and actual power-loss durability remain **BENCH PENDING**, requiring measurements on the intended device and storage. No binaries, deployment keys or personal deployment records are committed, and this PR is not a hardware release.
+D11 event/sample authentication and the real Agent-facing control MCP remain unimplemented. `verified` keeps its local evidence limitations and is not proof of physical effect or causation. All runtime work used loopback only. Hardware timing, wiring, physical effect and power-loss durability remain **BENCH PENDING**. No binaries, deployment keys or personal deployment records are committed. Raw logs and generated projects remain under the gitignored `evidence/` directory.

@@ -1,6 +1,6 @@
 # ia2.control/v0 — Tier0 ↔ IA2 控制写入联调契约（阶段 0 草案）
 
-状态：**草案 v0.8，2026-10-28**（D1–D10 已于 2026-10-27 定下，D11 已于 2026-10-28 定下，见 §10；D12–D14 同日定下；D11–D14 只有设计，代码尚未实现，见 `DESIGN-D11-signed-events.md`）。2026-10-27 起草时是纸面设计；之后 WP0 在 Mac + 假从站上实测了若干条 IA2 行为（§11.1），24 个 P0 用例已在桥参考实现上全部运行（§11.2、§11.3；`tier0-ia2-control-1a-20261027/RESULT-SLICE.md`、`RESULT-P0.md`）。实现等待独立复核：`tier0-ia2-control-1a-20261027/REVIEW-BRIEF.md`。上述为原独立副本的历史记录；仓库移植及本轮验证见上级 README 与 VALIDATION。
+状态：**草案 v0.9，2026-10-29**（v0.9 只改 M10 对账记录的措辞，见 §11.5、§12；D1–D10 已于 2026-10-27 定下，D11 已于 2026-10-28 定下，见 §10；D12–D14 同日定下；D11–D14 只有设计，代码尚未实现，见 `DESIGN-D11-signed-events.md`）。2026-10-27 起草时是纸面设计；之后 WP0 在 Mac + 假从站上实测了若干条 IA2 行为（§11.1），24 个 P0 用例已在桥参考实现上全部运行（§11.2、§11.3；`tier0-ia2-control-1a-20261027/RESULT-SLICE.md`、`RESULT-P0.md`）。实现等待独立复核：`tier0-ia2-control-1a-20261027/REVIEW-BRIEF.md`。上述为原独立副本的历史记录；仓库移植及本轮验证见上级 README 与 VALIDATION。
 
 IA2 的行为除 §11.1 列出的几条已测外，都是**读 `origin/main`（`1c42df7`）代码和文档得出的预期**，没有在运行实例上验证过。阶段 1 的每个用例（`TEST-CASES.md`）要么确认它，要么把它变成 FINDING 并回来改本契约。§11 列出每条依赖及其把握程度。
 
@@ -170,7 +170,7 @@ Agent ◄── query_action_results   读侧；verified 只在这里由证据�
 | M7 | 404 | `rejected`（`unknown_variable`）；该注册项**必须**自动禁用直到人审 | B5 |
 | M8 | 409（扫描循环已停） | `rejected`（`scan_stopped`） | B5 |
 | M9 | 500、非 JSON、缺 `undelivered_device` 键、3xx、截断、非预期结构 | `unknown`（`vm_error` 或 `runtime_unreachable`）；**缺键不是 null**（旧版 runtime 可能没有该字段，不能当"已送达"） | B11 |
-| M10 | 连接失败 / 超时 / 连接被重置（不知道有没有落地） | `unknown`（`runtime_unreachable`）；事后用 `/audit` 对账（§8.3，**看两次**）；**不在同一动作里盲重发**。桥随后（周期性，或重启时）对账，记一条 `reconcile_note`（landed / not landed / unverifiable），**不改状态** | R3 |
+| M10 | 连接失败 / 超时 / 连接被重置（不知道有没有落地） | `unknown`（`runtime_unreachable`）；事后用 `/audit` 对账（§8.3，**看两次**）；**不在同一动作里盲重发**。桥随后（周期性，或重启时）对账，记 `reconcile_note`，**不改状态**：`audit_entry` 写 `/audit` 里看到什么（`found` / `absent` / `unavailable`＝实例已重启、环已清空）；只有 `found` 才是断言（`landed: true`），其余 `landed` 为 null，**从不写 `landed: false`**——R3T1/R3T1X 实测：已读入并排队的写在连接关闭后照样执行，却没有审计条目（§11.5）。v0.9 之前的桥写的 `landed: false` 一律按 `absent` 读 | R3、R3T1、R3T1K、R3T1X、R3T2 |
 | M11 | 动作期间运行实例身份变了（重启） | `unknown`（`runtime_restarted`）；不重发；新实例上的匹配反馈**不**算该动作的证明。由读侧推导：发送之后出现另一个 `runtime_id` 的样本即 `unknown runtime_restarted`。实测：新实例启动时会把设备输出写成 0，所以「设备保留了旧值」这个陷阱要人为设置（C8 就是这么做的） | C8 |
 | M12 | 闸门 G8/G9 失败 | `rejected`（`latched` / `paused` / `forced` / `device_unhealthy` / `fieldbus_unhealthy` / `runtime_unreachable`） | C1, C5, C7 |
 | M13 | 闸门 G1–G7 失败 | `rejected`（见 §5 原因） | B1, B2, B6–B10, F2 |
@@ -222,13 +222,13 @@ Agent ◄── query_action_results   读侧；verified 只在这里由证据�
 
 **终态发布恢复**（IR03，独立修复副本）：已有 durable `terminal` 记录时，trace 写入或同步失败只增加内部错误计数，并把动作留在待发布集合；不得因此隔离原请求、改写终态或再次调用 IA2。相同请求重放、启动恢复及每 2 秒的例行步骤均可补发 journal 中同一个事件；每轮例行步骤最多处理 100 个动作，失败项轮转至队尾。启动通过整个 journal 的终态定位索引找回尚未发布的结果，包括旧版本已误隔离的请求及超过热索引期限的动作；旧隔离记录保留。状态文件以 `pending_trace_results` 显示待发布数量。journal 已失败时停止补发，沿用退出码 7。
 
-trace 使用无缓冲二进制写入，完成全部字节并同步之后才记为已发布；同一进程重试先截去未确认的写入后缀。启动保留撕裂尾行的独立副本、截去尾行，并同步已有完整行后才据其事件 ID 去重；完整行已落盘但之前同步报错时不追加重复行。补发可更新 journal 锚，事件 ID、状态及业务证据保持原值。消费者应按事件 ID 去重：此规则不承诺消费者从未看到过未同步的旧行，也不实现其它种类事件的持久重试队列。
+trace 使用无缓冲二进制写入，完成全部字节并同步之后才记为已发布；同一进程重试先截去未确认的写入后缀。启动保留撕裂尾行的独立副本、截去尾行，并同步已有完整行后才据其事件 ID 去重；不是桥能写出的完整行（含非 ASCII 字节、不是 JSON 对象、事件 ID 不是字符串、嵌套过深无法解析）一律跳过，不据其去重、不取其锚，启动时在 stderr 报出行号（其中若有本该去重的事件，可能再发一次）；锚只认非负整数的 `journal_seq` 加字符串的 `journal_hash`；完整行已落盘但之前同步报错时不追加重复行。补发可更新 journal 锚，事件 ID、状态及业务证据保持原值。消费者应按事件 ID 去重：此规则不承诺消费者从未看到过未同步的旧行，也不实现其它种类事件的持久重试队列。
 
 ### 8.3 `/audit` 对账
 
 - IA2 的 `/audit` 是**内存环、容量 256、重启即清**，只能佐证，不能当唯一记录。
 - 既有只读采集器每次轮询（约 1 s）归档一次 `/audit`（`collector.py` 的 `ring(... 'write_audit' ...)`），所以只要桥 + 其他写入者在一个轮询间隔内远低于 256 条就不丢；G6 把全桥限制在 ≤ 60 次/分正是为此。
-- 对账程序**必须**区分三类：journal 有且审计有（一致）；journal 有而审计无（环已回绕或实例重启 → 记"不可核对"，**不**据此推断"没写过"）；审计有而 journal 无（**不明写入**：可能是别的写入者，也可能是桥之外的路径 → 告警并保留）。
+- 对账程序**必须**区分三类：journal 有且审计有（一致）；journal 有而审计无（环已回绕、实例重启，或写入在客户端断开后才执行而没留条目（§11.5）→ 记"不可核对"，**不**据此推断"没写过"）；审计有而 journal 无（**不明写入**：可能是别的写入者，也可能是桥之外的路径 → 告警并保留）。
 
 ### 8.4 启动自检与运维可见性（v0.7）
 
@@ -335,7 +335,7 @@ D11–D14 都**只有设计**（`DESIGN-D11-signed-events.md`），实现等独�
 | 静默的从站：运行时的健康位约 **1.2 s**（每遍中位 1.198 / 1.199 / 1.21 s，24 次在 1.17–1.223 s）后才翻。窗口内桥放行的写（每遍 15–16 个中的全部）都 `undelivered_device:null`，没有一个能被验证 | 测（C4，3 遍） |
 | 断链写入的迟到下发：链路恢复后 **2.67–2.78 s** 下发请求值（`close`、`refuse` 一致；deadline 之后才恢复的节奏下，约在请求后 7 s、deadline 后 3 s）；WP0 里断开约 3 s 的那次是 1.8 s。`/audit` 无新条目 | 测（C3，3 遍） |
 | 被杀后重启的 runtime 在启动时对设备输出写 0；`/audit` 清空；新 `runtime_id` | 测（C8，3/3） |
-| 桥超时（3 s）后关闭连接，一个排队在被 `SIGSTOP` 的 runtime 前面、尚未被读走的请求，在 `SIGCONT` 之后**没有**被执行（`/audit` 为空）。挂起发生在请求被读走之后的时序没测 | 测（R3，3/3） |
+| 桥超时（3 s）后关闭连接，一个排队在被 `SIGSTOP` 的 runtime 前面、尚未被读走的请求，在 `SIGCONT` 之后**没有**被执行（`/audit` 为空）。挂起发生在请求被读走之后的时序没测（2026-10-29 已测，见 §11.5） | 测（R3，3/3） |
 | 向已锁存的 runtime 写：200、`undelivered_device:null`、VM 变量变成请求值，设备无写入（F2） | 测（C1，6/6） |
 | `http.client` 的 `read(n)` 对短于 `Content-Length` 的响应体不报错 | 测（B11，一个客户端缺陷） |
 
@@ -348,6 +348,19 @@ D11–D14 都**只有设计**（`DESIGN-D11-signed-events.md`），实现等独�
 | 生产打包的桥（无钩子加载代码）端到端 `accepted` → `verified` | 测（`PROD`，3/3） |
 | 探测：`runtime_id` 缺失、反馈变量缺失 / 无 `input.stale` 时桥以退出码 4 拒绝启动 | 测（单元测试里起假 runtime） |
 | 验证在扫描时钟里做，采样器墙钟再偏也不影响结论 | 测（向量） |
+
+### 11.5 R3 时序覆盖（2026-10-29）
+
+运行时 `047e7c1` 构建（源码同 `main` `e6a38aa`，SHA-256 `52160ab8…`），回环假从站。桥的 POST 超时为默认 3 s。真实情况取自假设备写日志、VM `/status`、`/audit`；挂起时序由 runtime 一端套接字的 `Recv-Q` 证明。
+
+| 事实 | 把握 |
+|---|---|
+| 请求还没读走时 runtime 被挂起（`Recv-Q` = 请求长度）：桥关闭连接、`SIGCONT` 之后，请求**没有**执行（VM 不变、设备无写入、`/audit` 无条目） | 测（R3，3/3） |
+| runtime 已读完请求（`Recv-Q` = 0），写入排在扫描循环里还没执行（注入一次 1 s 扫描停顿，停顿中 `SIGSTOP`）：桥超时、关闭连接之后，写入**照样执行**（VM 为请求值、设备收到 FC16），但 **`/audit` 没有条目** | 测（R3T1，3/3） |
+| 同一时序，只让 runtime 一侧的连接保持打开：写入执行，`/audit` **有**条目。缺条目由客户端断开引起 | 测（R3T1K，3/3） |
+| 同一时序，改由桥被 `SIGKILL` 触发：写入执行，`/audit` 无条目；重启后的桥结论为 `unknown / bridge_restarted` | 测（R3T1X，3/3） |
+| runtime 已执行并应答、响应没送到桥（代理扣住响应并同时挂起 runtime）：`/audit` 有条目，桥第一次对账即 `found` | 测（R3T2，3/3） |
+| 原因（读码）：`crates/runtime/src/main.rs` `rt_write` 在 `write_with_pulse(...).await` **之后**才 `record_audit_http`；`ProgramHandle::send_write` 先把命令放进通道再等应答；hyper 1.9 默认 `h1_half_close = false`，忙时读到 EOF 就结束连接并丢弃处理函数。`rt_force`、`rt_unforce` 同样写法（未运行）。与 `rt_audit` 的文档（"Every HTTP /write·/force·/unforce … lands here"）不符，属 IA2 运行时缺陷，修复不在本 PR | 读；由 R3T1K 对照证实 |
 
 ## 12 变更记录
 
@@ -372,3 +385,4 @@ D11–D14 都**只有设计**（`DESIGN-D11-signed-events.md`），实现等独�
 | AR01（独立修复副本） | 2026-10-28 | §5 统一 CRLF／LF 头边界，拒绝完整头块中的裸 CR、解析残留 payload 与 Unix mailbox 分隔行，防止字段被静默丢弃。IR03、D11、其它 P2 未修。 |
 | IR03（独立修复副本） | 2026-10-28 | §8.2 区分终态发布失败与请求处理失败；终态可在同请求重放、启动及后台补发而不重发控制写；trace 修复未确认后缀与撕裂尾行。D11、其它 P2 未修。 |
 | nullable-failsafe 兼容性 | 2026-10-28 | G8 与当前 API 对齐：允许省略／null／合法空报告，拒绝畸形报告；非空报告与其它安全字段仍独立限制写入。启动、发送前、发送后和恢复共用校验；无 journal 或事件格式变化。 |
+| v0.9（R3 时序） | 2026-10-29 | 依据 §11.5：M10 的对账记录改为 `audit_entry`（`found` / `absent` / `unavailable`）加 `landed`（只在 `found` 时为 true，否则 null，**不再写 false**），旧版 `landed: false` 按 `absent` 读；§8.3 增"写入在客户端断开后执行而没留条目"；恢复时无条目的 `detail` 注明"不证明没有执行"。状态词汇、闸门、journal 与 trace 的其余格式不变。IA2 运行时漏记审计的修复不在本 PR。同日：§8.4 trace 启动读取对所有非桥记录的完整行一致跳过并报行号（此前非 ASCII 行、非对象 JSON 会以未捕获异常结束启动，非 JSON 行则静默跳过）。 |

@@ -234,7 +234,9 @@ class Journal:
             seen = a['reconciles']
             if not seen:
                 out.append((aid, 1))
-            elif len(seen) == 1 and seen[0].get('landed') is False and now_ms >= seen[0]['t_ms'] + recheck_ms:
+            # `landed: false` is how bridges before v0.9 recorded an absent entry.
+            elif (len(seen) == 1 and (seen[0].get('audit_entry') == 'absent' or seen[0].get('landed') is False)
+                  and now_ms >= seen[0]['t_ms'] + recheck_ms):
                 out.append((aid, 2))
         return out
 

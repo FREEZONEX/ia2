@@ -3,6 +3,7 @@
 Group 1: A2 B2 B4 B6 B7 B8 B9 B11          value handling, throttle/time/dedup, stubbed IA2 faults
 Group 2: C3 C4 C6 C8 E1 E2 E3              delivery, silent links, program-owned outputs, restarts, read-side verification
 Group 3: R1 R2 R3 F1 F2                    crash recovery, a stopped runtime, tool surface, forged requests
+         R3T1 R3T1K R3T1X R3T2             R3 timings: read and queued, its control and crash variant, applied but unanswered
 
 Each case is `async def case_X(st, ck, notes)` and registers in CASES as (fn, registry targets[, options]).
 Expectations are the TEST-CASES.md EXPECT/pass columns; where the implementation deliberately differs, the check says so."""
@@ -13,6 +14,8 @@ import json
 import os
 import signal
 import struct
+import subprocess
+import sys
 import time
 
 import harness
@@ -383,9 +386,10 @@ async def case_B11(st, ck, notes):
     def notes_now():
         return [e for e in st.trace() if e.get('kind') == 'reconcile_note']
     await wait_until(lambda: len(notes_now()) >= 16, 25)                     # the periodic reconcile looks twice at each unknown
-    notes['reconcile_notes'] = [{'pass': e.get('pass_no'), 'landed': e.get('landed'), 'final': e.get('final')} for e in notes_now()]
-    ck('each of the 8 unknowns got two reconcile notes, the second one final (stub /audit is empty, so: not landed)',
-       len(notes_now()) == 16 and all(e.get('landed') is False for e in notes_now())
+    notes['reconcile_notes'] = [{'pass': e.get('pass_no'), 'landed': e.get('landed'), 'audit_entry': e.get('audit_entry'), 'final': e.get('final')}
+                                for e in notes_now()]
+    ck('each of the 8 unknowns got two reconcile notes, the second one final (stub /audit is empty: entry absent, landed not claimed either way)',
+       len(notes_now()) == 16 and all(e.get('audit_entry') == 'absent' and e.get('landed') is None for e in notes_now())
        and sorted((e.get('pass_no'), e.get('final')) for e in notes_now()) == [(1, False)] * 8 + [(2, True)] * 8, notes['reconcile_notes'])
     after = {x['action_id']: short(x) for x in st.trace() if x.get('kind') == 'action_status'}
     ck('...and no action changed status because of it', sorted(map(str, after.values())) == sorted(str(w) for _, _, w in results), after)
@@ -710,7 +714,8 @@ async def case_R1(st, ck, notes):
     ck('the device never received the value', not [e for e in st.slave_writes(100) if e.get('value') == 0x4148])
     ck('one terminal record for the action; the replay added nothing', len([r for r in st.journal() if r['kind'] == 'terminal' and r.get('action_id') == aid]) == 1)
     note = await wait_until(lambda: next((e for e in st.trace() if e.get('kind') == 'reconcile_note' and e.get('action_id') == aid and e.get('final')), None), 15)
-    ck('the periodic reconcile later recorded, finally: not landed', note is not None and note.get('landed') is False, note)
+    ck('the periodic reconcile later recorded, finally: no /audit entry, and no claim that it was not executed',
+       note is not None and note.get('audit_entry') == 'absent' and note.get('landed') is None, note)
     res = verifier.derive(p, st.entry('flow_setpoint'), st.trace(), st.samples(), now_ms())
     ck('the read side agrees: unknown', res['status'] == 'unknown', res)
     ok, n = verify_chain(st.p('journal.jsonl'))
@@ -761,42 +766,227 @@ async def case_R2(st, ck, notes):
     ck('journal hash chain verifies across both kills', ok, n)
 
 
-async def case_R3(st, ck, notes):
-    """The runtime is SIGSTOPped just before the write is sent, for longer than the bridge's HTTP timeout, then continued."""
-    await asyncio.sleep(1.0)
-    p = st.standin.payload('flow_setpoint', 12.5, ttl_ms=60000)
-    aid = p['action_id']
+# ---- R3: where the runtime is when the bridge's POST /write times out ------------------------------------------------------
+# Ground truth the bridge cannot see comes from the fake device's write log, the VM value and /audit, plus the receive queue of
+# the runtime's socket while it is stopped (netstat Recv-Q > 0: the request bytes are still unread).  The bridge's obligations
+# are checks; what IA2 itself did is compared with R3_EXPECT and a difference is a FINDING.
+R3_VALUE = 12.5
+R3_HIGH_WORD = (f32bits(R3_VALUE) >> 16) & 0xFFFF             # 0x4148: the first register of the f32 on holding 100
+R3_EXPECT = {                                                    # (executed on the VM/device, /audit has an entry); measured 2026-10-29
+    'R3': (False, False),                                        # stopped before reading: the request is dropped with the connection
+    'R3T1': (True, False),                                       # read and queued: applied after the client left, NOT audited
+    'R3T1K': (True, True),                                       # control: the same, connection kept open -> audited
+    'R3T1X': (True, False),                                      # read and queued, bridge SIGKILLed: applied, NOT audited
+    'R3T2': (True, True),                                        # applied and answered, answer lost: audited
+}
+
+
+def netstat_runtime_side(local_port):
+    """The runtime's end of the proxy's upstream connection in netstat (Proto Recv-Q Send-Q Local Foreign State): Recv-Q, Send-Q,
+    state.  macOS prints `addr.port` (`netstat -an -p tcp`, the recorded runs); Linux `netstat -tan` prints `addr:port` (untested)."""
+    cmd = ['netstat', '-an', '-p', 'tcp'] if sys.platform == 'darwin' else ['netstat', '-tan']
+    out = subprocess.run(cmd, capture_output=True, text=True, timeout=10).stdout
+    ends = [('127.0.0.1%s%d' % (sep, harness.RT_PORT), '127.0.0.1%s%d' % (sep, local_port)) for sep in '.:']
+    rows = []
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) >= 6 and (f[3], f[4]) in ends:
+            rows.append({'recv_q': int(f[1]), 'send_q': int(f[2]), 'state': f[5], 'line': line.strip()})
+    return rows
+
+
+def write_conn(st):
+    return next((r for r in st.wire_all() if r.get('ev') == 'req' and r.get('method') == 'POST' and r.get('path') == '/write'), None)
+
+
+async def r3_submit(st, ck):
+    p = st.standin.payload('flow_setpoint', R3_VALUE, ttl_ms=60000)
     st.standin.append_line(st.standin.envelope(st.standin.payload_text(p)))
     ck('hook point (intent journaled) reached', await wait_marker(st, 'after_intent'))
-    st.signal_runtime(signal.SIGSTOP)
-    t_stop = time.time()
-    release(st, 'after_intent')
+    return p
+
+
+async def r3_timed_out(st, ck, aid):
     ev = await wait_until(lambda: st.event(aid), 30)
     ck('while the runtime is stopped the action concludes unknown / runtime_unreachable', ev is not None and short(ev) == ('unknown', 'runtime_unreachable'), short(ev))
     resp = next((r for r in st.journal() if r.get('action_id') == aid and r['kind'] == 'response'), None)
-    ck('the journal records a transport timeout, not an answer', resp is not None and resp['http'].get('error_kind') == 'timeout', resp and resp['http'].get('error_kind'))
+    ck('the journal records a transport timeout, not an answer', resp is not None and resp['http'].get('error_kind') == 'timeout', resp and resp['http'])
     ck('the post-check was skipped (the write got no answer)', any(r['kind'] == 'post_check' and r.get('skipped') for r in st.journal() if r.get('action_id') == aid))
     ck('exactly one POST was sent: no resend', len(posts(st)) == 1, wire_summary(st.wire()))
+    return ev
+
+
+async def r3_arm_stall(st, ck):
+    """One 1 s scan stall (the watchdog needs 5 consecutive overruns), release the bridge, give the runtime 150 ms to read and queue."""
+    s, body = await st.rt('POST', '/inject-scan-stall', {'stall_ms': 1000, 'scans': 1}, timeout=3.0)
+    t_arm = time.time()
+    ck('a single 1 s scan stall was armed', s == 200, (s, body))
+    release(st, 'after_intent')
+    req = await wait_until(lambda: write_conn(st), 5, 0.002)
+    ck('the proxy forwarded the POST /write to the running runtime', req is not None)
+    await asyncio.sleep(0.15)
+    answered = [r for r in st.wire_all() if r.get('ev') == 'resp' and req and r.get('conn') == req['conn']]
+    return req, t_arm, answered
+
+
+async def r3_conclude(st, ck, notes, case_id, p, ev, after_t, reason='runtime_unreachable', from_audit=False):
+    """`from_audit`: a restarted bridge found the /audit entry and concluded `accepted` from it (D8), so no reconcile note follows."""
+    aid, label = p['action_id'], ev.get('label')
+    note = None if from_audit else await wait_until(
+        lambda: next((e for e in st.trace() if e.get('kind') == 'reconcile_note' and e.get('action_id') == aid and e.get('final')), None), 30)
+    await asyncio.sleep(1.0)
+    s, status = await st.rt('GET', '/status')
+    row = st.var_row(status if isinstance(status, dict) else None, 'sp_flow')
+    mine = [e for e in await audit_list(st) if e.get('origin') == label]
+    dev = [e for e in st.slave_writes(100, after_t) if e.get('value') == R3_HIGH_WORD]
+    vm = row is not None and row.get('bits') == f32bits(R3_VALUE)
+    executed = bool(dev) or vm
+    all_notes = [{k: e.get(k) for k in ('pass_no', 'landed', 'audit_entry', 'final', 'detail')}
+                 for e in st.trace() if e.get('kind') == 'reconcile_note' and e.get('action_id') == aid]
+    notes['truth'] = {'executed': executed, 'vm_bits': None if row is None else row.get('bits'), 'device_writes': [
+        {k: e.get(k) for k in ('t_req', 'fc', 'addr', 'value')} for e in dev], 'audit_rows': mine}
+    notes['reconcile_notes'] = all_notes
+    if from_audit:
+        ck('no reconcile note: the action was concluded from the /audit entry at the restart', all_notes == [], all_notes)
+    else:
+        ck('the bridge recorded a final reconcile note', note is not None, all_notes)
+        want = ('found', True) if len(mine) == 1 else ('absent', None)
+        ck('the final note states what /audit shows (%s, landed %s)' % want,
+           note is not None and (note.get('audit_entry'), note.get('landed')) == want, (note, len(mine)))
+    ck('no note claims the write was not executed (landed is never false)', all(n['landed'] is not False for n in all_notes), all_notes)
+    ck('a note that claims landed is backed by what the device or VM shows', all(executed for n in all_notes if n['landed'] is True), notes['truth'])
+    final = ('accepted', None) if from_audit else ('unknown', reason)
+    ck('the status is still %s / %s (terminal states do not upgrade)' % final, short(st.event(aid)) == final, short(st.event(aid)))
+    ck('still exactly one POST', len(posts(st)) == 1, wire_summary(st.wire()))
+    res = verifier.derive(p, st.entry('flow_setpoint'), st.trace(), st.samples(), now_ms())
+    if from_audit:
+        ck('the read side verifies the accepted write against the feedback', res['status'] == 'verified', res)
+    else:
+        ck('the read side shows unknown with the reconcile note attached, never "not landed"',
+           res['status'] == 'unknown' and 'reconcile' in res and res['reconcile']['landed'] is not False, res)
+    seen = (executed, len(mine) == 1)
+    notes['observed'] = {'executed': seen[0], 'audit_entry': seen[1]}
+    if executed and not mine:
+        notes['ia2_audit_gap'] = ('IA2 applied the write (device: %s, VM: %s) without an /audit entry: rt_write audits only after the queued '
+                                  'write is acknowledged, and its handler is dropped when the client connection closes' % (bool(dev), vm))
+    if seen != R3_EXPECT[case_id]:
+        notes['finding'] = ('%s EXPECT (executed, audited) = %s; observed %s.  Update R3_EXPECT and the contract after checking why.'
+                            % (case_id, R3_EXPECT[case_id], seen))
+
+
+async def case_R3(st, ck, notes):
+    """The runtime is SIGSTOPped before it reads the write request, for longer than the bridge's HTTP timeout, then continued."""
+    await asyncio.sleep(1.0)
+    p = await r3_submit(st, ck)
+    st.signal_runtime(signal.SIGSTOP)
+    t_stop = time.time()
+    release(st, 'after_intent')
+    req = await wait_until(lambda: write_conn(st), 10, 0.005)
+    ck('the proxy forwarded the POST /write to the stopped runtime', req is not None)
+    await asyncio.sleep(0.3)
+    port = st.proxy.up_local_port.get(req['conn']) if req else None
+    notes['netstat_while_stopped'] = q = netstat_runtime_side(port) if port else []
+    ck('timing: the request bytes are still unread in the runtime socket (Recv-Q > 0)', bool(q) and q[0]['recv_q'] > 0, q)
+    ev = await r3_timed_out(st, ck, p['action_id'])
     notes['stopped_for_s'] = round(time.time() - t_stop, 2)
     st.signal_runtime(signal.SIGCONT)
     await asyncio.sleep(3.0)
-    audit = await audit_list(st)
-    mine = [e for e in audit if e.get('origin') == ev.get('label')]
-    note = await wait_until(lambda: next((e for e in st.trace() if e.get('kind') == 'reconcile_note' and e.get('action_id') == aid and e.get('final')), None), 30)
-    ck('the bridge looked twice and recorded a final note', note is not None, note)
-    audit = await audit_list(st)
-    mine = [e for e in audit if e.get('origin') == ev.get('label')]
-    landed = len(mine) == 1
-    notes['landed_after_continue'] = landed
-    ck('the final note agrees with /audit (landed=%s)' % landed, note is not None and note.get('landed') is landed, (note, len(mine)))
-    ck('the status itself is still unknown (terminal states do not upgrade)', short(st.event(aid)) == ('unknown', 'runtime_unreachable'))
-    ck('still exactly one POST', len(posts(st)) == 1)
-    res = verifier.derive(p, st.entry('flow_setpoint'), st.trace(), st.samples(), now_ms())
-    ck('the read side shows unknown with the reconcile note attached', res['status'] == 'unknown' and 'reconcile' in res, res)
-    if not landed:
-        notes['finding'] = ('R3 EXPECT: the request queued behind the stopped runtime lands after SIGCONT. '
-                            'Observed: no matching /audit entry after resume. Timeout and missing audit evidence '
-                            'do not prove non-execution; the bridge keeps unknown and does not resend.')
+    await r3_conclude(st, ck, notes, 'R3', p, ev, req['t'] if req else t_stop)
+
+
+async def r3_queued_then_stopped(st, ck, notes, case_id, keep_open):
+    await asyncio.sleep(1.0)
+    p = await r3_submit(st, ck)
+    st.proxy.keep_write_upstream = keep_open
+    req, t_arm, answered = await r3_arm_stall(st, ck)
+    st.signal_runtime(signal.SIGSTOP)
+    t_stop = time.time()
+    notes['stop_after_stall_armed_s'] = round(t_stop - t_arm, 3)
+    ck('timing: no answer before the stop (the write was still queued behind the stall)', not answered, answered)
+    ck('timing: the stop came inside the 1 s stall', t_stop - t_arm < 0.8, t_stop - t_arm)
+    port = st.proxy.up_local_port.get(req['conn']) if req else None
+    await asyncio.sleep(0.2)
+    notes['netstat_while_stopped'] = q = netstat_runtime_side(port) if port else []
+    ck('timing: the runtime had read the whole request before the stop (Recv-Q = 0)', bool(q) and q[0]['recv_q'] == 0, q)
+    ev = await r3_timed_out(st, ck, p['action_id'])
+    await asyncio.sleep(0.3)
+    notes['netstat_after_bridge_closed'] = qa = netstat_runtime_side(port) if port else []
+    kept = [r for r in st.wire_all() if r.get('ev') == 'client_closed_upstream_kept_open']
+    if keep_open:
+        ck('control: the bridge gave up, the runtime connection stayed open (ESTABLISHED)', bool(kept) and bool(qa) and qa[0]['state'] == 'ESTABLISHED', (kept, qa))
+    else:
+        ck('the runtime connection closed with the bridge\'s (CLOSE_WAIT)', not kept and bool(qa) and qa[0]['state'] == 'CLOSE_WAIT', qa)
+    notes['stopped_for_s'] = round(time.time() - t_stop, 2)
+    st.signal_runtime(signal.SIGCONT)
+    await asyncio.sleep(3.0)
+    s, h = await st.rt('GET', '/health')
+    notes['health_after'] = {k: h.get(k) for k in ('status', 'watchdog_tripped', 'latch_reason')} if isinstance(h, dict) else h
+    ck('the injected stall did not trip the watchdog', isinstance(h, dict) and h.get('watchdog_tripped') is False, notes['health_after'])
+    await r3_conclude(st, ck, notes, case_id, p, ev, req['t'] if req else t_stop)
+
+
+async def case_R3T1(st, ck, notes):
+    """The runtime has read the request and queued the write; a 1 s scan stall keeps it unapplied; SIGSTOP inside the stall."""
+    await r3_queued_then_stopped(st, ck, notes, 'R3T1', False)
+
+
+async def case_R3T1K(st, ck, notes):
+    """Control for R3T1: identical, except the proxy keeps the runtime's connection open after the bridge gives up."""
+    await r3_queued_then_stopped(st, ck, notes, 'R3T1K', True)
+
+
+async def case_R3T1X(st, ck, notes):
+    """The R3T1 window reached by a bridge crash: SIGKILL while the write is queued behind the stall, then a plain restart."""
+    await asyncio.sleep(1.0)
+    p = await r3_submit(st, ck)
+    aid = p['action_id']
+    req, t_arm, answered = await r3_arm_stall(st, ck)
+    await st.kill_bridge()
+    t_kill = time.time()
+    notes['kill_after_stall_armed_s'] = round(t_kill - t_arm, 3)
+    ck('timing: the bridge was killed before any answer (the write was still queued behind the stall)', not answered, answered)
+    ck('timing: the kill came inside the 1 s stall', t_kill - t_arm < 0.8, t_kill - t_arm)
+    kinds = [r['kind'] for r in st.journal() if r.get('action_id') == aid]
+    ck('the journal holds the intent only', kinds == ['intent'], kinds)
+    await asyncio.sleep(2.0)                                     # the stall ends; whatever the runtime does with the queued write is done
+    await st.start_bridge()                                     # a plain bridge: recovery runs at start-up
+    ev = await wait_until(lambda: st.event(aid), 15)
+    # IA2 at main e6a38aa keeps no entry for this write, so recovery concludes unknown; a runtime that audits a write whose client went
+    # away gives recovery the entry, and it concludes accepted from it (D8).  Either way R3_EXPECT decides whether this is a FINDING.
+    from_audit = ev is not None and any(e.get('origin') == ev.get('label') for e in await audit_list(st))
+    if from_audit:
+        ck('after the restart the action is concluded accepted from the /audit entry', short(ev) == ('accepted', None), short(ev))
+        ck('...and the detail says so', 'from the /audit entry' in (ev.get('detail') or ''), ev.get('detail'))
+    else:
+        ck('after the restart the action is concluded unknown / bridge_restarted', ev is not None and short(ev) == ('unknown', 'bridge_restarted'), short(ev))
+        ck('...and the detail does not read the missing entry as "not executed"', ev is not None and 'does not show it was not executed' in (ev.get('detail') or ''),
+           ev and ev.get('detail'))
+    ck('exactly one POST in total: recovery did not resend', len(posts(st)) == 1, wire_summary(st.wire()))
+    await r3_conclude(st, ck, notes, 'R3T1X', p, ev, req['t'] if req else t_kill, reason='bridge_restarted', from_audit=from_audit)
+
+
+async def case_R3T2(st, ck, notes):
+    """The runtime applied the write and answered; the proxy holds the answer and the runtime is SIGSTOPped at that moment."""
+    await asyncio.sleep(1.0)
+    p = await r3_submit(st, ck)
+    held, gate = [], asyncio.Event()
+
+    def on_held():
+        st.signal_runtime(signal.SIGSTOP)
+        held.append(time.time())
+    st.proxy.on_held, st.proxy.hold_write = on_held, gate
+    release(st, 'after_intent')
+    req = await wait_until(lambda: write_conn(st), 5, 0.002)
+    ck('the runtime answered and the proxy held the answer (runtime stopped at that moment)', bool(await wait_until(lambda: held, 5, 0.002)))
+    hr = next((r for r in st.wire_all() if r.get('ev') == 'resp_held'), None)
+    notes['held_answer'] = hr
+    ck('timing: the held answer is a 200 (the write was applied before the stop)', hr is not None and hr.get('status') == 200, hr)
+    ev = await r3_timed_out(st, ck, p['action_id'])
+    notes['stopped_for_s'] = round(time.time() - held[0], 2) if held else None
+    st.signal_runtime(signal.SIGCONT)
+    gate.set()
+    await asyncio.sleep(3.0)
+    await r3_conclude(st, ck, notes, 'R3T2', p, ev, req['t'] if req else time.time())
 
 
 FORBIDDEN_PARAMS = {'command', 'cmd', 'variable', 'ia2_variable', 'name', 'bits', 'value', 'pulse', 'pulse_ms', 'force', 'unforce',
@@ -933,6 +1123,10 @@ CASES.update({
     'R2': (case_R2, [tgt('flow_a', 'sp_flow', 'REAL', 0.0, 40.0, require_devices=['coupler'], verify=fb('sp_flow_fb')),
                      tgt('flow_b', 'sp_flow', 'REAL', 0.0, 40.0, require_devices=['coupler'], verify=fb('sp_flow_fb'))]),
     'R3': (case_R3, [FLOW], {'hooks': HOOKS_SYNC, 'env': {'HOOK_AT': 'after_intent', 'HOOK_DIR': '{dir}'}}),
+    'R3T1': (case_R3T1, [FLOW], {'hooks': HOOKS_SYNC, 'env': {'HOOK_AT': 'after_intent', 'HOOK_DIR': '{dir}'}}),
+    'R3T1K': (case_R3T1K, [FLOW], {'hooks': HOOKS_SYNC, 'env': {'HOOK_AT': 'after_intent', 'HOOK_DIR': '{dir}'}}),
+    'R3T1X': (case_R3T1X, [FLOW], {'hooks': HOOKS_SYNC, 'env': {'HOOK_AT': 'after_intent', 'HOOK_DIR': '{dir}'}}),
+    'R3T2': (case_R3T2, [FLOW], {'hooks': HOOKS_SYNC, 'env': {'HOOK_AT': 'after_intent', 'HOOK_DIR': '{dir}'}}),
     'F1': (case_F1, [FLOW]),
     'F2': (case_F2, [FLOW]),
     'PROD': (case_PROD, [FLOW], {'prod': True}),

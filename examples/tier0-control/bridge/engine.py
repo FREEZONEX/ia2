@@ -12,8 +12,10 @@ Implementation notes that differ from or sharpen the contract text (see RESULT-S
   * Crash recovery never resends (D8).  It concludes an in-flight action from what IA2 recorded (the journal's response
     record, else /audit by label). An action concluded from /audit alone has no send timestamp, but can carry a scan-clock
     marker taken at recovery on the same runtime instance; only feedback after that marker can verify it.
-  * Writes that ended `unknown` for a transport/VM reason get `reconcile_note`s (two looks, the second after a pause): landed /
-    not seen / unverifiable.  The status itself never changes: terminal states do not upgrade.
+  * Writes that ended `unknown` for a transport/VM reason get `reconcile_note`s (two looks, the second after a pause).  `audit_entry`
+    says what /audit showed: found / absent / unavailable.  Only `found` is a claim (`landed: true`); otherwise `landed` is null.  An
+    absent entry never means "not executed" (R3T1/R3T1X): the runtime audits a write after the scan loop applied it, and records nothing
+    if the HTTP connection closed while the write was queued.  The status itself never changes: terminal states do not upgrade.
   * `accepted` events carry the runtime's own scan clock at the first post-write /status read (`post_scan_us`) and the offset between
     the bridge's wall clock and that scan clock (`scan_anchor_ms`): the read side orders feedback against the write in the
     runtime's own clock, never against another host's wall clock.
@@ -235,7 +237,7 @@ class Engine:
             row = find_audit_row(audit, intent['label'], intent['variable'], intent['bits'])
             if row is None:
                 outcome = {'state': 'unknown', 'reason': 'runtime_restarted' if identity_changed else 'bridge_restarted',
-                           'detail': 'no /audit entry carries this label; not resent (D8)'}
+                           'detail': 'no /audit entry carries this label (that does not show it was not executed); not resent (D8)'}
             else:
                 outcome = outcome_from_audit_row(row, intent['bits'])
             source = '/audit entry' if row is not None else '/audit (no entry)'
@@ -321,22 +323,26 @@ class Engine:
             return
         row = None
         if status.get('runtime_id') != intent.get('runtime_id'):
-            landed, detail = None, 'the runtime restarted; /audit was cleared, so nothing can be said'
+            audit_entry, detail = 'unavailable', 'the runtime restarted; /audit was cleared, so nothing can be said'
         else:
             row = find_audit_row(audit, intent['label'], intent['variable'], intent['bits'])
-            landed = row is not None
-            if landed:
+            audit_entry = 'found' if row is not None else 'absent'
+            if row is not None:
                 detail = ('/audit has an entry for this write: %r%s' % (row.get('result'), ' (it landed AFTER the first look)' if pass_no == 2 else ''))
             elif pass_no == 1:
-                detail = '/audit had no entry for this write at the first look; it will be looked at again'
+                detail = ('/audit had no entry for this write at the first look; it will be looked at again. No entry does not '
+                          'show that the write was not executed')
             else:
-                detail = ('/audit still has no entry for this write at the second look (it may never have arrived, or the '
-                          '256-entry ring may have turned over)')
-        self.journal.append('reconcile', action_id=aid, landed=landed, detail=detail, pass_no=pass_no)
+                detail = ('/audit still has no entry for this write at the second look. That does not show it was not executed: '
+                          'the request may never have been read, the runtime may have applied it without an entry (it records a '
+                          'write only after applying it, and nothing if the connection closed while the write was queued), or '
+                          'the 256-entry ring may have turned over')
+        landed = True if audit_entry == 'found' else None  # never False: absence is not evidence of non-execution
+        self.journal.append('reconcile', action_id=aid, landed=landed, audit_entry=audit_entry, detail=detail, pass_no=pass_no)
         self._emit({'schema': 'ia2.control/v0', 'kind': 'reconcile_note', 'action_id': aid, 'pass_no': pass_no,
-                    'final': pass_no == 2 or landed is not False,
+                    'final': pass_no == 2 or audit_entry != 'absent',
                     'event_id': sha256_text('%s:reconcile:%d' % (aid, pass_no))[:32], 'session_id': intent['info'].get('session_id'),
-                    'device_id': intent['info'].get('device_id'), 'landed': landed, 'detail': detail,
+                    'device_id': intent['info'].get('device_id'), 'landed': landed, 'audit_entry': audit_entry, 'detail': detail,
                     'audit_result': None if row is None else row.get('result'),
                     'note': 'does not change the action status', 'observed_at_ms': self.clock()})
 
