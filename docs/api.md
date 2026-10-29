@@ -337,7 +337,9 @@ the *deployed* edge runtime, proxy the same ops through
 `POST /api/edges/{name}/runtime/{op}`. All return `409` when nothing is running.
 
 Variable writes accept optional `pulse_ms: <u32>`: the runtime writes zero
-after that delay, including while paused. A later accepted pulse, ordinary
+after that delay, counted from when the write was applied (time it spent
+queued behind a slow scan does not shorten the pulse), including while
+paused. A later accepted pulse, ordinary
 write (including MQTT), or force to the same resolved variable supersedes
 the earlier reset; bare and qualified names share ownership. Rejected writes
 leave the existing reset active. The current reset bypasses write governance

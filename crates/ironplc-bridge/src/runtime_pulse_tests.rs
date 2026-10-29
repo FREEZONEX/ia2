@@ -259,9 +259,174 @@ async fn pulse_reset_survives_a_caller_dropped_while_the_write_is_queued() {
 
     tokio::time::sleep_until(t0 + Duration::from_millis(500)).await;
     let landed = handle.subscribe().recv().await.unwrap();
-    tokio::time::sleep_until(t0 + Duration::from_millis(1200)).await;
+    // The write landed about 240 ms after t0 and is held 800 ms from then.
+    tokio::time::sleep_until(t0 + Duration::from_millis(1500)).await;
     let after = handle.subscribe().recv().await.unwrap();
     handle.shutdown().await;
     assert_eq!(var_value(&landed, "x"), "1", "the queued write still lands");
     assert_eq!(var_value(&after, "x"), "0", "and its reset still runs");
+}
+
+/// Parks the scan thread in the input phase when armed, until released: a
+/// scan gate that does not depend on how long anything sleeps.
+struct ScanGateDevice {
+    armed: Arc<AtomicBool>,
+    parked: tokio::sync::mpsc::UnboundedSender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[async_trait::async_trait]
+impl IoDevice for ScanGateDevice {
+    fn name(&self) -> &str {
+        "gate"
+    }
+    fn is_healthy(&self) -> bool {
+        true
+    }
+    async fn read_channel(&mut self, _: &str) -> Result<ChannelValue, IoError> {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            let _ = self.parked.send(());
+            let _ = self.release.recv();
+        }
+        Ok(ChannelValue::I32(0))
+    }
+    async fn write_channel(&mut self, _: &str, _: ChannelValue) -> Result<(), IoError> {
+        Ok(())
+    }
+}
+
+struct ScanGate {
+    armed: Arc<AtomicBool>,
+    parked: tokio::sync::mpsc::UnboundedReceiver<()>,
+    release: std::sync::mpsc::Sender<()>,
+}
+
+impl ScanGate {
+    /// Returns once the scan thread is parked: no command is applied until
+    /// `release`.
+    async fn park(&mut self) {
+        self.arm();
+        self.parked().await;
+    }
+    /// Park at the next input phase.
+    fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+    async fn parked(&mut self) {
+        self.parked.recv().await.unwrap();
+    }
+    fn release(&self) {
+        self.release.send(()).unwrap();
+    }
+}
+
+fn gated_pulse_handle() -> (ProgramHandle, ScanGate) {
+    let armed = Arc::new(AtomicBool::new(false));
+    let (parked_tx, parked_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let handle = spawn_units_inner(
+        vec![single_unit(
+            crate::compile(
+                "PROGRAM main VAR x : INT; y : INT; barrier : INT; g : INT; END_VAR y := x; END_PROGRAM",
+            )
+            .unwrap(),
+            10,
+        )],
+        DeviceSource::Prebuilt(vec![Box::new(ScanGateDevice {
+            armed: armed.clone(),
+            parked: parked_tx,
+            release: release_rx,
+        })]),
+        vec![project::Mapping {
+            application: "main".into(),
+            variable: "g".into(),
+            direction: Direction::Input,
+            device: "gate".into(),
+            channel: "in".into(),
+            unit: None,
+            min: None,
+            max: None,
+            description: None,
+        }],
+        None,
+        WriteGovernance::default(),
+    );
+    (
+        handle,
+        ScanGate {
+            armed,
+            parked: parked_rx,
+            release: release_tx,
+        },
+    )
+}
+
+/// Poll once: `write_with_pulse` queues its write in that first poll, so
+/// Pending means the write is in the scan loop's queue and not yet applied.
+async fn queue_once<F: std::future::Future>(fut: &mut std::pin::Pin<&mut F>) -> bool {
+    std::future::poll_fn(|cx| std::task::Poll::Ready(fut.as_mut().poll(cx).is_pending())).await
+}
+
+/// The write waits `queued_ms` behind a parked scan, then lands; from that
+/// moment the value must be held for the whole pulse and then cleared.
+async fn pulse_held_from_landing(pulse_ms: u64, queued_ms: u64) {
+    let clock = hold_pulse_clock();
+    let (handle, mut gate) = gated_pulse_handle();
+    gate.park().await;
+    let pulse = crate::monitor::write_with_pulse(&handle, "x", 1, Some(pulse_ms as u32));
+    let mut pulse = std::pin::pin!(pulse);
+    assert!(queue_once(&mut pulse).await, "the write is still queued");
+    tokio::time::advance(Duration::from_millis(queued_ms)).await;
+    gate.release();
+    assert_eq!(pulse.await.unwrap().value, 1);
+    // The pulse time starts now, when the write has landed.
+    let before_deadline = pulse_value_after(&handle, pulse_ms - 1).await;
+    let after_deadline = pulse_value_after(&handle, 2).await;
+    clock.abort();
+    handle.shutdown().await;
+    assert_eq!(
+        before_deadline, 1,
+        "{queued_ms} ms in the queue must not shorten a {pulse_ms} ms pulse"
+    );
+    assert_eq!(after_deadline, 0, "the pulse clears at its deadline");
+}
+
+#[tokio::test(start_paused = true)]
+async fn pulse_queued_longer_than_its_time_is_held_for_all_of_it() {
+    pulse_held_from_landing(100, 300).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn pulse_queued_for_part_of_its_time_is_held_for_all_of_it() {
+    pulse_held_from_landing(800, 300).await;
+}
+
+/// The caller goes while its pulse write is queued: the write lands, the
+/// value is held for the whole pulse from then, and the reset still runs.
+#[tokio::test(start_paused = true)]
+async fn pulse_dropped_while_queued_is_held_for_its_time_and_then_cleared() {
+    let clock = hold_pulse_clock();
+    let (handle, mut gate) = gated_pulse_handle();
+    gate.park().await;
+    {
+        let pulse = crate::monitor::write_with_pulse(&handle, "x", 1, Some(100));
+        let mut pulse = std::pin::pin!(pulse);
+        assert!(queue_once(&mut pulse).await, "the write is still queued");
+    } // dropped here, still queued
+    tokio::time::advance(Duration::from_millis(300)).await;
+    // Nobody awaits the write any more. Park again at the next input phase:
+    // the scan drains its command queue before that, so once parked there the
+    // write has landed, and the test clock has not moved since.
+    gate.arm();
+    gate.release();
+    gate.parked().await;
+    gate.release();
+    let before_deadline = pulse_value_after(&handle, 99).await;
+    // The reset task was woken by the write's ack, before the scan parked;
+    // even if it ran late, its deadline is at most one pulse after the check.
+    let cleared = pulse_value_after(&handle, 100).await;
+    clock.abort();
+    handle.shutdown().await;
+    assert_eq!(before_deadline, 1, "the queue time must not shorten the pulse");
+    assert_eq!(cleared, 0, "and the reset still runs");
 }
