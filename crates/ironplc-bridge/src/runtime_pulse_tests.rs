@@ -238,3 +238,30 @@ async fn pulse_reset_reports_undelivered_and_zero_flushes_after_reconnect() {
     );
     handle.shutdown().await;
 }
+
+/// An HTTP server drops a handler's future when its client disconnects. A
+/// pulse write already queued to the scan loop still lands then, so its reset
+/// must not have been tied to the dropped caller: the value would stay
+/// latched, which is what `pulse_ms` exists to prevent.
+#[tokio::test]
+async fn pulse_reset_survives_a_caller_dropped_while_the_write_is_queued() {
+    let handle = pulse_test_handle();
+    // Hold the scan loop so the write is still queued when its caller goes.
+    handle.inject_scan_stall(300, 1).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let t0 = tokio::time::Instant::now();
+    let dropped = tokio::time::timeout(
+        Duration::from_millis(20),
+        crate::monitor::write_with_pulse(&handle, "x", 1, Some(800)),
+    )
+    .await;
+    assert!(dropped.is_err(), "the write must still be queued when dropped");
+
+    tokio::time::sleep_until(t0 + Duration::from_millis(500)).await;
+    let landed = handle.subscribe().recv().await.unwrap();
+    tokio::time::sleep_until(t0 + Duration::from_millis(1200)).await;
+    let after = handle.subscribe().recv().await.unwrap();
+    handle.shutdown().await;
+    assert_eq!(var_value(&landed, "x"), "1", "the queued write still lands");
+    assert_eq!(var_value(&after, "x"), "0", "and its reset still runs");
+}

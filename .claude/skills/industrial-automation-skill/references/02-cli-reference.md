@@ -157,7 +157,9 @@ runtime resets the value to zero after the delay, even while paused. A later
 accepted pulse, plain write (including MQTT), or force supersedes that reset
 for the same resolved variable, including bare/qualified aliases. A rejected
 write leaves the reset active. Reset bypasses governance bounds; if delivery
-is impossible, it still clears the VM and logs the undelivered device.
+is impossible, it still clears the VM and logs the undelivered device. A
+caller that disconnects after the runtime read the request still gets the
+write and its reset.
 The current VM value is sent on normal link recovery; no new start edge is
 introduced by this pulse contract.
 
