@@ -794,8 +794,9 @@ async def case_R3(st, ck, notes):
     res = verifier.derive(p, st.entry('flow_setpoint'), st.trace(), st.samples(), now_ms())
     ck('the read side shows unknown with the reconcile note attached', res['status'] == 'unknown' and 'reconcile' in res, res)
     if not landed:
-        notes['finding'] = ('R3 EXPECT: the request queued behind the stopped runtime lands after SIGCONT.  Observed: it did NOT land (/audit empty) -- '
-                            'the runtime dropped the request once the bridge closed its timed-out connection.  The bridge recorded exactly that.')
+        notes['finding'] = ('R3 EXPECT: the request queued behind the stopped runtime lands after SIGCONT. '
+                            'Observed: no matching /audit entry after resume. Timeout and missing audit evidence '
+                            'do not prove non-execution; the bridge keeps unknown and does not resend.')
 
 
 FORBIDDEN_PARAMS = {'command', 'cmd', 'variable', 'ia2_variable', 'name', 'bits', 'value', 'pulse', 'pulse_ms', 'force', 'unforce',

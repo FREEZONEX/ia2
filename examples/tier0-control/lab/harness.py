@@ -185,28 +185,34 @@ class Stack:
     async def _spawn_runtime(self):
         self.runtime_n += 1
         self.rtlog = open(self.p('runtime-%d.log' % self.runtime_n), 'wb')
-        self.proc = await asyncio.create_subprocess_exec(
-            self.bin, '--project-dir', self.p('project'), '--bind', '127.0.0.1:%d' % RT_PORT,
-            '--state-dir', self.p('state'), stdout=self.rtlog, stderr=self.rtlog, env=dict(os.environ, RUST_LOG='info'))
+        # The runtime is deliberately SIGSTOPped. Some macOS/Python versions
+        # report that stop to asyncio's exit watcher, which then blocks the
+        # event loop in waitpid. Keep this child outside that watcher.
+        self.proc = subprocess.Popen(
+            [self.bin, '--project-dir', self.p('project'), '--bind', '127.0.0.1:%d' % RT_PORT,
+             '--state-dir', self.p('state')], stdout=self.rtlog, stderr=self.rtlog, env=dict(os.environ, RUST_LOG='info'))
         if not await self._wait_runtime():
             raise RuntimeError('runtime not healthy within 20 s')
 
+    async def _wait_runtime_exit(self, timeout=None):
+        return await asyncio.get_running_loop().run_in_executor(None, self.proc.wait, timeout)
+
     async def kill_runtime(self):
-        if self.proc and self.proc.returncode is None:
+        if self.proc and self.proc.poll() is None:
             self.proc.kill()                          # only ever our own child
-            await self.proc.wait()
+            await self._wait_runtime_exit()
 
     async def restart_runtime(self):
         await self.kill_runtime()
         await self._spawn_runtime()
 
     def signal_runtime(self, sig):
-        os.kill(self.proc.pid, sig)                   # our own child only
+        self.proc.send_signal(sig)                   # our own child only
 
     async def _wait_runtime(self):
         end = time.time() + 20
         while time.time() < end:
-            if self.proc.returncode is not None:
+            if self.proc.poll() is not None:
                 return False
             st, body = await self.rt('GET', '/health', timeout=1.0)
             if st == 200 and isinstance(body, dict) and body.get('devices') and all(d.get('healthy') for d in body['devices']):
@@ -270,14 +276,14 @@ class Stack:
         await self.stop_bridge()
         if self.sampler:
             self.sampler.stop()
-        if self.proc and self.proc.returncode is None:
+        if self.proc and self.proc.poll() is None:
             try:
                 self.signal_runtime(signal.SIGCONT)
                 await self.rt('POST', '/stop', {}, timeout=3.0)
-                await asyncio.wait_for(self.proc.wait(), 25)
+                await self._wait_runtime_exit(timeout=25)
             except Exception:  # noqa: BLE001
                 self.proc.kill()                      # only ever our own child
-                await self.proc.wait()
+                await self._wait_runtime_exit()
         if self.proxy:
             await self.proxy.stop()
         if self.stub_srv:

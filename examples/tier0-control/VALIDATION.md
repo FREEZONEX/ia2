@@ -1,4 +1,16 @@
-# Validation — 2026-10-28 UTC+8
+# Validation
+
+## Review follow-up — 2026-10-29 UTC+8
+
+Review of `2d68f5b6976d35448084a6c922dcd51a83e4ca3c` reproduced a harness hang on macOS 27.0.1 with Python 3.14.7: R3 stopped the runtime, then the asyncio child watcher blocked the event-loop thread in `waitpid`. The bridge had already recorded `unknown / runtime_unreachable`; the harness could not resume the runtime. That run required terminating its test child and is retained as a failed run, not a pass.
+
+The harness now uses `subprocess.Popen` for the runtime and waits for exit in a worker thread. The same R3 scenario completes in 8.7 seconds on both Python 3.14.7 and 3.9.6, with all its assertions passing. Its original **FINDING remains**: no matching audit entry was observed after resume. The generated note now states that observation without claiming the runtime definitely dropped the write. Stage 1a remains incomplete; its criteria and follow-up list are unchanged.
+
+Normal writes, duplicate suppression, bridge crash recovery before and after sending, and runtime restart checks passed using the real loopback runtime and fake Modbus devices. The existing Python suites passed before the harness-only fix; bridge code was unchanged afterward. The device-free project compiled and its scenario passed, finishing stopped with no forces or alarms. Bundled Tomli source and license bytes were also compared with the PyPI 2.2.1 source archive.
+
+The reused runtime reports build `ab00029af76b`; its Rust sources, dependencies and configuration match `main` at `e6a38aa`. Binary SHA-256: `79bcbe8894aef6221922386c4720b614103a96c0a9174a7cf7c10ec234a2c0d1`. Final bridge/lab source-tree SHA-256: `215bd171447135a6c26e80023b1b33fec20464003dc0e0257a3eec5b06ff375f`. Evidence directories are `evidence/pr99-review-20261029` (including the failed pre-fix run), `evidence/pr99-review-fixed-20261029`, `evidence/pr99-final-20261029`, `evidence/pr99-python39-20261029` and `evidence/pr99-sim-20261029`. No Rust/Web changes required another full repository build or test run. No hardware was contacted.
+
+## Original acceptance record — 2026-10-28 UTC+8
 
 IR03 result publication recovery, nullable-failsafe compatibility and the D6 TOML guard repair are validated. The prior `failsafe_status: null` startup blocker is resolved. A null report means there is no failsafe-attempt report; it does not override any other safety evidence. Pending, acknowledged or unconfirmed entries still inhibit writes, and malformed reports still fail closed.
 

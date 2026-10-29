@@ -38,6 +38,8 @@ python3 -I -B lab/p0_bool_acceptance.py --bin ../../target/release/ia2-runtime
 
 Use a new output directory for each integration run. Run integration suites serially: they own loopback ports 13501, 13502, 13503, 13511 and 13512. The runner exits nonzero for a FAIL or setup error and records source-tree and binary hashes. See [VALIDATION.md](VALIDATION.md) for the exact tested runtime revision and results; the historical R3 finding remains visible.
 
+The harness manages the deliberately paused runtime with `subprocess.Popen` and waits for its exit in a worker thread. This avoids a macOS/Python 3.14.7 `asyncio` child-watcher hang on `SIGSTOP`, reproduced during review. It does not change the bridge or runtime behavior, or turn R3's missing audit evidence into proof of non-execution.
+
 The F1 case checks the pinned archived read-only tool schema in `tests/fixtures/`. It does not audit a live read-only MCP deployment or its delivery bundle. Golden HTTP fixtures come from the earlier loopback fake-device experiment.
 
 ## Device-free simulator smoke

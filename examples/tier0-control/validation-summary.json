@@ -1,4 +1,17 @@
 {
+  "review_20261029": {
+    "reviewed_head": "2d68f5b6976d35448084a6c922dcd51a83e4ca3c",
+    "repair": "Manage the SIGSTOP-tested runtime with Popen and wait for exit off the event loop; keep R3 audit absence inconclusive.",
+    "before": "Python 3.14.7/macOS 27.0.1: R3 blocked in asyncio child-watcher waitpid; manually terminated test child; run failed.",
+    "after": "R3 completed in 8.7 seconds on Python 3.14.7 and 3.9.6; assertions passed, original FINDING retained. Runtime restart C8 passed.",
+    "other_validation": "Existing Python suites, real loopback A1/B3/R1/R2, and device-free CLI compilation/scenario passed; Tomli bytes match PyPI sdist.",
+    "runtime_build_commit": "ab00029af76b",
+    "runtime_source_matches_main": "e6a38aa355cde1747114866b52c2e26f0e3ca724",
+    "runtime_bin_sha256": "79bcbe8894aef6221922386c4720b614103a96c0a9174a7cf7c10ec234a2c0d1",
+    "code_tree_sha256": "215bd171447135a6c26e80023b1b33fec20464003dc0e0257a3eec5b06ff375f",
+    "stage_1a_accepted": false,
+    "hardware_contacted": false
+  },
   "recorded_date": "2026-10-28 UTC+8",
   "base_commit": "e6a38aa355cde1747114866b52c2e26f0e3ca724",
   "python_tests": {
