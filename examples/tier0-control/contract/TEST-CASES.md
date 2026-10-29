@@ -1,14 +1,14 @@
 # 阶段 1 测试用例：Tier0 ↔ IA2 控制写入联调（草案 v0，2026-10-27）
 
-配套契约：[`CONTRACT.md`](CONTRACT.md)（`ia2.control/v0.9`）。**历史 P0 验证记录：24 个 P0 用例已全部在 1a 夹具上运行（各 3 遍：23 个 PASS，R3 为 FINDING，无 FAIL；`tier0-ia2-control-1a-20261027/RESULT-P0.md`）；当时其余 19 个 P1 / P2 未运行；另有 `PROD`（生产打包的桥端到端，3 遍 PASS）。**
+配套契约：[`CONTRACT.md`](CONTRACT.md)（`ia2.control/v0.10`）。**历史 P0 验证记录：24 个 P0 用例已全部在 1a 夹具上运行（各 3 遍：23 个 PASS，R3 为 FINDING，无 FAIL；`tier0-ia2-control-1a-20261027/RESULT-P0.md`）；当时其余 19 个 P1 / P2 未运行；另有 `PROD`（生产打包的桥端到端，3 遍 PASS）。**
 
-**当前 PR #99 状态（2026-10-29，工作树未提交）：** R3 时序覆盖与对账语义修复后，31 个回环用例（原 27 个 + R3T1、R3T1K、R3T1X、R3T2）**全部 PASS**，471 条断言无失败；R3 组 5 个用例各 3 遍 15/15 PASS，详见 [VALIDATION.md](../VALIDATION.md)。R3 原 FINDING 已按 §2 回改 EXPECT 并重跑通过，历史留证保留。**阶段 1a 仍未满足第 4 节退出条件**：通用三方对账（WP6）与 2 小时浸泡（WP9）未做，见 [HANDOFF.md](../HANDOFF.md#验收待办)。
+**当前状态（2026-10-29，PR #99 合并之后）：** 28 个 P0、`PROD`、两个复核回归与 13 个 P1 在最终代码上 54/54 PASS（R3 组三遍），727 条断言无失败；WP6 对账程序与 2 小时浸泡已完成。**第 4 节的五条退出条件都有了证据**，逐条见 [`RESULT-1A.md`](../RESULT-1A.md)；其中 R3、B5、C5、C10、R5、F4 的 EXPECT 与浸泡对账的一条判据是运行后修订的，均有登记。
 
 ## 0 阶段划分
 
 | 段 | 内容 | 触碰 | 状态 |
 |---|---|---|---|
-| **1a** | Mac 本机：沙箱 IA2 runtime + 假 Modbus TCP 从站 + 桥参考实现 + Tier0 替身（本地 JSONL）。本文第 3 节的全部用例 | 只用本机回环端口；不连 grey0、不连真 Tier0 | 夹具与桥已实现；当前回环集 31 PASS（含 R3 时序），WP6、WP9 未做，尚未退出 |
+| **1a** | Mac 本机：沙箱 IA2 runtime + 假 Modbus TCP 从站 + 桥参考实现 + Tier0 替身（本地 JSONL）。本文第 3 节的全部用例 | 只用本机回环端口；不连 grey0、不连真 Tier0 | 退出条件都有了证据（`RESULT-1A.md`）；P2 的 C11、A3b 未做 |
 | **1b** | 真 Tier0（grey0 上已在跑的六个容器）+ grey0 上**另起的**沙箱 runtime。第 5 节只列入口条件和追加用例 | 触碰 grey0 | **需要用户另行授权，本文不授权** |
 
 1a 是 1b 的前置：真 Tier0 只会让问题更难定位，契约本身的错先在本机排掉。
@@ -147,6 +147,21 @@ R3 组的共同判据：状态不升级；读侧仍为 `unknown` 且不出现 `l
 | B11、R1、R3 | 对账看**两次**：B11 里每个 unknown 得到两条 note（第二条 `final`）；R1、R3 等 `final` note | W9 |
 | R3 | EXPECT（排队的请求在 CONT 后落地）**不成立**：请求没有落地（`/audit` 为空），桥的对账记 `landed: false`（历史，2026-10-28）。2026-10-29 的时序覆盖证明 `/audit` 无条目不能说明没有执行（R3T1、R3T1X），EXPECT 与对账记录已在 v0.8 改写 | 见 `RESULT-P0.md`、CONTRACT §11.5 |
 
+### 3.2 P1 运行中据实修订的地方（2026-10-29）
+
+P1 由 `lab/cases_p1_table.py` 端到端运行（结果见 [`RESULT-1A.md`](../RESULT-1A.md) §2）。与上面的表不同之处：
+
+| 用例 | 与表不同之处 | 为什么 |
+|---|---|---|
+| A4 | 写入经桥发出（journal 才有 300 条），并另开每秒一次的 `/audit` 归档作对照 | 判据要求 journal 完整、对账程序对丢失条目报"不可核对"；只有经桥的写入才有 journal |
+| B5 | (a) 启动预检就拒绝指向不存在变量的注册表（退出码 4）；用例另起关掉预检的桥，才观察到 404 → `unknown_variable` 并禁用，之后的请求 `not_in_registry`。(b) `/stop` 之后 runtime 进程退出，G8 以 `runtime_unreachable` 先拒，不触达 IA2；409 → `scan_stopped` 的映射只在单元向量里 | 桥的检查比 EXPECT 设想的更早 |
+| C5 | 正常模式下暂停：G8 先拒（扫描计数不动，`runtime_unreachable`），不是 G9 的 `paused`；强制：`forced`。桥没有跳过 G9 的开关，"诊断"半边改为直连 runtime 表征 | 闸门顺序 |
+| C10 | (e) 不重启 runtime：桥每个请求前都重读文件，改文件后的下一个请求就被拒 | 比 EXPECT 更严；runtime 只在下次启动时采用新文件 |
+| R5 | 先在同一分钟里分批写 55 次，再在 1 s 内涌入 50 个 | 单靠突发到不了全桥上限：桥一次读一行，读到时距 `requested_at_ms` 超过 2 s 的请求按 G4 `expired`（第一次运行 12 个 `expired`、0 个 `rate_limited`） |
+| F4 | 检查工具新增可选的运行中快照名单，逐字比对；原工具剥掉实例前缀再比，`main_inst.sp_flow` 漏报（GAP，已补） | 判据要求指出名字不符 |
+| C9 | 不单独运行：`main` `e6a38aa` 就是 #98 的合并提交，P0 的 C1、C3、C8 都跑在它上面 | 被测构建相同 |
+| E4–E7 | 由验证器的表驱动向量覆盖，没有端到端 | 验证器是纯函数；端到端的样本来自 E1/E2 已用过的同一采样器 |
+
 ## 4 阶段 1a 的退出条件
 
 1. 全部 P0 为 PASS；若有 FINDING，已回改 `CONTRACT` 并重跑受影响用例直到 PASS。
@@ -194,4 +209,5 @@ R3 组的共同判据：状态不升级；读侧仍为 `unknown` 且不出现 `l
 | v0.5 | 2026-10-28 | 24 个 P0 运行后：新增 §3.1（运行中据实修订的地方）；B7、B9 增加「journal 里这个动作只有四条记录」的检查（变异检查发现去重会被单飞门掩盖）；C4 要求每次写的值互不相同；R3 结果为 FINDING。判定标准未变。 |
 | v0.6 | 2026-10-28 | 复核前的畸形输入探针：新增 `tests/test_robustness.py`（25 种畸形签名输入、`internal_error` 隔离、重启重读不重复记）作为 F2 / B2 之外的单元级补充；24 个 P0 在修后的代码树上重跑 3 遍，结果不变（23 PASS、R3 FINDING）。 |
 | v0.7 | 2026-10-28 | 修复 W1–W19 后：新增非 P0 用例 `PROD`；B2 加超长行；B3、B4 用 `warn`；B11、R1、R3 配合对账两次；R2(A) 变为可验证；harness 不再把桥启动期间的读取算作请求流量。24 个 P0 + `PROD` 各 3 遍的结果见 `RESULT-P0.md`。判定标准未变。 |
+| v0.9 | 2026-10-29 | P1 端到端（`lab/cases_p1_table.py`：A3 A4 B5 B10 C2 C5 C7 C10 R4 R5 F3 F4 F5），**运行后改 EXPECT** 的地方见 §3.2（B5、C5、C10、R5、F4）；A4 的判据由 WP6 对账程序检验；新增 WP9 浸泡（`lab/soak.py`），退出条件 3 的证据见 `RESULT-1A.md` §3。浸泡后**对账程序加了一条判据**（设备日志显示链路一直断着直到值被替换，则旧值没到设备不算差异），理由与两份报告见 `RESULT-1A.md` §3。判定标准未变。 |
 | v0.8 | 2026-10-29 | R3 时序覆盖（HANDOFF 待办）：**运行后改 EXPECT**——R3 原 EXPECT「排队的请求在 CONT 后落地」与 3 遍实测不符，改为实测的「请求未读走时不执行」，并加 `Recv-Q`、VM、设备日志的核对；新增 R3T1、R3T1K、R3T1X、R3T2（P0）。实测发现 runtime 读完并排队的写在客户端断开后照样执行却不进 `/audit`（CONTRACT §11.5），所以 R1、R3、B11 的「最终对账 `landed: false`」判据改为 `audit_entry: absent`、`landed: null`（CONTRACT v0.9 M10）。历史 FINDING 的留证保留不动。同日补：R3T1X 的桥侧判据改为跟随重启时 `/audit` 的实际内容（此前只写了无条目一种，在修好审计的 runtime 上会误报 FAIL 而不是 FINDING）。 |

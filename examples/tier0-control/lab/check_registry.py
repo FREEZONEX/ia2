@@ -3,6 +3,8 @@
   not_declared               the variable is not declared in any VAR block (the name would 404)
   not_in_governance          the variable has no governance rule although the project runs in allowlist mode
   range_outside_governance   the registry range is not inside the governance rule's range
+  not_in_snapshot            (only when the running runtime's /status variable names are given) the name is not spelled exactly as
+                             the runtime spells it -- case, an instance prefix -- so a write to it would 404
 It is a conservative TEXT scan, not a parser: comments are stripped, `name :=` is looked for.  Approximate by design; the
 runtime result of case C6 is the evidence, this is the early warning."""
 import os
@@ -19,7 +21,7 @@ def governance(project_toml):
     return governance_check.parse(project_toml)
 
 
-def check(targets, project_dir):
+def check(targets, project_dir, snapshot_names=None):
     findings = []
     with open(os.path.join(project_dir, 'project.toml'), encoding='utf-8') as f:
         mode, rules = governance(f.read())
@@ -33,6 +35,9 @@ def check(targets, project_dir):
         if not t.get('enabled', True):
             continue
         short = t['ia2_variable'].split('.')[-1]
+        if snapshot_names is not None and t['ia2_variable'] not in snapshot_names:
+            findings.append({'key': t['key'], 'kind': 'not_in_snapshot',
+                             'detail': '%s is not a variable name in the running runtime\'s /status snapshot' % t['ia2_variable']})
         if not any(re.search(r'(?m)^\s*%s\s*:[^=]' % re.escape(short), txt) for _, txt in st_texts):
             findings.append({'key': t['key'], 'kind': 'not_declared', 'detail': '%s is not declared in any VAR block' % short})
         for name, txt in st_texts:
