@@ -28,10 +28,14 @@ def words(bits):
 
 class Lab:
     def __init__(self, tc):
+        self.tc = tc
         tmp = tempfile.TemporaryDirectory()
         tc.addCleanup(tmp.cleanup)
         self.dir = Path(tmp.name)
         self.journal, self.polls, self.slave, self.wire, self.life = [], [], [], [], []
+        # The device log as the lab's fake device writes it: `listen` when it starts, `stopped` when it is stopped, a `seq` on
+        # every record.  Tests that need a truncated or older log change these.
+        self.log_start, self.log_end, self.sequenced, self.device_map = T0 - 1, T0 + 60, True, DEVICE_MAP
 
     # -- journal ----------------------------------------------------------------------------------------------------------------
     def rec(self, kind, t, **fields):
@@ -60,9 +64,28 @@ class Lab:
 
     def device(self, t, var, bits, action='resp'):
         m = DEVICE_MAP[var]
-        r = {'ev': 'req', 'action': action, 't_req': t, 'addr': m['addr']}
+        r = {'ev': 'req', 'action': action, 't': t, 't_req': t, 'addr': m['addr']}
         r.update({'fc': 5, 'value': 0xFF00 if bits else 0} if m['kind'] == 'coil' else {'fc': 16, 'words': words(bits), 'value': words(bits)[0]})
         self.slave.append(r)
+
+    def answered_polls(self, t0, t1):
+        """The runtime reading the device every 100 ms and the device answering: a working link."""
+        for k in range(int(round((t1 - t0) * 10)) + 1):
+            t = t0 + k / 10.0
+            self.slave.append({'ev': 'req', 'action': 'resp', 'fc': 3, 'addr': 100, 'qty': 2, 't': t, 't_req': t})
+
+    def mode(self, t, mode):
+        self.slave.append({'ev': 'mode', 'mode': mode, 't': t})
+
+    def device_log(self):
+        rows = sorted(self.slave, key=lambda r: r.get('t', r.get('t_req')))
+        if self.log_start is not None:
+            rows.insert(0, {'ev': 'listen', 't': self.log_start, 'port': 13511})
+        if self.log_end is not None:
+            rows.append({'ev': 'stopped', 't': self.log_end})
+        if self.sequenced:
+            rows = [dict(r, seq=n) for n, r in enumerate(rows, 1)]
+        return rows
 
     def post(self, t, label):
         self.wire.append({'ev': 'req', 'method': 'POST', 'path': '/write', 'origin': label, 't': t})
@@ -77,16 +100,36 @@ class Lab:
         if chain_break and len(lines) > 1:
             lines[1] = lines[1].replace(b'"seq":2', b'"seq":9')
         (self.dir / 'journal.jsonl').write_bytes(b''.join(l + b'\n' for l in lines))
-        for name, rows in (('audit.jsonl', self.polls), ('slave-1.jsonl', self.slave), ('wire.jsonl', self.wire),
+        for name, rows in (('audit.jsonl', self.polls), ('slave-1.jsonl', self.device_log()), ('wire.jsonl', self.wire),
                            ('life.jsonl', self.life)):
             (self.dir / name).write_text(''.join(json.dumps(r) + '\n' for r in rows))
-        (self.dir / 'map.json').write_text(json.dumps(DEVICE_MAP))
+        (self.dir / 'map.json').write_text(json.dumps(self.device_map))
         return self.dir
 
     def run(self, wire=False, lifecycle=False, chain_break=False):
         d = self.files(chain_break)
-        return rr.reconcile(str(d / 'journal.jsonl'), str(d / 'audit.jsonl'), str(d / 'map.json'), {'1': str(d / 'slave-1.jsonl')},
-                            str(d / 'life.jsonl') if lifecycle else None, str(d / 'wire.jsonl') if wire else None)
+        return reconcile_or_fail(self.tc, d, lifecycle=str(d / 'life.jsonl') if lifecycle else None,
+                                 wire=str(d / 'wire.jsonl') if wire else None)
+
+
+def reconcile_or_fail(tc, d, **kw):
+    """A crash of the program under test is a failed test, not a test error: the vectors judge what the program does."""
+    try:
+        return rr.reconcile(str(d / 'journal.jsonl'), str(d / 'audit.jsonl'), str(d / 'map.json'), {'1': str(d / 'slave-1.jsonl')}, **kw)
+    except rr.InputError:
+        raise
+    except Exception as exc:                                          # noqa: BLE001
+        tc.fail('reconcile crashed: %s: %s' % (type(exc).__name__, exc))
+
+
+def assert_refused(tc, d):
+    try:
+        rr.reconcile(str(d / 'journal.jsonl'), str(d / 'audit.jsonl'), str(d / 'map.json'), {'1': str(d / 'slave-1.jsonl')})
+    except rr.InputError as exc:
+        return str(exc)
+    except Exception as exc:                                          # noqa: BLE001
+        tc.fail('unusable input should be refused, the program crashed: %s: %s' % (type(exc).__name__, exc))
+    tc.fail('unusable input was accepted')
 
 
 def entry(label, var='sp_flow', bits=BITS_12_5, applied=BITS_12_5, result='ok', ts=int(T0)):
@@ -257,13 +300,18 @@ class Reconcile(unittest.TestCase):
         rep = lab.run(wire=True)
         self.assertEqual(cls(rep, 'f' * 32), 'not_sent')
         self.assertEqual(cls(lab.run(wire=False), 'f' * 32), 'no_effect_no_entry')
-        lab.polls = [p for p in lab.polls if p['t'] <= T0 + 2]        # the instance ends right after: the proxy still says it never left
-        self.assertEqual(cls(lab.run(wire=True), 'f' * 32), 'not_sent')
+        lab.polls = [p for p in lab.polls if p['t'] <= T0 + 2]        # the archive stops seeing the instance right after
+        self.assertEqual(cls(lab.run(wire=True), 'f' * 32), 'not_sent')       # the proxy still says it never left
+        rep = lab.run(wire=False)
+        self.assertEqual(cls(rep, 'f' * 32), 'uncheckable_archive')   # nothing says the instance ended: the archive just stops
+        self.assertEqual(rep['verdict'], 'INCOMPLETE')
+        lab.polls_every(T0 + 6, T0 + 20, lambda t: [], rid=RID2)      # a later instance: the first one ended
         self.assertEqual(cls(lab.run(wire=False), 'f' * 32), 'uncheckable_restart')
 
     def test_an_applied_value_the_device_never_got(self):
         lab = Lab(self)
         label = lab.write('1' * 32, T0 + 1)
+        lab.answered_polls(T0, T0 + 20)                               # the device answered the runtime throughout
         lab.polls_every(T0, T0 + 20, lambda t: [entry(label)] if t >= T0 + 2 else [])
         self.assertEqual(lab.run()['verdict'], 'DISCREPANCY')
         lab.device(T0 + 1.05, 'sp_flow', BITS_12_5, action='swallowed')   # the runtime sent it; a silent device did not answer
@@ -321,6 +369,7 @@ class Reconcile(unittest.TestCase):
 
     def test_a_poll_across_a_restart_is_ignored(self):
         lab = Lab(self)
+        lab.poll(T0 - 1, [])
         lab.poll(T0, [entry('tier0.lab.ffffffff')], rid=RID, rid_after=RID2)
         rep = lab.run()
         self.assertEqual(rep['audit_archive']['polls_ignored'], 1)
@@ -360,6 +409,337 @@ class Reconcile(unittest.TestCase):
                                        + json.dumps({'t': T0 + 1, 'runtime_id': RID, 'runtime_id_after': RID, 'audit': [entry('y')]}) + '\n')
         r = subprocess.run(args, capture_output=True, text=True)
         self.assertEqual(r.returncode, 2, r.stderr)
+
+
+NEWER = 1099409916                         # REAL 15.5
+
+
+def device_row(report, aid):
+    return next(r for r in report['actions'] if r['action_id'] == aid)
+
+
+class Replacement(unittest.TestCase):
+    """REPAIR-ADVICE FIX01: only a later write that /audit shows applied, in the same runtime instance, after this one in the ring,
+    can explain why this write's value never reached a device that was answering."""
+
+    def first_write_never_delivered(self, lab):
+        """sp_flow 12.5 applied and audited `ok`, the device answering the runtime throughout, the value never on the device."""
+        lab.answered_polls(T0, T0 + 30)
+        return lab.write('a1' * 16, T0 + 1)
+
+    def test_a_denied_later_write_explains_nothing(self):
+        lab = Lab(self)
+        l1 = self.first_write_never_delivered(lab)
+        l2 = lab.write('b2' * 16, T0 + 1.5, bits=NEWER, status=403, terminal=('rejected', 'governance_denied'))
+        lab.polls_every(T0, T0 + 30, lambda t: [entry(l1), entry(l2, bits=NEWER, applied=None, result='governance: denied')]
+                        if t >= T0 + 2 else [])
+        rep = lab.run()
+        self.assertEqual(cls(rep, 'a1' * 16), 'unexplained', device_row(rep, 'a1' * 16))
+        self.assertEqual(rep['verdict'], 'DISCREPANCY')
+
+    def test_a_later_write_refused_with_its_answer_lost_explains_nothing(self):
+        lab = Lab(self)
+        l1 = self.first_write_never_delivered(lab)
+        l2 = lab.write('b1' * 16, T0 + 1.5, bits=NEWER, status=None, error='timeout', terminal=('unknown', 'runtime_unreachable'))
+        lab.polls_every(T0, T0 + 30, lambda t: [entry(l1), entry(l2, bits=NEWER, applied=None, result='governance: denied')]
+                        if t >= T0 + 2 else [])
+        rep = lab.run()                                               # only the entry says it was refused; nothing was applied
+        self.assertEqual(cls(rep, 'a1' * 16), 'unexplained', device_row(rep, 'a1' * 16))
+
+    def test_a_later_intent_the_bridge_never_sent_explains_nothing(self):
+        lab = Lab(self)
+        l1 = self.first_write_never_delivered(lab)
+        lab.post(T0 + 1, l1)
+        lab.write('b3' * 16, T0 + 1.5, bits=NEWER, status=None, terminal=('unknown', 'bridge_restarted'))
+        lab.polls_every(T0, T0 + 30, lambda t: [entry(l1)] if t >= T0 + 2 else [])
+        rep = lab.run(wire=True)
+        self.assertEqual(cls(rep, 'b3' * 16), 'not_sent')
+        self.assertEqual(cls(rep, 'a1' * 16), 'unexplained', device_row(rep, 'a1' * 16))
+
+    def test_a_later_write_that_timed_out_with_no_entry_and_no_effect_explains_nothing(self):
+        lab = Lab(self)
+        l1 = self.first_write_never_delivered(lab)
+        lab.write('b4' * 16, T0 + 1.5, bits=NEWER, status=None, error='timeout', terminal=('unknown', 'runtime_unreachable'))
+        lab.polls_every(T0, T0 + 30, lambda t: [entry(l1)] if t >= T0 + 2 else [])
+        rep = lab.run()
+        self.assertEqual(cls(rep, 'a1' * 16), 'unexplained', device_row(rep, 'a1' * 16))
+
+    def test_a_confirmed_later_write_in_the_same_instance_and_output_cycle_explains_it(self):
+        lab = Lab(self)
+        l1 = self.first_write_never_delivered(lab)
+        l2 = lab.write('b5' * 16, T0 + 1.5, bits=NEWER, status=None, error='timeout', terminal=('unknown', 'runtime_unreachable'))
+        lab.device(T0 + 1.55, 'sp_flow', NEWER)                       # only the newer value went out
+        lab.polls_every(T0, T0 + 30, lambda t: [entry(l1), entry(l2, bits=NEWER, applied=NEWER)] if t >= T0 + 2 else [])
+        rep = lab.run()                                               # an audited apply is proof even without an HTTP answer
+        self.assertEqual(device_row(rep, 'a1' * 16).get('device'), 'replaced_before_delivery', rep['unexplained'])
+        self.assertEqual(device_row(rep, 'a1' * 16).get('replaced_by'), 'b5' * 16)
+        self.assertEqual(rep['verdict'], 'CLEAN', rep['unexplained'])
+
+    def test_a_clamped_later_write_is_checked_with_the_value_it_applied(self):
+        lab = Lab(self)
+        l1 = self.first_write_never_delivered(lab)
+        clamped = 1092616192                                          # REAL 10.0: what governance let through
+        l2 = lab.write('b6' * 16, T0 + 1.5, bits=NEWER)
+        lab.polls_every(T0, T0 + 30, lambda t: [entry(l1), entry(l2, bits=NEWER, applied=clamped, result='ok (clamped)')]
+                        if t >= T0 + 2 else [])
+        lab.device(T0 + 1.55, 'sp_flow', clamped)
+        rep = lab.run()
+        self.assertEqual(device_row(rep, 'a1' * 16).get('device'), 'replaced_before_delivery')
+        self.assertEqual(rep['verdict'], 'CLEAN', (rep['unexplained'], rep['unexplained_device_writes']))
+        lab.slave = [r for r in lab.slave if r.get('fc') != 16]
+        lab.device(T0 + 1.55, 'sp_flow', NEWER)                       # the requested value, which nothing applied
+        rep = lab.run()
+        self.assertEqual([d['bits'] for d in rep['unexplained_device_writes']], [NEWER])
+
+    def test_writing_the_same_value_again_does_not_end_the_duty_to_deliver_it(self):
+        lab = Lab(self)
+        l1 = self.first_write_never_delivered(lab)
+        l2 = lab.write('b7' * 16, T0 + 1.5)                           # 12.5 again, applied again, still never delivered
+        lab.polls_every(T0, T0 + 30, lambda t: [entry(l1), entry(l2)] if t >= T0 + 2 else [])
+        rep = lab.run()
+        self.assertEqual(cls(rep, 'a1' * 16), 'unexplained', device_row(rep, 'a1' * 16))
+        self.assertEqual(cls(rep, 'b7' * 16), 'unexplained')
+
+    def test_a_write_to_another_variable_explains_nothing(self):
+        lab = Lab(self)
+        l1 = self.first_write_never_delivered(lab)
+        l2 = lab.write('b8' * 16, T0 + 1.5, var='lamp', bits=1)
+        lab.device(T0 + 1.55, 'lamp', 1)
+        lab.polls_every(T0, T0 + 30, lambda t: [entry(l1), entry(l2, var='lamp', bits=1, applied=1)] if t >= T0 + 2 else [])
+        self.assertEqual(cls(lab.run(), 'a1' * 16), 'unexplained')
+
+    def test_ring_order_not_intent_time_says_which_write_came_last(self):
+        """Both entries appear in one read, the later intent's entry first: IA2 applied it first, so 12.5 is the last value."""
+        lab = Lab(self)
+        lab.answered_polls(T0, T0 + 30)
+        l1 = lab.write('a1' * 16, T0 + 1, status=None, error='timeout', terminal=('unknown', 'runtime_unreachable'))
+        l2 = lab.write('b9' * 16, T0 + 1.5, bits=NEWER)
+        lab.device(T0 + 1.55, 'sp_flow', NEWER)
+        lab.polls_every(T0, T0 + 30, lambda t: [entry(l2, bits=NEWER, applied=NEWER), entry(l1)] if t >= T0 + 2 else [])
+        rep = lab.run()
+        self.assertEqual(cls(rep, 'a1' * 16), 'unexplained', device_row(rep, 'a1' * 16))
+
+    def test_a_later_write_whose_entry_contradicts_it_explains_nothing(self):
+        other = 1092616192
+        for name, status, ent in (('HTTP 409 yet applied', 409, lambda l: entry(l, bits=NEWER, applied=NEWER)),
+                                  ('entry for another value', 200, lambda l: entry(l, bits=other, applied=other))):
+            with self.subTest(name):
+                lab = Lab(self)
+                l1 = self.first_write_never_delivered(lab)
+                l2 = lab.write('c3' * 16, T0 + 1.5, bits=NEWER, status=status)
+                lab.polls_every(T0, T0 + 30, lambda t: [entry(l1), ent(l2)] if t >= T0 + 2 else [])
+                rep = lab.run()
+                self.assertEqual(cls(rep, 'c3' * 16), 'unexplained')
+                self.assertEqual(cls(rep, 'a1' * 16), 'unexplained', device_row(rep, 'a1' * 16))
+
+    def test_a_write_the_next_instance_executed_does_not_replace_the_old_instance_s_value(self):
+        """No lifecycle log: the bridge sent to the instance it knew, the next instance executed it (the entry is in that
+        instance's ring), and the archive first saw the next instance later."""
+        lab = Lab(self)
+        l1 = self.first_write_never_delivered(lab)
+        l2 = lab.write('c4' * 16, T0 + 2.5, bits=NEWER)
+        lab.device(T0 + 2.6, 'sp_flow', NEWER)
+        lab.polls_every(T0, T0 + 2, lambda t: [entry(l1)] if t >= T0 + 2 else [])
+        lab.polls_every(T0 + 8, T0 + 30, lambda t: [entry(l2, bits=NEWER, applied=NEWER)], rid=RID2)
+        rep = lab.run()
+        self.assertEqual(device_row(rep, 'c4' * 16).get('note', '')[:20], 'executed by the next')
+        self.assertEqual(cls(rep, 'a1' * 16), 'unexplained', device_row(rep, 'a1' * 16))
+
+    def test_a_write_in_the_next_instance_does_not_replace_a_value_of_the_old_one(self):
+        lab = Lab(self)
+        l1 = self.first_write_never_delivered(lab)
+        lab.life += [{'ev': 'runtime_ready', 't': T0 - 1, 'spawned_t': T0 - 2, 'runtime_id': RID},
+                     {'ev': 'runtime_ready', 't': T0 + 6, 'spawned_t': T0 + 5.5, 'runtime_id': RID2}]
+        l2 = lab.write('c1' * 16, T0 + 7, bits=NEWER, rid=RID2)
+        lab.device(T0 + 5.6, 'sp_flow', 0)                            # the new instance's initial output
+        lab.device(T0 + 7.05, 'sp_flow', NEWER)
+        lab.polls_every(T0, T0 + 5, lambda t: [entry(l1)] if t >= T0 + 2 else [])
+        lab.polls_every(T0 + 6, T0 + 30, lambda t: [entry(l2, bits=NEWER, applied=NEWER)] if t >= T0 + 8 else [], rid=RID2)
+        rep = lab.run(lifecycle=True)
+        # The old instance lived 4.5 s after the write with the device answering, and never sent 12.5.
+        self.assertEqual(cls(rep, 'a1' * 16), 'unexplained', device_row(rep, 'a1' * 16))
+        lab.life[1] = dict(lab.life[1], spawned_t=T0 + 1.6)          # the instance ended within the output cycle: explained
+        lab.slave = [r for r in lab.slave if not (r.get('fc') == 16 and r['words'] == [0, 0])]
+        lab.device(T0 + 1.7, 'sp_flow', 0)
+        rep = lab.run(lifecycle=True)
+        self.assertEqual(device_row(rep, 'a1' * 16).get('device'), 'replaced_before_delivery', rep['unexplained'])
+        self.assertEqual(device_row(rep, 'a1' * 16).get('replaced_by'), 'restart')
+        self.assertEqual(rep['verdict'], 'CLEAN', (rep['unexplained'], rep['unexplained_device_writes']))
+
+
+class DeviceLogCoverage(unittest.TestCase):
+    """REPAIR-ADVICE FIX02: "no answered request" proves no working link only over a stretch the device log demonstrably covers,
+    and a missing, cut-off or damaged log is an evidence gap, never a clean result."""
+
+    def replaced_after_a_quiet_stretch(self, lab):
+        """12.5 applied at T0 + 1.2; the device answers nothing after T0 + 1.0; 15.5 is confirmed applied at T0 + 8.8."""
+        lab.answered_polls(T0, T0 + 0.9)
+        l1 = lab.write('d1' * 16, T0 + 1.2)
+        l2 = lab.write('d2' * 16, T0 + 8.8, bits=NEWER, terminal=('undelivered', 'link_down'))
+        res = "ok; not delivered to device 'coupler' (link down)"
+        lab.polls_every(T0, T0 + 30, lambda t: ([entry(l1)] if t >= T0 + 2 else [])
+                        + ([entry(l2, bits=NEWER, applied=NEWER, result=res)] if t >= T0 + 9 else []))
+        lab.answered_polls(T0 + 16.4, T0 + 18)
+        lab.device(T0 + 16.4, 'sp_flow', NEWER)
+
+    def test_an_explicit_link_down_interval_explains_it_even_in_an_unsequenced_log(self):
+        lab = Lab(self)
+        lab.sequenced = False                                         # the soak logs of 2026-10-29 carry no `seq`
+        self.replaced_after_a_quiet_stretch(lab)
+        lab.mode(T0 + 1.0, 'refuse')
+        lab.mode(T0 + 12.0, 'normal')
+        rep = lab.run()
+        self.assertEqual(device_row(rep, 'd1' * 16).get('device'), 'link_down_until_replaced', rep['unexplained'])
+        self.assertEqual(rep['verdict'], 'CLEAN')
+        lab.slave[-1]['t'] = T0 + 5.0                                 # the link came back before the newer write: 12.5 should have gone out
+        lab.answered_polls(T0 + 5.0, T0 + 6.0)
+        self.assertEqual(lab.run()['verdict'], 'DISCREPANCY')
+
+    def test_silence_in_an_unsequenced_log_without_a_mode_change_proves_nothing(self):
+        lab = Lab(self)
+        lab.sequenced = False
+        self.replaced_after_a_quiet_stretch(lab)
+        rep = lab.run()
+        self.assertEqual(cls(rep, 'd1' * 16), 'uncheckable_device_log')
+        self.assertEqual(rep['verdict'], 'INCOMPLETE')
+
+    def test_silence_in_a_sequenced_log_that_covers_the_stretch_is_no_link(self):
+        lab = Lab(self)
+        self.replaced_after_a_quiet_stretch(lab)
+        rep = lab.run()
+        self.assertEqual(device_row(rep, 'd1' * 16).get('device'), 'link_down_until_replaced')
+        self.assertEqual(rep['verdict'], 'CLEAN')
+
+    def test_a_log_that_ends_before_the_write_cannot_vouch_for_it(self):
+        lab = Lab(self)
+        lab.answered_polls(T0 - 0.5, T0 - 0.1)
+        lab.log_end = None                                            # no `stopped`: the log just ends at T0 - 0.1
+        label = lab.write('d3' * 16, T0 + 1)
+        lab.polls_every(T0, T0 + 30, lambda t: [entry(label)] if t >= T0 + 2 else [])
+        rep = lab.run()
+        self.assertEqual(cls(rep, 'd3' * 16), 'uncheckable_device_log')
+        self.assertEqual(rep['verdict'], 'INCOMPLETE')
+
+    def test_a_log_that_ends_inside_the_stretch_cannot_vouch_for_it(self):
+        lab = Lab(self)
+        self.replaced_after_a_quiet_stretch(lab)
+        lab.slave.append({'ev': 'accept', 'conn': 9, 'mode': 'normal', 't': T0 + 3.0})
+        lab.slave = [r for r in lab.slave if r['t'] < T0 + 4]
+        lab.log_end = None                                            # cut off at T0 + 3, before the newer write
+        rep = lab.run()
+        self.assertEqual(cls(rep, 'd1' * 16), 'uncheckable_device_log')
+        self.assertEqual(rep['verdict'], 'INCOMPLETE')
+
+    def test_a_device_stopped_and_started_again_leaves_a_gap(self):
+        lab = Lab(self)
+        self.replaced_after_a_quiet_stretch(lab)
+        lab.slave += [{'ev': 'stopped', 't': T0 + 1.1}, {'ev': 'listen', 't': T0 + 16.3, 'port': 13511}]
+        rep = lab.run()
+        self.assertEqual(cls(rep, 'd1' * 16), 'uncheckable_device_log')
+        self.assertEqual(rep['device_logs']['1']['gaps'], [[T0 + 1.1, T0 + 16.3]])
+
+    def test_a_missing_record_in_a_sequenced_log_leaves_a_gap(self):
+        lab = Lab(self)
+        self.replaced_after_a_quiet_stretch(lab)
+        lab.slave.append({'ev': 'accept', 'conn': 9, 'mode': 'normal', 't': T0 + 3.0})
+        rows = lab.device_log()
+        del rows[next(i for i, r in enumerate(rows) if r['t'] == T0 + 3.0)]    # `seq` jumps over it
+        lab.files()
+        (lab.dir / 'slave-1.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows))
+        rep = reconcile_or_fail(self, lab.dir)
+        self.assertEqual(cls(rep, 'd1' * 16), 'uncheckable_device_log')
+        self.assertTrue(rep['device_logs']['1']['gaps'])
+
+    def test_a_gap_leaves_it_open_even_when_the_device_answered_around_it(self):
+        """The value may have arrived late, inside the gap: neither delivered nor missing can be shown."""
+        lab = Lab(self)
+        label = lab.write('d8' * 16, T0 + 1)
+        lab.answered_polls(T0, T0 + 3)
+        lab.slave += [{'ev': 'stopped', 't': T0 + 3.05}, {'ev': 'listen', 't': T0 + 3.5, 'port': 13511}]
+        lab.answered_polls(T0 + 3.6, T0 + 30)
+        lab.polls_every(T0, T0 + 30, lambda t: [entry(label)] if t >= T0 + 2 else [])
+        rep = lab.run()
+        self.assertEqual(cls(rep, 'd8' * 16), 'uncheckable_device_log')
+        self.assertEqual(rep['verdict'], 'INCOMPLETE')
+
+    def test_no_effect_needs_a_log_that_was_there_to_see_one(self):
+        lab = Lab(self)
+        lab.answered_polls(T0 - 0.5, T0 - 0.1)
+        lab.log_end = None
+        lab.write('d9' * 16, T0 + 1, status=None, error='timeout', terminal=('unknown', 'runtime_unreachable'))
+        lab.polls_every(T0, T0 + 30, lambda t: [])
+        rep = lab.run()
+        self.assertEqual(cls(rep, 'd9' * 16), 'uncheckable_device_log')
+        self.assertEqual(rep['verdict'], 'INCOMPLETE')
+
+    def test_one_answered_request_in_the_stretch_rules_out_no_link(self):
+        lab = Lab(self)
+        self.replaced_after_a_quiet_stretch(lab)
+        lab.answered_polls(T0 + 5.0, T0 + 5.0)
+        rep = lab.run()
+        self.assertEqual(cls(rep, 'd1' * 16), 'unexplained')
+
+    def test_a_link_down_until_a_complete_log_ends(self):
+        lab = Lab(self)
+        lab.answered_polls(T0, T0 + 0.9)
+        lab.mode(T0 + 1.0, 'close')
+        label = lab.write('d4' * 16, T0 + 1.2)
+        lab.polls_every(T0, T0 + 30, lambda t: [entry(label)] if t >= T0 + 2 else [])
+        rep = lab.run()
+        self.assertEqual(device_row(rep, 'd4' * 16).get('device'), 'link_down_until_log_end')
+        self.assertEqual(rep['verdict'], 'CLEAN')
+
+    def test_unusable_device_logs_are_refused(self):
+        def no_start(rows):
+            return rows[1:]
+
+        def mixed_seq(rows):
+            return [rows[0]] + [{k: v for k, v in r.items() if k != 'seq'} for r in rows[1:]]
+
+        def damaged(rows):
+            return rows + ['{"ev": "req", "t": 18000']
+
+        for name, spoil in (('empty file', lambda rows: []), ('no start record', no_start), ('mixed seq', mixed_seq),
+                            ('damaged record', damaged)):
+            with self.subTest(name):
+                lab = Lab(self)
+                label = lab.write('d5' * 16, T0 + 1)
+                lab.device(T0 + 1.05, 'sp_flow', BITS_12_5)
+                lab.polls_every(T0, T0 + 20, lambda t: [entry(label)] if t >= T0 + 2 else [])
+                d = lab.files()
+                rows = spoil(lab.device_log())
+                (d / 'slave-1.jsonl').write_text(''.join((r if isinstance(r, str) else json.dumps(r)) + '\n' for r in rows))
+                assert_refused(self, d)
+        lab = Lab(self)
+        lab.polls_every(T0, T0 + 5, lambda t: [])
+        lab.device_map = dict(DEVICE_MAP, d2_sp={'device': '2', 'kind': 'f32', 'addr': 100})
+        d = lab.files()
+        self.assertIn('role', assert_refused(self, d))                # a mapped device with no log
+
+    def test_an_archive_with_no_usable_poll_is_refused(self):
+        lab = Lab(self)
+        lab.write('d6' * 16, T0 + 1, status=None, error='timeout', terminal=('unknown', 'runtime_unreachable'))
+        lab.poll(T0, [], rid=RID, rid_after=RID2)
+        d = lab.files()
+        assert_refused(self, d)
+
+    def test_command_line_reports_an_evidence_gap_with_exit_2_and_a_report(self):
+        lab = Lab(self)
+        label = lab.write('d7' * 16, T0 + 1)
+        lab.polls_every(T0, T0 + 30, lambda t: [entry(label)] if t >= T0 + 2 else [])
+        lab.log_end = None
+        lab.answered_polls(T0 - 0.5, T0 - 0.1)
+        d = lab.files()
+        args = [sys.executable, '-I', '-B', str(ROOT / 'tools' / 'reconcile_report.py'), '--journal', str(d / 'journal.jsonl'),
+                '--audit-archive', str(d / 'audit.jsonl'), '--device-map', str(d / 'map.json'), '--device-log', '1=%s' % (d / 'slave-1.jsonl'),
+                '--out', str(d / 'report.json')]
+        r = subprocess.run(args, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertEqual(json.loads(r.stdout)['verdict'], 'INCOMPLETE')
+        self.assertEqual(json.loads((d / 'report.json').read_text())['counts'].get('uncheckable_device_log'), 1)
+        lab.device(T0 + 1.05, 'sp_flow', BITS_12_5)                   # positive evidence needs no coverage claim
+        lab.files()
+        self.assertEqual(subprocess.run(args, capture_output=True).returncode, 0)
 
 
 if __name__ == '__main__':

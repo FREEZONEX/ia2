@@ -6,15 +6,17 @@
 
 **本轮改动在本地分支 `fix/tier0-r3-audit-reconcile` 上，未推送，没开 PR。** IA2 运行时修复在另一个本地分支，同样未推送。
 
+**同日晚的审核修复**：审核指出对账程序两条漏检路径（FIX01 替换、FIX02 设备日志覆盖）、运行时修复里的脉冲截短（FIX03）与浸泡统计口径（DOC01），都已修复并重新验证，结果见 [`RESULT-1A.md`](RESULT-1A.md) §7。对账结论多了 `INCOMPLETE`（退出码 2）；假设备日志每条带 `seq` 与 `mono`；新用例 WP6C；`lab/check_pulse_hold.py`；`tools/check_reconcile_mutations.py`。`R3_EXPECT` 已改为修复后的「执行且有条目」，所以本分支依赖运行时分支。修复者与作者是同一人，等复核。
+
 ## 交付定位
 
 | 项目 | 内容 |
 |---|---|
 | 仓库 / 基线 | `FREEZONEX/ia2` / `main` `a2dec2a`（Rust 源码与 `e6a38aa` 相同） |
 | 本分支 | `fix/tier0-r3-audit-reconcile`：第一个提交是 R3 时序与对账语义（下文「R3 时序覆盖」），第二个提交是 WP6、P1、WP9 与文档；只改 `examples/tier0-control/` |
-| 运行时修复 | 分支 `fix/control-write-detached`（worktree `~/Projects/soft-PLC/ia2-control-write-detached-20261029`），本地提交 `48dec8a`；见下文「运行时修复」 |
+| 运行时修复 | 分支 `fix/control-write-detached`（worktree `~/Projects/soft-PLC/ia2-control-write-detached-20261029`），本地提交 `48dec8a`，加审核修复 `1cc16c0`（脉冲从落地起计时）；见下文「运行时修复」 |
 | 结果与退出条件 | [`RESULT-1A.md`](RESULT-1A.md) |
-| 对账程序（WP6） | [`tools/reconcile_report.py`](tools/reconcile_report.py)；向量 [`tests/test_reconcile_report.py`](tests/test_reconcile_report.py) |
+| 对账程序（WP6） | [`tools/reconcile_report.py`](tools/reconcile_report.py)；向量 [`tests/test_reconcile_report.py`](tests/test_reconcile_report.py)（48 项）；变异 [`tools/check_reconcile_mutations.py`](tools/check_reconcile_mutations.py)（39 个） |
 | 浸泡（WP9） | [`lab/soak.py`](lab/soak.py)、[`lab/hooks_soak.py`](lab/hooks_soak.py) |
 | P1 用例 | [`lab/cases_p1_table.py`](lab/cases_p1_table.py)；注册表检查加了快照名单（[`lab/check_registry.py`](lab/check_registry.py)） |
 | 契约 | [CONTRACT.md](contract/CONTRACT.md) v0.10（§8.3 实现、§11.6）；[TEST-CASES.md](contract/TEST-CASES.md) v0.9（§3.2）；[DESIGN-1A.md](contract/DESIGN-1A.md) v0.8 |
@@ -24,11 +26,11 @@
 
 | 验证 | 结果 |
 |---|---|
-| Python 单元与进程测试 | 288 项通过（28 个套件），含对账程序 22 项向量 |
-| 对账程序的变异对照 | 16 个改坏的版本全部被抓到（`evidence/reconcile-mutations.log`） |
+| Python 单元与进程测试 | 288 项通过（28 个套件），含对账程序 22 项向量；审核修复后 314 项（向量 48 项） |
+| 对账程序的变异对照 | 16 个改坏的版本全部被抓到（`evidence/reconcile-mutations.log`）；审核修复后 39 个，全部被断言抓到（`evidence/reconcile-mutations/`） |
 | 最终代码整套回环（28 个 P0、`PROD`、P1F5、P1F6、13 个 P1，R3 组三遍） | 54/54 PASS，727 条断言 0 失败（`evidence/final-20261029/`，代码树 `255e1166…`）；逐动作崩溃恢复 3/3、BOOL 21 项、nullable-failsafe 变异 3/3 |
 | Python 3.14.8 上 R3 组与 R1、R2 | 7/7 PASS，没有卡住 |
-| 2 小时浸泡（`main` 的 runtime） | 121 分钟、4496 行请求、40 次故障；最终程序对账 CLEAN：2179 个 intent 中 2166 个一致，13 个差异各对应一次注入的故障，不明写入 0。浸泡当场的对账报了 1 处设备侧差异，分析后加了一条判据（RESULT-1A §3，**运行后改判据**） |
+| 2 小时浸泡（`main` 的 runtime） | 121 分钟、请求循环 4496 次（文件 4848 行，新动作 3999 个）、40 次故障；最终程序对账 CLEAN：2179 个 intent 中 2166 个一致，13 个差异各对应一次注入的故障，不明写入 0。浸泡当场的对账报了 1 处设备侧差异，分析后加了一条判据（RESULT-1A §3，**运行后改判据**） |
 | 60 分钟浸泡（修好的 runtime `b7e455d4…`） | 1128 个 intent 中 1125 个一致、3 个没发出（R1）；两次 R3T1 精确点都有审计条目；PASS |
 
 运行后改的地方（都已登记）：R3（上一提交，v0.8）；B5、C5、C10、R5、F4 的 EXPECT（TEST-CASES §3.2）；对账程序的「链路一直断着直到值被替换」判据（RESULT-1A §3）。
@@ -66,8 +68,10 @@ python3 -I -B examples/tier0-control/tools/check_failsafe_controls.py
 - [x] R3 时序覆盖与判据（上一提交）。
 - [x] IA2 运行时审计修复（单独分支，本地提交）。
 - [x] WP6 通用对账；P1；WP9 浸泡；退出条件逐条核对（`RESULT-1A.md`）。
-- [ ] **推送并开 PR**：本分支与运行时修复各一个，等你点头；推到哪里（`FREEZONEX/ia2` 上的分支，还是 fork）也请你定。
-- [ ] **运行时修复合并后**：`lab/cases_p0.py` 的 `R3_EXPECT` 里 R3T1、R3T1X 改为 `(True, True)`，更新 CONTRACT §11.5 与 TEST-CASES，再跑 R3 组。
+- [ ] **推送并开 PR**：本分支与运行时修复各一个，等你点头；推到哪里（`FREEZONEX/ia2` 上的分支，还是 fork）也请你定。运行时修复先开先合：本分支的 R3 期望依赖它。
+- [x] `R3_EXPECT` 里 R3T1、R3T1X 改为 `(True, True)`，CONTRACT §11.5 与 TEST-CASES 同步，R3 组在修好的 runtime 上跑过（审核修复时做了，见 `RESULT-1A.md` §7）。
+- [x] 审核修复 FIX01、FIX02、FIX03、DOC01（`RESULT-1A.md` §7；仓库外的逐项回复 `REPAIR-RESPONSE-2026-10-29-tier0-stage-1a.md`）。
+- [ ] 复核者检查审核修复。
 - [ ] 未决问题清单（`RESULT-1A.md` §6）里要你决定的：是否复议 D1；1b 的授权。
 
 ## R3 时序覆盖（本分支第一个提交）

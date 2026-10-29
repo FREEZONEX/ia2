@@ -128,13 +128,13 @@ async def archive_audit(st, path, stop):
             await asyncio.sleep(max(0.05, 1.0 - (time.time() - t)))
 
 
-def reconcile(st, archive, tag):
+def reconcile(st, archive, tag, device_log=None):
     with open(st.p('device-map.json'), 'w') as f:
         json.dump({'sp_flow': {'device': '1', 'kind': 'f32', 'addr': 100}, 'big': {'device': '1', 'kind': 'i32', 'addr': 120}}, f)
     out = st.p('reconcile-%s.json' % tag)
     r = subprocess.run([sys.executable, '-I', '-B', RECONCILE, '--journal', st.p('journal.jsonl'), '--audit-archive', archive,
-                        '--device-map', st.p('device-map.json'), '--device-log', '1=' + st.p('slave-1.jsonl'), '--wire', st.p('wire.jsonl'),
-                        '--out', out], capture_output=True, text=True, timeout=120)
+                        '--device-map', st.p('device-map.json'), '--device-log', '1=' + (device_log or st.p('slave-1.jsonl')),
+                        '--wire', st.p('wire.jsonl'), '--out', out], capture_output=True, text=True, timeout=120)
     return r.returncode, (json.load(open(out)) if os.path.exists(out) else None), r.stderr
 
 
@@ -181,6 +181,56 @@ async def case_A4(st, ck, notes):
     notes['archive'] = rep and rep['counts']
     ck('from the once-a-second archive: all 300 consistent with journal and device, CLEAN',
        rc == 0 and rep is not None and rep['counts'].get('consistent') == 300 and not rep['audit_archive']['turnover_gaps'], (rc, err[-300:], notes['archive']))
+
+
+async def case_WP6C(st, ck, notes):
+    """REPAIR-ADVICE FIX02 on a real run: the fake device's log covers the run (it starts with `listen`, every record has `seq` and
+    `mono`); a device stopped and started again leaves a gap the reconciliation reports; a copy of the log cut short leaves the
+    writes after the cut uncheckable, never consistent."""
+    await asyncio.sleep(1.0)
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(archive_audit(st, st.p('audit-archive.jsonl'), stop))
+    p1, e1 = await submit_wait(st, 'flow_setpoint', 11.5)
+    await asyncio.sleep(1.0)
+    await st.slave.stop()                                           # the device goes away and comes back: its log says so
+    down = await healthy(st, 'coupler', False, 20)
+    await asyncio.sleep(1.0)
+    await st.slave.start()
+    up = await healthy(st, 'coupler', True, 30)
+    ck('IA2 saw the device go and come back', down is not None and up is not None, (down, up))
+    await asyncio.sleep(max(0.0, p1['requested_at_ms'] / 1000.0 + 5.5 - time.time()))   # FLOW's single-flight window: settle_ms 5000
+    p2, e2 = await submit_wait(st, 'flow_setpoint', 13.5)
+    await asyncio.sleep(max(0.0, p2['requested_at_ms'] / 1000.0 + 5.5 - time.time()))
+    t_cut = time.time()
+    p3, e3 = await submit_wait(st, 'flow_setpoint', 14.5)
+    ck('three writes accepted', [e and e['status'] for e in (e1, e2, e3)] == ['accepted'] * 3, [e and e['status'] for e in (e1, e2, e3)])
+    await asyncio.sleep(12.0)                                       # past the reconciler's coverage window for the last write
+    stop.set()
+    await task
+    with open(st.p('slave-1.jsonl')) as f:
+        recs = [json.loads(line) for line in f]
+    seqs = [r.get('seq') for r in recs]
+    ck('the device log starts with `listen`, and every record has `seq` 1, 2, ... and `mono`',
+       recs[0].get('ev') == 'listen' and seqs == list(range(1, len(recs) + 1)) and all('mono' in r for r in recs), recs[:2])
+    stops = [r['t'] for r in recs if r.get('ev') == 'stopped']
+    relisten = [r['t'] for r in recs if r.get('ev') == 'listen'][1:]
+    rc, rep, err = await off_loop(reconcile, st, st.p('audit-archive.jsonl'), 'coverage')
+    notes['full'] = rep and {'verdict': rep['verdict'], 'counts': rep['counts'], 'device_logs': rep['device_logs']}
+    ck('the reconciliation is CLEAN and all three are consistent', rc == 0 and rep is not None and rep['counts'].get('consistent') == 3,
+       (rc, err[-300:], notes['full']))
+    gaps = (rep or {}).get('device_logs', {}).get('1', {}).get('gaps')
+    ck('the report shows exactly one gap, from the device\'s `stopped` to its next `listen`',
+       len(stops) == 1 and len(relisten) == 1 and gaps == [[stops[0], relisten[0]]], (gaps, stops, relisten))
+    with open(st.p('slave-1-cut.jsonl'), 'w') as f:                 # the same log, as if its collection had stopped at t_cut
+        f.write(''.join(json.dumps(r) + '\n' for r in recs if r['t'] < t_cut))
+    rc, rep, err = await off_loop(reconcile, st, st.p('audit-archive.jsonl'), 'cut', st.p('slave-1-cut.jsonl'))
+    rows = {r['action_id']: r for r in (rep or {}).get('actions', [])}
+    notes['cut'] = rep and {'verdict': rep['verdict'], 'counts': rep['counts']}
+    ck('cut short: the write after the cut is uncheckable_device_log, the verdict INCOMPLETE and the exit code 2',
+       rc == 2 and rep is not None and rep['verdict'] == 'INCOMPLETE'
+       and rows.get(p3['action_id'], {}).get('class') == 'uncheckable_device_log', (rc, notes['cut']))
+    ck('...the writes before it are still consistent',
+       all(rows.get(p['action_id'], {}).get('class') == 'consistent' for p in (p1, p2)), [rows.get(p['action_id']) for p in (p1, p2)])
 
 
 # ---- B ---------------------------------------------------------------------------------------------------------------------
@@ -470,6 +520,7 @@ WARN = {'bridge_args': ['--governance-check', 'warn']}
 CASES = {
     'A3': (case_A3, [FLOW]),
     'A4': (case_A4, [NOFB, BIG_NOFB]),
+    'WP6C': (case_WP6C, [FLOW]),
     'B5': (case_B5, [FLOW, BOGUS], {'bridge_args': ['--governance-check', 'warn', '--preflight', 'off']}),
     'B10': (case_B10, [FLOW, LIVE]),
     'C2': (case_C2, [FLOW], SYNC),

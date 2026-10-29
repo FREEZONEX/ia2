@@ -774,11 +774,13 @@ R3_VALUE = 12.5
 R3_HIGH_WORD = (f32bits(R3_VALUE) >> 16) & 0xFFFF             # 0x4148: the first register of the f32 on holding 100
 R3_EXPECT = {                                                    # (executed on the VM/device, /audit has an entry); measured 2026-10-29
     'R3': (False, False),                                        # stopped before reading: the request is dropped with the connection
-    'R3T1': (True, False),                                       # read and queued: applied after the client left, NOT audited
+    'R3T1': (True, True),                                        # read and queued: applied after the client left, and audited
     'R3T1K': (True, True),                                       # control: the same, connection kept open -> audited
-    'R3T1X': (True, False),                                      # read and queued, bridge SIGKILLed: applied, NOT audited
+    'R3T1X': (True, True),                                       # read and queued, bridge SIGKILLed: applied and audited
     'R3T2': (True, True),                                        # applied and answered, answer lost: audited
 }
+# R3T1 and R3T1X expect the runtime fix (branch fix/control-write-detached).  A runtime built from main before it applies the
+# write without an /audit entry, (True, False): a FINDING here, and `executed_unaudited` in the reconciliation (CONTRACT 11.5).
 
 
 def netstat_runtime_side(local_port):

@@ -1,4 +1,202 @@
 {
+  "repair_20261029": {
+    "recorded_at": "2026-10-29",
+    "advice": "REPAIR-ADVICE-2026-10-29-tier0-stage-1a.md (outside the repository); reply REPAIR-RESPONSE-2026-10-29-tier0-stage-1a.md",
+    "fixes": {
+      "FIX01": "a value the device never got is explained only by a later write /audit shows applied, same instance, later in the ring, another value",
+      "FIX02": "no-link inference needs device-log coverage and proof of recording (explicit mode interval or unbroken seq); verdict INCOMPLETE, exit 2",
+      "FIX03": "runtime branch commit 1cc16c0: pulse deadline taken once the write has landed",
+      "DOC01": "soak request counts named by what they count"
+    },
+    "reconcile_tool_sha256": "bc4c97b8608b696dfacdbce80b16c4312e1ef373a5ad082aa0708367a40d3aac",
+    "python_tests": 314,
+    "reconcile_mutations": {
+      "variants": 39,
+      "detected_by_assertion": 39
+    },
+    "vectors_failing_on_reviewed_program": "21 of 48, all by assertion (vectors-on-reviewed-program.log)",
+    "recompute": {
+      "final-20261029/A4-r1@archive": {
+        "changed_rows": 0,
+        "exit_code": 0,
+        "verdict_after": "CLEAN",
+        "verdict_before": "CLEAN"
+      },
+      "final-20261029/A4-r1@final-only": {
+        "changed_rows": 0,
+        "exit_code": 0,
+        "verdict_after": "CLEAN",
+        "verdict_before": "CLEAN"
+      },
+      "soak-detached-20261029": {
+        "changed_rows": 0,
+        "exit_code": 0,
+        "verdict_after": "CLEAN",
+        "verdict_before": "CLEAN"
+      },
+      "soak-main-20261029": {
+        "changed_rows": 7,
+        "exit_code": 0,
+        "verdict_after": "CLEAN",
+        "verdict_before": "CLEAN"
+      }
+    },
+    "runtime": {
+      "binary": "ia2-runtime-detached-r2",
+      "sha256": "c18b0aaab60425ef848e8e278b3ac60c1ec7a50dfb708ed25184a0a987018893",
+      "commit": "1cc16c0"
+    },
+    "pulse_hold": {
+      "verdict": "PASS",
+      "band_ms": {
+        "early": 10,
+        "late": 50
+      },
+      "held_ms": [
+        [
+          "under_test",
+          800,
+          801.159
+        ],
+        [
+          "under_test",
+          800,
+          809.189
+        ],
+        [
+          "under_test",
+          800,
+          809.948
+        ],
+        [
+          "under_test",
+          100,
+          110.062
+        ],
+        [
+          "under_test",
+          100,
+          109.299
+        ],
+        [
+          "under_test",
+          100,
+          108.971
+        ],
+        [
+          "main",
+          800,
+          809.521
+        ],
+        [
+          "main",
+          100,
+          110.356
+        ],
+        [
+          "first_fix",
+          800,
+          530.411
+        ],
+        [
+          "first_fix",
+          100,
+          9.518
+        ]
+      ]
+    },
+    "final_suite": {
+      "checks": 732,
+      "code_trees": [
+        "17a3e07624182b6c9324277fdb1758e9e69890e08e53e0691e1cc4fab0ba6a4a"
+      ],
+      "errors": [],
+      "failed_checks": 0,
+      "not_pass": [],
+      "pythons": [
+        "3.9.6"
+      ],
+      "r3_observed": {
+        "R3": [
+          {
+            "audit_entry": false,
+            "executed": false
+          },
+          {
+            "audit_entry": false,
+            "executed": false
+          },
+          {
+            "audit_entry": false,
+            "executed": false
+          }
+        ],
+        "R3T1": [
+          {
+            "audit_entry": true,
+            "executed": true
+          },
+          {
+            "audit_entry": true,
+            "executed": true
+          },
+          {
+            "audit_entry": true,
+            "executed": true
+          }
+        ],
+        "R3T1K": [
+          {
+            "audit_entry": true,
+            "executed": true
+          },
+          {
+            "audit_entry": true,
+            "executed": true
+          },
+          {
+            "audit_entry": true,
+            "executed": true
+          }
+        ],
+        "R3T1X": [
+          {
+            "audit_entry": true,
+            "executed": true
+          },
+          {
+            "audit_entry": true,
+            "executed": true
+          },
+          {
+            "audit_entry": true,
+            "executed": true
+          }
+        ],
+        "R3T2": [
+          {
+            "audit_entry": true,
+            "executed": true
+          },
+          {
+            "audit_entry": true,
+            "executed": true
+          },
+          {
+            "audit_entry": true,
+            "executed": true
+          }
+        ]
+      },
+      "runs": 55,
+      "runtime_bins": [
+        "c18b0aaab60425ef848e8e278b3ac60c1ec7a50dfb708ed25184a0a987018893"
+      ],
+      "verdicts": {
+        "PASS": 55
+      }
+    }
+  },
   "stage_1a_closeout_20261029": {
     "recorded_at": "2026-10-29T15:55:00+08:00",
     "base": {
@@ -152,7 +350,15 @@
       },
       "evidence": "evidence/soak-main-20261029",
       "post_run_criterion_change": "The in-run verdict is FAIL because the reconciliation frozen with the soak reported one device-side discrepancy (journal and /audit agreed): a d2_sp write IA2 answered 200/ok 0.18 s after device 2 had closed its link was replaced by a newer write before the link returned, and the device answered no request in between. The final program accepts exactly that (no answered request from the write until the value is replaced or the log ends); with it the same data reconciles CLEAN and that write is the only one the rule applies to in either soak. See RESULT-1A.md section 3.",
-      "turnover_note": "The 12-minute archive pause covered about 216 entries, fewer than 256, so the soak did not turn the ring over; A4 covers turnover."
+      "turnover_note": "The 12-minute archive pause covered about 216 entries, fewer than 256, so the soak did not turn the ring over; A4 covers turnover.",
+      "request_counts": {
+        "request_loop_iterations": 4496,
+        "request_file_lines": 4848,
+        "authenticated_lines_including_duplicates": 4486,
+        "duplicate_submissions": 487,
+        "new_authenticated_actions": 3999,
+        "answer_check_denominator": "new authenticated actions (soak.py `submitted`); duplicate submissions are not counted"
+      }
     },
     "soak_fixed_runtime": {
       "verdict": "PASS",
@@ -242,7 +448,15 @@
         "polls_used": 2892,
         "polls_ignored": 2
       },
-      "evidence": "evidence/soak-detached-20261029"
+      "evidence": "evidence/soak-detached-20261029",
+      "request_counts": {
+        "request_loop_iterations": 2252,
+        "request_file_lines": 2440,
+        "authenticated_lines_including_duplicates": 2289,
+        "duplicate_submissions": 250,
+        "new_authenticated_actions": 2039,
+        "answer_check_denominator": "new authenticated actions (soak.py `submitted`); duplicate submissions are not counted"
+      }
     },
     "stage_1a_exit_criteria": "see RESULT-1A.md",
     "hardware_contacted": false,
