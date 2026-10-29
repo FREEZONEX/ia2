@@ -1,0 +1,454 @@
+{
+  "review_20261029": {
+    "reviewed_head": "2d68f5b6976d35448084a6c922dcd51a83e4ca3c",
+    "repair": "Manage the SIGSTOP-tested runtime with Popen and wait for exit off the event loop; keep R3 audit absence inconclusive.",
+    "before": "Python 3.14.7/macOS 27.0.1: R3 blocked in asyncio child-watcher waitpid; manually terminated test child; run failed.",
+    "after": "R3 completed in 8.7 seconds on Python 3.14.7 and 3.9.6; assertions passed, original FINDING retained. Runtime restart C8 passed.",
+    "other_validation": "Existing Python suites, real loopback A1/B3/R1/R2, and device-free CLI compilation/scenario passed; Tomli bytes match PyPI sdist.",
+    "runtime_build_commit": "ab00029af76b",
+    "runtime_source_matches_main": "e6a38aa355cde1747114866b52c2e26f0e3ca724",
+    "runtime_bin_sha256": "79bcbe8894aef6221922386c4720b614103a96c0a9174a7cf7c10ec234a2c0d1",
+    "code_tree_sha256": "215bd171447135a6c26e80023b1b33fec20464003dc0e0257a3eec5b06ff375f",
+    "stage_1a_accepted": false,
+    "hardware_contacted": false
+  },
+  "recorded_date": "2026-10-28 UTC+8",
+  "base_commit": "e6a38aa355cde1747114866b52c2e26f0e3ca724",
+  "python_tests": {
+    "suites": [
+      {
+        "suite": "test_ar01_headers",
+        "exit_code": 0,
+        "tests": 8
+      },
+      {
+        "suite": "test_client",
+        "exit_code": 0,
+        "tests": 6
+      },
+      {
+        "suite": "test_d6_toml",
+        "exit_code": 0,
+        "tests": 6
+      },
+      {
+        "suite": "test_failsafe_compat",
+        "exit_code": 0,
+        "tests": 7
+      },
+      {
+        "suite": "test_fixes",
+        "exit_code": 0,
+        "tests": 24
+      },
+      {
+        "suite": "test_ir01_framing",
+        "exit_code": 0,
+        "tests": 4
+      },
+      {
+        "suite": "test_ir02_durable",
+        "exit_code": 0,
+        "tests": 4
+      },
+      {
+        "suite": "test_ir03_publication",
+        "exit_code": 0,
+        "tests": 14
+      },
+      {
+        "suite": "test_ir_process",
+        "exit_code": 0,
+        "tests": 7
+      },
+      {
+        "suite": "test_p0_f01",
+        "exit_code": 0,
+        "tests": 2
+      },
+      {
+        "suite": "test_p0_f02",
+        "exit_code": 0,
+        "tests": 4
+      },
+      {
+        "suite": "test_p0_f03",
+        "exit_code": 0,
+        "tests": 5
+      },
+      {
+        "suite": "test_p0_f04",
+        "exit_code": 0,
+        "tests": 7
+      },
+      {
+        "suite": "test_p0_process",
+        "exit_code": 0,
+        "tests": 4
+      },
+      {
+        "suite": "test_p1_client",
+        "exit_code": 0,
+        "tests": 10
+      },
+      {
+        "suite": "test_p1_client_clock",
+        "exit_code": 0,
+        "tests": 14
+      },
+      {
+        "suite": "test_p1_d01_trust_matrix",
+        "exit_code": 0,
+        "tests": 7
+      },
+      {
+        "suite": "test_p1_engine_http",
+        "exit_code": 0,
+        "tests": 3
+      },
+      {
+        "suite": "test_p1_f07",
+        "exit_code": 0,
+        "tests": 12
+      },
+      {
+        "suite": "test_p1_f07_process",
+        "exit_code": 0,
+        "tests": 3
+      },
+      {
+        "suite": "test_p1_numeric",
+        "exit_code": 0,
+        "tests": 16
+      },
+      {
+        "suite": "test_p1_recovery",
+        "exit_code": 0,
+        "tests": 22
+      },
+      {
+        "suite": "test_pure",
+        "exit_code": 0,
+        "tests": 39
+      },
+      {
+        "suite": "test_robustness",
+        "exit_code": 0,
+        "tests": 6
+      },
+      {
+        "suite": "test_verifier",
+        "exit_code": 0,
+        "tests": 19
+      }
+    ],
+    "tests": 253,
+    "passed": true
+  },
+  "bool_checks": {
+    "cases": 21,
+    "passed": true
+  },
+  "crash_per_action_passed": true,
+  "nullable_failsafe_controls": [
+    {
+      "mutation": "reject-null",
+      "detected_by_assertion": true,
+      "exit_code": 1
+    },
+    {
+      "mutation": "ignore-other-report",
+      "detected_by_assertion": true,
+      "exit_code": 1
+    },
+    {
+      "mutation": "accept-falsy-malformed",
+      "detected_by_assertion": true,
+      "exit_code": 1
+    }
+  ],
+  "initial_regression_reproduction": {
+    "tests": 7,
+    "assertion_failures": 44,
+    "errors": 0
+  },
+  "compiled_sources_unchanged_since_import_quality_gate": true,
+  "bridge_sha256": {
+    "bridge/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "bridge/_vendor/__init__.py": "3f9d244c34d97c50af9cab9340fcada57708978ddaaed10ecca93bdb06d8a0b8",
+    "bridge/_vendor/tomli/__init__.py": "3e1370fdec8b81d9fb31c27a9eb00df32226ddd5c2ef9bebd6c546555c034a90",
+    "bridge/_vendor/tomli/_parser.py": "f70f0b1b48c1edfc26659581d2f5576de7a30c7725e00348271076b1c1270e50",
+    "bridge/_vendor/tomli/_re.py": "b21e2c0434603bde0a259c0d22b81d73257fa906acb79d18bf3380506a510ca0",
+    "bridge/_vendor/tomli/_types.py": "f864c6d9552a929c7032ace654ee05ef26ca75d21b027b801d77e65907138b74",
+    "bridge/auth.py": "5d2e6e0b09e9c3191971716de27222ac2988331f6fbea3908a19f54852d62817",
+    "bridge/build_flavor.py": "8cbb1e8d6f266b36b22409f974fcfd5b2eb72f4b179ae83be6af8efadf04751a",
+    "bridge/classify.py": "24f109c26a4ef90fb1da699387f25a5c1fb59a71526ed4f8758be5ef85736640",
+    "bridge/durable.py": "55633d7931b3499ea67717ff22986a23f195db04f305f1e7a726a78f389fc45d",
+    "bridge/engine.py": "dff16c72bd619f342d8c9722e8b374a95fed8ea4ab3e0a2da3582c09e3231e69",
+    "bridge/errors.py": "3b963e9113aeb31fe1c4103f20a5f4e2e36b18db5a85ce96de8c8bc0fbb9a6c7",
+    "bridge/facts.py": "88d65b40fb2b1d55352cd6cde5fd18bd029e897f78308010828dce48253159de",
+    "bridge/gates.py": "b6fcc9ec4f5ecf93f4947f4815370b859905774cf99b02e03ef7042068f401c4",
+    "bridge/governance_check.py": "eb2338d6854ccad02bfea9ef95982ddb9a35a430da358a6d133f28ca54dccbb0",
+    "bridge/ia2client.py": "11b9d1ae61eac2bc3bec13a9c64b2b8b728a6bb384da8d6def9616560c49892a",
+    "bridge/journal.py": "12824b60783751ef78c37315320fc0e8a64d9a92e4fb8ca6a0a151b0088e459c",
+    "bridge/main.py": "7eecc0951c1a29aea8a77846ee7b2c231cdb62f273f084859922c64ee4b061e7",
+    "bridge/northbound_guard.py": "8552d7e686086c1ae8870d8134e24650eb625a1afebdbc3ae6dd3fcdc3a9ffe7",
+    "bridge/preflight.py": "3bd00056c5eaba6e0ff8fbdf716ff9df8ec82ce0af2247d83b803da1dd1ef33b",
+    "bridge/registry.py": "5f1a910073b598fd5e3ed53b5bddba5a93d3d1488dcfab8a909b66c87991d6b4",
+    "bridge/runtime_schema.py": "555fd35007000f0b87557b19f6847653508638753cd733eefbb8fa9689cf163a",
+    "bridge/strictjson.py": "6077ea038b33e6178ad40ba8cff8346f20cff3d9cf6a3e54ca61f698bbdfc178",
+    "bridge/tail.py": "367e14c566428cffb6745be83b4cfeffec01b92c7d03c89d17906e683832791d",
+    "bridge/testhooks_loader.py": "0a5a584a2f3f6d26a402f1819c1429a1f313b224bf2a209622eab86d13990e6f",
+    "bridge/trace.py": "0463c78721cce84f65d89906e50c18f5bd45563956e8e6f735919673bf866489",
+    "bridge/values.py": "5476728c5a2ed0599f39fac45262c822f3071aa0c51b986a3b77e7c6c8714d0f",
+    "bridge/vocab.py": "eef6450a9158903641864318ba137d72835aa3e5479d9af6392b59e6c1b99386",
+    "bridge_run.py": "7a4f6aaef61d71738be920bf7343de261daac23dbe7353a37c028246f57ee350",
+    "contract_vocab.json": "ba643211081f380440a6d905df4ea1d58508f96b7c30067e3662a73dc9833932"
+  },
+  "prior_import_validation": {
+    "historical_runtime_integration": {
+      "cases": 27,
+      "verdicts": {
+        "PASS": 26,
+        "FINDING": 1
+      },
+      "assertions": 395,
+      "failed_assertions": 0,
+      "runtime_sha256": [
+        "cf64e6a28d375496fb39664588cde25287d40c70e9bf3f23f0e857acfb7f4b27"
+      ],
+      "code_tree_sha256": [
+        "e1eaee825d2c50ad8a5206f647cc17ac1629ecdc1aeb9694caad80386dbd2572"
+      ]
+    },
+    "current_main_runtime_smoke": {
+      "cases": 7,
+      "failed": 7,
+      "reason": "startup refused: missing or invalid runtime evidence: status.failsafe_status",
+      "runtime_sha256": [
+        "8247e4525d89a273d0cff2d7fe525c7fe91c321d3c708b75afbcb11318c76483"
+      ]
+    },
+    "final_harness_exit_checks": [
+      {
+        "runtime": "current-main",
+        "exit_code": 1,
+        "expected": 1,
+        "verdict": "FAIL",
+        "assertions": 1,
+        "code_tree_sha256": "5974a70ab6a360686d0fea65aa681cfc4124a462074a7c2c8f8ed2a39dfa6bea"
+      },
+      {
+        "runtime": "pinned-baseline",
+        "exit_code": 0,
+        "expected": 0,
+        "verdict": "PASS",
+        "assertions": 24,
+        "code_tree_sha256": "5974a70ab6a360686d0fea65aa681cfc4124a462074a7c2c8f8ed2a39dfa6bea"
+      }
+    ]
+  },
+  "test_ports_released": true,
+  "real_devices": false,
+  "merged": false,
+  "prior_nullable_failsafe_validation": {
+    "python_tests": 247,
+    "integration": {
+      "runtime_commit": "e6a38aa355cde1747114866b52c2e26f0e3ca724",
+      "cases": 27,
+      "verdicts": {
+        "PASS": 26,
+        "FINDING": 1
+      },
+      "assertions": 395,
+      "failed_assertions": 0,
+      "runtime_sha256": [
+        "8247e4525d89a273d0cff2d7fe525c7fe91c321d3c708b75afbcb11318c76483"
+      ],
+      "code_tree_sha256": "d1b56f18dc1198bd59ce953ccf8a6828b9fdae8749b5bbdff5d2ff88c4e80d93",
+      "source_hash_matches_all_cases": true,
+      "setup_errors": 0
+    },
+    "bridge_sha256": {
+      "bridge/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bridge/auth.py": "5d2e6e0b09e9c3191971716de27222ac2988331f6fbea3908a19f54852d62817",
+      "bridge/build_flavor.py": "8cbb1e8d6f266b36b22409f974fcfd5b2eb72f4b179ae83be6af8efadf04751a",
+      "bridge/classify.py": "24f109c26a4ef90fb1da699387f25a5c1fb59a71526ed4f8758be5ef85736640",
+      "bridge/durable.py": "55633d7931b3499ea67717ff22986a23f195db04f305f1e7a726a78f389fc45d",
+      "bridge/engine.py": "77699253ce4fba571424d410c0bf8174939975dbf177f3d6383290a7bc4fa5d6",
+      "bridge/errors.py": "3b963e9113aeb31fe1c4103f20a5f4e2e36b18db5a85ce96de8c8bc0fbb9a6c7",
+      "bridge/facts.py": "88d65b40fb2b1d55352cd6cde5fd18bd029e897f78308010828dce48253159de",
+      "bridge/gates.py": "b6fcc9ec4f5ecf93f4947f4815370b859905774cf99b02e03ef7042068f401c4",
+      "bridge/governance_check.py": "eb2338d6854ccad02bfea9ef95982ddb9a35a430da358a6d133f28ca54dccbb0",
+      "bridge/ia2client.py": "11b9d1ae61eac2bc3bec13a9c64b2b8b728a6bb384da8d6def9616560c49892a",
+      "bridge/journal.py": "12824b60783751ef78c37315320fc0e8a64d9a92e4fb8ca6a0a151b0088e459c",
+      "bridge/main.py": "7eecc0951c1a29aea8a77846ee7b2c231cdb62f273f084859922c64ee4b061e7",
+      "bridge/northbound_guard.py": "faf8fc02ed1c6f49d556de62c2dcf95f2eafbb9207a433fe0b21d910d4ae45b7",
+      "bridge/preflight.py": "3bd00056c5eaba6e0ff8fbdf716ff9df8ec82ce0af2247d83b803da1dd1ef33b",
+      "bridge/registry.py": "5f1a910073b598fd5e3ed53b5bddba5a93d3d1488dcfab8a909b66c87991d6b4",
+      "bridge/runtime_schema.py": "555fd35007000f0b87557b19f6847653508638753cd733eefbb8fa9689cf163a",
+      "bridge/strictjson.py": "6077ea038b33e6178ad40ba8cff8346f20cff3d9cf6a3e54ca61f698bbdfc178",
+      "bridge/tail.py": "367e14c566428cffb6745be83b4cfeffec01b92c7d03c89d17906e683832791d",
+      "bridge/testhooks_loader.py": "0a5a584a2f3f6d26a402f1819c1429a1f313b224bf2a209622eab86d13990e6f",
+      "bridge/trace.py": "0463c78721cce84f65d89906e50c18f5bd45563956e8e6f735919673bf866489",
+      "bridge/values.py": "5476728c5a2ed0599f39fac45262c822f3071aa0c51b986a3b77e7c6c8714d0f",
+      "bridge/vocab.py": "eef6450a9158903641864318ba137d72835aa3e5479d9af6392b59e6c1b99386",
+      "bridge_run.py": "7a4f6aaef61d71738be920bf7343de261daac23dbe7353a37c028246f57ee350",
+      "contract_vocab.json": "ba643211081f380440a6d905df4ea1d58508f96b7c30067e3662a73dc9833932"
+    }
+  },
+  "recorded_at": "2026-10-28 22:48:58 UTC+8",
+  "runtime_integration": {
+    "runtime_commit": "047e7c17ffda1c52ac3d0f68726d9a15889a3cba",
+    "runtime_source_base_commit": "e6a38aa355cde1747114866b52c2e26f0e3ca724",
+    "runtime_sources_identical_to_base": true,
+    "cases": 27,
+    "verdicts": {
+      "PASS": 26,
+      "FINDING": 1
+    },
+    "assertions": 395,
+    "failed_assertions": 0,
+    "runtime_sha256": "52160ab8ba63cd16852c66b5647f0a16844bdc45f410c48da2c589c2cc2e74de",
+    "code_tree_sha256": "4b79f02cbca51474192941cf17496ca49f2a121451a66158e7ceea2225cb0e2b",
+    "source_hash_matches_all_cases": true,
+    "includes_bundled_parser": true,
+    "setup_errors": 0
+  },
+  "quality_gate": [
+    {
+      "check": "adaptation",
+      "exit_code": 0,
+      "seconds": 0.09
+    },
+    {
+      "check": "format",
+      "exit_code": 0,
+      "seconds": 0.69
+    },
+    {
+      "check": "clippy",
+      "exit_code": 0,
+      "seconds": 0.38
+    },
+    {
+      "check": "server-build",
+      "exit_code": 0,
+      "seconds": 0.2
+    },
+    {
+      "check": "rust-tests",
+      "exit_code": 0,
+      "seconds": 49.91
+    },
+    {
+      "check": "release",
+      "exit_code": 0,
+      "seconds": 0.21
+    },
+    {
+      "check": "web-build",
+      "exit_code": 0,
+      "seconds": 0.93
+    },
+    {
+      "check": "web-tests",
+      "exit_code": 0,
+      "seconds": 3.17
+    }
+  ],
+  "rust_tests": {
+    "passed": 8589,
+    "failed": 0,
+    "ignored": 105
+  },
+  "web_tests": {
+    "files": 39,
+    "passed": 423
+  },
+  "d6_toml": {
+    "regression_tests": 6,
+    "before": {
+      "tests": 3,
+      "failures": 18,
+      "errors": 0,
+      "old_guard_rejected_by_regressions": true
+    },
+    "python_versions": [
+      "3.9.6",
+      "3.14.8"
+    ],
+    "python314_passed": true,
+    "runtime_checks": [
+      {
+        "case": "escaped",
+        "flavor": "lab",
+        "bridge_exit": 3,
+        "ready": false,
+        "runtime_build_commit": "047e7c17ffda"
+      },
+      {
+        "case": "escaped",
+        "flavor": "prod",
+        "bridge_exit": 3,
+        "ready": false,
+        "runtime_build_commit": "047e7c17ffda"
+      },
+      {
+        "case": "inline",
+        "flavor": "lab",
+        "bridge_exit": 3,
+        "ready": false,
+        "runtime_build_commit": "047e7c17ffda"
+      },
+      {
+        "case": "inline",
+        "flavor": "prod",
+        "bridge_exit": 3,
+        "ready": false,
+        "runtime_build_commit": "047e7c17ffda"
+      },
+      {
+        "case": "safe",
+        "flavor": "lab",
+        "bridge_exit": null,
+        "ready": true,
+        "runtime_build_commit": "047e7c17ffda"
+      },
+      {
+        "case": "safe",
+        "flavor": "prod",
+        "bridge_exit": null,
+        "ready": true,
+        "runtime_build_commit": "047e7c17ffda"
+      }
+    ],
+    "runtime_checks_passed": true,
+    "parser_provenance": {
+      "package": "tomli",
+      "version": "2.2.1",
+      "source_url": "https://files.pythonhosted.org/packages/18/87/302344fed471e44a87289cf4967697d07e532f2421fdaf868a303cbae4ff/tomli-2.2.1.tar.gz",
+      "source_sha256": "cd45e1dc79c835ce60f7404ec8119f2eb06d38b1deba146f07ced3bbc44505ff",
+      "requires_python": ">=3.8",
+      "files_sha256": {
+        "__init__.py": "3e1370fdec8b81d9fb31c27a9eb00df32226ddd5c2ef9bebd6c546555c034a90",
+        "_parser.py": "f70f0b1b48c1edfc26659581d2f5576de7a30c7725e00348271076b1c1270e50",
+        "_re.py": "b21e2c0434603bde0a259c0d22b81d73257fa906acb79d18bf3380506a510ca0",
+        "_types.py": "f864c6d9552a929c7032ace654ee05ef26ca75d21b027b801d77e65907138b74",
+        "py.typed": "f0f8f2675695a10a5156fb7bd66bafbaae6a13e8d315990af862c792175e6e67",
+        "LICENSE": "b80816b0d530b8accb4c2211783790984a6e3b61922c2b5ee92f3372ab2742fe"
+      },
+      "changes": "None; package source and MIT license copied verbatim."
+    },
+    "prior_review_bypass_cases": 2,
+    "blocker_closed": true
+  },
+  "sim": {
+    "steps": 7,
+    "passed": true,
+    "program_stopped": true,
+    "forces": [],
+    "alarms": [],
+    "server_stopped": true
+  }
+}

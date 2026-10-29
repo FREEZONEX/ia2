@@ -1,0 +1,81 @@
+{
+ "version": "ia2.control/v0.3",
+ "statuses": [
+  "requested",
+  "accepted",
+  "verified",
+  "unknown",
+  "rejected",
+  "modified",
+  "undelivered"
+ ],
+ "bridge_terminal": [
+  "unknown",
+  "rejected",
+  "modified",
+  "undelivered"
+ ],
+ "reasons": [
+  "bad_request",
+  "unauthenticated",
+  "not_in_registry",
+  "simulation_mismatch",
+  "unsupported_type",
+  "bad_value",
+  "out_of_range",
+  "expired",
+  "conflicting_action_id",
+  "rate_limited",
+  "busy",
+  "held",
+  "runtime_unreachable",
+  "latched",
+  "paused",
+  "forced",
+  "device_unhealthy",
+  "fieldbus_unhealthy",
+  "governance_denied",
+  "unknown_variable",
+  "scan_stopped",
+  "vm_error",
+  "clamped",
+  "link_down",
+  "latched_after_write",
+  "runtime_restarted",
+  "no_feedback",
+  "feedback_stale",
+  "no_proof_by_deadline",
+  "northbound_write_enabled",
+  "bridge_restarted"
+ ],
+ "claims": {
+  "requested": {
+   "claim": "已收到，尚未判定",
+   "not_claimed": "任何结果"
+  },
+  "accepted": {
+   "claim": "IA2 接受了写入，传输当时健康",
+   "not_claimed": "生效、线上送达、物理效果"
+  },
+  "verified": {
+   "claim": "反馈通道在期限内报告了目标值（容差内），数据新鲜",
+   "not_claimed": "线上送达、物理效果、反馈通道本身没有被卡住、这次写入就是原因（目标值本来就等于现值时同样成立）"
+  },
+  "modified": {
+   "claim": "已写入 applied_value，不是请求的值",
+   "not_claimed": "请求被满足"
+  },
+  "undelivered": {
+   "claim": "IA2 接受但设备不可达；值可能迟到执行",
+   "not_claimed": "任何生效"
+  },
+  "rejected": {
+   "claim": "未写入",
+   "not_claimed": ""
+  },
+  "unknown": {
+   "claim": "不知道（见原因）",
+   "not_claimed": "成功或失败"
+  }
+ }
+}
