@@ -1,5 +1,15 @@
 # Validation
 
+## Maintainer review — 2026-10-30
+
+Reviewed runtime #100 at `1cc16c0` and example #101 at `a5e4a85` together, using macOS 27.0.1 / Python 3.14.7 and an isolated checkout. Evidence: `evidence/pr100-101-review-20261030/`; exact runtime and source hashes are in `validation-summary.json` under `maintainer_review_20261030`.
+
+The old runtime reproduced applied writes missing from `/audit` and a disconnected 100 ms pulse left TRUE without a reset. The fixed runtime audited the disconnected pulse once and reset it after 110.525 ms. Queued 100 ms and 800 ms pulses held for 109.985 ms and 809.898 ms. Normal writes, timeout before reading, disconnect after queueing, bridge crash/recovery, and fake-device restart/reconciliation passed. A truncated device log still returned `INCOMPLETE` / exit 2.
+
+Two lab compatibility problems were reproduced and repaired without weakening the checks. When macOS `netstat` omits an accepted loopback socket, R3 uses `lsof`'s exact endpoint, receive/send queue and state fields. For a connection the stopped runtime has not accepted, R3 confirms the process stop before forwarding the request and again afterwards. Fake-device shutdown now closes its active connections before awaiting server closure: [Python 3.12+ waits for those connections in `Server.wait_closed()`](https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.Server.wait_closed). The earlier R3 timing failures and interrupted WP6C run are retained as failed attempts. Bridge diagnostic text now identifies missing disconnect audits as an older-runtime defect.
+
+Existing Python checks, affected Rust format/Clippy and pulse/audit checks, the server caller's Clippy, and agent adaptation passed. No new unit tests or framework were added. No new soak, hardware, deployment, Windows or systemd validation was performed. Historical author-side raw soak/oracle evidence is not available on this machine and was not independently replayed. The documented stage limitations below still apply.
+
 ## PR submission verification, 2026-10-30 UTC+8
 
 Submitted [runtime PR #100](https://github.com/FREEZONEX/ia2/pull/100) at `1cc16c0` and [stage 1a PR #101](https://github.com/FREEZONEX/ia2/pull/101), whose repair commit is `7a8f59a`. The repair commit's tree exactly matches sealed candidate `0bf9275c949d7c66a0809c1f051f79f97971dd19`; the following publication update changes documentation only. Both branches merge without conflicts in a merge simulation. Merge #100 first because #101's R3 expectations require it; neither PR was merged during submission.

@@ -24,6 +24,12 @@ class FakeSlavePlus(FakeSlave):
         self._seq += 1
         super().emit(ev, seq=self._seq, mono=round(time.monotonic(), 6), **fields)
 
+    async def stop(self):
+        # Recent asyncio versions wait for client connections in Server.wait_closed(). Close our connections first,
+        # otherwise restarting the fake device waits forever while the runtime keeps polling it.
+        self._abort_all('stop')
+        await super().stop()
+
     @staticmethod
     def _describe(pdu):
         info = FakeSlave._describe(pdu)
