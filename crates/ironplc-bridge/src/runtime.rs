@@ -521,19 +521,37 @@ impl ProgramHandle {
     }
 
     /// Register ownership only after a governed write succeeds in the VM.
+    /// `write_with_pulse` uses `queue_pulse`; tests start pulses with this.
+    #[cfg(test)]
     pub(crate) async fn start_pulse(
         &self,
         name: &str,
         value: i32,
     ) -> Result<(WriteOutcome, PulseToken), RuntimeWriteError> {
+        let (landed, token) = self.queue_pulse(name, value)?;
+        Ok((landed.await?, token))
+    }
+
+    /// Queue a pulse's first write now, in the caller's command order, and
+    /// return what resolves once the scan loop has applied it. Ownership is
+    /// still registered only if that write succeeds.
+    pub(crate) fn queue_pulse(
+        &self,
+        name: &str,
+        value: i32,
+    ) -> Result<
+        (
+            impl std::future::Future<Output = Result<WriteOutcome, RuntimeWriteError>> + Send + 'static,
+            PulseToken,
+        ),
+        RuntimeWriteError,
+    > {
         let token = PulseToken {
             name: name.to_string(),
             owner: Arc::new(()),
         };
-        let outcome = self
-            .send_write(name, value, Some(token.owner.clone()))
-            .await?;
-        Ok((outcome, token))
+        let landed = self.queue_write(name, value, Some(token.owner.clone()))?;
+        Ok((landed, token))
     }
 
     /// Bypass governance for the runtime's own reset (ADR-0002), but never
@@ -555,6 +573,19 @@ impl ProgramHandle {
         value: i32,
         pulse_owner: Option<Arc<()>>,
     ) -> Result<WriteOutcome, RuntimeWriteError> {
+        self.queue_write(name, value, pulse_owner)?.await
+    }
+
+    /// Send the write command now; the returned future waits for its ack.
+    fn queue_write(
+        &self,
+        name: &str,
+        value: i32,
+        pulse_owner: Option<Arc<()>>,
+    ) -> Result<
+        impl std::future::Future<Output = Result<WriteOutcome, RuntimeWriteError>> + Send + 'static,
+        RuntimeWriteError,
+    > {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
             .send(RuntimeCommand::WriteVariable {
@@ -564,7 +595,7 @@ impl ProgramHandle {
                 ack: ack_tx,
             })
             .map_err(|_| RuntimeWriteError::Disconnected)?;
-        ack_rx.await.map_err(|_| RuntimeWriteError::Disconnected)?
+        Ok(async move { ack_rx.await.unwrap_or(Err(RuntimeWriteError::Disconnected)) })
     }
 
     /// Pin a variable to a fixed value. Until `unforce_variable` is

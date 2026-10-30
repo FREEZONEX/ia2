@@ -153,11 +153,15 @@ for BOOL, `50.0` for REAL (the CLI bit-packs by the variable's live
 type). Negative numbers after `--`: `cs runtime force setpoint -- -5`.
 
 HTTP variable writes also accept `pulse_ms` (via `cs api` or HMI): the
-runtime resets the value to zero after the delay, even while paused. A later
+runtime resets the value to zero after the delay, counted from when the write
+was applied (queueing behind a slow scan does not shorten it), even while
+paused. A later
 accepted pulse, plain write (including MQTT), or force supersedes that reset
 for the same resolved variable, including bare/qualified aliases. A rejected
 write leaves the reset active. Reset bypasses governance bounds; if delivery
-is impossible, it still clears the VM and logs the undelivered device.
+is impossible, it still clears the VM and logs the undelivered device. A
+caller that disconnects after the runtime read the request still gets the
+write and its reset.
 The current VM value is sent on normal link recovery; no new start edge is
 introduced by this pulse contract.
 

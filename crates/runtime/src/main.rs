@@ -1620,26 +1620,59 @@ fn write_response(name: &str, outcome: &WriteOutcome) -> serde_json::Value {
     })
 }
 
+/// Runs a control command and records its audit entry in a task of its own.
+/// hyper drops a handler's future when its client disconnects, but a command
+/// already queued to the scan loop still runs; recorded from the handler, its
+/// audit entry was lost with the future, leaving an applied write with no
+/// `/audit` row. A panic in the task still reaches the handler's panic layer.
+async fn run_detached<T: Send + 'static>(
+    work: impl std::future::Future<Output = Result<T, (StatusCode, String)>> + Send + 'static,
+) -> Result<T, (StatusCode, String)> {
+    match tokio::spawn(work).await {
+        Ok(result) => result,
+        Err(e) => match e.try_into_panic() {
+            Ok(payload) => std::panic::resume_unwind(payload),
+            Err(_) => Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "runtime is shutting down".to_string(),
+            )),
+        },
+    }
+}
+
 async fn rt_write(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Json(req): Json<VarWriteReq>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // The momentary-pulse reset guarantee lives in the shared monitor
-    // core — one implementation for IDE server and edge runtime.
-    let result = monitor::write_with_pulse(&state.handle, &req.name, req.value, req.pulse_ms).await;
-    let (applied, outcome) = write_audit_outcome(req.value, &result);
-    record_audit_http(
-        &state.audit,
-        &headers,
-        "write",
-        &req.name,
-        Some(req.value),
-        applied,
-        &outcome,
-    );
-    let outcome = result.map_err(write_err)?;
-    Ok(Json(write_response(&req.name, &outcome)))
+    let name = req.name.clone();
+    let outcome = audited_write(state.handle.clone(), state.audit.clone(), headers, req).await?;
+    Ok(Json(write_response(&name, &outcome)))
+}
+
+async fn audited_write(
+    handle: ProgramHandle,
+    audit: AuditLog,
+    headers: axum::http::HeaderMap,
+    req: VarWriteReq,
+) -> Result<WriteOutcome, (StatusCode, String)> {
+    run_detached(async move {
+        // The momentary-pulse reset guarantee lives in the shared monitor
+        // core — one implementation for IDE server and edge runtime.
+        let result = monitor::write_with_pulse(&handle, &req.name, req.value, req.pulse_ms).await;
+        let (applied, outcome) = write_audit_outcome(req.value, &result);
+        record_audit_http(
+            &audit,
+            &headers,
+            "write",
+            &req.name,
+            Some(req.value),
+            applied,
+            &outcome,
+        );
+        result.map_err(write_err)
+    })
+    .await
 }
 
 async fn rt_force(
@@ -1647,24 +1680,37 @@ async fn rt_force(
     headers: axum::http::HeaderMap,
     Json(req): Json<VarWriteReq>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let result = state.handle.force_variable(&req.name, req.value).await;
-    // Forces bypass governance (ADR-0002), so `applied == requested`
-    // on success — audit_outcome would still expose a regression that
-    // ever clamped a force, as a "clamped" entry.
-    let (applied, outcome) = audit_outcome(req.value, &result);
-    record_audit_http(
-        &state.audit,
-        &headers,
-        "force",
-        &req.name,
-        Some(req.value),
-        applied,
-        &outcome,
-    );
-    let v = result.map_err(write_err)?;
+    let name = req.name.clone();
+    let v = audited_force(state.handle.clone(), state.audit.clone(), headers, req).await?;
     Ok(Json(
-        serde_json::json!({ "ok": true, "name": req.name, "value": v }),
+        serde_json::json!({ "ok": true, "name": name, "value": v }),
     ))
+}
+
+async fn audited_force(
+    handle: ProgramHandle,
+    audit: AuditLog,
+    headers: axum::http::HeaderMap,
+    req: VarWriteReq,
+) -> Result<i32, (StatusCode, String)> {
+    run_detached(async move {
+        let result = handle.force_variable(&req.name, req.value).await;
+        // Forces bypass governance (ADR-0002), so `applied == requested`
+        // on success — audit_outcome would still expose a regression that
+        // ever clamped a force, as a "clamped" entry.
+        let (applied, outcome) = audit_outcome(req.value, &result);
+        record_audit_http(
+            &audit,
+            &headers,
+            "force",
+            &req.name,
+            Some(req.value),
+            applied,
+            &outcome,
+        );
+        result.map_err(write_err)
+    })
+    .await
 }
 
 async fn rt_unforce(
@@ -1672,29 +1718,27 @@ async fn rt_unforce(
     headers: axum::http::HeaderMap,
     Json(req): Json<VarNameReq>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let result = state.handle.unforce_variable(&req.name).await;
-    match &result {
-        Ok(()) => record_audit_http(
-            &state.audit,
-            &headers,
-            "unforce",
-            &req.name,
-            None,
-            None,
-            "ok",
-        ),
-        Err(e) => record_audit_http(
-            &state.audit,
-            &headers,
-            "unforce",
-            &req.name,
-            None,
-            None,
-            &e.to_string(),
-        ),
-    }
-    result.map_err(write_err)?;
-    Ok(Json(serde_json::json!({ "ok": true, "name": req.name })))
+    let name = req.name.clone();
+    audited_unforce(state.handle.clone(), state.audit.clone(), headers, req).await?;
+    Ok(Json(serde_json::json!({ "ok": true, "name": name })))
+}
+
+async fn audited_unforce(
+    handle: ProgramHandle,
+    audit: AuditLog,
+    headers: axum::http::HeaderMap,
+    req: VarNameReq,
+) -> Result<(), (StatusCode, String)> {
+    run_detached(async move {
+        let result = handle.unforce_variable(&req.name).await;
+        let outcome = match &result {
+            Ok(()) => "ok".to_string(),
+            Err(e) => e.to_string(),
+        };
+        record_audit_http(&audit, &headers, "unforce", &req.name, None, None, &outcome);
+        result.map_err(write_err)
+    })
+    .await
 }
 
 #[derive(serde::Deserialize)]
@@ -1742,8 +1786,9 @@ async fn stop_handler(State(state): State<AppState>) -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        audit_outcome, health_of, http_origin_of, origin_of, record_audit, record_audit_http,
-        sibling_web_dir, write_err, AuditLog, RuntimeWriteError, StatusCode, AUDIT_CAP,
+        audit_outcome, audited_force, audited_unforce, audited_write, health_of, http_origin_of,
+        origin_of, record_audit, record_audit_http, sibling_web_dir, write_err, AuditLog,
+        RuntimeWriteError, StatusCode, VarNameReq, VarWriteReq, AUDIT_CAP,
     };
 
     /// The policy a project that declares nothing runs with.
@@ -2192,6 +2237,86 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), handle.shutdown())
             .await
             .expect("shutdown");
+    }
+
+    /// hyper drops a handler's future when its client disconnects, yet a
+    /// command already queued to the scan loop still runs. Its audit entry
+    /// was recorded after the `await`, so it went with the future: `/audit`
+    /// had no row for a write the plant received.
+    #[tokio::test]
+    async fn control_writes_dropped_while_queued_are_still_audited() {
+        use std::time::Duration;
+        let handle = spawn_main("z := x;");
+        let log = AuditLog::default();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-ia2-origin", "tier0".parse().unwrap());
+        // Hold the scan loop so each command is still queued when dropped.
+        handle
+            .inject_scan_stall(300, 1)
+            .await
+            .expect("stall injected");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let write = VarWriteReq {
+            name: "x".into(),
+            value: 7,
+            pulse_ms: None,
+        };
+        let force = VarWriteReq {
+            name: "x".into(),
+            value: 9,
+            pulse_ms: None,
+        };
+        let unforce = VarNameReq { name: "x".into() };
+        let drop_soon = Duration::from_millis(20);
+        let queued = [
+            tokio::time::timeout(
+                drop_soon,
+                audited_write(handle.clone(), log.clone(), headers.clone(), write),
+            )
+            .await
+            .is_err(),
+            tokio::time::timeout(
+                drop_soon,
+                audited_force(handle.clone(), log.clone(), headers.clone(), force),
+            )
+            .await
+            .is_err(),
+            tokio::time::timeout(
+                drop_soon,
+                audited_unforce(handle.clone(), log.clone(), headers, unforce),
+            )
+            .await
+            .is_err(),
+        ];
+        assert_eq!(queued, [true; 3], "each command was dropped while queued");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while log.lock().len() < 3 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let snap = handle
+            .subscribe()
+            .recv()
+            .await
+            .expect("a scan after the stall");
+        handle.shutdown().await;
+        let x = snap.vars.iter().find(|v| v.name == "x").expect("x").bits;
+        // The force and unforce drain in the same pass, before any scan
+        // applies the force, so the VM keeps the write's value.
+        assert_eq!(x, 7, "the queued write landed");
+        let rows: Vec<_> = log
+            .lock()
+            .iter()
+            .map(|e| (e.origin.clone(), e.op.clone(), e.applied, e.result.clone()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("tier0".into(), "write".into(), Some(7), "ok".into()),
+                ("tier0".into(), "force".into(), Some(9), "ok".into()),
+                ("tier0".into(), "unforce".into(), None, "ok".into()),
+            ]
+        );
     }
 
     #[test]
