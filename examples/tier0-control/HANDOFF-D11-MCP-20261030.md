@@ -58,10 +58,23 @@ Agent ── stdio MCP ── requests.jsonl（请求 HMAC）── bridge ─�
 | 采样 | 独立进程、独立样本密钥，仅 GET 回环 `/status`；默认 200 ms；非有限反馈编码为 null，保留原始 bits；输出有单写者锁。见 [readside/sampler.py](readside/sampler.py) |
 | MCP 工具面 | 只有 `ia2_set` 和 `get_action_status`。启动固定注册表 SHA-256 和文件路径，拒绝启用的非 simulation 目标。没有任意变量、地址、force、pulse、文件路径或执行命令参数。见 [control_mcp.py](control_mcp.py) |
 | 查询 | 从验签后的请求恢复 action_id 绑定，验签事件／样本后推导；重启 MCP 不创建新请求。`requested` 不是执行成功，`accepted` 不是反馈达标，`verified` 不是物理效果或因果证明 |
-| 异常 | 畸形已签名数据返回工具错误，stdio 仍可服务；请求写入／同步不确定时返回 action_id + unknown，禁止自动重投 |
+| 异常 | 按发生层级区分信封拒绝计数、推导结果 `unknown` 与 MCP 工具错误，详见下表；请求追加／同步不确定时返回 action_id + `unknown`，禁止自动重投 |
 | 包装 | [tools/package_prod.py](tools/package_prod.py) 包含桥、读侧、采样器与 MCP，去掉 lab hooks；`prod` 命名不是部署验收 |
 
 `simulation: true` 是注册表约束，不是对 runtime 接线的自动证明。此次用例确实由 harness 创建回环假设备。接手者仍须保证自己的 runtime 项目也是模拟项目。
+
+### 异常返回的判读
+
+`get_action_status` 的动作状态与 MCP 的 `isError` 是不同层级：`isError: false` 只表示工具正常返回结果，不能据此判断动作成功，也不能据此排除证据异常。
+
+| 发生位置／条件 | 当前返回行为 |
+|---|---|
+| 事件／样本信封未通过签名、撤销、JSON 或基础结构检查 | 忽略该行并增加 `rejected_envelopes`／`rejected_by_role`；继续用其余可信证据推导。查询正常完成时为 `isError: false`，动作状态取决于剩余证据，并非统一报工具错误。 |
+| 已验签证据在 verifier 推导阶段触发其内部捕获的异常 | 返回 `status: unknown`、`reason: no_proof_by_deadline`、`detail: malformed authenticated evidence`，MCP 为 `isError: false`；该推导异常不增加信封拒绝计数，因此计数仍可能为 0。例：非 `accepted` 终态分支中，两条 `reconcile_note` 的 `pass_no` 分别为字符串和整数，排序时触发类型异常。 |
+| 查询外层的请求恢复、注册表绑定、证据读取／筛选等触发 MCP 捕获的异常，或超过本地历史／大小预算 | 返回 `isError: true` 的工具错误。`KeyError`／`TypeError`／`AttributeError`／`OverflowError` 为 `local_data_error`，`OSError` 为 `local_io_error`，`ValueError` 或注册表错误为 `tool_refused`；stdio 仍可继续服务。 |
+| `ia2_set` 在请求日志追加／同步期间发生 I/O 异常，无法确认请求持久化结果 | 返回 action_id、`status: unknown`、`reason: request_persistence_unconfirmed`，MCP 为 `isError: false`；请求可能已可见，应查询同一个 action_id，禁止自动重投。 |
+
+客户端应同时检查 `isError`、动作 `status`、`reason`／`detail` 与拒绝计数；工具错误也不能作为「动作未执行」的证明。实现边界见 [readside/verifier.py](readside/verifier.py) 的 `derive` 和 [control_mcp.py](control_mcp.py) 的 `get_action_status`／`Server.dispatch`。
 
 ## 密钥、权限与恢复操作
 
