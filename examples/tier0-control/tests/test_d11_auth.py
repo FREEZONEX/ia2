@@ -142,6 +142,48 @@ class Authentication(unittest.TestCase):
             finally:
                 writer.close()
 
+    def test_signed_invalid_json_values_cannot_supply_recovery_identity_or_anchor(self):
+        event = dict(self.event, journal_seq=999, journal_hash='f' * 64)
+        base = json.dumps(event)[:-1]
+        for suffix in (',"extra":1e999}', ',"extra":{"value":-1e999}}'):
+            with self.subTest(suffix=suffix), tempfile.TemporaryDirectory() as tmp:
+                payload = base + suffix
+                env = dict(self.events[0], payload=payload)
+                env['sig'] = hmac.new(b'E' * 32, b'ia2.event/v0\n' + payload.encode(), hashlib.sha256).hexdigest()
+                with self.assertRaises(ValueError):
+                    auth.verify(env, EVENT_KEYS, 'event')
+                with self.assertRaises(ValueError):
+                    eventauth.verify(json.dumps(env), EVENT_KEYS)
+                path = Path(tmp, 'trace.jsonl')
+                path.write_text(json.dumps(env) + '\n')
+                writer = TraceWriter(str(path), EVENT_KEYS)
+                try:
+                    self.assertIsNone(writer.last_anchor)
+                    self.assertNotIn(event['event_id'], writer.seen)
+                    self.assertTrue(writer.emit(self.event))
+                finally:
+                    writer.close()
+
+    def test_json_escaped_diagnostic_strings_survive_signing_and_recovery(self):
+        event = dict(self.event, detail='\udfff 温度 \x00 \U0001f600')
+        signed = eventauth.sign(event, EVENT_KEYS)
+        wire = json.dumps(signed).encode('utf-8')
+        self.assertEqual(auth.verify(wire, EVENT_KEYS, 'event'), event)
+        self.assertEqual(eventauth.verify(wire.decode('utf-8'), EVENT_KEYS), event)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, 'trace.jsonl')
+            writer = TraceWriter(str(path), EVENT_KEYS)
+            try:
+                self.assertTrue(writer.emit(event))
+            finally:
+                writer.close()
+            writer = TraceWriter(str(path), EVENT_KEYS)
+            try:
+                self.assertEqual(writer.skipped, [])
+                self.assertFalse(writer.emit(event))
+            finally:
+                writer.close()
+
     def test_revoked_anchor_is_not_trusted_at_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = str(Path(tmp, 'trace.jsonl'))

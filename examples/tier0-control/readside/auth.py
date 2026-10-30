@@ -35,9 +35,10 @@ def _bad_constant(value):
 def _finite(value):
     if isinstance(value, float) and not math.isfinite(value):
         raise ValueError('nonfinite JSON number')
-    if isinstance(value, str):
-        value.encode('utf-8')
-    elif isinstance(value, dict):
+    # JSON escapes in diagnostic strings are preserved, including a lone
+    # surrogate from a rejected request. UTF-8 is enforced on wire bytes and
+    # on the exact signed payload, not by re-encoding decoded string values.
+    if isinstance(value, dict):
         for key, item in value.items():
             _finite(key)
             _finite(item)
@@ -50,6 +51,8 @@ def loads(raw):
     try:
         if len(raw) > MAX_ENVELOPE:
             raise ValueError('JSON exceeds size limit')
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode('utf-8')  # json.loads(bytes) also accepts UTF-16/32
         value = json.loads(raw, object_pairs_hook=_pairs, parse_constant=_bad_constant)
         _finite(value)
         return value

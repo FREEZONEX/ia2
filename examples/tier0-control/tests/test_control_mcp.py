@@ -157,6 +157,17 @@ class Control(unittest.TestCase):
         Path(self.args.samples).write_text(json.dumps(sample) + '\n')
         self.assertNotEqual(self.tools.get_action_status(aid)['status'], 'verified')
 
+    def test_stdio_rejects_non_utf8_json_and_continues(self):
+        ping = json.dumps(dict(jsonrpc='2.0', id=1, method='ping')) + '\n'
+        for encoding in ('utf-16-be', 'utf-32-be'):
+            with self.subTest(encoding=encoding):
+                output = io.BytesIO()
+                server = mcp.Server(self.tools)
+                self.assertEqual(server.run(io.BytesIO(ping.encode(encoding) + ping.encode('utf-8')), output), 0)
+                rejected, valid = map(json.loads, output.getvalue().splitlines())
+                self.assertEqual(rejected.get('error', {}).get('code'), -32700)
+                self.assertEqual(valid, dict(jsonrpc='2.0', id=1, result={}))
+
     def test_index_waits_for_complete_line_and_rebuilds_on_replacement(self):
         path = Path(self.args.trace)
         event = event_record(tv.ACC)

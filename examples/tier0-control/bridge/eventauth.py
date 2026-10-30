@@ -47,6 +47,10 @@ def _check(event):
         raise ValueError('invalid bridge event')
     if event['kind'] != 'bridge_notice' and not isinstance(event.get('action_id'), str):
         raise ValueError('missing action identity')
+    # The stdlib parser accepts exponent overflow. Recovery must reject it
+    # just like the read side. Preserve JSON escapes in diagnostic strings;
+    # this validation never changes the payload bytes covered by the MAC.
+    json.dumps(event, ensure_ascii=True, allow_nan=False)
 
 
 def _hint(event):
