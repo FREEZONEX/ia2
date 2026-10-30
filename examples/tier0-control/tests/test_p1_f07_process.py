@@ -4,6 +4,9 @@
     one POST, and the next start replays the journal, sends nothing again and serves the next request;
   * a status file that cannot be written is refused at start (exit code 2), not found out later;
   * a housekeeping step that fails after the start (here: the status file) does not end the service."""
+import sys
+sys.path.insert(0, __import__('os').path.dirname(__file__))
+from signing_fixtures import event_keys_path, decode_event
 import hashlib
 import json
 import os
@@ -70,7 +73,7 @@ def rows(path):
     if Path(path).exists():
         for line in Path(path).read_text().splitlines():
             try:
-                out.append(json.loads(line))
+                out.append(decode_event(json.loads(line)) if Path(path).name == 'trace.jsonl' else json.loads(line))
             except ValueError:
                 pass
     return out
@@ -94,7 +97,7 @@ class Process(unittest.TestCase):
         (self.dest / 'project.toml').write_text('[governance]\nwrite_mode = "allowlist"\n[[governance.rules]]\nvariable = "sp"\nmin = 0\nmax = 100\n')
         (self.dest / 'requests.jsonl').write_text('')
         self.cmd = [sys.executable, '-I', str(SRC / 'bridge_run.py'), '--registry', str(self.dest / 'registry.json'),
-                    '--registry-sha256', hashlib.sha256(text.encode()).hexdigest(), '--keys', str(self.dest / 'keys.json'),
+                    '--registry-sha256', hashlib.sha256(text.encode()).hexdigest(), '--keys', str(self.dest / 'keys.json'), '--event-keys', event_keys_path(str(self.dest / 'keys.json')),
                     '--runtime', '127.0.0.1:%d' % self.server.server_port, '--journal', str(self.dest / 'journal.jsonl'),
                     '--trace', str(self.dest / 'trace.jsonl'), '--requests', str(self.dest / 'requests.jsonl'), '--project-dir', str(self.dest)]
 

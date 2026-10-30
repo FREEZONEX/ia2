@@ -1,0 +1,96 @@
+{
+  "reviewed_at": "2026-10-30T13:34:03.513859+08:00",
+  "review_type": "same-author rereview; not independent audit",
+  "baseline_commit": "25ac47ca92fe68ba6dc420a95ac138373a20f557",
+  "code_commit": "9c72dce6f677f9f7beb2c7121eda090162fa1b1c",
+  "scope": "local loopback simulation; no Tier0/grey0/hardware/client configuration changes",
+  "evidence_root": "evidence/d11-rereview-20261030",
+  "findings_fixed": [
+    "R-D11-01 signed exponent overflow and recovery identity/anchor",
+    "R-MCP-01 non-UTF8 stdio frames",
+    "R-D11-02 escaped JSON diagnostic string interoperability"
+  ],
+  "python": {
+    "passed": 365,
+    "suites": 30
+  },
+  "integration": {
+    "passed": 16,
+    "cases": [
+      "A1",
+      "B2",
+      "R1",
+      "R2",
+      "R3",
+      "R3T1",
+      "R3T1K",
+      "R3T1X",
+      "R3T2",
+      "P1F5",
+      "F6",
+      "F7",
+      "F8",
+      "MCP",
+      "MCPPROD",
+      "PROD"
+    ]
+  },
+  "d11_mutations_detected": 5,
+  "quality_gate": {
+    "commands_passed": 8,
+    "rust_passed": 8589,
+    "rust_ignored": 105,
+    "web_passed": 423,
+    "web_files": 39
+  },
+  "simulator": {
+    "steps_passed": 7,
+    "final_runtime_running": false,
+    "forces": [],
+    "server_stopped": true
+  },
+  "test_processes_remaining": 0,
+  "source_manifest_sha256": "2c939fdf59f25ab2334f71661b0b490bef788c7f3eb0535ff7017e8fef8cb2a0",
+  "runtime_sha256": "c18b0aaab60425ef848e8e278b3ac60c1ec7a50dfb708ed25184a0a987018893",
+  "upstream": {
+    "checked_at": "2026-10-30T13:23:48.680401+08:00",
+    "origin_main": "f0fa410bc8c22263aba7de0bc5400d0273d61c13",
+    "pull_requests": [
+      {
+        "headRefOid": "1cc16c0ebf1007c1826d4b63d504c9cd5e77fa79",
+        "mergeCommit": {
+          "oid": "88bcc6ec48c57510fa4a8fd8cb855ffc04a8cadf"
+        },
+        "mergedAt": "2026-10-30T05:10:14Z",
+        "number": 100,
+        "state": "MERGED",
+        "url": "https://github.com/FREEZONEX/ia2/pull/100",
+        "merged_at_utc_plus_8": "2026-10-30T13:10:14+08:00"
+      },
+      {
+        "headRefOid": "5d6a654849536659b6c39be090559106a903e8e2",
+        "mergeCommit": {
+          "oid": "f0fa410bc8c22263aba7de0bc5400d0273d61c13"
+        },
+        "mergedAt": "2026-10-30T05:10:45Z",
+        "number": 101,
+        "state": "MERGED",
+        "url": "https://github.com/FREEZONEX/ia2/pull/101",
+        "merged_at_utc_plus_8": "2026-10-30T13:10:45+08:00"
+      }
+    ]
+  },
+  "merge_preview": {
+    "exit_code": 0,
+    "tree": "bb07509fbd637ee1580ec658f020fe56310dbfed",
+    "actually_merged": false,
+    "merged_tree_tested": false
+  },
+  "not_rerun": [
+    "full 50-case suite",
+    "64 reconciliation and 3 nullable-failsafe mutations",
+    "two-hour soak"
+  ],
+  "pushed": false,
+  "deployed": false
+}

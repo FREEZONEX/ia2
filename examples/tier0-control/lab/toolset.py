@@ -10,9 +10,10 @@ import verifier
 class ControlToolset:
     TOOLS = {'ia2_set': ['target_key', 'target', 'ttl_ms'], 'get_action_status': ['action_id']}
 
-    def __init__(self, standin, trace_reader, samples_reader, registry_entries):
+    def __init__(self, standin, trace_reader, samples_reader, registry_entries, event_keys, sample_keys):
         self._standin, self._trace, self._samples, self._entries = standin, trace_reader, samples_reader, registry_entries
         self._requests = {}
+        self.event_keys, self.sample_keys = event_keys, sample_keys
 
     def ia2_set(self, target_key, target, ttl_ms=20000):
         """Ask for the registered target `target_key` to be set to `target`.  Returns the action id."""
@@ -24,4 +25,4 @@ class ControlToolset:
         """The derived status of an action (read side); never anything the bridge merely claimed."""
         request = self._requests[action_id]
         entry = next(e for e in self._entries if e['key'] == request['target_key'])
-        return verifier.derive(request, entry, self._trace(), self._samples(), int(__import__('time').time() * 1000))
+        return verifier.derive(request, entry, self._trace(), self._samples(), int(__import__('time').time() * 1000), event_keys=self.event_keys, sample_keys=self.sample_keys)

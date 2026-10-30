@@ -1,4 +1,5 @@
 """Run isolated stdlib test suites serially; stop with a failure if any suite fails."""
+import argparse
 import json
 from pathlib import Path
 import re
@@ -6,7 +7,10 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-OUT = ROOT / 'evidence' / 'unit'
+ap = argparse.ArgumentParser(description=__doc__)
+ap.add_argument('--out', type=Path, default=ROOT / 'evidence' / 'unit')
+args = ap.parse_args()
+OUT = args.out
 OUT.mkdir(parents=True, exist_ok=True)
 results = []
 for path in sorted((ROOT / 'tests').glob('test_*.py')):

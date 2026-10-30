@@ -1,4 +1,7 @@
 """Poison lines must not end the bridge: odd signed payloads, unexpected exceptions, repeated bad lines across a restart."""
+import sys
+sys.path.insert(0, __import__('os').path.dirname(__file__))
+from signing_fixtures import event_keys_path
 import json
 import os
 import sys
@@ -11,7 +14,7 @@ import robustness_cases as rc  # noqa: E402
 from bridge import auth  # noqa: E402
 from bridge.engine import Engine  # noqa: E402
 from bridge.journal import Journal  # noqa: E402
-from bridge.trace import TraceWriter  # noqa: E402
+from signing_fixtures import TraceWriter  # noqa: E402
 
 
 class Robustness(unittest.TestCase):

@@ -1,6 +1,10 @@
 """A trace holding complete lines the bridge could not have written (non-ASCII bytes, JSON that is not an object, an event ID that is not
 a string, nesting too deep to parse): startup skips each one and reports its line number, the same as a line that is not JSON at all,
 instead of ending with an uncaught exception."""
+import sys
+sys.path.insert(0, __import__('os').path.dirname(__file__))
+from signing_fixtures import event_keys_path, event_record, EVENT_KEYS
+from bridge import eventauth
 import json
 from pathlib import Path
 import sys
@@ -10,12 +14,12 @@ import unittest
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from p0_support import SRC
-from bridge.trace import TraceWriter
+from signing_fixtures import TraceWriter
 import test_p1_f07_process as proc
 
 
 def line(rec):
-    return (json.dumps(rec, sort_keys=True, separators=(',', ':')) + '\n').encode('ascii')
+    return (json.dumps(eventauth.sign(event_record(rec), EVENT_KEYS), sort_keys=True, separators=(',', ':')) + '\n').encode('ascii')
 
 
 A = line({'event_id': 'a' * 32, 'journal_seq': 2, 'journal_hash': 'h2'})

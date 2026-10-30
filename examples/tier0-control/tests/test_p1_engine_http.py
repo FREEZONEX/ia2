@@ -5,6 +5,9 @@
   * post-send reads that stall cost no more than their own budgets.
 
 Budgets are shortened (GET 0.3 s, POST 0.4 s) and judged with the same fixed 100 ms local margin as the client tests.  Everything is on loopback."""
+import sys
+sys.path.insert(0, __import__('os').path.dirname(__file__))
+from signing_fixtures import event_keys_path
 import json
 import socketserver
 import sys
@@ -20,7 +23,7 @@ from p0_support import AID, KEYS, envelope, payload, reg_for
 from bridge.engine import Engine, now_ms
 from bridge.ia2client import Ia2Client
 from bridge.journal import Journal
-from bridge.trace import TraceWriter
+from signing_fixtures import TraceWriter
 
 GET_S, POST_S, MARGIN = 0.3, 0.4, 0.1
 AID2 = 'b' * 32

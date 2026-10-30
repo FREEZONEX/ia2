@@ -22,7 +22,7 @@ results = []
 for name, old, new, method in CASES:
     with tempfile.TemporaryDirectory(prefix='ia2-failsafe-control-') as tmp:
         dest = Path(tmp)
-        for directory in ('bridge', 'tests'):
+        for directory in ('bridge', 'tests', 'readside'):
             shutil.copytree(ROOT / directory, dest / directory, ignore=shutil.ignore_patterns('__pycache__'))
         shutil.copy2(ROOT / 'contract_vocab.json', dest / 'contract_vocab.json')
         path = dest / 'bridge/runtime_schema.py'

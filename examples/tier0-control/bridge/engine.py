@@ -28,6 +28,7 @@ Implementation notes that differ from or sharpen the contract text (see RESULT-S
 import hashlib
 from itertools import islice
 import json
+import math
 import os
 import re
 import time
@@ -626,6 +627,13 @@ class Engine:
                  'status': status, 'reason': reason, 'claim': CLAIMS[status]['claim'],
                  'not_claimed': CLAIMS[status]['not_claimed'], 'observed_at_ms': self.clock()}
         event.update({k: v for k, v in extra.items() if v is not None})
+        # JSON permits exponent syntax that overflows a parser's float. Keep
+        # rejection events signable as strict JSON; the reason still reports
+        # bad_value, and the original request bytes remain in the journal.
+        for name in ('requested_value', 'applied_value'):
+            value = event.get(name)
+            if isinstance(value, float) and not math.isfinite(value):
+                event[name] = None
         return event
 
     def _notice(self, aid, ids, reason, req_hash):

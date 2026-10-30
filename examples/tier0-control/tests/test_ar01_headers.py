@@ -3,6 +3,9 @@
 Memory sockets and temporary loopback servers only. Tests exercise the real
 client, engine, verifier and bridge process; no result/classifier substitutions.
 """
+import sys
+sys.path.insert(0, __import__('os').path.dirname(__file__))
+from signing_fixtures import event_keys_path
 import itertools
 import json
 from pathlib import Path
@@ -17,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from p0_support import AID, Client, SRC, close, engine, envelope, payload, reg_for
 from test_ir01_framing import BODY, N, CHUNKS, MemorySocket, reply, request
 from bridge.ia2client import Ia2Client
-import verifier
+import signing_fixtures as verifier
 import test_p1_f07_process as proc
 
 START = 1800000000000

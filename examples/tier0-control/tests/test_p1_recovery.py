@@ -4,6 +4,9 @@ and never on a diagnostic copy of the text or on a health reading that is better
 A crash is simulated the way it leaves the disk: a real journal is cut right after the last record of a kind (the terminal, or the
 post_check and terminal, ...), so the same test runs against the P0 code and the P1 code.  `strip` rewrites a journal as the P0 bridge
 wrote it.  Every case ends with the same two facts: the runtime saw exactly one POST, and the action has exactly one terminal record."""
+import sys
+sys.path.insert(0, __import__('os').path.dirname(__file__))
+from signing_fixtures import event_keys_path
 import hashlib
 import json
 import sys
@@ -17,7 +20,7 @@ from p0_support import AID, Client, close, engine, envelope, payload, reg_for
 from bridge import strictjson
 from bridge.journal import DAY_MS, GENESIS
 import test_verifier as tv
-import verifier
+import signing_fixtures as verifier
 
 START = 1800000000000
 CLEAR = {'pending': [], 'acknowledged': [], 'unconfirmed': []}

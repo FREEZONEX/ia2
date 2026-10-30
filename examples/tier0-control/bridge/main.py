@@ -11,7 +11,7 @@ import os
 import sys
 import time
 
-from . import auth, build_flavor, governance_check, northbound_guard, preflight
+from . import auth, build_flavor, eventauth, governance_check, northbound_guard, preflight, strictjson
 from . import registry as registry_mod
 from .engine import Engine, now_ms
 from .errors import Reject
@@ -33,6 +33,8 @@ def main(argv=None):
     ap.add_argument('--registry', required=True)
     ap.add_argument('--registry-sha256', required=True)
     ap.add_argument('--keys', required=True, help='JSON key file; must not be readable by group or others')
+    ap.add_argument('--event-keys', required=True, help='separate mode-0600 event signing keys')
+    ap.add_argument('--revoked-keys', help='JSON array of revoked event key IDs; reload on restart')
     ap.add_argument('--runtime', required=True, help='host:port of the IA2 edge runtime (127.0.0.1 only)')
     ap.add_argument('--journal', required=True)
     ap.add_argument('--requests', required=True)
@@ -59,6 +61,15 @@ def main(argv=None):
         return 2
     try:
         keys = auth.load_keys(args.keys)
+        event_keys = eventauth.load_keys(args.event_keys)
+        if {k['secret'] for k in keys.values()} & {k['secret'] for k in event_keys.values()}:
+            raise ValueError('request and event keys must be independent')
+        revoked = []
+        if args.revoked_keys:
+            with open(args.revoked_keys, encoding='utf-8') as f:
+                revoked = strictjson.loads(f.read())
+            if not isinstance(revoked, list) or not all(isinstance(k, str) for k in revoked):
+                raise ValueError('invalid revocation list')
         reg = registry_mod.load_pinned(args.registry, args.registry_sha256)
     except (registry_mod.RegistryError, OSError, ValueError, KeyError) as exc:
         print('startup refused: %s' % exc, file=sys.stderr)
@@ -86,7 +97,7 @@ def main(argv=None):
         return 2
     trace = None
     try:
-        trace = TraceWriter(args.trace)
+        trace = TraceWriter(args.trace, event_keys, revoked)
         if trace.skipped:
             shown = ', '.join(str(n) for n in trace.skipped[:10]) + (', ...' if len(trace.skipped) > 10 else '')
             print('skipped %d trace line(s) that are not bridge records (lines %s); an event such a line held may be published again'
