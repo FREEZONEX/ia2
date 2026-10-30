@@ -49,7 +49,7 @@ It owns the same loopback ports as the cases; run it alone, or give it its own `
 
 ## Run the tests
 
-Python 3.8+ on macOS or Linux; no package installation is required. The example bundles the unmodified pure Python [Tomli 2.2.1 parser](https://pypi.org/project/tomli/2.2.1/) under `bridge/_vendor/tomli`, including its MIT license, source archive hash and per-file hashes in `SOURCE.json`. All other imports use the standard library. The recorded acceptance used Python 3.9.6. The process tests use loopback sockets, POSIX file locks and subprocess signals.
+Python 3.8+ on macOS or Linux; no package installation is required. The example bundles the unmodified pure Python [Tomli 2.2.1 parser](https://pypi.org/project/tomli/2.2.1/) under `bridge/_vendor/tomli`, including its MIT license, source archive hash and per-file hashes in `SOURCE.json`. All other imports use the standard library. The recorded acceptance used Python 3.9.6. The process tests use loopback sockets, POSIX file locks and subprocess signals. On macOS the R3 timing checks use `lsof` when `netstat` omits a loopback socket; before an unaccepted request they confirm the runtime is stopped. Fake-device restart closes active connections before waiting for the listener, including on Python 3.12+.
 
 From the repository root:
 

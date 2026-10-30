@@ -785,7 +785,8 @@ R3_EXPECT = {                                                    # (executed on 
 
 def netstat_runtime_side(local_port):
     """The runtime's end of the proxy's upstream connection in netstat (Proto Recv-Q Send-Q Local Foreign State): Recv-Q, Send-Q,
-    state.  macOS prints `addr.port` (`netstat -an -p tcp`, the recorded runs); Linux `netstat -tan` prints `addr:port` (untested)."""
+    state.  macOS prints `addr.port`; if netstat omits the socket, lsof supplies its queues and state. Linux `netstat -tan`
+    prints `addr:port` (untested). Both readers match the exact runtime/proxy endpoint pair."""
     cmd = ['netstat', '-an', '-p', 'tcp'] if sys.platform == 'darwin' else ['netstat', '-tan']
     out = subprocess.run(cmd, capture_output=True, text=True, timeout=10).stdout
     ends = [('127.0.0.1%s%d' % (sep, harness.RT_PORT), '127.0.0.1%s%d' % (sep, local_port)) for sep in '.:']
@@ -794,6 +795,24 @@ def netstat_runtime_side(local_port):
         f = line.split()
         if len(f) >= 6 and (f[3], f[4]) in ends:
             rows.append({'recv_q': int(f[1]), 'send_q': int(f[2]), 'state': f[5], 'line': line.strip()})
+    if not rows and sys.platform == 'darwin':
+        # Some macOS installations omit even our own loopback sockets from netstat. lsof's machine-readable TCP fields
+        # expose the same observations; an absent socket still fails the timing assertion, never counts as an empty queue.
+        out = subprocess.run(['lsof', '-nP', '-iTCP:%d' % harness.RT_PORT, '-Tqs', '-F', 'nT'],
+                             capture_output=True, text=True, timeout=10).stdout
+        endpoint = '127.0.0.1:%d->127.0.0.1:%d' % (harness.RT_PORT, local_port)
+        sockets, current = [], {}
+        for line in out.splitlines():
+            if line.startswith('n'):
+                current = {'name': line[1:]}
+                sockets.append(current)
+            elif line.startswith('T') and '=' in line:
+                key, value = line[1:].split('=', 1)
+                current[key] = value
+        for sock in sockets:
+            if sock.get('name') == endpoint and all(k in sock for k in ('QR', 'QS', 'ST')):
+                rows.append({'recv_q': int(sock['QR']), 'send_q': int(sock['QS']), 'state': sock['ST'],
+                             'line': 'lsof ' + json.dumps(sock, sort_keys=True)})
     return rows
 
 
@@ -882,13 +901,20 @@ async def case_R3(st, ck, notes):
     p = await r3_submit(st, ck)
     st.signal_runtime(signal.SIGSTOP)
     t_stop = time.time()
+    def stopped():
+        return subprocess.run(['ps', '-o', 'state=', '-p', str(st.proc.pid)], capture_output=True, text=True).stdout.strip().startswith('T')
+    stopped_before_send = await wait_until(stopped, 2, 0.01)
+    ck('timing: the runtime is confirmed stopped before forwarding the request', bool(stopped_before_send))
     release(st, 'after_intent')
     req = await wait_until(lambda: write_conn(st), 10, 0.005)
     ck('the proxy forwarded the POST /write to the stopped runtime', req is not None)
     await asyncio.sleep(0.3)
     port = st.proxy.up_local_port.get(req['conn']) if req else None
     notes['netstat_while_stopped'] = q = netstat_runtime_side(port) if port else []
-    ck('timing: the request bytes are still unread in the runtime socket (Recv-Q > 0)', bool(q) and q[0]['recv_q'] > 0, q)
+    # lsof cannot see a connection the stopped process has not accepted yet. If netstat also omits it, a confirmed stop
+    # before the proxy forwards the request, still in effect afterwards, proves the runtime could not read those bytes.
+    ck('timing: the forwarded request remains unread (receive queue or confirmed process stop)',
+       q[0]['recv_q'] > 0 if q else bool(stopped_before_send and req and req['t'] >= t_stop and stopped()), q)
     ev = await r3_timed_out(st, ck, p['action_id'])
     notes['stopped_for_s'] = round(time.time() - t_stop, 2)
     st.signal_runtime(signal.SIGCONT)

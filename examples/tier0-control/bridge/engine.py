@@ -14,8 +14,8 @@ Implementation notes that differ from or sharpen the contract text (see RESULT-S
     marker taken at recovery on the same runtime instance; only feedback after that marker can verify it.
   * Writes that ended `unknown` for a transport/VM reason get `reconcile_note`s (two looks, the second after a pause).  `audit_entry`
     says what /audit showed: found / absent / unavailable.  Only `found` is a claim (`landed: true`); otherwise `landed` is null.  An
-    absent entry never means "not executed" (R3T1/R3T1X): the runtime audits a write after the scan loop applied it, and records nothing
-    if the HTTP connection closed while the write was queued.  The status itself never changes: terminal states do not upgrade.
+    absent entry never means "not executed" (R3T1/R3T1X): older runtimes lost the audit when the HTTP caller disconnected. The fixed
+    runtime completes it independently, but its ring can still turn over or be cleared. Terminal states do not upgrade.
   * `accepted` events carry the runtime's own scan clock at the first post-write /status read (`post_scan_us`) and the offset between
     the bridge's wall clock and that scan clock (`scan_anchor_ms`): the read side orders feedback against the write in the
     runtime's own clock, never against another host's wall clock.
@@ -335,8 +335,8 @@ class Engine:
                           'show that the write was not executed')
             else:
                 detail = ('/audit still has no entry for this write at the second look. That does not show it was not executed: '
-                          'the request may never have been read, the runtime may have applied it without an entry (it records a '
-                          'write only after applying it, and nothing if the connection closed while the write was queued), or '
+                          'the request may never have been read, an older runtime may have lost the audit when the client '
+                          'disconnected while the write was queued, or '
                           'the 256-entry ring may have turned over')
         landed = True if audit_entry == 'found' else None  # never False: absence is not evidence of non-execution
         self.journal.append('reconcile', action_id=aid, landed=landed, audit_entry=audit_entry, detail=detail, pass_no=pass_no)

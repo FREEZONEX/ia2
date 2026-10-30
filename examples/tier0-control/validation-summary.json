@@ -1,4 +1,47 @@
 {
+  "maintainer_review_20261030": {
+    "date": "2026-10-30",
+    "runtime_head": "1cc16c0ebf1007c1826d4b63d504c9cd5e77fa79",
+    "stage1a_reviewed_head": "a5e4a851044f9fa6462e6eff71576d9de82a00b2",
+    "runtime_binary_sha256": "9bbe2e56e39b7a42911c35ab72f0462a5449e9b8a6200a8619965469d6bbcc60",
+    "runtime_build_commit": "8141969de976a9139cb9fc557981d47d5eb9b8ff",
+    "bridge_lab_source_sha256": "16bbc7a8f8e1328ed701d30950d007c48cb9bc14e600ab6f1566ea0c74bce28d",
+    "evidence": "evidence/pr100-101-review-20261030",
+    "scope": "macOS 27.0.1, Python 3.14.7, local runtime and loopback fake Modbus only",
+    "repairs": [
+      "Use lsof TCP fields when macOS netstat omits an accepted loopback socket; confirm the process is stopped before forwarding an unaccepted request.",
+      "Close fake-device connections before awaiting server closure so device restart completes on Python 3.12+.",
+      "Describe missing disconnect audit entries as an older-runtime defect, not current behavior."
+    ],
+    "before": {
+      "runtime": "R3T1 executed without audit; disconnected 100 ms pulse stayed TRUE without reset or audit.",
+      "observer": "R3T1 initially failed two timing assertions because netstat omitted the socket; lsof recovered the exact endpoints and queue/state.",
+      "device_restart": "WP6C hung at FakeSlave.stop -> Server.wait_closed while the runtime still polled; interrupted with SIGINT, not counted as pass."
+    },
+    "after": {
+      "real_cases": [
+        "A1",
+        "R3",
+        "R3T1",
+        "R3T1X",
+        "WP6C"
+      ],
+      "pulse_after_disconnect": "100 ms pulse audited once, held 110.525 ms, then reset to zero before shutdown.",
+      "queued_pulse_hold_ms": {
+        "100": 109.985,
+        "800": 809.898
+      },
+      "reconciliation": "Full device log CLEAN; log cut before third write INCOMPLETE, exit 2.",
+      "python": "Existing isolated suites passed; affected reconciliation suite rerun after wording correction.",
+      "rust": "Affected crates format/Clippy, pulse and dropped-caller audit checks, server caller Clippy passed.",
+      "agent_adaptation": "passed"
+    },
+    "limits": [
+      "No new soak, hardware, deployment, Windows or systemd validation.",
+      "Author-side historical soak and oracle raw evidence is not available locally; no claim to have independently rerun it.",
+      "CLEAN still permits documented restart/turnover gaps; D11 signing and real control MCP remain outside these PRs."
+    ]
+  },
   "pr_submission_20261030": {
     "recorded_at": "2026-10-30 11:05:29 UTC+8",
     "status": "submitted_for_review_not_merged",

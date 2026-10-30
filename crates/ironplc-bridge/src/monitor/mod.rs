@@ -224,6 +224,14 @@ pub fn step(handle: &ProgramHandle, cycles: u32) -> ModeResponse {
 /// bypasses governance (same rationale as the force bypass, ADR-0002).
 /// Otherwise a rule with `min > 0` would clamp the reset up to `min`
 /// and silently latch the momentary command forever.
+///
+/// The pulse write is queued when this is called, in the caller's command
+/// order. Waiting for it to land and the reset run in a task of their own,
+/// not in the caller's future: an HTTP server drops a handler's future when
+/// the client disconnects, and a write already queued to the scan loop lands
+/// anyway. Tied to the caller, its reset was never scheduled and the value
+/// latched. The value is held for `pulse_ms` from the moment the write
+/// landed: time spent queued behind a slow scan does not shorten it.
 pub async fn write_with_pulse(
     handle: &ProgramHandle,
     name: &str,
@@ -231,11 +239,22 @@ pub async fn write_with_pulse(
     pulse_ms: Option<u32>,
 ) -> Result<WriteOutcome, RuntimeWriteError> {
     if let Some(ms) = pulse_ms {
-        let (v, token) = handle.start_pulse(name, value).await?;
+        let (landed, token) = handle.queue_pulse(name, value)?;
         let h = handle.clone();
         let n = name.to_string();
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(ms as u64);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
+            let outcome = match landed.await {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    let _ = started_tx.send(Err(e));
+                    return;
+                }
+            };
+            let deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_millis(ms as u64);
+            // The caller may be gone; the reset runs regardless.
+            let _ = started_tx.send(Ok(outcome));
             tokio::time::sleep_until(deadline).await;
             match h.reset_pulse(token).await {
                 // The program may have stopped in the window — that also
@@ -266,7 +285,11 @@ pub async fn write_with_pulse(
                 }
             }
         });
-        Ok(v)
+        // The sender is dropped unanswered only if the task was cancelled
+        // (the Tokio runtime shutting down) or panicked.
+        started_rx
+            .await
+            .unwrap_or(Err(RuntimeWriteError::Disconnected))
     } else {
         handle.write_variable(name, value).await
     }

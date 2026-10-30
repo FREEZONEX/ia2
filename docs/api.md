@@ -337,13 +337,17 @@ the *deployed* edge runtime, proxy the same ops through
 `POST /api/edges/{name}/runtime/{op}`. All return `409` when nothing is running.
 
 Variable writes accept optional `pulse_ms: <u32>`: the runtime writes zero
-after that delay, including while paused. A later accepted pulse, ordinary
+after that delay, counted from when the write was applied (time it spent
+queued behind a slow scan does not shorten the pulse), including while
+paused. A later accepted pulse, ordinary
 write (including MQTT), or force to the same resolved variable supersedes
 the earlier reset; bare and qualified names share ownership. Rejected writes
 leave the existing reset active. The current reset bypasses write governance
 so a positive minimum cannot prevent zero. If its device is disconnected,
 zero still lands in the VM and the runtime logs the failed delivery; normal
 output synchronization sends the current value when the link returns.
+Once the request has been read, neither the write nor its reset depends on
+the client: one that disconnects before the answer still gets both.
 This contract is shared by the IDE server and the edge runtime's `/write`.
 
 | Method | Path | Purpose |
@@ -531,7 +535,7 @@ the IDE server. The legacy-browser limitation above also applies here.
 | `POST` | `/force` | Pin a variable every cycle until released. Body: `{ name, value }`. Same precedence as the server route: applied before the program runs, so a program-written variable is overwritten by the program and the force never reaches the field. Force is the debug override: it **bypasses governance** by explicit decision (ADR-0002) and is never exported on any northbound surface. |
 | `POST` | `/unforce` | Release a forced variable. Body: `{ name }`. |
 | `POST` | `/inject-scan-stall` | Fault injection (test primitive): same contract as the server's `/api/runtime/inject-scan-stall` — stall `scans` scans by `stall_ms` each and trip the watchdog for real. Body: `{ stall_ms, scans? }`. |
-| `GET` | `/audit` | The write-audit ring (bounded at 256, oldest first): every `/write`·`/force`·`/unforce` and MQTT northbound write with `ts_unix_secs`, `origin` (the self-declared `X-IA2-Origin` label, `mqtt`, or `anonymous` — a label anyone who reaches the socket can claim), `http_origin` (the real HTTP `Origin` header of a browser-made request, e.g. the operator panel's own address; absent for curl, `cs`, the IDE server's proxy and MQTT), `op`, `name`, bit-packed `requested` and `applied` values (an `unforce` entry carries neither — there is no value to release to), and `result` — `ok`, `clamped` (governance altered the value; `requested`/`applied` show both sides), or the error text (denied writes are recorded too, with the denial reason; `applied` is then absent). In-memory only — cleared when the runtime process restarts (a redeploy restarts it), and under steady write traffic the 256-entry window covers only the recent past; `/history` is the surface that survives restarts. Also readable through the IDE as `GET /api/edges/{name}/audit` / `cs get edges/<n>/audit`. |
+| `GET` | `/audit` | The write-audit ring (bounded at 256, oldest first): every `/write`·`/force`·`/unforce` and MQTT northbound write with `ts_unix_secs`, `origin` (the self-declared `X-IA2-Origin` label, `mqtt`, or `anonymous` — a label anyone who reaches the socket can claim), `http_origin` (the real HTTP `Origin` header of a browser-made request, e.g. the operator panel's own address; absent for curl, `cs`, the IDE server's proxy and MQTT), `op`, `name`, bit-packed `requested` and `applied` values (an `unforce` entry carries neither — there is no value to release to), and `result` — `ok`, `clamped` (governance altered the value; `requested`/`applied` show both sides), or the error text (denied writes are recorded too, with the denial reason; `applied` is then absent). A request the runtime has read is executed and recorded even when its client disconnects before the answer, so a write whose call timed out can still have an entry. In-memory only — cleared when the runtime process restarts (a redeploy restarts it), and under steady write traffic the 256-entry window covers only the recent past; `/history` is the surface that survives restarts. Also readable through the IDE as `GET /api/edges/{name}/audit` / `cs get edges/<n>/audit`. |
 | `GET` | `/history` | Downsampled history, same query/response shape as `/api/runtime/history`. Backed by JSONL segments under the edge's state dir — survives restarts AND deploys (state/ sits beside `current`). The disk is written on its own thread behind a bounded queue (about eight minutes at 1 Hz): a stalled disk cannot freeze the alarm engine, `/status` or `/events`, and cannot block this endpoint; if it stays stalled past the queue, new samples are still held in memory and served here but are not persisted, which is logged (at the 1st, 2nd, 4th ... dropped sample) as `history persistence is not keeping up`. |
 | `GET` | `/alarms` | Live `AlarmState[]` for the deployed `alarms.toml`, standing-first. `/status` carries the `alarms_standing` count on the panel's existing poll. |
 | `POST` | `/alarms/{id}/ack` | Acknowledge one alarm (operator action from the panel). 404 unknown id. |
