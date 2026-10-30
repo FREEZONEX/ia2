@@ -1,4 +1,49 @@
 {
+  "pr_submission_20261030": {
+    "recorded_at": "2026-10-30 11:05:29 UTC+8",
+    "status": "submitted_for_review_not_merged",
+    "runtime_pr": "https://github.com/FREEZONEX/ia2/pull/100",
+    "stage1a_pr": "https://github.com/FREEZONEX/ia2/pull/101",
+    "merge_order": [
+      100,
+      101
+    ],
+    "runtime_commit": "1cc16c0ebf1007c1826d4b63d504c9cd5e77fa79",
+    "stage_repair_commit": "7a8f59a1ce20b40206c51659e1cece8f00764bc7",
+    "repair_tree_matches_sealed_candidate": true,
+    "candidate_git_tree": "0bf9275c949d7c66a0809c1f051f79f97971dd19",
+    "merge_simulation_no_conflicts": true,
+    "publication_update": "documentation only",
+    "fresh_python": {
+      "suites": 28,
+      "tests": 335,
+      "passed": true,
+      "reconcile_mutations_detected": 64,
+      "failsafe_controls_detected": 3,
+      "review_cli_correct": 7,
+      "counterexample_enumeration_exit_code": 0
+    },
+    "fresh_runtime_gate": {
+      "all_eight_steps_passed": true,
+      "rust_passed": 8594,
+      "rust_failed": 0,
+      "rust_ignored": 105,
+      "web_passed": 423,
+      "web_files": 39
+    },
+    "stage_gate": "Close-out gate retained: stage source unchanged; see rereview2_20261030.quality_gate",
+    "sealed_hashes_rechecked": {
+      "inputs": 21,
+      "original_r2": 858,
+      "closeout": 1400,
+      "mismatches": 0
+    },
+    "evidence": "tier0-pr-submit-20261030/ (outside repository; earlier sealed evidence retained)",
+    "new_soak": false,
+    "new_loopback_run": false,
+    "hardware_contacted": false,
+    "merged": false
+  },
   "rereview2_20261030": {
     "recorded_at": "2026-10-30",
     "timezone": "UTC+8",

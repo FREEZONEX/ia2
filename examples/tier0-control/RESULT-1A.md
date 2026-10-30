@@ -1,5 +1,7 @@
 # 阶段 1a 结果（WP9）
 
+**PR 提交更新（2026-10-30 UTC+8）：** 运行时修复 [#100](https://github.com/FREEZONEX/ia2/pull/100) 与本阶段 1a 工作 [#101](https://github.com/FREEZONEX/ia2/pull/101) 已提交，尚未合并；合并顺序为 #100 → #101。修复提交 `7a8f59a` 的 Git 树与 §9 封存候选完全一致。提交前重新验证 Python 335 项、对账变异 64/64、nullable-failsafe 3/3、复核 CLI 7/7 全部通过；运行时分支的全仓检查通过（Rust 8594 通过、105 忽略、0 失败，Web 423 项）。以下保留各轮历史结果；「未推送」等表述对应当时状态。
+
 日期：2026-10-29 UTC+8。被测 IA2：`main` `a2dec2a`（Rust 源码与 `e6a38aa` 相同，即 PR #98 的合并提交），runtime 二进制 SHA-256 `52160ab8ba63cd16852c66b5647f0a16844bdc45f410c48da2c589c2cc2e74de`。全部在这台 Mac 的回环端口上，假 Modbus TCP 从站；没有连 grey0、真 Tier0 或任何硬件。
 
 **结论：阶段 1a 的五条退出条件（[TEST-CASES.md](contract/TEST-CASES.md) §4）都有了证据，见下表。** 这只说明契约与桥在本机回环上站得住；第 6 节列出 1a 证明不了的东西和待决问题。

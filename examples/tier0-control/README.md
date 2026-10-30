@@ -14,6 +14,8 @@ Trace writes handle short writes, remove an uncommitted suffix before retry, and
 
 ## R3: a missing /audit entry is not proof that a write did not run
 
+Merge dependency: this stage 1a update is [PR #101](https://github.com/FREEZONEX/ia2/pull/101) and requires [runtime fix #100](https://github.com/FREEZONEX/ia2/pull/100) first. The validation history and pre-submit checks are in [VALIDATION.md](VALIDATION.md).
+
 When the bridge's POST times out, the runtime may still apply the write. Loopback tests (R3T1, R3T1X) show this: the runtime had already read the request and queued the write when the bridge closed the connection. The write was applied with no `/audit` entry. The current runtime records an audit entry only after the queued write is acknowledged. When the client disconnects, the request handler is dropped.
 
 The bridge's `reconcile_note` therefore reports only what `/audit` shows. `audit_entry` is `found`, `absent` or `unavailable` (the runtime restarted). `landed` is `true` only when an entry was found and `null` otherwise; the bridge never writes `landed: false`. A `landed: false` from an older bridge means `absent`. The action status stays `unknown`, and the bridge never resends. The runtime fix that records the audit entry even after a client disconnect is on the separate branch `fix/control-write-detached`. The R3T1 and R3T1X expectations assume it: on a runtime built from `main` before that fix, those two cases report a FINDING (executed, no entry).

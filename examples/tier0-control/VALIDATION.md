@@ -1,5 +1,11 @@
 # Validation
 
+## PR submission verification, 2026-10-30 UTC+8
+
+Submitted [runtime PR #100](https://github.com/FREEZONEX/ia2/pull/100) at `1cc16c0` and [stage 1a PR #101](https://github.com/FREEZONEX/ia2/pull/101), whose repair commit is `7a8f59a`. The repair commit's tree exactly matches sealed candidate `0bf9275c949d7c66a0809c1f051f79f97971dd19`; the following publication update changes documentation only. Both branches merge without conflicts in a merge simulation. Merge #100 first because #101's R3 expectations require it; neither PR was merged during submission.
+
+The pre-submit replay passed 335 Python tests in 28 suites, all 64 reconciliation mutation controls, all 3 nullable-failsafe controls, all 7 second-review CLI cases and its counterexample enumeration. The runtime branch's fresh full repository gate passed: 8,594 Rust tests, 0 failed, 105 ignored; 423 Web tests in 39 files. The stage 1a gate from the close-out below remains applicable: its source was unchanged. All 21 input hashes, 858 retained repair-evidence hashes and 1,400 close-out evidence hashes matched before committing. New local logs are outside the repository in `tier0-pr-submit-20261030/`; older sealed evidence was not overwritten. No integration run, soak or hardware test was added during submission.
+
 ## Second re-review repair and close-out, 2026-10-30 UTC+8
 
 The second independent review (`tier0-stage1a-independent-review-20261029-r2/REVIEW.md`, outside the repository) found F1 and F2 (P1) and F3 (P2) in tool `d40c5ea3…`. The repair candidate is `8274acdfef3d8f88bb21a7fdd0f81f111e9fcf249c958c6eaa8fe581f25ec150`; [RESULT-1A.md](RESULT-1A.md) §9 describes the fixes. The original repair evidence remains in `evidence/rereview2-20261029/`. The takeover checks and delivery records are in `evidence/rereview2-closeout-20261030/`, using a frozen copy of the current Python source and the existing Python 3.9.6 interpreter with `-I -B` and no added dependencies.
