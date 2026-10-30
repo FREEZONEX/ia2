@@ -3,6 +3,7 @@ CONTRACT 8.3 plus the R3T1 lesson (a write applied after its client went away, w
 unknown writes, unexplained device writes and resends."""
 import hashlib
 import json
+import math
 from pathlib import Path
 import subprocess
 import sys
@@ -251,8 +252,16 @@ class Reconcile(unittest.TestCase):
         rep = lab.run(lifecycle=True)
         self.assertEqual(cls(rep, 'd' * 32), 'uncheckable_restart')
         self.assertEqual(rep['verdict'], 'CLEAN', (rep['unexplained'], rep['unexplained_device_writes']))
-        without = lab.run(lifecycle=False)                            # without the spawn time the boot write looks like the old instance's
-        self.assertEqual(without['counts']['unexplained_device_writes'], 1)
+        # Without the spawn time both device writes fall after the archive last read the old instance (T0 + 1) and before it
+        # first read the new one (T0 + 4): 12.5 then 0 is explained only if the handover came between them (old's value, then
+        # new's initial output).  An evidence gap, not a discrepancy -- and a value neither could have written is still one.
+        without = lab.run(lifecycle=False)
+        self.assertEqual((without['counts']['unexplained_device_writes'], without['counts']['unchecked_device_writes']), (0, 2))
+        self.assertEqual([d.get('possible_instances') for d in without['unchecked_device_writes']], [[RID, RID2]] * 2)
+        self.assertEqual(without['verdict'], 'INCOMPLETE')
+        lab.device(T0 + 3.0, 'sp_flow', 777)
+        without = lab.run(lifecycle=False)
+        self.assertEqual([d['bits'] for d in without['unexplained_device_writes']], [777])
 
     def test_a_device_value_nothing_asked_for_is_unexplained(self):
         lab = Lab(self)
@@ -508,15 +517,46 @@ class Replacement(unittest.TestCase):
         lab.polls_every(T0, T0 + 30, lambda t: [entry(l1), entry(l2, var='lamp', bits=1, applied=1)] if t >= T0 + 2 else [])
         self.assertEqual(cls(lab.run(), 'a1' * 16), 'unexplained')
 
-    def test_ring_order_not_intent_time_says_which_write_came_last(self):
-        """Both entries appear in one read, the later intent's entry first: IA2 applied it first, so 12.5 is the last value."""
+    def test_the_ring_order_is_not_the_apply_order(self):
+        """Re-review R2: IA2 records an entry after the scan thread applied and acknowledged the write, in whatever order the
+        request tasks get the audit lock, so the ring does not say which write came last.  12.5 (no answer, entry first seen at
+        T0 + 2) and 15.5 (sent at T0 + 1.5, answered at T0 + 1.51) may have been applied either way round; only 15.5 reached
+        the device.  12.5 was merged if it came first, and should have gone out if it came last: not decided by guessing."""
+        for ring in ('newer first', 'older first'):
+            with self.subTest(ring):
+                lab = Lab(self)
+                lab.answered_polls(T0, T0 + 30)
+                l1 = lab.write('a1' * 16, T0 + 1, status=None, error='timeout', terminal=('unknown', 'runtime_unreachable'))
+                l2 = lab.write('b9' * 16, T0 + 1.5, bits=NEWER)
+                lab.device(T0 + 1.55, 'sp_flow', NEWER)
+                both = [entry(l2, bits=NEWER, applied=NEWER), entry(l1)]
+                lab.polls_every(T0, T0 + 30, lambda t: (both if ring == 'newer first' else both[::-1]) if t >= T0 + 2 else [])
+                rep = lab.run()
+                self.assertEqual(device_row(rep, 'a1' * 16).get('device'), 'uncheckable_order', rep['unexplained'])
+                self.assertEqual(device_row(rep, 'a1' * 16).get('unordered_with'), ['b9' * 16])
+                self.assertEqual(rep['verdict'], 'INCOMPLETE')
+
+    def test_the_bridge_s_own_answers_fix_the_order(self):
+        """The order is known when one write's interval ends before the other's begins: 12.5's entry was first seen at T0 + 2,
+        before 15.5 was sent -- 15.5 came last and replaced 12.5 within the output cycle.  Sent after 15.5's answer instead, 12.5
+        came last and should have reached the device."""
         lab = Lab(self)
         lab.answered_polls(T0, T0 + 30)
         l1 = lab.write('a1' * 16, T0 + 1, status=None, error='timeout', terminal=('unknown', 'runtime_unreachable'))
-        l2 = lab.write('b9' * 16, T0 + 1.5, bits=NEWER)
-        lab.device(T0 + 1.55, 'sp_flow', NEWER)
-        lab.polls_every(T0, T0 + 30, lambda t: [entry(l2, bits=NEWER, applied=NEWER), entry(l1)] if t >= T0 + 2 else [])
+        l2 = lab.write('b9' * 16, T0 + 2.5, bits=NEWER)
+        lab.device(T0 + 2.55, 'sp_flow', NEWER)
+        lab.polls_every(T0, T0 + 30, lambda t: ([entry(l1)] if t >= T0 + 2 else []) + ([entry(l2, bits=NEWER, applied=NEWER)]
+                                                                                       if t >= T0 + 3 else []))
         rep = lab.run()
+        self.assertEqual(device_row(rep, 'a1' * 16).get('device'), 'replaced_before_delivery', rep['unexplained'])
+        self.assertEqual(rep['verdict'], 'CLEAN', (rep['unexplained'], rep['unchecked_device_writes']))
+        lab = Lab(self)
+        lab.answered_polls(T0, T0 + 30)
+        l2 = lab.write('b9' * 16, T0 + 1.5, bits=NEWER)
+        l1 = lab.write('a1' * 16, T0 + 1.6, status=None, error='timeout', terminal=('unknown', 'runtime_unreachable'))
+        lab.device(T0 + 1.55, 'sp_flow', NEWER)
+        lab.polls_every(T0, T0 + 30, lambda t: [entry(l1), entry(l2, bits=NEWER, applied=NEWER)] if t >= T0 + 2 else [])
+        rep = lab.run()                                               # the ring says 12.5 first; the bridge's answers say otherwise
         self.assertEqual(cls(rep, 'a1' * 16), 'unexplained', device_row(rep, 'a1' * 16))
 
     def test_a_later_write_whose_entry_contradicts_it_explains_nothing(self):
@@ -537,13 +577,25 @@ class Replacement(unittest.TestCase):
         instance's ring), and the archive first saw the next instance later."""
         lab = Lab(self)
         l1 = self.first_write_never_delivered(lab)
-        l2 = lab.write('c4' * 16, T0 + 2.5, bits=NEWER)
+        l2 = lab.write('c4' * 16, T0 + 5.5, bits=NEWER)
+        lab.device(T0 + 5.6, 'sp_flow', NEWER)
+        lab.polls_every(T0, T0 + 5, lambda t: [entry(l1)] if t >= T0 + 2 else [])
+        lab.polls_every(T0 + 8, T0 + 30, lambda t: [entry(l2, bits=NEWER, applied=NEWER)], rid=RID2)
+        rep = lab.run()
+        self.assertEqual(device_row(rep, 'c4' * 16).get('note', '')[:20], 'executed by the next')
+        # The archive read the old instance until T0 + 5, four seconds after the write, the device answering throughout.
+        self.assertEqual(cls(rep, 'a1' * 16), 'unexplained', device_row(rep, 'a1' * 16))
+        lab = Lab(self)
+        l1 = self.first_write_never_delivered(lab)
+        l2 = lab.write('c4' * 16, T0 + 2.5, bits=NEWER)               # applied by the next instance within the output cycle
         lab.device(T0 + 2.6, 'sp_flow', NEWER)
         lab.polls_every(T0, T0 + 2, lambda t: [entry(l1)] if t >= T0 + 2 else [])
         lab.polls_every(T0 + 8, T0 + 30, lambda t: [entry(l2, bits=NEWER, applied=NEWER)], rid=RID2)
         rep = lab.run()
-        self.assertEqual(device_row(rep, 'c4' * 16).get('note', '')[:20], 'executed by the next')
-        self.assertEqual(cls(rep, 'a1' * 16), 'unexplained', device_row(rep, 'a1' * 16))
+        # Last read at T0 + 2: the old instance may have ended within one output cycle, or lived on; nothing records the
+        # handover, and the next instance's write explains nothing about it.
+        self.assertEqual(cls(rep, 'a1' * 16), 'uncheckable_order', device_row(rep, 'a1' * 16))
+        self.assertEqual(device_row(rep, 'a1' * 16).get('handover'), [T0 + 2, T0 + 8])
 
     def test_a_write_in_the_next_instance_does_not_replace_a_value_of_the_old_one(self):
         lab = Lab(self)
@@ -689,6 +741,18 @@ class DeviceLogCoverage(unittest.TestCase):
         self.assertEqual(device_row(rep, 'd4' * 16).get('device'), 'link_down_until_log_end')
         self.assertEqual(rep['verdict'], 'CLEAN')
 
+    def test_a_link_down_until_a_cut_off_log_ends_proves_nothing_after_it(self):
+        lab = Lab(self)
+        lab.answered_polls(T0, T0 + 0.9)
+        label = lab.write('da' * 16, T0 + 1.2)
+        lab.mode(T0 + 5.0, 'normal')                                  # the last record: no `stopped`, the log is cut here
+        lab.log_end = None
+        lab.polls_every(T0, T0 + 30, lambda t: [entry(label)] if t >= T0 + 2 else [])
+        rep = lab.run()
+        self.assertEqual(cls(rep, 'da' * 16), 'uncheckable_device_log', device_row(rep, 'da' * 16))
+        lab.log_end = T0 + 5.1
+        self.assertEqual(device_row(lab.run(), 'da' * 16).get('device'), 'link_down_until_log_end')
+
     def test_unusable_device_logs_are_refused(self):
         def no_start(rows):
             return rows[1:]
@@ -699,8 +763,11 @@ class DeviceLogCoverage(unittest.TestCase):
         def damaged(rows):
             return rows + ['{"ev": "req", "t": 18000']
 
+        def endless(rows):
+            return rows[:-1] + ['{"ev": "stopped", "t": Infinity, "seq": %d}' % rows[-1]['seq']]
+
         for name, spoil in (('empty file', lambda rows: []), ('no start record', no_start), ('mixed seq', mixed_seq),
-                            ('damaged record', damaged)):
+                            ('damaged record', damaged), ('a time that is not finite', endless)):
             with self.subTest(name):
                 lab = Lab(self)
                 label = lab.write('d5' * 16, T0 + 1)
@@ -740,6 +807,341 @@ class DeviceLogCoverage(unittest.TestCase):
         lab.device(T0 + 1.05, 'sp_flow', BITS_12_5)                   # positive evidence needs no coverage claim
         lab.files()
         self.assertEqual(subprocess.run(args, capture_output=True).returncode, 0)
+
+
+def cli(d, lifecycle=False):
+    """(exit code, report) of the command line on the files in `d`."""
+    out = d / 'report.json'
+    if out.exists():
+        out.unlink()
+    args = [sys.executable, '-I', '-B', str(ROOT / 'tools' / 'reconcile_report.py'), '--journal', str(d / 'journal.jsonl'),
+            '--audit-archive', str(d / 'audit.jsonl'), '--device-map', str(d / 'map.json'), '--device-log', '1=%s' % (d / 'slave-1.jsonl'),
+            '--out', str(out)] + (['--lifecycle', str(d / 'life.jsonl')] if lifecycle else [])
+    r = subprocess.run(args, capture_output=True, text=True, timeout=60)
+    return r.returncode, json.loads(out.read_text()) if out.exists() else None
+
+
+class CompleteLogBeforeTheWrite(unittest.TestCase):
+    """Re-review R1: a complete device log (`listen` ... `stopped`) that ends before a write vouches for nothing after its end --
+    neither with an unbroken `seq` nor, in the older format, with an explicit link-down `mode` that runs to its end."""
+
+    def lab(self, sequenced):
+        lab = Lab(self)
+        lab.sequenced = sequenced
+        lab.log_end = T0 + 0.5                                        # `stopped` half a second before the write
+        if sequenced:
+            lab.answered_polls(T0, T0)
+        else:
+            lab.mode(T0, 'refuse')
+        label = lab.write('e1' * 16, T0 + 1)
+        lab.polls_every(T0, T0 + 30, lambda t: [entry(label)] if t >= T0 + 2 else [])
+        return lab
+
+    def test_on_the_command_line(self):
+        for sequenced in (True, False):
+            with self.subTest('seq' if sequenced else 'mode records, no seq'):
+                lab = self.lab(sequenced)
+                code, rep = cli(lab.files())
+                self.assertEqual(code, 2, rep and rep['actions'])
+                self.assertEqual(rep['verdict'], 'INCOMPLETE')
+                self.assertEqual(device_row(rep, 'e1' * 16).get('device'), 'uncheckable_device_log')
+                lab.log_end = T0 + 30                                 # the same log running on past the write: down to its end
+                code, rep = cli(lab.files())
+                self.assertEqual(code, 0, rep and rep['actions'])
+                self.assertEqual(device_row(rep, 'e1' * 16).get('device'), 'link_down_until_log_end')
+
+    def test_coverage_is_an_ordered_finite_stretch_inside_the_log(self):
+        lab = Lab(self)                                               # listen at T0 - 1, stopped at T0 + 60, nothing answered
+        log = rr.DeviceLog('1', str(lab.files() / 'slave-1.jsonl'))
+        self.assertTrue(log.covers(T0, T0 + 1))
+        for t0, t1 in ((T0 + 1, T0), (T0, math.inf), (-math.inf, T0), (math.nan, T0), (T0 + 59, T0 + 61)):
+            self.assertFalse(log.covers(t0, t1), (t0, t1))
+        self.assertTrue(log.no_link(T0, T0 + 1))
+        self.assertFalse(log.no_link(T0 + 1, T0 + 1))                 # a moment is not a stretch without a link
+        self.assertFalse(log.no_link(T0 + 1, T0))
+
+
+class ApplyOrder(unittest.TestCase):
+    """Re-review R2: which of two writes the runtime applied first is known from the bridge's answers and the poll times (one
+    interval ends before the other begins), or from a value reaching the device before the other write was sent -- never from
+    the ring -- and the device check uses the same order.  A result that depends on an order nothing fixes is an evidence gap."""
+
+    A, B = BITS_12_5, NEWER
+
+    def a_times_out_then_b(self, lab, a_first_seen=T0 + 6):
+        """12.5 sent at T0 + 1 and never answered (its entry first seen at `a_first_seen`); 15.5 sent at T0 + 4.5, answered."""
+        la = lab.write('aa' * 16, T0 + 1, status=None, error='timeout', terminal=('unknown', 'runtime_unreachable'))
+        lb = lab.write('bb' * 16, T0 + 4.5, bits=self.B, status=None, terminal=None)
+        lab.rec('response', T0 + 4.51, action_id='bb' * 16, http={'kind': 'response', 'status': 200})
+        lab.poll(T0, [])
+        lab.poll(a_first_seen, [entry(la)] + ([entry(lb, bits=self.B, applied=self.B)] if a_first_seen > T0 + 4.51 else []))
+        lab.polls_every(T0 + 7, T0 + 30, lambda t: [entry(la), entry(lb, bits=self.B, applied=self.B)])
+        lab.answered_polls(T0, T0 + 30)
+
+    def device_check(self, writes, **kw):
+        lab = Lab(self)
+        self.a_times_out_then_b(lab, **kw)
+        for t, bits in writes:
+            lab.device(t, 'sp_flow', bits)
+        return lab.run()
+
+    def test_device_sequences_that_only_one_of_two_possible_orders_explains(self):
+        A, B = self.A, self.B
+        for writes, decided in (([(T0 + 4.7, A), (T0 + 5.0, B)], (T0 + 5.0, B)),        # explained if 12.5 came first
+                                ([(T0 + 4.55, B), (T0 + 4.7, A)], (T0 + 4.7, A))):      # explained if 15.5 came first
+            with self.subTest(writes):
+                rep = self.device_check(writes)
+                self.assertEqual(rep['unexplained_device_writes'], [])
+                self.assertEqual([(d['t'], d['bits']) for d in rep['unchecked_device_writes']], [decided])
+                self.assertEqual(rep['unchecked_device_writes'][0]['order_decided_by'], ['aa' * 16, 'bb' * 16])
+                self.assertEqual([cls(rep, a) for a in ('aa' * 16, 'bb' * 16)], ['consistent', 'consistent'])
+                self.assertEqual(rep['verdict'], 'INCOMPLETE')
+
+    def test_a_device_sequence_no_order_explains(self):
+        A, B = self.A, self.B
+        rep = self.device_check([(T0 + 4.7, A), (T0 + 5.0, B), (T0 + 5.5, A)])
+        self.assertEqual([(d['t'], d['bits']) for d in rep['unexplained_device_writes']], [(T0 + 5.5, A)])
+        self.assertEqual(rep['verdict'], 'DISCREPANCY')
+
+    def test_device_sequences_in_a_known_order(self):
+        A, B = self.A, self.B                                         # 12.5's entry was read before 15.5 was sent
+        rep = self.device_check([(T0 + 4.2, A), (T0 + 4.55, B)], a_first_seen=T0 + 4.4)
+        self.assertEqual(rep['verdict'], 'CLEAN', (rep['unexplained_device_writes'], rep['unchecked_device_writes']))
+        rep = self.device_check([(T0 + 4.55, B), (T0 + 4.7, A)], a_first_seen=T0 + 4.4)
+        self.assertEqual([(d['t'], d['bits']) for d in rep['unexplained_device_writes']], [(T0 + 4.7, A)])   # older after newer
+        self.assertEqual(rep['verdict'], 'DISCREPANCY')
+
+    def test_a_value_on_the_device_before_the_other_write_was_sent_fixes_the_order(self):
+        """The 60-minute soak (d2_sp, 2026-10-29): 27.875 timed out, the device got it 24 ms before 7.492 was sent; nothing
+        else could have put 27.875 into the VM, so it was applied first."""
+        A, B = self.A, self.B
+        rep = self.device_check([(T0 + 4.4, A), (T0 + 4.55, B)])
+        self.assertEqual(rep['verdict'], 'CLEAN', (rep['unexplained_device_writes'], rep['unchecked_device_writes']))
+        rep = self.device_check([(T0 + 4.6, A), (T0 + 4.65, B)])     # got it after 15.5 was sent: no proof which came first
+        self.assertEqual(rep['verdict'], 'INCOMPLETE')
+
+    def test_a_value_two_writes_could_have_put_there_proves_no_order(self):
+        """12.5 was applied once already at T0 + 0.5, so 12.5 on the device at T0 + 4.4 does not show that the second 12.5 was
+        applied by then.  12.5 again after 15.5 arrived is a stale write if the second 12.5 came first, explained if it came last."""
+        A, B = self.A, self.B
+        lab = Lab(self)
+        l0 = lab.write('a0' * 16, T0 + 0.5)
+        self.a_times_out_then_b(lab)
+        lab.polls = [dict(p, audit=[entry(l0)] + p['audit']) if 'audit' in p and p['t'] >= T0 + 0.6 else p for p in lab.polls]
+        for t, bits in ((T0 + 0.55, A), (T0 + 4.4, A), (T0 + 4.55, B), (T0 + 4.7, A)):
+            lab.device(t, 'sp_flow', bits)
+        rep = lab.run()
+        self.assertEqual(rep['unexplained_device_writes'], [])
+        self.assertEqual([(d['t'], d['bits']) for d in rep['unchecked_device_writes']], [(T0 + 4.7, A)])
+        self.assertEqual(rep['verdict'], 'INCOMPLETE')
+
+    def test_every_value_before_it_in_an_order_must_have_been_applicable_by_then(self):
+        """Called directly: a device write at T0 + 4.3 of the value applied in [T0 + 1, T0 + 6] fits the order in which it came
+        first, not the one in which it followed a value sent at T0 + 4.5."""
+        a = {'bits': 7, 'lo': (T0 + 1, 1), 'hi': (T0 + 6, math.inf), 'action_id': 'a'}
+        b = {'bits': 9, 'lo': (T0 + 4.5, 4), 'hi': (T0 + 4.51, 5), 'action_id': 'b'}
+        w = {'t': T0 + 4.3, 'bits': 7}
+        self.assertEqual(rr.check_device_sequence([a, b], [w]), ([], [(w, ['a', 'b'])]))
+        self.assertEqual(rr.check_device_sequence([a, dict(b, lo=(T0 + 4.2, 4))], [w]), ([], []))
+
+    def test_concurrent_writes_whose_audit_order_is_not_the_apply_order(self):
+        """The runtime measurement of the re-review: concurrent ordinary writes, every answer 200, the last two /audit entries in
+        the opposite order to the VM.  Four writes sent within 3 ms, all answered 10 ms later; the device got only the last
+        value the VM took.  Nothing says which came last: no discrepancy, and no clean result either."""
+        lab = Lab(self)
+        lab.answered_polls(T0, T0 + 30)
+        values = [1092616192 + i for i in range(4)]
+        aids = ['c%d' % i * 16 for i in range(4)]
+        for i, (aid, v) in enumerate(zip(aids, values)):
+            lab.rec('intent', T0 + 1 + i * 0.001, action_id=aid, label='tier0.lab.%s' % aid[:8], variable='sp_flow', bits=v,
+                    runtime_id=RID, target_key='sp_flow')
+        for i, aid in enumerate(aids):
+            lab.rec('response', T0 + 1.010 + i * 0.001, action_id=aid, http={'kind': 'response', 'status': 200})
+        ring = [entry('tier0.lab.%s' % aids[i][:8], bits=values[i], applied=values[i]) for i in (0, 1, 3, 2)]
+        lab.polls_every(T0, T0 + 30, lambda t: ring if t >= T0 + 2 else [])
+        lab.device(T0 + 1.05, 'sp_flow', values[3])
+        rep = lab.run()
+        self.assertEqual(rep['unexplained'], [])
+        self.assertEqual(rep['unexplained_device_writes'], [])
+        self.assertEqual([cls(rep, a) for a in aids], ['uncheckable_order'] * 3 + ['consistent'])
+        self.assertEqual(rep['verdict'], 'INCOMPLETE')
+
+
+class JointOrder(unittest.TestCase):
+    """Independent review r2 (2026-10-29): every full combination of orders, and every way an unrecorded handover could have
+    split the device writes, must explain the device -- not each group or each write taken alone."""
+
+    def lamp(self, lab, aid, t, bits, timeout=False, rid=RID):
+        if timeout:
+            return lab.write(aid, t, var='lamp', bits=bits, rid=rid, status=None, error='timeout',
+                             terminal=('unknown', 'runtime_unreachable'))
+        return lab.write(aid, t, var='lamp', bits=bits, rid=rid)
+
+    def two_pairs(self, known=None):
+        """lamp 0 (no answer) at T0 + 1 and 1 at T0 + 4.5 in an unknown order; again 0 at T0 + 7 and 1 at T0 + 10.5.  The first
+        pair surely came before the second.  `known` gives each write an answer 0.1 s after it instead, fixing the order."""
+        lab = Lab(self)
+        lab.answered_polls(T0, T0 + 30)
+        plan = known or (('a', T0 + 1, 0, True), ('b', T0 + 4.5, 1, False), ('c', T0 + 7, 0, True), ('d', T0 + 10.5, 1, False))
+        labels = {}
+        for name, t, bits, timeout in plan:
+            labels[name] = (self.lamp(lab, name * 32, t, bits, timeout), bits)
+        ent = lambda names: [entry(labels[n][0], var='lamp', bits=labels[n][1], applied=labels[n][1]) for n in names]
+        lab.poll(T0, [])
+        lab.poll(T0 + 6, ent('ab'))
+        lab.poll(T0 + 12, ent('abcd'))
+        lab.poll(T0 + 30, ent('abcd'))
+        for t, bits in ((T0 + 1.5, 0), (T0 + 4.7, 1), (T0 + 10.7, 0), (T0 + 10.8, 1)):
+            lab.device(t, 'lamp', bits)
+        return lab.run()
+
+    def test_every_full_combination_of_group_orders_must_explain_the_device(self):
+        """0, 1, 0, 1 on the device: a-b-c-d, b-a-c-d and b-a-d-c explain it; a-b-d-c does not (1 after the last 0).  Each pair
+        alone has an order that explains it, whatever the other pair's order is."""
+        rep = self.two_pairs()
+        self.assertEqual(rep['unexplained_device_writes'], [])
+        self.assertEqual([(d['t'], d['bits']) for d in rep['unchecked_device_writes']], [(T0 + 10.8, 1)])
+        self.assertEqual(rep['unchecked_device_writes'][0]['order_decided_by'], [c * 32 for c in 'abcd'])
+        self.assertEqual(rep['verdict'], 'INCOMPLETE')
+
+    def test_a_known_full_order_decides_it_either_way(self):
+        rep = self.two_pairs(known=(('a', T0 + 1, 0, False), ('b', T0 + 4.5, 1, False), ('c', T0 + 7, 0, False),
+                                    ('d', T0 + 10.6, 1, False)))
+        self.assertEqual(rep['verdict'], 'CLEAN', (rep['unexplained_device_writes'], rep['unchecked_device_writes']))
+        rep = self.two_pairs(known=(('a', T0 + 1, 0, False), ('b', T0 + 4.5, 1, False), ('d', T0 + 7, 1, False),
+                                    ('c', T0 + 10.6, 0, False)))
+        self.assertEqual([(d['t'], d['bits']) for d in rep['unexplained_device_writes']], [(T0 + 10.8, 1)])
+
+    def handover(self, got, pair=True):
+        """No lifecycle log.  The old instance applied lamp 0 (no answer, entry read at T0 + 6) and 1 at T0 + 4.5 in an unknown
+        order -- or, with pair=False, only 1 at T0 + 1; the archive last read it at T0 + 8 (T0 + 4) and first read the new
+        instance, which applied nothing, at T0 + 12 (T0 + 8).  `got`: what the device got and when."""
+        lab = Lab(self)
+        lab.answered_polls(T0, T0 + 30)
+        if pair:
+            la, lb = self.lamp(lab, 'aa' * 16, T0 + 1, 0, True), self.lamp(lab, 'bb' * 16, T0 + 4.5, 1)
+            both = [entry(la, var='lamp', bits=0, applied=0), entry(lb, var='lamp', bits=1, applied=1)]
+            lab.poll(T0, [])
+            lab.poll(T0 + 6, both)
+            lab.poll(T0 + 8, both)
+            lab.poll(T0 + 12, [], rid=RID2)
+        else:
+            la = self.lamp(lab, 'aa' * 16, T0 + 1, 1)
+            lab.poll(T0, [])
+            lab.poll(T0 + 2, [entry(la, var='lamp', bits=1, applied=1)])
+            lab.poll(T0 + 4, [entry(la, var='lamp', bits=1, applied=1)])
+            lab.poll(T0 + 8, [], rid=RID2)
+        lab.poll(T0 + 30, [], rid=RID2)
+        for t, bits in got:
+            lab.device(t, 'lamp', bits)
+        return lab.run()
+
+    def test_a_handover_keeps_the_order_the_old_instance_leaves_open(self):
+        """0 at T0 + 9, during the handover: the new instance's initial output, or the old instance's 0 if it was applied
+        after 1.  Neither is shown -- the order gap must not be lost because some owner explains it."""
+        rep = self.handover([(T0 + 1.5, 0), (T0 + 4.7, 1), (T0 + 9, 0)])
+        self.assertEqual(rep['unexplained_device_writes'], [])
+        self.assertIn((T0 + 9, 0, [RID, RID2]),
+                      [(d['t'], d['bits'], d.get('possible_instances')) for d in rep['unchecked_device_writes']])
+        self.assertEqual(rep['verdict'], 'INCOMPLETE')
+        rep = self.handover([(T0 + 1.5, 0), (T0 + 4.7, 1), (T0 + 7, 0)])   # surely the old instance's: the same gap
+        self.assertEqual(rep['verdict'], 'INCOMPLETE')
+
+    def test_one_handover_must_explain_every_write_made_during_it(self):
+        """The old instance delivered 1; during the handover the device got 0 (only the new instance's initial output explains
+        it) and then 1 (only the old instance's): that needs old, new, old -- no single handover."""
+        rep = self.handover([(T0 + 1.1, 1), (T0 + 5, 0), (T0 + 6, 1)], pair=False)
+        self.assertEqual([(d['t'], d['bits'], d.get('possible_instances')) for d in rep['unexplained_device_writes']],
+                         [(T0 + 5, 0, [RID, RID2]), (T0 + 6, 1, [RID, RID2])])
+        self.assertEqual(rep['verdict'], 'DISCREPANCY')
+        rep = self.handover([(T0 + 1.1, 1), (T0 + 5, 1), (T0 + 6, 0)], pair=False)   # old, then new: a handover in between
+        self.assertEqual(rep['unexplained_device_writes'], [])
+        self.assertEqual(rep['verdict'], 'INCOMPLETE')
+
+    def test_a_branch_keeps_the_orders_it_fixed_ahead_of_its_states(self):
+        """Called directly; found by brute force over full orders (evidence/rereview2-20261029/oracle_crosscheck.py): every
+        order of these five values explains 0 then 1 on the device.  A search that forgot, after each write, the orders a
+        combination had fixed for groups its states had not reached would pair a state with an order it did not come from
+        and report a gap that is not there."""
+        ev = [{'action_id': aid, 'bits': bits, 'lo': (lo, n), 'hi': (hi, n)} for n, (aid, bits, lo, hi) in enumerate(
+            (('e1', 1, 1.29, 1.30), ('e2', 0, 1.37, 2.37), ('e3', 0, 1.54, 4.04), ('e4', 0, 4.10, 6.60), ('e5', 1, 4.72, 5.02)), 1)]
+        self.assertEqual(rr.check_device_sequence(ev, [{'t': 5.33, 'bits': 0}, {'t': 6.08, 'bits': 1}]), ([], []))
+
+    def test_a_handover_past_its_budget_leaves_its_writes_unchecked(self):
+        cap = rr.HANDOVER_CAP
+        self.addCleanup(setattr, rr, 'HANDOVER_CAP', cap)
+        rr.HANDOVER_CAP = 2                                           # two writes, two instances: three splits
+        rep = self.handover([(T0 + 1.1, 1), (T0 + 5, 0), (T0 + 6, 1)], pair=False)
+        self.assertEqual(rep['unexplained_device_writes'], [])
+        self.assertEqual([(d['t'], d['bits']) for d in rep['unchecked_device_writes']], [(T0 + 5, 0), (T0 + 6, 1)])
+        self.assertEqual(rep['verdict'], 'INCOMPLETE')
+
+    def test_a_search_past_its_budget_leaves_the_writes_unchecked(self):
+        """Two values of 1 in an unknown order: every order explains the device, unless the search may not follow both."""
+        lab = Lab(self)
+        lab.answered_polls(T0, T0 + 30)
+        la = self.lamp(lab, 'aa' * 16, T0 + 1, 1, True)
+        lb = self.lamp(lab, 'bb' * 16, T0 + 4.5, 1)
+        lab.poll(T0, [])
+        lab.polls_every(T0 + 6, T0 + 30, lambda t: [entry(la, var='lamp', bits=1, applied=1), entry(lb, var='lamp', bits=1, applied=1)])
+        lab.device(T0 + 4.7, 'lamp', 1)
+        self.assertEqual(lab.run()['verdict'], 'CLEAN')
+        cap = rr.BRANCH_CAP
+        self.addCleanup(setattr, rr, 'BRANCH_CAP', cap)
+        rr.BRANCH_CAP = 1
+        rep = lab.run()
+        self.assertEqual([(d['t'], d['bits']) for d in rep['unchecked_device_writes']], [(T0 + 4.7, 1)])
+        self.assertEqual(rep['verdict'], 'INCOMPLETE')
+
+
+class InstanceBoundary(unittest.TestCase):
+    """Re-review R3: a value an instance applied must reach the device while that instance is live.  The next instance writing
+    the same value delivers nothing for it, and the end of an instance replaces a value only within one output cycle."""
+
+    def restart(self, spawned, again):
+        """12.5 applied at T0 + 1 in RID, the device answering throughout and never getting it from RID; RID2 spawned at
+        `spawned` writes its initial 0, then 12.5 again at `again`, which reaches the device."""
+        lab = Lab(self)
+        lab.answered_polls(T0, T0 + 30)
+        l1 = lab.write('f1' * 16, T0 + 1)
+        l2 = lab.write('f2' * 16, again, rid=RID2)
+        lab.life += [{'ev': 'runtime_ready', 't': T0 - 1, 'spawned_t': T0 - 2, 'runtime_id': RID},
+                     {'ev': 'runtime_ready', 't': spawned + 0.5, 'spawned_t': spawned, 'runtime_id': RID2}]
+        lab.device(spawned + 0.1, 'sp_flow', 0)
+        lab.device(again + 0.05, 'sp_flow', BITS_12_5)
+        lab.polls_every(T0, spawned - 0.5, lambda t: [entry(l1)] if t >= T0 + 2 else [])
+        lab.polls_every(spawned + 0.5, T0 + 30, lambda t: [entry(l2)] if t >= again + 0.5 else [], rid=RID2)
+        return lab.run(lifecycle=True)
+
+    def test_the_next_instance_delivering_the_same_value_delivers_nothing_for_this_one(self):
+        for again in (T0 + 7, T0 + 8):
+            with self.subTest(again - T0):
+                rep = self.restart(T0 + 5.5, again)
+                self.assertEqual(cls(rep, 'f1' * 16), 'unexplained', device_row(rep, 'f1' * 16))
+                self.assertEqual(device_row(rep, 'f2' * 16).get('device'), 'seen')
+                self.assertEqual(rep['verdict'], 'DISCREPANCY')
+
+    def test_a_restart_replaces_a_value_only_within_one_output_cycle(self):
+        rep = self.restart(T0 + 1 + 1.9, T0 + 3.0)
+        self.assertEqual(device_row(rep, 'f1' * 16).get('device'), 'replaced_before_delivery', rep['unexplained'])
+        self.assertEqual(device_row(rep, 'f1' * 16).get('replaced_by'), 'restart')
+        self.assertEqual(rep['verdict'], 'CLEAN', (rep['unexplained'], rep['unexplained_device_writes']))
+        rep = self.restart(T0 + 1 + 2.1, T0 + 3.2)
+        self.assertEqual(cls(rep, 'f1' * 16), 'unexplained', device_row(rep, 'f1' * 16))
+
+    def test_without_a_lifecycle_record_a_delivery_during_the_handover_is_undecided(self):
+        """No lifecycle log: the archive last read RID at T0 + 4 and first read RID2 at T0 + 7; either may have been live in
+        between."""
+        for got, expect in ((T0 + 3.5, 'consistent'), (T0 + 5.0, 'uncheckable_order'), (T0 + 7.5, 'unexplained')):
+            with self.subTest(got - T0):
+                lab = Lab(self)
+                lab.answered_polls(T0, T0 + 30)
+                l1 = lab.write('f3' * 16, T0 + 1)
+                lab.device(got, 'sp_flow', BITS_12_5)
+                lab.polls_every(T0, T0 + 4, lambda t: [entry(l1)] if t >= T0 + 2 else [])
+                lab.polls_every(T0 + 7, T0 + 30, lambda t: [], rid=RID2)
+                rep = lab.run()
+                self.assertEqual(cls(rep, 'f3' * 16), expect, device_row(rep, 'f3' * 16))
 
 
 if __name__ == '__main__':

@@ -1,9 +1,482 @@
 {
+  "rereview2_20261030": {
+    "recorded_at": "2026-10-30",
+    "timezone": "UTC+8",
+    "status": "local_repair_candidate_awaiting_independent_review",
+    "review": "tier0-stage1a-independent-review-20261029-r2/REVIEW.md (outside the repository)",
+    "reply": "REREVIEW2-RESPONSE-2026-10-30-tier0-stage-1a.md (outside the repository)",
+    "base_commit": "7d861f401c5dd5f2713485ecf16c03ae57ee45bf",
+    "branch": "fix/tier0-r3-audit-reconcile",
+    "source_state": "uncommitted working-tree candidate; no push or PR",
+    "fixes": {
+      "F1": "Check full combinations of group orders and retain cross-group dependencies; budget overruns remain unchecked.",
+      "F2": "Propagate both unexplained and newly unchecked results through handover checks, including effects on definitely owned writes.",
+      "F3": "Check one chronological handover shared across output variables; no valid split is a discrepancy, partial validity is incomplete."
+    },
+    "contract_version": "0.13",
+    "reconcile_tool_sha256": "8274acdfef3d8f88bb21a7fdd0f81f111e9fcf249c958c6eaa8fe581f25ec150",
+    "source_sha256": {
+      "tools/reconcile_report.py": "8274acdfef3d8f88bb21a7fdd0f81f111e9fcf249c958c6eaa8fe581f25ec150",
+      "tests/test_reconcile_report.py": "7af34eefd90ce279cb554bb4e44800152eaa09376ebe6d75f1db67b1c8f022fe",
+      "tools/check_reconcile_mutations.py": "1aec0884fdc7e561775cd6a71513433d20860c776b9f047625b8991a9081b688"
+    },
+    "takeover_changed_repair_code": false,
+    "evidence": "evidence/rereview2-closeout-20261030",
+    "prior_repair_evidence": "evidence/rereview2-20261029",
+    "python": {
+      "version": "3.9.6",
+      "isolated_flags": [
+        "-I",
+        "-B"
+      ],
+      "additional_dependencies": false
+    },
+    "python_tests": 335,
+    "python_suite_count": 28,
+    "python_suites_passed": true,
+    "reconcile_vectors": 69,
+    "reconcile_mutations": {
+      "variants": 64,
+      "detected_by_assertion": 64
+    },
+    "failsafe_controls": {
+      "variants": 3,
+      "detected_by_assertion": 3
+    },
+    "independent_review_scripts": {
+      "cases": 7,
+      "correct": 7,
+      "reproduce_exit": 0,
+      "counterexample_enumeration_exit": 0,
+      "new_independent_review": false
+    },
+    "previous_review_regression_scripts": [
+      {
+        "script": "previous-regressions/fix01/restart-boundary-vectors.py",
+        "exit_code": 0,
+        "adaptation": "Only TOOL points to frozen current code; all assertions unchanged."
+      },
+      {
+        "script": "previous-regressions/fix01/ring-order-vectors.py",
+        "exit_code": 0,
+        "adaptation": "Only TOOL points to frozen current code; all assertions unchanged."
+      },
+      {
+        "script": "previous-regressions/fix02/complete-log-before-intent.py",
+        "exit_code": 0,
+        "adaptation": "Only TOOL points to frozen current code; all assertions unchanged."
+      }
+    ],
+    "oracle_crosscheck": {
+      "tool_sha256": "8274acdfef3d8f88bb21a7fdd0f81f111e9fcf249c958c6eaa8fe581f25ec150",
+      "cases": {
+        "bounded/clean": 16048,
+        "bounded/unchecked": 18336,
+        "bounded/unexplained": 90788,
+        "random/capped": 459,
+        "random/clean": 2829,
+        "random/unchecked": 2107,
+        "random/unexplained": 14605
+      },
+      "mismatch_count": 0,
+      "mismatches": []
+    },
+    "oracle_provenance_correction": {
+      "previous_saved_tool_sha256": "b391378b6eec07c8ae455e71893f50e948f928dbfc6e002a5dc3008a2342beb3",
+      "previous_saved_result_retained": true,
+      "current_tool_rerun": true,
+      "oracle_functions_equal_to_review": true,
+      "random_cases_past_order_cap": 459,
+      "capped_case_policy": "Require every write unchecked; not an exhaustive oracle comparison.",
+      "reviewed_tool_mismatches_saved": 1722
+    },
+    "vectors_on_reviewed_program": {
+      "tests": 69,
+      "assertion_failures": 4,
+      "errors": 2,
+      "error_reason": "missing BRANCH_CAP / HANDOVER_CAP",
+      "rerun_during_takeover": false
+    },
+    "recompute": {
+      "recompute-soak-main-20261029.json": {
+        "verdict": "CLEAN",
+        "counts": {
+          "consistent": 2166,
+          "device_writes": 1878,
+          "executed_unaudited": 6,
+          "intents": 2179,
+          "no_effect_no_entry": 1,
+          "not_sent": 5,
+          "uncheckable_restart": 1,
+          "unchecked_device_writes": 0,
+          "unexplained_device_writes": 0,
+          "unknown_writes": 0
+        },
+        "semantic_fields_equal_to_saved": true
+      },
+      "recompute-soak-detached-20261029.json": {
+        "verdict": "CLEAN",
+        "counts": {
+          "consistent": 1125,
+          "device_writes": 941,
+          "intents": 1128,
+          "not_sent": 3,
+          "unchecked_device_writes": 0,
+          "unexplained_device_writes": 0,
+          "unknown_writes": 0
+        },
+        "semantic_fields_equal_to_saved": true
+      },
+      "recompute-A4-audit-archive.jsonl.json": {
+        "verdict": "CLEAN",
+        "counts": {
+          "consistent": 300,
+          "device_writes": 304,
+          "intents": 300,
+          "unchecked_device_writes": 0,
+          "unexplained_device_writes": 0,
+          "unknown_writes": 0
+        },
+        "semantic_fields_equal_to_saved": true
+      },
+      "recompute-A4-audit-final-only.jsonl.json": {
+        "verdict": "CLEAN",
+        "counts": {
+          "consistent": 256,
+          "device_writes": 304,
+          "intents": 300,
+          "uncheckable_turnover": 44,
+          "unchecked_device_writes": 0,
+          "unexplained_device_writes": 0,
+          "unknown_writes": 0
+        },
+        "semantic_fields_equal_to_saved": true
+      }
+    },
+    "order_stats": {
+      "recompute-soak-main-20261029.json": {
+        "with_device_bound": {
+          "verdict": "CLEAN",
+          "groups_open_order": 0,
+          "largest": 0,
+          "open_groups_action_ids": [],
+          "max_full_order_combinations_per_sequence": 1,
+          "group_budget_exceeded_calls": 0,
+          "unchecked_device_writes": 0,
+          "uncheckable_order": 0
+        },
+        "without_device_bound": {
+          "verdict": "CLEAN",
+          "groups_open_order": 0,
+          "largest": 0,
+          "open_groups_action_ids": [],
+          "max_full_order_combinations_per_sequence": 1,
+          "group_budget_exceeded_calls": 0,
+          "unchecked_device_writes": 0,
+          "uncheckable_order": 0
+        }
+      },
+      "recompute-soak-detached-20261029.json": {
+        "with_device_bound": {
+          "verdict": "CLEAN",
+          "groups_open_order": 0,
+          "largest": 0,
+          "open_groups_action_ids": [],
+          "max_full_order_combinations_per_sequence": 1,
+          "group_budget_exceeded_calls": 0,
+          "unchecked_device_writes": 0,
+          "uncheckable_order": 0
+        },
+        "without_device_bound": {
+          "verdict": "INCOMPLETE",
+          "groups_open_order": 1,
+          "largest": 2,
+          "open_groups_action_ids": [
+            [
+              "98f26d32ce7e38a503429b0972d34d52",
+              "bf4309d08a303fa361dc74f6fe10d5ea"
+            ]
+          ],
+          "max_full_order_combinations_per_sequence": 2,
+          "group_budget_exceeded_calls": 0,
+          "unchecked_device_writes": 1,
+          "uncheckable_order": 0
+        }
+      },
+      "recompute-A4-audit-archive.jsonl.json": {
+        "with_device_bound": {
+          "verdict": "CLEAN",
+          "groups_open_order": 0,
+          "largest": 0,
+          "open_groups_action_ids": [],
+          "max_full_order_combinations_per_sequence": 1,
+          "group_budget_exceeded_calls": 0,
+          "unchecked_device_writes": 0,
+          "uncheckable_order": 0
+        },
+        "without_device_bound": {
+          "verdict": "CLEAN",
+          "groups_open_order": 0,
+          "largest": 0,
+          "open_groups_action_ids": [],
+          "max_full_order_combinations_per_sequence": 1,
+          "group_budget_exceeded_calls": 0,
+          "unchecked_device_writes": 0,
+          "uncheckable_order": 0
+        }
+      },
+      "recompute-A4-audit-final-only.jsonl.json": {
+        "with_device_bound": {
+          "verdict": "CLEAN",
+          "groups_open_order": 0,
+          "largest": 0,
+          "open_groups_action_ids": [],
+          "max_full_order_combinations_per_sequence": 1,
+          "group_budget_exceeded_calls": 0,
+          "unchecked_device_writes": 0,
+          "uncheckable_order": 0
+        },
+        "without_device_bound": {
+          "verdict": "CLEAN",
+          "groups_open_order": 0,
+          "largest": 0,
+          "open_groups_action_ids": [],
+          "max_full_order_combinations_per_sequence": 1,
+          "group_budget_exceeded_calls": 0,
+          "unchecked_device_writes": 0,
+          "uncheckable_order": 0
+        }
+      }
+    },
+    "loopback": {
+      "WP6C": {
+        "verdict": "PASS",
+        "checks": 8,
+        "failed": 0,
+        "code_tree_matches": true,
+        "runtime_sha256": "c18b0aaab60425ef848e8e278b3ac60c1ec7a50dfb708ed25184a0a987018893",
+        "runtime_binary_matches": true,
+        "manifest": {
+          "manifest": "/Users/au73/Projects/soft-PLC/ia2-ir03-pr-20261028/examples/tier0-control/evidence/rereview2-20261029/loopback/WP6C-r1/MANIFEST.sha256",
+          "entries": 28,
+          "mismatches": []
+        },
+        "rerun_during_takeover": false
+      },
+      "A4": {
+        "verdict": "PASS",
+        "checks": 10,
+        "failed": 0,
+        "code_tree_matches": true,
+        "runtime_sha256": "c18b0aaab60425ef848e8e278b3ac60c1ec7a50dfb708ed25184a0a987018893",
+        "runtime_binary_matches": true,
+        "manifest": {
+          "manifest": "/Users/au73/Projects/soft-PLC/ia2-ir03-pr-20261028/examples/tier0-control/evidence/rereview2-20261029/loopback/A4-r1/MANIFEST.sha256",
+          "entries": 28,
+          "mismatches": []
+        },
+        "rerun_during_takeover": false
+      }
+    },
+    "runtime": {
+      "sha256": "c18b0aaab60425ef848e8e278b3ac60c1ec7a50dfb708ed25184a0a987018893",
+      "commit": "1cc16c0",
+      "changed_this_round": false,
+      "separate_branch": "fix/control-write-detached"
+    },
+    "quality_gate": [
+      {
+        "check": "adaptation",
+        "command": [
+          "./scripts/check-agent-adaptation.sh"
+        ],
+        "exit_code": 0,
+        "seconds": 0.09
+      },
+      {
+        "check": "format",
+        "command": [
+          "cargo",
+          "fmt",
+          "--all"
+        ],
+        "exit_code": 0,
+        "seconds": 0.81
+      },
+      {
+        "check": "clippy",
+        "command": [
+          "cargo",
+          "clippy",
+          "--workspace",
+          "--all-targets",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "exit_code": 0,
+        "seconds": 3.42
+      },
+      {
+        "check": "server-build",
+        "command": [
+          "cargo",
+          "build",
+          "-p",
+          "server"
+        ],
+        "exit_code": 0,
+        "seconds": 0.3
+      },
+      {
+        "check": "rust-tests",
+        "command": [
+          "cargo",
+          "test",
+          "--workspace"
+        ],
+        "exit_code": 0,
+        "seconds": 57.64
+      },
+      {
+        "check": "release",
+        "command": [
+          "cargo",
+          "build",
+          "--release",
+          "-p",
+          "server",
+          "-p",
+          "ia2-cli",
+          "-p",
+          "ia2-runtime",
+          "-p",
+          "lsp-launcher"
+        ],
+        "exit_code": 0,
+        "seconds": 24.75
+      },
+      {
+        "check": "web-build",
+        "command": [
+          "pnpm",
+          "--filter",
+          "@cs/web",
+          "build"
+        ],
+        "exit_code": 0,
+        "seconds": 1.25
+      },
+      {
+        "check": "web-tests",
+        "command": [
+          "pnpm",
+          "--filter",
+          "@cs/web",
+          "test"
+        ],
+        "exit_code": 0,
+        "seconds": 3.56
+      }
+    ],
+    "rust_tests": {
+      "passed": 8589,
+      "failed": 0,
+      "ignored": 105
+    },
+    "web_tests": {
+      "files": 39,
+      "passed": 423
+    },
+    "quality_gate_runtime_preservation": {
+      "before_sha256": "52160ab8ba63cd16852c66b5647f0a16844bdc45f410c48da2c589c2cc2e74de",
+      "gate_build_sha256": "fec37a22eb011b70cb3a35978647e9ca68084a0a97d89ad2f1a0752e8d6f5a09",
+      "after_sha256": "52160ab8ba63cd16852c66b5647f0a16844bdc45f410c48da2c589c2cc2e74de",
+      "restored": true
+    },
+    "closeout_harness_note": "Initial order-stats wrapper passed Path objects to a string-path API and stopped after the first CLI recompute. The wrapper was corrected to pass strings; only recompute/statistics resumed successfully. Initial log retained; product code unchanged.",
+    "new_soak": false,
+    "simulation_repeated": false,
+    "hardware_contacted": false,
+    "limitations": [
+      "This is repair close-out and replay of review scripts, not a new independent-review approval.",
+      "The main-soak CLEAN report retains one uncheckable_restart; A4 final-only CLEAN retains 44 uncheckable_turnover intents.",
+      "Saved loopback acceptance uses the separate runtime-fix branch; the repository gate builds this branch baseline."
+    ],
+    "delivery": {
+      "patch": "evidence/rereview2-closeout-20261030/rereview2.patch",
+      "release": "evidence/rereview2-closeout-20261030/RELEASE.txt",
+      "manifest": "evidence/rereview2-closeout-20261030/MANIFEST.sha256"
+    }
+  },
+  "rereview_20261029": {
+    "recorded_at": "2026-10-29",
+    "review": "tier0-stage1a-rereview-20261029/REVIEW.html (outside the repository); reply REREVIEW-RESPONSE-2026-10-29-tier0-stage-1a.md",
+    "fixes": {
+      "R1": "device-log coverage only over a finite, ordered stretch inside the log; no-link needs a stretch; non-finite record times make a log unusable",
+      "R2": "apply order from evidence (intent, bridge answer and journal order, first poll that saw the entry, first device receipt of a value only that write could have put there), never the ring; uncheckable_order and unchecked_device_writes are evidence gaps; device writes must be explained by every order the evidence allows",
+      "R3": "a delivery counts only while the write's own instance was surely live; without a lifecycle record the handover stretch is uncheckable_order, and a device write in it must be explained by every instance that may have made it",
+      "evidence_description": "the first repair's 21 of 48 was 21 of 43 (an earlier draft); the final 48 vectors fail 27 on the reviewed program, all by assertion"
+    },
+    "reconcile_tool_sha256": "d40c5ea39ebc28a50e432a6b0df652521a53db592c875e5e49da77aa7348f403",
+    "python_tests": 328,
+    "python_suites_passed": true,
+    "reconcile_vectors": 62,
+    "reconcile_mutations": {
+      "variants": 56,
+      "detected_by_assertion": 56
+    },
+    "vectors_on_reviewed_program": "62 tests, 16 fail: 14 assertion failures, 6 errors (missing unchecked_device_writes / check_device_sequence)",
+    "recompute": {
+      "final-20261029/A4-r1@archive": {
+        "changed_rows": 0,
+        "exit_code": 0,
+        "verdict_after": "CLEAN",
+        "verdict_before": "CLEAN"
+      },
+      "final-20261029/A4-r1@final-only": {
+        "changed_rows": 0,
+        "exit_code": 0,
+        "verdict_after": "CLEAN",
+        "verdict_before": "CLEAN"
+      },
+      "soak-detached-20261029": {
+        "changed_rows": 0,
+        "exit_code": 0,
+        "verdict_after": "CLEAN",
+        "verdict_before": "CLEAN"
+      },
+      "soak-main-20261029": {
+        "changed_rows": 4,
+        "exit_code": 0,
+        "verdict_after": "CLEAN",
+        "verdict_before": "CLEAN"
+      }
+    },
+    "loopback": {
+      "WP6C": {
+        "verdict": "PASS",
+        "checks": 8,
+        "failed": 0
+      },
+      "A4": {
+        "verdict": "PASS",
+        "checks": 10,
+        "failed": 0
+      }
+    },
+    "runtime": {
+      "binary": "ia2-runtime-detached-r2",
+      "sha256": "c18b0aaab60425ef848e8e278b3ac60c1ec7a50dfb708ed25184a0a987018893",
+      "commit": "1cc16c0",
+      "changed_this_round": false
+    }
+  },
   "repair_20261029": {
     "recorded_at": "2026-10-29",
     "advice": "REPAIR-ADVICE-2026-10-29-tier0-stage-1a.md (outside the repository); reply REPAIR-RESPONSE-2026-10-29-tier0-stage-1a.md",
     "fixes": {
-      "FIX01": "a value the device never got is explained only by a later write /audit shows applied, same instance, later in the ring, another value",
+      "FIX01": "a value the device never got is explained only by a later write /audit shows applied, same instance, later in the ring, another value (superseded by the re-review: the ring order is not the apply order, see rereview_20261029.R2)",
       "FIX02": "no-link inference needs device-log coverage and proof of recording (explicit mode interval or unbroken seq); verdict INCOMPLETE, exit 2",
       "FIX03": "runtime branch commit 1cc16c0: pulse deadline taken once the write has landed",
       "DOC01": "soak request counts named by what they count"
@@ -14,7 +487,7 @@
       "variants": 39,
       "detected_by_assertion": 39
     },
-    "vectors_failing_on_reviewed_program": "21 of 48, all by assertion (vectors-on-reviewed-program.log)",
+    "vectors_failing_on_reviewed_program": "corrected 2026-10-29 after the re-review: the kept log is of an earlier draft, 21 of 43; the final 48 vectors fail 27, all by assertion (evidence/rereview-20261029/final-48-vectors-on-43671d7.log)",
     "recompute": {
       "final-20261029/A4-r1@archive": {
         "changed_rows": 0,

@@ -1,5 +1,49 @@
 # Validation
 
+## Second re-review repair and close-out, 2026-10-30 UTC+8
+
+The second independent review (`tier0-stage1a-independent-review-20261029-r2/REVIEW.md`, outside the repository) found F1 and F2 (P1) and F3 (P2) in tool `d40c5ea3…`. The repair candidate is `8274acdfef3d8f88bb21a7fdd0f81f111e9fcf249c958c6eaa8fe581f25ec150`; [RESULT-1A.md](RESULT-1A.md) §9 describes the fixes. The original repair evidence remains in `evidence/rereview2-20261029/`. The takeover checks and delivery records are in `evidence/rereview2-closeout-20261030/`, using a frozen copy of the current Python source and the existing Python 3.9.6 interpreter with `-I -B` and no added dependencies.
+
+- **F1:** track combinations of group orders, preserving constraints across groups. An order that fails contributes an evidence gap even if each group separately has an explanation. `ORDER_CAP = 6` and `BRANCH_CAP = 4096` bound the supported search; a budget overrun leaves writes unchecked.
+- **F2:** handover checks preserve both unexplained and unchecked results, including newly unchecked writes previously attributed to an instance with certainty.
+- **F3:** all outputs in an uncertain handover share one chronological split between possible instances. No legal split explains the sequence: discrepancy; only some possibilities explain it: incomplete. More than `HANDOVER_CAP = 4096` splits leaves the writes unchecked.
+
+| Check | Result |
+|---|---|
+| Frozen-copy Python suites | 335 tests passed in 28 suites, including 69 reconciliation test methods |
+| Reconciliation mutations | 64/64 detected by assertions; no test errors substituted for detection |
+| Nullable-failsafe controls | 3/3 detected by assertions |
+| Second review's complete CLI cases and independent counterexample enumeration | 7/7 correct; both scripts exit 0 in a new copy of the review directory |
+| First review's three corrected regression scripts | All pass; only their tool path changed to the frozen source |
+| Full-order oracle cross-check on the current tool | 125,172 bounded sequences + 20,000 seeded random sequences; 0 mismatches. Of the random sequences, 459 exceed `ORDER_CAP` and were checked for an unchecked result, not brute-force agreement |
+| Two soaks and A4 with the periodic archive / final snapshot | All four CLI recomputations exit 0, `CLEAN`; every report field except the input path spelling matches the saved second-repair report |
+| Order statistics recomputed with the current algorithm | No open-order groups with the device-receipt bound. Removing that bound exposes one two-value group in the 60-minute soak (two full orders) and one unchecked device write; that report becomes `INCOMPLETE`. Other runs stay `CLEAN` |
+| Saved WP6C / A4 loopback evidence | PASS, 8 / 10 assertions, 0 failed; tool hash `8274acdf…`, runtime `c18b0aaa…`. Retained from the repair run; not rerun during takeover |
+| Repository gate during takeover | Adaptation, format, Clippy, server build, workspace tests, release build, Web build and tests all exit 0; 8,589 Rust tests passed, 105 ignored, 0 failed; 423 Web tests passed in 39 files |
+
+**Evidence version correction:** `evidence/rereview2-20261029/oracle-crosscheck.json` names an earlier tool (`b391378b…`), so it cannot validate the final candidate. It is retained unchanged. The takeover's `oracle-crosscheck.json` names `8274acdf…` and supplies the current result above. The reviewed tool's saved cross-check has 1,722 mismatches.
+
+This is a local repair candidate, not a new independent-review approval. The takeover changed documentation and evidence only; the F1–F3 code, bridge and runtime source are unchanged. No new soak, simulation or hardware test ran. The `CLEAN` main-soak report still contains one `uncheckable_restart`; the A4 final-only report still contains 44 `uncheckable_turnover` intents. Neither means every intent was fully checked. The repository gate built this branch's baseline runtime; the saved loopback acceptance uses the separate runtime-fix branch. The pre-gate runtime binary was preserved and restored after the release build.
+
+## Re-review repair, 2026-10-29 (night)
+
+An independent re-review of the repair below (`tier0-stage1a-rereview-20261029/REVIEW.html`, outside the repository) found three remaining P1 gaps in the reconciliation program; FIX03 and DOC01 passed it. The reply is `REREVIEW-RESPONSE-2026-10-29-tier0-stage-1a.md`, outside the repository; local evidence is in `evidence/rereview-20261029/`. [RESULT-1A.md](RESULT-1A.md) §8 summarizes it.
+
+- **R1** (FIX02). A complete device log that ended before a write still gave `CLEAN`: the coverage check accepted a reversed stretch. Coverage now needs a finite, ordered stretch inside the log, "no link" needs a stretch rather than a moment, and a log record with a time that is not finite makes the log unusable.
+- **R2** (FIX01). The ring order was taken as the apply order, and the device check used the intent order. Both now use one order taken from evidence: the bridge's answers and journal order, the poll that first saw an entry, and the first time a device got a value only one write could have put there. A conclusion that depends on an order nothing fixes is a new evidence gap: `uncheckable_order` for an intent, `unchecked_device_writes` for a device write that only some of the allowed orders explain. Either gives `INCOMPLETE`.
+- **R3** (FIX01). The next instance writing the same value counted as the old instance's delivery. A delivery now counts only while the write's own instance was surely live; without a lifecycle record, a device write between the old instance's last archive read and the next instance's first sighting is `uncheckable_order`. The device check uses the same attribution: a device write in that stretch must be explained by every instance that may have made it.
+- **Evidence description.** The first repair's "21 of 48" mixed two versions of the vectors; corrected below.
+
+| Check | Result |
+|---|---|
+| New vectors against the reviewed program (`bc4c97b8…`) | 62 tests: 16 fail, with 14 assertion failures and 6 errors (five `KeyError: 'unchecked_device_writes'`, one missing `check_device_sequence`) |
+| The re-review's three repro scripts, with their asserts turned into the correct results | pass on the fixed program; fail on the reviewed one (`evidence/rereview-20261029/review-vectors/`) |
+| Isolated Python suites | 328 tests passed in 28 suites, including 62 reconciliation vectors |
+| Reconciliation mutations | 56 of 56 detected by an assertion (`evidence/rereview-20261029/reconcile-mutations/`) |
+| Both soaks and A4 reconciled with the fixed program | all `CLEAN` with the same counts; in the main soak 4 `lamp` writes moved from `seen` to `already_held`: the device write the first repair counted as their delivery came 21 ms after the next instance was spawned |
+
+No runtime code changed in this round. The fixer is the same author; it awaits the reviewer.
+
 ## Review repair, 2026-10-29
 
 A review of the stage 1a close-out (`REPAIR-ADVICE-2026-10-29-tier0-stage-1a.md`, outside the repository) found two ways the reconciliation program could call a missing delivery explained, a pulse regression in the separate runtime fix, and soak request counts named for what they did not count. The reply, item by item, is `REPAIR-RESPONSE-2026-10-29-tier0-stage-1a.md`; local evidence is in `evidence/repair-20261029/`. [RESULT-1A.md](RESULT-1A.md) §7 summarizes it.
@@ -11,7 +55,7 @@ A review of the stage 1a close-out (`REPAIR-ADVICE-2026-10-29-tier0-stage-1a.md`
 
 | Check | Result |
 |---|---|
-| New vectors against the reviewed program | 21 of 48 fail, all by assertion, no errors |
+| New vectors against the reviewed program | corrected 2026-10-29 (re-review): the kept log `vectors-on-reviewed-program.log` is of an earlier draft, 21 of 43 failing; the final 48 vectors fail 27, all by assertion, no errors (`evidence/rereview-20261029/final-48-vectors-on-43671d7.log`) |
 | Isolated Python suites | 314 tests passed, including 48 reconciliation vectors |
 | Reconciliation mutations (`tools/check_reconcile_mutations.py`) | 39 of 39 detected by an assertion, including the variant that restores the reviewed `next_same` rule |
 | Both soaks and A4 reconciled with the repaired program | still `CLEAN` with the same counts; in the main soak 7 `lamp` rows moved from `already_held` to `seen`, and the one write that relies on "no link" still does, on an explicit `refuse` interval in device 2's own log |

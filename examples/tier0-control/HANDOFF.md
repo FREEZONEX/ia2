@@ -1,5 +1,7 @@
 # 阶段 1a 收尾交接（PR #99 之后）
 
+**最新状态：2026-10-30 UTC+8。** 第二轮独立复核的 F1–F3 修复及收尾记录见 [`RESULT-1A.md`](RESULT-1A.md) §9、[`VALIDATION.md`](VALIDATION.md) 首节与 `validation-summary.json` 的 `rereview2_20261030`。对账工具为 `8274acdf…`，当前为 335 项 Python 测试、69 项对账向量、64 个对账变异；契约 v0.13。本地证据在 `evidence/rereview2-20261029/` 与 `evidence/rereview2-closeout-20261030/`，补丁、版本及哈希清单在后者。原始复核证据保持不变；此前的验证历史保留如下。本轮收尾没有更改运行时、桥或 F1–F3 修复代码，仍待下一轮独立复核；未推送、未开 PR。
+
 日期：2026-10-29 UTC+8。上一轮（IR03、`failsafe_status: null` 兼容、D6）的交接见本文件的 git 历史（`2d68f5b`）。
 
 [PR #99](https://github.com/FREEZONEX/ia2/pull/99) 已于 2026-10-29 由维护者合并（`a2dec2a`）。合并前维护者补了一个提交 `f44755a`：harness 改用 `subprocess.Popen` 管理 runtime，并在线程里等它退出，避免 macOS 上 Python 3.14.7 的 asyncio 子进程监视器在 `SIGSTOP` 时卡住事件循环。本轮在合并后的 `main` 上，把 #99 留下的验收待办做完：R3 时序与对账语义、WP6 对账程序、P1 用例、WP9 两小时浸泡，并逐条核对阶段 1a 的退出条件。**结论与证据见 [`RESULT-1A.md`](RESULT-1A.md)：五条退出条件都有了证据。** 其中有几处是运行后改的 EXPECT 或判据，都已登记。
@@ -16,10 +18,10 @@
 | 本分支 | `fix/tier0-r3-audit-reconcile`：第一个提交是 R3 时序与对账语义（下文「R3 时序覆盖」），第二个提交是 WP6、P1、WP9 与文档；只改 `examples/tier0-control/` |
 | 运行时修复 | 分支 `fix/control-write-detached`（worktree `~/Projects/soft-PLC/ia2-control-write-detached-20261029`），本地提交 `48dec8a`，加审核修复 `1cc16c0`（脉冲从落地起计时）；见下文「运行时修复」 |
 | 结果与退出条件 | [`RESULT-1A.md`](RESULT-1A.md) |
-| 对账程序（WP6） | [`tools/reconcile_report.py`](tools/reconcile_report.py)；向量 [`tests/test_reconcile_report.py`](tests/test_reconcile_report.py)（48 项）；变异 [`tools/check_reconcile_mutations.py`](tools/check_reconcile_mutations.py)（39 个） |
+| 对账程序（WP6） | [`tools/reconcile_report.py`](tools/reconcile_report.py)；向量 [`tests/test_reconcile_report.py`](tests/test_reconcile_report.py)（69 项）；变异 [`tools/check_reconcile_mutations.py`](tools/check_reconcile_mutations.py)（64 个） |
 | 浸泡（WP9） | [`lab/soak.py`](lab/soak.py)、[`lab/hooks_soak.py`](lab/hooks_soak.py) |
 | P1 用例 | [`lab/cases_p1_table.py`](lab/cases_p1_table.py)；注册表检查加了快照名单（[`lab/check_registry.py`](lab/check_registry.py)） |
-| 契约 | [CONTRACT.md](contract/CONTRACT.md) v0.10（§8.3 实现、§11.6）；[TEST-CASES.md](contract/TEST-CASES.md) v0.9（§3.2）；[DESIGN-1A.md](contract/DESIGN-1A.md) v0.8 |
+| 契约 | [CONTRACT.md](contract/CONTRACT.md) v0.13（§8.3 完整先后组合与共同交接时刻、§11.6 实测）；[TEST-CASES.md](contract/TEST-CASES.md) v0.9（§3.2）；[DESIGN-1A.md](contract/DESIGN-1A.md) v0.8 |
 | 验证详情 / 机器可读结果 | [VALIDATION.md](VALIDATION.md)、[validation-summary.json](validation-summary.json) |
 
 ## 本轮结果
@@ -71,7 +73,8 @@ python3 -I -B examples/tier0-control/tools/check_failsafe_controls.py
 - [ ] **推送并开 PR**：本分支与运行时修复各一个，等你点头；推到哪里（`FREEZONEX/ia2` 上的分支，还是 fork）也请你定。运行时修复先开先合：本分支的 R3 期望依赖它。
 - [x] `R3_EXPECT` 里 R3T1、R3T1X 改为 `(True, True)`，CONTRACT §11.5 与 TEST-CASES 同步，R3 组在修好的 runtime 上跑过（审核修复时做了，见 `RESULT-1A.md` §7）。
 - [x] 审核修复 FIX01、FIX02、FIX03、DOC01（`RESULT-1A.md` §7；仓库外的逐项回复 `REPAIR-RESPONSE-2026-10-29-tier0-stage-1a.md`）。
-- [ ] 复核者检查审核修复。
+- [x] 第一、第二轮独立复核已完成并提出缺口；修复及本地收尾见 RESULT-1A §8、§9。
+- [ ] 复核者检查 F1–F3 修复候选（本轮复跑既有脚本，不等同于新的独立复核）。
 - [ ] 未决问题清单（`RESULT-1A.md` §6）里要你决定的：是否复议 D1；1b 的授权。
 
 ## R3 时序覆盖（本分支第一个提交）
