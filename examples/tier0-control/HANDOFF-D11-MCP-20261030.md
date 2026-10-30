@@ -1,8 +1,14 @@
 # D11 与本地控制 MCP 复核交接
 
-日期：2026-10-30 UTC+8。范围：用户要求「把 D11 和控制 MCP 再核对一遍，做交接文档」。这是同一实现者的再次核对，不标作独立第三方审计。
+日期：2026-10-30 UTC+8。原复核范围：用户要求「把 D11 和控制 MCP 再核对一遍，做交接文档」；后续 main 集成与 PR 交付见首节。这是同一实现者的再次核对，不标作独立第三方审计。
 
-## 接手结论与定位
+## main 集成更新
+
+2026-10-30 UTC+8：已将 `origin/main` `f0fa410bc8c22263aba7de0bc5400d0273d61c13` 合入，合并提交为 `9eaa24bea7e70f44aba8f655d29afc10e60032df`，包含 #100/#101。最新验证与 PR 交付状态见 [VALIDATION-D11-INTEGRATED.md](VALIDATION-D11-INTEGRATED.md)。下面的 365 项／16 类结果及“尚未合入 main／未推送”均为此前复核的历史状态；异常返回和操作边界仍适用。
+
+本次集成验证为 **OFFLINE PASS**：366 项 Python、50 类回环／596 条断言、72 个变异检查、3 个崩溃恢复动作、7 步无设备模拟及全仓八项检查均通过。新增四类返回边界回归；修正一条与 main 新诊断措辞不一致的旧断言，保留首次失败证据。没有新增生产代码修改或发现。runtime 从合并后的树重新构建并固定散列；全部测试服务已退出，模拟结束时 `running=false`、`forces=[]`、告警 `[]`。
+
+## 此前复核结论与定位
 
 本地实现包含事件／样本签名、独立只读采样进程，以及真实 stdio 控制 MCP。运行范围仍是本机回环与假设备；没有连接 grey0、真实 Tier0 或硬件，没有修改客户端 MCP 配置，没有推送本轮工作。
 
@@ -15,11 +21,11 @@
 | 使用说明 | [LOCAL-CONTROL.md](LOCAL-CONTROL.md) |
 | 上一轮验证 | [VALIDATION-D11.md](VALIDATION-D11.md)、[validation-d11-summary.json](validation-d11-summary.json)；历史数字不改写 |
 | 本轮原始证据 | `evidence/d11-rereview-20261030/`，Git 忽略；包含修复前断言失败、修复后运行、冻结源码与散列 |
-| 当前结论 | **OFFLINE PASS**；365 项 Python、16 类回环、5 个 D11 变异及全仓检查通过；现场项仍待验证 |
+| 此前复核结论 | **OFFLINE PASS**；365 项 Python、16 类回环、5 个 D11 变异及全仓检查通过；现场项仍待验证 |
 
 上游状态已重新通过 GitHub 查询：[#100](https://github.com/FREEZONEX/ia2/pull/100) 于 **13:10:14 UTC+8** 合并，合并提交 `88bcc6ec48c57510fa4a8fd8cb855ffc04a8cadf`；[#101](https://github.com/FREEZONEX/ia2/pull/101) 于 **13:10:45 UTC+8** 合并，合并提交 `f0fa410bc8c22263aba7de0bc5400d0273d61c13`。旧交接里「待合并」是历史状态。此次只 fetch 并核对，没有把 `origin/main` 合入本地 D11 分支；因此本地 Rust 源码仍不含 #100。对 `9c72dce` 与该 main 做的 `git merge-tree --write-tree` 预演无冲突，但未运行合并树。后续提交 D11 PR 前应先对齐 main 并验证合并后的树。
 
-集成验证固定使用已含 #100 修复的二进制，不能替换为本分支刚构建的 `target/release/ia2-runtime`：
+此前复核固定使用以下已含 #100 修复的二进制，当时本分支源码尚未合入 #100，不能直接替换为当时构建的 `target/release/ia2-runtime`。本次已合入 main 并重新构建；旧限制不适用于现已集成的树，新旧验证的固定二进制及散列分开记录：
 
 ```text
 /Users/au73/Projects/soft-PLC/pr99-r3-timing-20261029/bin/ia2-runtime-detached-r2
@@ -113,7 +119,7 @@ HMAC 验证方也能签名，因此 MCP 持有的三种秘密使其处于完整�
 
 ## 最短复跑入口
 
-以下使用本机已验证 runtime，全部命令从仓库根目录运行。输出目录必须是新的；示例名称若已存在则换一个。Python 环境沿用项目现状，无第三方包安装要求。
+以下使用 main 集成轮固定的 runtime，全部命令从仓库根目录运行；具体 SHA-256 与构建来源见 [集成验证](VALIDATION-D11-INTEGRATED.md)。其他机器可按 [LOCAL-CONTROL.md](LOCAL-CONTROL.md) 从已集成源码重新构建。输出目录必须是新的；示例名称若已存在则换一个。Python 环境沿用项目现状，无第三方包安装要求。
 
 ```sh
 python3 -I -B examples/tier0-control/tools/run_tests.py \
@@ -121,7 +127,7 @@ python3 -I -B examples/tier0-control/tools/run_tests.py \
 python3 -I -B examples/tier0-control/tools/check_d11_mutations.py \
   --out examples/tier0-control/evidence/handoff-mutations-new
 python3 -I -B examples/tier0-control/lab/run_cases.py \
-  --bin /Users/au73/Projects/soft-PLC/pr99-r3-timing-20261029/bin/ia2-runtime-detached-r2 \
+  --bin examples/tier0-control/evidence/d11-pr-20261030/bin/ia2-runtime-integrated \
   --out examples/tier0-control/evidence/handoff-mcp-new \
   --cases F6,F7,F8,MCP,MCPPROD
 ```
@@ -132,7 +138,7 @@ python3 -I -B examples/tier0-control/lab/run_cases.py \
 
 | 状态 | 项目 | 关闭条件 |
 |---|---|---|
-| 待接手 | 同步已合并 main 后提交 D11 PR | 对齐 `origin/main`、核对集成后的 diff，重跑质量检查与相关回环；当前分支尚未推送 |
+| 验证完成 | main 集成与 D11 PR | main 已同步且集成验证通过，PR 提交状态以 [最新记录](VALIDATION-D11-INTEGRATED.md) 为准 |
 | 本地限制 | 每个日志最多索引 20,000 条（包括坏行） | 5 Hz 约 67 分钟；超限报工具错误。重启 MCP 并不会减少同一日志的行数。长期运行需持久索引或完整会话轮换 |
 | 未实现 | 真 Tier0 HTTP/MQTT 适配、服务部署 | 明确传输契约、权限范围与故障处理后实现；当前只是签名文件通道 |
 | BENCH PENDING | 采样负载与 #65 | 实测目标机器新增 `/status` 负载、扫描周期与查询延迟 |

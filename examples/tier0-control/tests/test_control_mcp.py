@@ -217,6 +217,48 @@ class Control(unittest.TestCase):
         self.assertEqual(len(Path(self.args.requests).read_text().splitlines()), 1)
         self.assertEqual(self.tools.get_action_status(r['action_id'])['status'], 'requested')
 
+    def test_action_outcomes_and_tool_errors_have_distinct_boundaries(self):
+        def call(name, arguments):
+            server = mcp.Server(mcp.ControlTools(self.args))
+            server.ready = True
+            reply = server.dispatch(dict(jsonrpc='2.0', id=1, method='tools/call',
+                                         params=dict(name=name, arguments=arguments)))['result']
+            return reply['isError'], json.loads(reply['content'][0]['text'])
+
+        aid = self.tools.ia2_set('flow', 12.5)['action_id']
+        event, sample = self.evidence(aid)
+        with open(self.args.samples, 'a') as stream:
+            stream.write(json.dumps(sample) + '\n')
+        error, result = call('get_action_status', {'action_id': aid})
+        self.assertFalse(error)
+        self.assertEqual((result['status'], result['rejected_envelopes']), ('verified', 1))
+
+        event, _ = self.evidence(aid)
+        event.update(status='unknown', reason='runtime_unreachable')
+        notes = [dict(event, kind='reconcile_note', event_id='note-%d' % i, pass_no=value)
+                 for i, value in enumerate((1, '2'))]
+        Path(self.args.trace).write_text(''.join(json.dumps(eventauth.sign(row, EVENT_KEYS)) + '\n'
+                                              for row in [event] + notes))
+        error, result = call('get_action_status', {'action_id': aid})
+        self.assertFalse(error)
+        self.assertEqual((result['status'], result['reason'], result['rejected_envelopes']),
+                         ('unknown', 'no_proof_by_deadline', 0))
+        self.assertEqual(result['detail'], 'malformed authenticated evidence')
+
+        with mock.patch.object(mcp, 'MAX_RECORDS', 0):
+            error, result = call('get_action_status', {'action_id': aid})
+        self.assertTrue(error)
+        self.assertEqual(result['error']['code'], 'tool_refused')
+
+        with mock.patch.object(mcp.os, 'fsync', side_effect=OSError('injected uncertainty')):
+            error, result = call('ia2_set', {'target_key': 'flow', 'target': 13.5})
+        self.assertFalse(error)
+        self.assertEqual((result['status'], result['reason']), ('unknown', 'request_persistence_unconfirmed'))
+        error, status = call('get_action_status', {'action_id': result['action_id']})
+        self.assertFalse(error)
+        self.assertEqual(status['status'], 'requested')
+        self.assertEqual(len(Path(self.args.requests).read_text().splitlines()), 2)
+
     def test_malformed_authenticated_data_is_tool_error_and_stdio_survives(self):
         aid = self.tools.ia2_set('flow', 12.5)['action_id']
         original = Path(self.args.requests).read_text()

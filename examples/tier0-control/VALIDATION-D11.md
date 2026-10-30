@@ -1,6 +1,6 @@
 # D11 and local control MCP validation
 
-This is the original implementation validation. Subsequent review fixes and fresh results are recorded in [the D11/MCP handoff](HANDOFF-D11-MCP-20261030.md); the counts and failures below remain historical evidence.
+This is the original implementation validation. Subsequent review fixes are recorded in [the D11/MCP handoff](HANDOFF-D11-MCP-20261030.md), and validation after merging main is in [VALIDATION-D11-INTEGRATED.md](VALIDATION-D11-INTEGRATED.md); the counts and failures below remain historical evidence.
 
 2026-10-30 UTC+8. Branch `feat/tier0-signed-control-mcp`, based on `a5e4a851044f9fa6462e6eff71576d9de82a00b2` (PR #101). This is a separate local increment; PR #100/#101 were not merged or changed by this work. No grey0, live Tier0, hardware, client MCP configuration or deployment was modified.
 

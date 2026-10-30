@@ -56,7 +56,10 @@ class AbsentEntry(unittest.TestCase):
             self.assertEqual([shape(n) for n in notes], [(1, 'absent', None, False), (2, 'absent', None, True)])
             for n in notes:
                 self.assertIn('does not show', n['detail'])
-            self.assertIn('without an entry', notes[1]['detail'], 'the second look names the queued-write gap')
+            self.assertIn('older runtime may have lost the audit', notes[1]['detail'],
+                          'the second look distinguishes the historical queued-write audit gap')
+            self.assertIn('256-entry ring may have turned over', notes[1]['detail'],
+                          'missing retained evidence still cannot prove non-execution')
             recs = [r for r in jr.actions[p['action_id']]['reconciles']]
             self.assertEqual([(r['pass_no'], r['audit_entry'], r['landed']) for r in recs], [(1, 'absent', None), (2, 'absent', None)])
             t[0] += 60000

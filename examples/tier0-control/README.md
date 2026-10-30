@@ -2,7 +2,7 @@
 
 A local, file-backed reference for the `ia2.control/v0` contract. It accepts HMAC-authenticated setpoint requests, applies a pinned target registry, records write intent before sending to a loopback IA2 runtime, and publishes the recorded outcome. The bridge never reports `verified`; the independent read-side verifier derives that status from separate feedback samples.
 
-This imports the previously separate reference implementation with its P0/P1, IR01/IR02, AR01 and IR03 repairs. It is a laboratory integration example, not a deployed Tier0 connector. D11 event/sample authentication and a real stdio control MCP are implemented locally. Events and samples must be signed; unsigned legacy evidence is rejected. The dedicated sampler is an independent read-only process. See [local setup and limits](LOCAL-CONTROL.md), [D11 validation](VALIDATION-D11.md), and the [latest review and handoff](HANDOFF-D11-MCP-20261030.md). `verified` does not prove physical effect or that this command caused the observed value.
+This imports the previously separate reference implementation with its P0/P1, IR01/IR02, AR01 and IR03 repairs. It is a laboratory integration example, not a deployed Tier0 connector. D11 event/sample authentication and a real stdio control MCP are implemented locally. Events and samples must be signed; unsigned legacy evidence is rejected. The dedicated sampler is an independent read-only process. See [local setup and limits](LOCAL-CONTROL.md), [validation after integrating main](VALIDATION-D11-INTEGRATED.md), and the [latest review and handoff](HANDOFF-D11-MCP-20261030.md). `verified` does not prove physical effect or that this command caused the observed value.
 
 ## IR03: recover result publication without repeating the write
 

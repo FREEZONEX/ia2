@@ -13,14 +13,16 @@ No tool accepts a variable name, raw bit pattern, runtime URL, force/pulse opera
 
 ## Reproduce the local closed loop
 
-From `examples/tier0-control`, with the runtime fix from PR #100 built locally:
+Build `ia2-runtime` from the integrated branch (`cargo build --release -p ia2-runtime` at the repository root); it includes the runtime fix merged in PR #100. Then, from `examples/tier0-control`:
 
 ```sh
-python3 -I -B lab/run_cases.py --bin /absolute/path/to/ia2-runtime \
+python3 -I -B lab/run_cases.py --bin ../../target/release/ia2-runtime \
   --out evidence/local-signed-demo --cases F6,F7,F8,MCP,MCPPROD
 ```
 
 The harness starts only its own loopback runtime and fake Modbus devices. It generates separate disposable request/event/sample keys, starts the bridge and sampler as independent processes, calls the actual stdio MCP, restarts MCP, and checks there was only one runtime write. It saves JSON protocol transcripts, signed trace/samples, the runtime audit, fake-device logs and checksums, then stops its children. Choose a fresh output directory. The `MCPPROD` case uses the standalone package without lab hooks.
+
+The integrated validation's exact source and runtime hash are recorded in [VALIDATION-D11-INTEGRATED.md](VALIDATION-D11-INTEGRATED.md). Older validation records pin a different binary and retain their historical results.
 
 ## Launch against your own local simulation
 
@@ -84,7 +86,8 @@ For a client configuration, use absolute paths for every file and for the interp
 - MCP recovers action bindings from authenticated request records after restart. It incrementally reads and authenticates newly appended event/sample lines, caches them, and re-verifies selected evidence when deriving a status. Complete malformed rows are counted; an incomplete final line waits for completion. Replacing or truncating a file rebuilds its index. These files are append-only transports, not a transactional database.
 - Local resource budgets are explicit: 64 KiB per MCP frame/request line, 4 MiB per evidence line, and 20,000 records per evidence/request log in an MCP session's index, including rejected rows. At 5 Hz the sample budget is roughly 67 minutes. Exceeding a budget gives a tool error, never an incomplete success. This bounded local example needs deliberate session rotation or a future persistent indexed Tier0 adapter for long-running operation; do not delete evidence to hide a limit.
 - Restarting MCP alone does not reset the budget for existing logs. Archive a complete session only after resolving outstanding actions, then use a fresh set of state paths; do not mix an old request file with a new journal or truncate individual evidence files.
-- Rejection counters cover the entire indexed event/sample logs, not just the selected action. I/O failure, a history-budget error or malformed authenticated data that prevents a lookup is a tool error; the stdio connection remains available. If request append/sync fails after bytes may have become visible, `ia2_set` returns `unknown` with its action ID and instructs the client to query it instead of automatically submitting again.
+- Rejection counters cover the entire indexed event/sample logs, not just the selected action. Rejected envelopes are skipped and counted. An exception caught within outcome derivation returns `unknown` with `isError:false`; rejected-envelope counts may still be zero. `isError:false` does not establish action success or exclude evidence anomalies.
+- An exception caught by the outer lookup or a history-budget error returns `isError:true`; the stdio connection remains available. Such a tool error does not prove the action was not executed. If request append/sync fails after bytes may have become visible, `ia2_set` returns `unknown` and `isError:false` with its action ID; query that ID instead of automatically submitting again. See the [four return boundaries](HANDOFF-D11-MCP-20261030.md#异常返回的判读).
 - Sampling defaults to 200 ms. The standalone sampler holds an exclusive writer lock on its sample file, bounds response size, and never calls a runtime mutation endpoint. Nonfinite decoded floating values become null and cannot verify a target. Samples are observational evidence; no power-loss durability guarantee is made for them.
 
 HMAC verification secrets also permit forgery. A compromised verifier, bridge or sampler remains a trust-boundary failure. Separate files under the same OS account do not isolate processes. A valid signature authenticates a report, not its truth, physical effect or causation. Additional `/status` load on grey0/#65, real Tier0 access controls, hardware timing and power-loss behavior remain **BENCH PENDING**.
