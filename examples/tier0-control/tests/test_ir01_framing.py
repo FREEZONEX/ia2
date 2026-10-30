@@ -1,4 +1,7 @@
 """IR01 regression: ambiguous framing must not supply successful write evidence. Offline memory sockets and the real engine/verifier."""
+import sys
+sys.path.insert(0, __import__('os').path.dirname(__file__))
+from signing_fixtures import event_keys_path
 import json
 import random
 import sys
@@ -10,7 +13,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from p0_support import AID, Client, close, engine, envelope, payload, reg_for
 from bridge.ia2client import Ia2Client
-import verifier
+import signing_fixtures as verifier
 
 START = 1800000000000
 BODY = b'{"ok":true,"name":"sp","value":1,"undelivered_device":null}'

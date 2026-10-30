@@ -1,4 +1,7 @@
 """One test (or more) per weakness W1-W19 of HANDOFF-2026-10-28 section 5, as fixed.  No ports, no runtime."""
+import sys
+sys.path.insert(0, __import__('os').path.dirname(__file__))
+from signing_fixtures import event_keys_path, decode_event
 import json
 import os
 import socket
@@ -17,7 +20,7 @@ from bridge.errors import Reject  # noqa: E402
 from bridge.engine import Engine, make_label  # noqa: E402
 from bridge.journal import Journal  # noqa: E402
 from bridge.tail import RequestTail  # noqa: E402
-from bridge.trace import TraceWriter  # noqa: E402
+from signing_fixtures import TraceWriter  # noqa: E402
 
 ROOT = rc.ROOT
 KEYS = {'k1': {'secret': b'\x07' * 32, 'not_before_ms': 0, 'not_after_ms': 2 ** 60}}
@@ -146,7 +149,7 @@ class W2_Anchor(unittest.TestCase):
             eng, jr, tw, t = make(tmp)
             ln, p = line(t)
             eng.handle_line(ln)
-            events = [json.loads(l) for l in lines(os.path.join(tmp, 't.jsonl'))]
+            events = [decode_event(json.loads(l)) for l in lines(os.path.join(tmp, 't.jsonl'))]
             self.assertTrue(events and all('journal_seq' in e and 'journal_hash' in e for e in events))
             self.assertEqual(events[-1]['journal_hash'], jr.last_hash)
             close_all(jr, tw)
@@ -215,7 +218,7 @@ class W6_ProductionPackage(unittest.TestCase):
             helpp = subprocess.run([sys.executable, '-I', os.path.join(pkg, 'bridge_run.py'), '--help'], capture_output=True, text=True)
             self.assertEqual(helpp.returncode, 0)
             self.assertNotIn('hooks', helpp.stdout)
-            args = ['--registry', 'r', '--registry-sha256', 'x', '--keys', 'k', '--runtime', '127.0.0.1:1', '--journal', 'j', '--requests', 'q',
+            args = ['--registry', 'r', '--registry-sha256', 'x', '--keys', 'k', '--event-keys', event_keys_path('k'), '--runtime', '127.0.0.1:1', '--journal', 'j', '--requests', 'q',
                     '--trace', 't', '--project-dir', 'p', '--test-hooks', 'evil.py']
             bad = subprocess.run([sys.executable, '-I', os.path.join(pkg, 'bridge_run.py')] + args, capture_output=True, text=True)
             self.assertEqual(bad.returncode, 2)
@@ -296,7 +299,7 @@ class W9_ReconcileTwice(unittest.TestCase):
             self.assertEqual((ev['status'], ev['reason']), ('unknown', 'runtime_unreachable'))
             t[0] += 5000
             eng.reconcile_unknowns()                                        # first look: nothing in /audit
-            notes = [json.loads(l) for l in lines(os.path.join(tmp, 't.jsonl')) if '"reconcile_note"' in l]
+            notes = [decode_event(json.loads(l)) for l in lines(os.path.join(tmp, 't.jsonl')) if '"reconcile_note"' in l]
             self.assertEqual([(n['pass_no'], n['audit_entry'], n['landed'], n['final']) for n in notes], [(1, 'absent', None, False)])
             eng.reconcile_unknowns()
             self.assertEqual(len([l for l in lines(os.path.join(tmp, 't.jsonl')) if '"reconcile_note"' in l]), 1, 'not again before the pause')
@@ -304,7 +307,7 @@ class W9_ReconcileTwice(unittest.TestCase):
             client.audit = [{'origin': label, 'name': 'sp_flow', 'requested': 1095237632, 'applied': 1095237632, 'result': 'ok'}]
             t[0] += 11000
             eng.reconcile_unknowns()                                        # second look: it has landed since
-            notes = [json.loads(l) for l in lines(os.path.join(tmp, 't.jsonl')) if '"reconcile_note"' in l]
+            notes = [decode_event(json.loads(l)) for l in lines(os.path.join(tmp, 't.jsonl')) if '"reconcile_note"' in l]
             self.assertEqual([(n['pass_no'], n['audit_entry'], n['landed'], n['final']) for n in notes],
                              [(1, 'absent', None, False), (2, 'found', True, True)])
             self.assertIn('AFTER the first look', notes[1]['detail'])
@@ -384,7 +387,7 @@ class W11_Governance(unittest.TestCase):
             os.chmod(keys, 0o600)
             import hashlib
             sha = hashlib.sha256(rb(reg)).hexdigest()
-            base = [sys.executable, '-I', os.path.join(ROOT, 'bridge_run.py'), '--registry', reg, '--registry-sha256', sha, '--keys', keys,
+            base = [sys.executable, '-I', os.path.join(ROOT, 'bridge_run.py'), '--registry', reg, '--registry-sha256', sha, '--keys', keys, '--event-keys', event_keys_path(keys),
                     '--runtime', '127.0.0.1:1', '--journal', os.path.join(tmp, 'j'), '--requests', os.path.join(tmp, 'q'),
                     '--trace', os.path.join(tmp, 't'), '--project-dir', d, '--preflight', 'off']
             r = subprocess.run(base, capture_output=True, text=True, timeout=30)
@@ -480,7 +483,7 @@ class W15_Preflight(unittest.TestCase):
                 os.chmod(keys, 0o600)
                 import hashlib
                 sha = hashlib.sha256(rb(reg)).hexdigest()
-                r = subprocess.run([sys.executable, '-I', os.path.join(ROOT, 'bridge_run.py'), '--registry', reg, '--registry-sha256', sha, '--keys', keys,
+                r = subprocess.run([sys.executable, '-I', os.path.join(ROOT, 'bridge_run.py'), '--registry', reg, '--registry-sha256', sha, '--keys', keys, '--event-keys', event_keys_path(keys),
                                     '--runtime', '127.0.0.1:%d' % srv.server_address[1], '--journal', os.path.join(tmp, 'j'),
                                     '--requests', os.path.join(tmp, 'q'), '--trace', os.path.join(tmp, 't'), '--project-dir', os.path.join(tmp, 'p'),
                                     '--governance-check', 'off'], capture_output=True, text=True, timeout=30)
@@ -503,7 +506,7 @@ class W17_Visibility(unittest.TestCase):
             self.assertEqual((snap['counters']['unauthenticated'], snap['counters']['unattributed_rejects']), (2, 1))
             eng.maybe_notice()
             eng.maybe_notice()                                              # nothing changed, and not within a minute anyway
-            notices = [json.loads(l) for l in lines(os.path.join(tmp, 't.jsonl')) if '"bridge_notice"' in l]
+            notices = [decode_event(json.loads(l)) for l in lines(os.path.join(tmp, 't.jsonl')) if '"bridge_notice"' in l]
             self.assertEqual(len(notices), 1)
             self.assertEqual(notices[0]['counts']['unauthenticated'], 2)
             self.assertNotIn('payload', json.dumps(notices[0]), 'counts only, never content')

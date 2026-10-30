@@ -71,7 +71,7 @@ async def derive_until_settled(st, p, key, timeout=10):
     res = None
     end = time.time() + timeout
     while time.time() < end:
-        res = verifier.derive(p, st.entry(key), st.trace(), st.samples(), now_ms())
+        res = verifier.derive(p, st.entry(key), st.event_envelopes(), st.sample_envelopes(), now_ms(), event_keys=st.event_keys, sample_keys=st.sample_keys)
         if res['status'] != 'accepted':
             break
         await asyncio.sleep(0.2)
@@ -252,16 +252,16 @@ async def case_B4(st, ck, notes):
     sc, status = await st.rt('GET', '/status')
     row = vars_of(status).get('sp_flow_fb')
     ck('the feedback really does show 40.0', row is not None and row['value'] in ('40', '40.0'), row)
-    res = verifier.derive(p, st.entry('flow_wide'), st.trace(), st.samples(), now_ms())
+    res = verifier.derive(p, st.entry('flow_wide'), st.event_envelopes(), st.sample_envelopes(), now_ms(), event_keys=st.event_keys, sample_keys=st.sample_keys)
     ck('the verifier keeps it `modified`', res['status'] == 'modified' and res.get('applied_value') == 40.0, res)
-    control = verifier.derive(p, st.entry('flow_wide'), [dict(ev, status='accepted')], st.samples(), now_ms())
+    control = verifier.derive(p, st.entry('flow_wide'), [st.signed_event(dict(ev, status='accepted'))], st.sample_envelopes(), now_ms(), event_keys=st.event_keys, sample_keys=st.sample_keys)
     ck('negative control: had it been `accepted`, the same feedback would have verified it', control['status'] == 'verified', control)
     ck('no `verified` in the trace', all(e.get('status') != 'verified' for e in st.trace()))
     audit = await audit_list(st)
     ck('IA2 /audit: one entry, `clamped`, requested 45.0 applied 40.0',
        len(audit) == 1 and audit[0].get('result') == 'clamped' and audit[0].get('requested') == f32bits(45.0) and audit[0].get('applied') == f32bits(40.0), audit)
     await wait_deadline(p, 1.5)
-    res = verifier.derive(p, st.entry('flow_wide'), st.trace(), st.samples(), now_ms())
+    res = verifier.derive(p, st.entry('flow_wide'), st.event_envelopes(), st.sample_envelopes(), now_ms(), event_keys=st.event_keys, sample_keys=st.sample_keys)
     ck('still `modified` after the deadline', res['status'] == 'modified', res)
 
 
@@ -433,7 +433,7 @@ async def case_C3(st, ck, notes):
         await asyncio.sleep(1.5)
         audit2 = await audit_list(st)
         ck('[%s] the late delivery added NO entry to IA2 /audit' % mode, len([e for e in audit2 if e.get('origin') == (ev or {}).get('label')]) == 1)
-        res = verifier.derive(p, st.entry('d2_set'), st.trace(), st.samples(), now_ms())
+        res = verifier.derive(p, st.entry('d2_set'), st.event_envelopes(), st.sample_envelopes(), now_ms(), event_keys=st.event_keys, sample_keys=st.sample_keys)
         ck('[%s] even with the matching feedback now present, the action stays `undelivered`' % mode, res['status'] == 'undelivered', res)
         ok = await healthy(st, 'second', True, timeout=30)
         ck('[%s] the device is healthy again' % mode, ok is not None)
@@ -488,7 +488,7 @@ async def case_C4(st, ck, notes):
     ck('every request got an answer', all(ev is not None for _, ev in evs), statuses)
     ck('some writes fell into the window: accepted by the bridge while the link was already dead (%d)' % len(accepted), len(accepted) >= 2, statuses)
     ck('the accepted ones reported `undelivered_device: null` (the runtime still believed in the link)', all(ev.get('undelivered_device') is None for _, ev in accepted))
-    verdicts = [verifier.derive(p, st.entry(p['target_key']), st.trace(), st.samples(), now_ms()) for p, _ in accepted]
+    verdicts = [verifier.derive(p, st.entry(p['target_key']), st.event_envelopes(), st.sample_envelopes(), now_ms(), event_keys=st.event_keys, sample_keys=st.sample_keys) for p, _ in accepted]
     notes['read_side_verdicts'] = {k: len([v for v in verdicts if (v['status'], v.get('reason')) == k]) for k in set((v['status'], v.get('reason')) for v in verdicts)}
     notes['read_side_verdicts'] = {str(k): v for k, v in notes['read_side_verdicts'].items()}
     ck('NOT ONE of them is `verified`', not any(v['status'] == 'verified' for v in verdicts), notes['read_side_verdicts'])
@@ -516,7 +516,7 @@ async def case_C6(st, ck, notes):
     ck('the feedback never moved: still 1.5', fbrow is not None and fbrow['value'] == '1.5', fbrow)
     ck('the device never received 7.0', not [e for e in st.slave_writes(130, t0) if e.get('value') == f32bits(7.0) >> 16], [hex(e.get('value') or 0) for e in st.slave_writes(130, t0)])
     await wait_deadline(p, 3.0)
-    res = verifier.derive(p, st.entry('prog_setpoint'), st.trace(), st.samples(), now_ms())
+    res = verifier.derive(p, st.entry('prog_setpoint'), st.event_envelopes(), st.sample_envelopes(), now_ms(), event_keys=st.event_keys, sample_keys=st.sample_keys)
     ck('the read side ends `unknown` / no_proof_by_deadline, never verified', (res['status'], res.get('reason')) == ('unknown', 'no_proof_by_deadline'), res)
 
 
@@ -542,7 +542,7 @@ async def case_C8(st, ck, notes):
     ck('observed: the restarted runtime zeroed the device output at boot', st.slave.regs.get(100) == 0 and len(boot) >= 2, st.slave.regs.get(100))
     st.sampler.paused.clear()
     await asyncio.sleep(1.5)
-    res = verifier.derive(p, st.entry('flow_setpoint'), st.trace(), st.samples(), now_ms())
+    res = verifier.derive(p, st.entry('flow_setpoint'), st.event_envelopes(), st.sample_envelopes(), now_ms(), event_keys=st.event_keys, sample_keys=st.sample_keys)
     ck('natural case: the read side says unknown / runtime_restarted', (res['status'], res.get('reason')) == ('unknown', 'runtime_restarted'), res)
     # Plant the trap: the device shows 12.5 again (e.g. another writer, or a device that keeps its value across a restart).
     u = f32bits(12.5) & 0xFFFFFFFF
@@ -553,7 +553,7 @@ async def case_C8(st, ck, notes):
     ck('there ARE matching fresh samples from the new instance (so the rule, not their absence, is what holds)',
        any(s['native_runtime_id'] == second_id and (next((v for v in s['variables'] if v['name'] == 'sp_flow_fb'), {}).get('decoded_value') == 12.5)
            for s in st.samples()))
-    res = verifier.derive(p, st.entry('flow_setpoint'), st.trace(), st.samples(), now_ms())
+    res = verifier.derive(p, st.entry('flow_setpoint'), st.event_envelopes(), st.sample_envelopes(), now_ms(), event_keys=st.event_keys, sample_keys=st.sample_keys)
     ck('trap case: still unknown / runtime_restarted, not verified', (res['status'], res.get('reason')) == ('unknown', 'runtime_restarted'), res)
     ck('nothing was resent: still exactly one POST /write', len(posts(st)) == 1, wire_summary(st.wire()))
     await wait_deadline(p, 0.3)
@@ -607,7 +607,7 @@ async def case_E1(st, ck, notes):
     ck('...and none of the samples after the send is fresh', not [s for s in st.samples() if s['collected_at_ms'] > ev['sent_at_ms'] and
        (next((v for v in s['variables'] if v['name'] == 'd2_fb'), {}).get('input') or {}).get('stale') is False])
     await wait_deadline(p, 1.5)
-    res = verifier.derive(p, st.entry('d2_set'), st.trace(), st.samples(), now_ms())
+    res = verifier.derive(p, st.entry('d2_set'), st.event_envelopes(), st.sample_envelopes(), now_ms(), event_keys=st.event_keys, sample_keys=st.sample_keys)
     ck('not verified: unknown / feedback_stale', (res['status'], res.get('reason')) == ('unknown', 'feedback_stale'), res)
     await s2.set_mode('normal')
 
@@ -627,13 +627,13 @@ async def case_E2(st, ck, notes):
     ck('accepted', ev is not None and ev['status'] == 'accepted', short(ev))
     entry = st.entry('flow_fast')
     await asyncio.sleep(max(0.0, ev['sent_at_ms'] / 1000.0 + 1.5 + 1.5 - time.time()))
-    res = verifier.derive(p, entry, st.trace(), st.samples(), now_ms())
+    res = verifier.derive(p, entry, st.event_envelopes(), st.sample_envelopes(), now_ms(), event_keys=st.event_keys, sample_keys=st.sample_keys)
     ck('with only pre-request samples the read side says unknown / no_proof_by_deadline', (res['status'], res.get('reason')) == ('unknown', 'no_proof_by_deadline'), res)
     st.sampler.paused.clear()
     await asyncio.sleep(1.5)
     post = [s for s in st.samples() if s['collected_at_ms'] > ev['sent_at_ms'] + 3000]
     ck('samples taken after the window also show 12.5 (and still do not help)', len(post) >= 3, len(post))
-    res = verifier.derive(p, entry, st.trace(), st.samples(), now_ms())
+    res = verifier.derive(p, entry, st.event_envelopes(), st.sample_envelopes(), now_ms(), event_keys=st.event_keys, sample_keys=st.sample_keys)
     ck('still unknown after those samples arrive', res['status'] == 'unknown', res)
 
 
@@ -645,10 +645,10 @@ async def case_E3(st, ck, notes):
     await asyncio.sleep(1.5)
     sc, status = await st.rt('GET', '/status')
     ck('the feedback variable does show 12.5 (a proof exists in the world, but the registry names none)', (vars_of(status).get('sp_flow_fb') or {}).get('value') == '12.5')
-    res = verifier.derive(p, st.entry('flow_nofb'), st.trace(), st.samples(), now_ms())
+    res = verifier.derive(p, st.entry('flow_nofb'), st.event_envelopes(), st.sample_envelopes(), now_ms(), event_keys=st.event_keys, sample_keys=st.sample_keys)
     ck('before the deadline: accepted', res['status'] == 'accepted', res)
     await wait_deadline(p, 0.5)
-    res = verifier.derive(p, st.entry('flow_nofb'), st.trace(), st.samples(), now_ms())
+    res = verifier.derive(p, st.entry('flow_nofb'), st.event_envelopes(), st.sample_envelopes(), now_ms(), event_keys=st.event_keys, sample_keys=st.sample_keys)
     ck('after the deadline: unknown / no_feedback', (res['status'], res.get('reason')) == ('unknown', 'no_feedback'), res)
     ck('the claim says what was and was not established', 'not_claimed' in res and res['claim'] == '不知道（见原因）', res)
 
@@ -716,7 +716,7 @@ async def case_R1(st, ck, notes):
     note = await wait_until(lambda: next((e for e in st.trace() if e.get('kind') == 'reconcile_note' and e.get('action_id') == aid and e.get('final')), None), 15)
     ck('the periodic reconcile later recorded, finally: no /audit entry, and no claim that it was not executed',
        note is not None and note.get('audit_entry') == 'absent' and note.get('landed') is None, note)
-    res = verifier.derive(p, st.entry('flow_setpoint'), st.trace(), st.samples(), now_ms())
+    res = verifier.derive(p, st.entry('flow_setpoint'), st.event_envelopes(), st.sample_envelopes(), now_ms(), event_keys=st.event_keys, sample_keys=st.sample_keys)
     ck('the read side agrees: unknown', res['status'] == 'unknown', res)
     ok, n = verify_chain(st.p('journal.jsonl'))
     ck('journal hash chain verifies across the kill', ok, n)
@@ -860,7 +860,7 @@ async def r3_conclude(st, ck, notes, case_id, p, ev, after_t, reason='runtime_un
     final = ('accepted', None) if from_audit else ('unknown', reason)
     ck('the status is still %s / %s (terminal states do not upgrade)' % final, short(st.event(aid)) == final, short(st.event(aid)))
     ck('still exactly one POST', len(posts(st)) == 1, wire_summary(st.wire()))
-    res = verifier.derive(p, st.entry('flow_setpoint'), st.trace(), st.samples(), now_ms())
+    res = verifier.derive(p, st.entry('flow_setpoint'), st.event_envelopes(), st.sample_envelopes(), now_ms(), event_keys=st.event_keys, sample_keys=st.sample_keys)
     if from_audit:
         ck('the read side verifies the accepted write against the feedback', res['status'] == 'verified', res)
     else:
@@ -999,7 +999,7 @@ async def case_F1(st, ck, notes):
     """The control entry's tool surface (the stand-in toolset) and the unchanged read-only MCP."""
     import toolset
     await asyncio.sleep(1.0)
-    ts = toolset.ControlToolset(st.standin, st.trace, st.samples, st.targets)
+    ts = toolset.ControlToolset(st.standin, st.event_envelopes, st.sample_envelopes, st.targets, st.event_keys, st.sample_keys)
     surface = {n: list(inspect.signature(getattr(ts, n)).parameters) for n in dir(ts) if not n.startswith('_') and callable(getattr(ts, n))}
     notes['control_surface'] = surface
     ck('the control surface is exactly the two agreed tools with the agreed parameters', surface == toolset.ControlToolset.TOOLS, surface)
@@ -1041,8 +1041,7 @@ async def case_F1(st, ck, notes):
     ck('the control tool names are disjoint from the read-only ones', not (set(surface) & set(names)))
     ck('the archived read-only tool schema has its recorded hash',
        sha256_file(READONLY_SCHEMA) == '07b66cb4329d3f8848ea3a2c90d3055d1f43c40aa1e9e2222e075b320d7c455f')
-    notes['half'] = ('F1 is only half done in 1a: the surface checked is the stand-in toolset; the real Agent-facing MCP/CLI does not exist yet '
-                     '(open question: who hosts it and holds the signing key).')
+    notes['scope'] = 'F1 checks the stand-in surface and archived read-only schema; MCP and MCPPROD check the real control MCP.'
 
 
 async def case_F2(st, ck, notes):

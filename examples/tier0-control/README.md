@@ -1,8 +1,8 @@
 # Tier0 control bridge reference
 
-A local, file-backed reference for the `ia2.control/v0` contract. It accepts HMAC-authenticated setpoint requests, applies a pinned target registry, records write intent before sending to a loopback IA2 runtime, and publishes the recorded outcome. The bridge never reports `verified`; the laboratory read-side verifier derives that status from separate feedback samples.
+A local, file-backed reference for the `ia2.control/v0` contract. It accepts HMAC-authenticated setpoint requests, applies a pinned target registry, records write intent before sending to a loopback IA2 runtime, and publishes the recorded outcome. The bridge never reports `verified`; the independent read-side verifier derives that status from separate feedback samples.
 
-This imports the previously separate reference implementation with its P0/P1, IR01/IR02, AR01 and IR03 repairs. It is a laboratory integration example, not a deployed Tier0 connector. The real Agent-facing control MCP and D11 event/sample authentication are still unimplemented. Until D11 is implemented, the verifier assumes trusted local trace and sample files. `verified` does not prove physical effect or that this command caused the observed value.
+This imports the previously separate reference implementation with its P0/P1, IR01/IR02, AR01 and IR03 repairs. It is a laboratory integration example, not a deployed Tier0 connector. D11 event/sample authentication and a real stdio control MCP are implemented locally. Events and samples must be signed; unsigned legacy evidence is rejected. The dedicated sampler is an independent read-only process. See [local setup and limits](LOCAL-CONTROL.md) and [D11 validation](VALIDATION-D11.md). `verified` does not prove physical effect or that this command caused the observed value.
 
 ## IR03: recover result publication without repeating the write
 
@@ -10,7 +10,7 @@ Previously, a trace write failure after a durable terminal record escaped into r
 
 The engine now keeps failed terminal publications pending. Request replay, startup and periodic housekeeping retry the same saved event without another runtime read, write, classification or journal append. Startup includes old quarantined requests and results outside the hot-index horizon. Genuine request-processing exceptions still quarantine the request. Journal failure still stops processing.
 
-Trace writes handle short writes, remove an uncommitted suffix before retry, and preserve a torn-tail backup on restart. Existing complete lines must sync before their event IDs suppress publication. A complete line the bridge could not have written (non-ASCII bytes, JSON that is not an object, a non-string event ID, nesting too deep to parse) is skipped and its line number reported on stderr at startup; it neither suppresses an event nor supplies an anchor. Consumers must deduplicate by event ID: a reader can observe an unsynced line before recovery. This is not an exactly-once delivery claim.
+Trace writes handle short writes, remove an uncommitted suffix before retry, and preserve a torn-tail backup on restart. Existing complete lines must sync before their event IDs suppress publication. A complete line without a valid event signature and envelope (including unsigned legacy rows, revoked keys and malformed JSON) is skipped and its line number reported on stderr at startup; it neither suppresses an event nor supplies an anchor. Consumers must deduplicate by event ID: a reader can observe an unsynced line before recovery. This is not an exactly-once delivery claim.
 
 ## R3: a missing /audit entry is not proof that a write did not run
 
@@ -58,7 +58,7 @@ python3 -I -B examples/tier0-control/tools/run_tests.py
 python3 -I -B examples/tier0-control/tools/check_failsafe_controls.py
 ```
 
-The first runner executes each suite in its own interpreter, writes logs under `evidence/unit/`, and fails if any suite fails. It covers 335 tests, including 14 IR03 regressions, 7 nullable-failsafe compatibility regressions, 6 D6 TOML/parser/packaging regressions, 9 R3 reconcile regressions, 4 trace-reload regressions and 69 vectors for the reconciliation program. Legacy IR03 tests use a small test-only reproduction of the previous publication semantics; they do not require an archived developer checkout. The original archived engine and process were also exercised during the independent repair acceptance. The second command verifies that three deliberately broken nullable-failsafe variants fail by assertion.
+The first runner executes each suite in its own interpreter, writes logs under `evidence/unit/` (or `--out <new-directory>`), and fails if any suite fails. It covers the original 335 tests plus D11 and MCP regressions, including 14 IR03 regressions, 7 nullable-failsafe compatibility regressions, 6 D6 TOML/parser/packaging regressions, 9 R3 reconcile regressions, 4 trace-reload regressions and 69 vectors for the reconciliation program. Legacy IR03 tests use a small test-only reproduction of the previous publication semantics; they do not require an archived developer checkout. The original archived engine and process were also exercised during the independent repair acceptance. The second command verifies that three deliberately broken nullable-failsafe variants fail by assertion.
 
 D6 parses `northbound.toml` using TOML semantics at startup and before each new write. A missing file, omitted `mqtt` table or omitted `mqtt.allow_write` uses the runtime's disabled default. An explicit flag must be the boolean `false`, including when `mqtt.enabled` is false; malformed TOML, an invalid `mqtt` table or a flag of another type fails closed. Quoted/escaped keys, dotted keys, inline tables and `#` inside strings cannot hide enabled writes. Parser diagnostics are not exposed because configuration may contain credentials. The standalone production package includes the same parser and license.
 
@@ -98,10 +98,13 @@ The scenario verifies scan progress, a REAL governance clamp, a negative DINT an
 ## Layout and packaging
 
 - `bridge/`, `bridge_run.py`: request processing, journal, HTTP client and trace writer.
-- `lab/`: fake runtime/device harness, sample collector, independent verifier and stand-in tool surface.
+- `readside/`: mandatory evidence authentication, independent verifier and read-only sampler.
+- `control_mcp.py`, `control_mcp_run.py`: simulation-only stdio MCP and signed local file transport.
+- `sampler_run.py`: standalone sampler process, default 5 Hz.
+- `lab/`: fake runtime/device harness, sampler process controls and compatibility imports.
 - `tests/`: regression tests, explicit fault hooks and small data fixtures.
 - `contract/`: contract, design decisions and historical test definitions; references to earlier local reports are historical context.
-- `tools/package_prod.py`: removes lab hook loading from a copy of the bridge.
+- `tools/package_prod.py`: packages the bridge, independent read side, sampler and MCP, removing lab hook loading.
 - `tools/reconcile_report.py`: the three-way reconciliation (WP6); `lab/soak.py`: the soak (WP9).
 
 ```sh
@@ -109,6 +112,6 @@ python3 -I -B tools/package_prod.py prod
 python3 -I -B prod/bridge_run.py --help
 ```
 
-`package_prod.py` replaces the specified output directory. Its `prod` flavor only means fault hooks are absent; it does not mean hardware or production acceptance. The bridge CLI requires a registry and its SHA-256, a mode-0600 request-key file, loopback runtime address, project directory, journal, request file and trace path. Lab fixtures create their own test keys; no deployment keys or runtime binaries are included.
+`package_prod.py` replaces the specified output directory. Its `prod` flavor only means fault hooks are absent; it does not mean hardware or production acceptance. The bridge CLI requires a registry and its SHA-256, separate mode-0600 request and event key files, loopback runtime address, project directory, journal, request file and trace path. Lab fixtures create their own test keys; no deployment keys or runtime binaries are included.
 
 On macOS, a failing `F_FULLFSYNC` is propagated rather than downgraded to `fsync`. A filesystem that exposes but cannot support full sync will therefore refuse to proceed. Actual power-loss durability and hardware behavior remain bench work; this example supplies offline evidence only.

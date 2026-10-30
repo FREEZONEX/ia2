@@ -3,7 +3,7 @@ number of the right kind never proves anything.  (F05: a feedback of +-infinity 
 magnitude of the numbers, so a DINT feedback one count off passed with tolerance 0.)
 
 The expected results are written out as tables and re-checked against a second arithmetic engine (decimal, with far more digits than
-any number here needs).  Nothing in this file calls the verifier's own comparison helpers.  Read-side only: no POST is involved."""
+any number here needs).  Nothing in this file calls the verifier's own comparison helpers.  These vectors isolate arithmetic AFTER authentication; test_d11_auth.py checks the mandatory authentication boundary. No POST is involved."""
 import decimal
 import math
 import os
@@ -12,9 +12,10 @@ import unittest
 
 sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path[:0] = [HERE, os.path.join(os.path.dirname(HERE), 'lab')]
+sys.path[:0] = [os.path.dirname(HERE), HERE, os.path.join(os.path.dirname(HERE), 'lab')]
 import sampler  # noqa: E402
 import test_verifier as tv  # noqa: E402
+from readside.verifier import _derive_authenticated
 
 LATE = 1000 + 10_000 + 1001            # ms: after the proof window and the grace period
 CTX = decimal.Context(prec=500)
@@ -28,7 +29,9 @@ def entry(kind='REAL', tolerance=0.05):
 def derive(samples, **kwargs):
     """tv.derive, but an exception from the verifier is a failed assertion: it must answer whatever it is given."""
     try:
-        return tv.derive(samples, **kwargs)
+        return _derive_authenticated(kwargs.pop('request', tv.REQ), kwargs.pop('entry', tv.ENTRY),
+                                     list(kwargs.pop('events', [tv.ACC])), list(samples),
+                                     kwargs.pop('as_of', tv.AS_OF), kwargs.pop('sha', None))
     except Exception as exc:  # noqa: BLE001
         raise AssertionError('the verifier raised %r instead of answering' % (exc,)) from None
 

@@ -1,5 +1,7 @@
 # 阶段 1a 收尾交接（PR #99 之后）
 
+**本地后续工作：2026-10-30 UTC+8。** 用户确认保留 D11 签名；`feat/tier0-signed-control-mcp` 在 #101 提交基础上实现独立采样、强制验签和真实本地 stdio MCP。此增量尚未推送，不改变 #100/#101；交付与验证见 [LOCAL-CONTROL.md](LOCAL-CONTROL.md)、[VALIDATION-D11.md](VALIDATION-D11.md)。
+
 **PR 提交状态：2026-10-30 UTC+8。** 运行时修复已提交为 [PR #100](https://github.com/FREEZONEX/ia2/pull/100)（`1cc16c0`）；本阶段 1a 工作已提交为 [PR #101](https://github.com/FREEZONEX/ia2/pull/101)，F1–F3 修复与封存文档提交为 `7a8f59a`，树与此前封存候选一致。两条分支均推送至 `FREEZONEX/ia2`；**先合 #100，再合 #101**。本次没有合并 PR，仍待审阅。提交前又重跑了 335 项 Python 测试、64 + 3 个变异及第二轮复核的 7 个 CLI 用例，全部通过；运行时分支全仓检查也通过（Rust 8594 通过 / 105 忽略 / 0 失败，Web 423 项）。新证据位于仓库外 `tier0-pr-submit-20261030/`。
 
 **此前本地封存：2026-10-30 UTC+8。** 第二轮独立复核的 F1–F3 修复及收尾记录见 [`RESULT-1A.md`](RESULT-1A.md) §9、[`VALIDATION.md`](VALIDATION.md) 与 `validation-summary.json` 的 `rereview2_20261030`。对账工具为 `8274acdf…`，当前为 335 项 Python 测试、69 项对账向量、64 个对账变异；契约 v0.13。本地证据在 `evidence/rereview2-20261029/` 与 `evidence/rereview2-closeout-20261030/`，补丁、版本及哈希清单在后者。封存记录里的「未提交、未推送」是当时状态，原记录保持不变；当前 PR 状态见上段。
@@ -106,5 +108,5 @@ python3 -I -B examples/tier0-control/tools/check_failsafe_controls.py
 
 - `main` 上的 IA2 运行时漏记审计仍在（R3T1、R3T1X），修复在另一分支、未合并；桥只是不再据此作错误断言。自然触发（不靠 `SIGSTOP` 或注入停顿）未测。
 - 对账程序区分「客户端断开后执行」与「没有效果」要靠设备日志，这只在实验室有。
-- D11 事件／样本签名未实现；真实面向 Agent 的控制 MCP 未实现；P2 的 C11、A3b 没做；真实硬件、现场总线时序、断电持久性未验收；没有碰 grey0 或真 Tier0。
+- 此前未实现的 D11 事件／样本签名和真实控制 MCP 已在后续本地分支实现，见 [VALIDATION-D11.md](VALIDATION-D11.md)；P2 的 C11、A3b 没做；真实硬件、现场总线时序、断电持久性未验收；没有碰 grey0 或真 Tier0。
 - 其余未决问题见 `RESULT-1A.md` §6（D1 的代价、静默设备窗口、突发请求会过期、几种「答 200 ≠ 生效」、桥的内存随 journal 增长）。

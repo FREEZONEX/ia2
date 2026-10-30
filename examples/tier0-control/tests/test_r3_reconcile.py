@@ -3,6 +3,9 @@
 R3T1/R3T1X showed the runtime applying a queued write after the bridge's connection closed, without recording an /audit entry.
 So the reconcile note states what /audit showed (`audit_entry`: found / absent / unavailable) and claims `landed: true` only for a
 found entry; it never says `landed: false`.  Journals and trace events of older bridges (`landed: false`) are read as `absent`."""
+import sys
+sys.path.insert(0, __import__('os').path.dirname(__file__))
+from signing_fixtures import event_keys_path, decode_event
 import json
 import os
 import sys
@@ -14,17 +17,17 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(os.path.dirname(HERE), 'lab'))
 import robustness_cases as rc  # noqa: E402
-import verifier  # noqa: E402
+import signing_fixtures as verifier  # noqa: E402
 from bridge.engine import Engine  # noqa: E402
 from bridge.journal import Journal  # noqa: E402
-from bridge.trace import TraceWriter  # noqa: E402
+from signing_fixtures import TraceWriter  # noqa: E402
 from test_fixes import KEYS, Timeout, close_all, line, lines, make  # noqa: E402
 
 BITS = 1095237632                                               # 12.5 as f32 bits
 
 
 def notes_of(tmp):
-    return [json.loads(l) for l in lines(os.path.join(tmp, 't.jsonl')) if '"reconcile_note"' in l]
+    return [decode_event(json.loads(l)) for l in lines(os.path.join(tmp, 't.jsonl')) if '"reconcile_note"' in l]
 
 
 def shape(n):

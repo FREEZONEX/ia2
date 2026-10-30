@@ -1,4 +1,7 @@
 """Real bridge subprocesses and a loopback HTTP IA2 stub; evidence stays in repair copy."""
+import sys
+sys.path.insert(0, __import__('os').path.dirname(__file__))
+from signing_fixtures import event_keys_path
 import concurrent.futures
 import hashlib
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
@@ -74,7 +77,7 @@ class Process(unittest.TestCase):
         (self.dest/'project.toml').write_text('[governance]\nwrite_mode = "allowlist"\n[[governance.rules]]\nvariable = "sp"\nmin = 0\nmax = 100\n')
         (self.dest/'requests.jsonl').write_text('')
         self.cmd=[sys.executable,'-I',str(SRC/'bridge_run.py'),'--registry',str(self.dest/'registry.json'),
-                  '--registry-sha256',hashlib.sha256(text.encode()).hexdigest(),'--keys',str(self.dest/'keys.json'),
+                  '--registry-sha256',hashlib.sha256(text.encode()).hexdigest(),'--keys',str(self.dest/'keys.json'), '--event-keys', event_keys_path(str(self.dest/'keys.json')),
                   '--runtime','127.0.0.1:%d'%self.server.server_port,'--journal',str(self.dest/'journal.jsonl'),
                   '--trace',str(self.dest/'trace.jsonl'),'--requests',str(self.dest/'requests.jsonl'),'--project-dir',str(self.dest)]
     def tearDown(self):
