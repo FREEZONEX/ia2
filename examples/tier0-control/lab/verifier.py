@@ -98,7 +98,13 @@ def derive(request, entry, events, samples, as_of_ms, registry_sha256=None):
         extra = {}
         notes = sorted([e for e in events if e.get('kind') == 'reconcile_note' and e.get('action_id') == aid], key=lambda e: e.get('pass_no', 0))
         if notes:
-            extra['reconcile'] = {'landed': notes[-1].get('landed'), 'final': notes[-1].get('final'), 'detail': notes[-1].get('detail')}
+            last = notes[-1]
+            # Bridges before v0.9 wrote `landed: false` for an absent entry; that never showed the write was not executed.
+            seen = last.get('audit_entry')
+            if seen not in ('found', 'absent', 'unavailable'):
+                seen = 'found' if last.get('landed') is True else 'absent' if last.get('landed') is False else 'unavailable'
+            extra['reconcile'] = {'audit_entry': seen, 'landed': True if seen == 'found' else None, 'final': last.get('final'),
+                                  'detail': last.get('detail')}
         return _result(ev['status'], aid, ev.get('reason'), applied_value=ev.get('applied_value'), **extra)
     if registry_sha256 is not None and ev.get('registry_sha256') != registry_sha256:
         return _result('unknown', aid, 'no_proof_by_deadline', detail='the bridge used a different registry than the one the read side holds')

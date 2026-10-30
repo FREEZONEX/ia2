@@ -297,7 +297,7 @@ class W9_ReconcileTwice(unittest.TestCase):
             t[0] += 5000
             eng.reconcile_unknowns()                                        # first look: nothing in /audit
             notes = [json.loads(l) for l in lines(os.path.join(tmp, 't.jsonl')) if '"reconcile_note"' in l]
-            self.assertEqual([(n['pass_no'], n['landed'], n['final']) for n in notes], [(1, False, False)])
+            self.assertEqual([(n['pass_no'], n['audit_entry'], n['landed'], n['final']) for n in notes], [(1, 'absent', None, False)])
             eng.reconcile_unknowns()
             self.assertEqual(len([l for l in lines(os.path.join(tmp, 't.jsonl')) if '"reconcile_note"' in l]), 1, 'not again before the pause')
             label = jr.actions[p['action_id']]['intent']['label']
@@ -305,7 +305,8 @@ class W9_ReconcileTwice(unittest.TestCase):
             t[0] += 11000
             eng.reconcile_unknowns()                                        # second look: it has landed since
             notes = [json.loads(l) for l in lines(os.path.join(tmp, 't.jsonl')) if '"reconcile_note"' in l]
-            self.assertEqual([(n['pass_no'], n['landed'], n['final']) for n in notes], [(1, False, False), (2, True, True)])
+            self.assertEqual([(n['pass_no'], n['audit_entry'], n['landed'], n['final']) for n in notes],
+                             [(1, 'absent', None, False), (2, 'found', True, True)])
             self.assertIn('AFTER the first look', notes[1]['detail'])
             t[0] += 60000
             eng.reconcile_unknowns()

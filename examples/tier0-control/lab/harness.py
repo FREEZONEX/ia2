@@ -32,7 +32,9 @@ from sampler import Sampler  # noqa: E402
 from stubia2 import StubIA2  # noqa: E402
 from standin import Standin, read_jsonl, read_trace  # noqa: E402
 
-RT_PORT, PROXY_PORT, SLAVE_PORT, SLAVE2_PORT, STUB_PORT = 13501, 13502, 13511, 13512, 13503
+# Loopback ports; IA2_LAB_PORT_BASE moves the whole set (default 13500) so two labs can run side by side.
+_BASE = int(os.environ.get('IA2_LAB_PORT_BASE', '13500'))
+RT_PORT, PROXY_PORT, SLAVE_PORT, SLAVE2_PORT, STUB_PORT = _BASE + 1, _BASE + 2, _BASE + 11, _BASE + 12, _BASE + 3
 BRIDGE_RUN = os.path.join(ROOT, 'bridge_run.py')
 HOOKS_SKIP_G8 = os.path.join(ROOT, 'lab', 'hooks_skip_g8.py')
 

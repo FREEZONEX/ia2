@@ -208,13 +208,13 @@ WP0 → WP1（只做最小版：F-5 + 同地址回读，不含线圈）→ WP2 �
 | WP0 | 完成（`RESULT-WP0.md`） |
 | WP1 | 完成：`lab/mkproject_ctl.py`（REAL / DINT / BOOL 目标、两台设备、被程序赋值的输出、不在治理名单里的目标）、`lab/fakemodbus_plus.py`（线圈、完整写入日志）。F-4 的「延迟 / 冻结回读」**没有做**：E1、E2 改用「暂停采样器」控制哪些样本存在 |
 | WP2 | 完成（`bridge/` 纯函数层；`tests/test_pure.py`）。`reconcile` 以引擎内的 `/audit` 对账实现 |
-| WP3 | 完成，**含崩溃对账**：重启时按 journal 的响应记录或 `/audit` 条目收尾，不重发；传输层 `unknown` 周期性对账成 `reconcile_note`。生产构建的钩子剥离与断言**没做** |
-| WP4 | 完成：Tier0 替身、采样器（同形状、不同代码）、验证器 v2（含 `runtime_restarted` 规则）、录制代理 |
+| WP3 | 完成，**含崩溃对账**：重启时按 journal 的响应记录或 `/audit` 条目收尾，不重发；传输层 `unknown` 周期性对账成 `reconcile_note`。生产构建的钩子剥离与断言**没做**。2026-10-29：对账记录改为 `audit_entry` + 只在 `found` 时为 true 的 `landed`（`CONTRACT` v0.9 M10），因为 R3T1/R3T1X 证明 `/audit` 无条目不等于没执行 |
+| WP4 | 完成：Tier0 替身、采样器（同形状、不同代码）、验证器 v2（含 `runtime_restarted` 规则）、录制代理。2026-10-29：录制代理加了 R3 时序用的两个开关（扣住 `/write` 的响应；桥断开后保留 runtime 一侧的连接），并记录上游套接字端口供 `netstat` 读 `Recv-Q`；不启用时行为不变 |
 | WP5 桩 IA2 | 完成：`lab/stubia2.py`（B11） |
-| WP6 对账程序 | **没做**（独立的 journal ↔ `/audit` ↔ 设备日志三方对账；各用例里有针对性的核对，但没有通用程序，所以 2 小时浸泡的「不明写入 = 0」还没法判） |
-| WP7 注册表静态检查 | 部分：`lab/check_registry.py`（程序赋值、未声明、不在治理名单、范围超出）。F4 的用例本身没跑 |
-| WP8 | 24 个 P0 场景 |
-| WP9 浸泡 | **没做** |
+| WP6 对账程序 | **完成（2026-10-29）**：`tools/reconcile_report.py`，journal ↔ 每秒一次的 `/audit` 归档 ↔ 设备写日志（可选生命周期、代理日志），只读文件、不导入桥的代码；分类见 `CONTRACT` §8.3（含 R3T1 的「客户端断开后执行、IA2 漏记」= `executed_unaudited`，以及环回绕、实例重启的「不可核对」）。22 项单元向量，16 个人为改坏的版本全部被抓到；A4 端到端检验。**2026-10-29 审核修复**：替换只认确认应用的写入，断链推断先证明设备日志覆盖，新增 `INCOMPLETE`；48 项向量，`tools/check_reconcile_mutations.py` 的 39 个改坏版本都被断言抓到；WP6C 端到端检验 |
+| WP7 注册表静态检查 | 部分：`lab/check_registry.py`（程序赋值、未声明、不在治理名单、范围超出；2026-10-29 加可选的运行中快照名单，逐字比对名字——F4 发现原来剥掉实例前缀会漏报）。F4 已端到端运行 |
+| WP8 | 28 个 P0 场景（含 R3 时序四个）、`PROD`、两个复核回归（P1F5、P1F6）与 13 个 P1 场景（`lab/cases_p1_table.py`；审核修复后加 WP6C）；假设备日志每条带 `seq` 与 `mono`（2026-10-29）；端口基址可用 `IA2_LAB_PORT_BASE` 整体平移，两套实验可以并行 |
+| WP9 浸泡 | **完成（2026-10-29）**：`lab/soak.py`（混合请求 + 每 2–4 分钟一次故障，含 R1/R2/R3T1 的精确时序点与一次让环回绕的归档暂停），结果与退出条件逐条核对见 `../RESULT-1A.md` |
 
 跑法与结果：`RESULT-SLICE.md`（A1、B1、B3、C1）、`RESULT-P0.md`（全部 24 个 P0）。
 
@@ -231,6 +231,7 @@ WP0 → WP1（只做最小版：F-5 + 同地址回读，不含线圈）→ WP2 �
 | C8 | 同上 + kill / 重启沙箱 | |
 | C10 | WP2（自检） | 不需要 broker |
 | R1 R2 R3 B9 | WP3 的钩子 + WP8 的 kill / SIGSTOP | |
+| R3T1 R3T1K R3T1X R3T2 | 同上 + `POST /inject-scan-stall`（单次 1 s，低于看门狗阈值）+ 录制代理的两个开关 + `netstat` | 2026-10-29 |
 | E1–E7 | WP4 的验证器；E1/E7 的端到端要 WP1 F-4 | 先向量后端到端 |
 | A4 | WP6 | 300 次写 |
 | F1 | **1a 里只能做一半**：桩出的「控制入口」工具清单 + 只读 MCP 的 `delivery-lock.json` 哈希不变。真正的 Agent 面工具集 1a 还不存在 | 见 §8 第 7 条 |
@@ -271,3 +272,6 @@ WP0 → WP1（只做最小版：F-5 + 同地址回读，不含线圈）→ WP2 �
 | v0.4 | 2026-10-28 | P0 完成后：实现状态改写；F-4 未做、WP6 / WP9 未做、桩 IA2 与崩溃对账已做。 |
 | v0.5 | 2026-10-28 | 复核前的畸形输入探针与修复（`safe_handle_line`、纯 ASCII 落盘）；复核任务书 `REVIEW-BRIEF.md`。 |
 | v0.6 | 2026-10-28 | 修复 W1–W19（`RESULT-FIXES.md`）：验证改在扫描时钟里；trace 锚；enable 文件；生产打包；预检；治理检查；行长上限；对账两次；单飞窗口；24 小时索引。实现状态表里「WP3」「WP4」按此理解。 |
+| v0.9 | 2026-10-29 | 审核修复：WP6 的替换只认确认应用的写入、断链推断要先证明设备日志的覆盖，新增结论 `INCOMPLETE`（`CONTRACT` v0.11 §8.3）；`tools/check_reconcile_mutations.py`（39 种改坏的版本）；WP8 的假设备日志每条带 `seq` 与 `mono`，新增 WP6C 与 `lab/check_pulse_hold.py`。 |
+| v0.8 | 2026-10-29 | WP6、WP9 完成；WP7 加快照名单；WP8 加 P1 场景与端口基址。见实现状态表与 `../RESULT-1A.md`。 |
+| v0.7 | 2026-10-29 | R3 时序覆盖：录制代理加扣响应、保留连接两个开关；新增 R3T1、R3T1K、R3T1X、R3T2；对账记录不再写 `landed: false`；WP6 的分类补「客户端断开后执行、IA2 漏记」。 |

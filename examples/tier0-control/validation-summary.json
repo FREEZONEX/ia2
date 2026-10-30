@@ -1,4 +1,1042 @@
 {
+  "maintainer_review_20261030": {
+    "date": "2026-10-30",
+    "runtime_head": "1cc16c0ebf1007c1826d4b63d504c9cd5e77fa79",
+    "stage1a_reviewed_head": "a5e4a851044f9fa6462e6eff71576d9de82a00b2",
+    "runtime_binary_sha256": "9bbe2e56e39b7a42911c35ab72f0462a5449e9b8a6200a8619965469d6bbcc60",
+    "runtime_build_commit": "8141969de976a9139cb9fc557981d47d5eb9b8ff",
+    "bridge_lab_source_sha256": "16bbc7a8f8e1328ed701d30950d007c48cb9bc14e600ab6f1566ea0c74bce28d",
+    "evidence": "evidence/pr100-101-review-20261030",
+    "scope": "macOS 27.0.1, Python 3.14.7, local runtime and loopback fake Modbus only",
+    "repairs": [
+      "Use lsof TCP fields when macOS netstat omits an accepted loopback socket; confirm the process is stopped before forwarding an unaccepted request.",
+      "Close fake-device connections before awaiting server closure so device restart completes on Python 3.12+.",
+      "Describe missing disconnect audit entries as an older-runtime defect, not current behavior."
+    ],
+    "before": {
+      "runtime": "R3T1 executed without audit; disconnected 100 ms pulse stayed TRUE without reset or audit.",
+      "observer": "R3T1 initially failed two timing assertions because netstat omitted the socket; lsof recovered the exact endpoints and queue/state.",
+      "device_restart": "WP6C hung at FakeSlave.stop -> Server.wait_closed while the runtime still polled; interrupted with SIGINT, not counted as pass."
+    },
+    "after": {
+      "real_cases": [
+        "A1",
+        "R3",
+        "R3T1",
+        "R3T1X",
+        "WP6C"
+      ],
+      "pulse_after_disconnect": "100 ms pulse audited once, held 110.525 ms, then reset to zero before shutdown.",
+      "queued_pulse_hold_ms": {
+        "100": 109.985,
+        "800": 809.898
+      },
+      "reconciliation": "Full device log CLEAN; log cut before third write INCOMPLETE, exit 2.",
+      "python": "Existing isolated suites passed; affected reconciliation suite rerun after wording correction.",
+      "rust": "Affected crates format/Clippy, pulse and dropped-caller audit checks, server caller Clippy passed.",
+      "agent_adaptation": "passed"
+    },
+    "limits": [
+      "No new soak, hardware, deployment, Windows or systemd validation.",
+      "Author-side historical soak and oracle raw evidence is not available locally; no claim to have independently rerun it.",
+      "CLEAN still permits documented restart/turnover gaps; D11 signing and real control MCP remain outside these PRs."
+    ]
+  },
+  "pr_submission_20261030": {
+    "recorded_at": "2026-10-30 11:05:29 UTC+8",
+    "status": "submitted_for_review_not_merged",
+    "runtime_pr": "https://github.com/FREEZONEX/ia2/pull/100",
+    "stage1a_pr": "https://github.com/FREEZONEX/ia2/pull/101",
+    "merge_order": [
+      100,
+      101
+    ],
+    "runtime_commit": "1cc16c0ebf1007c1826d4b63d504c9cd5e77fa79",
+    "stage_repair_commit": "7a8f59a1ce20b40206c51659e1cece8f00764bc7",
+    "repair_tree_matches_sealed_candidate": true,
+    "candidate_git_tree": "0bf9275c949d7c66a0809c1f051f79f97971dd19",
+    "merge_simulation_no_conflicts": true,
+    "publication_update": "documentation only",
+    "fresh_python": {
+      "suites": 28,
+      "tests": 335,
+      "passed": true,
+      "reconcile_mutations_detected": 64,
+      "failsafe_controls_detected": 3,
+      "review_cli_correct": 7,
+      "counterexample_enumeration_exit_code": 0
+    },
+    "fresh_runtime_gate": {
+      "all_eight_steps_passed": true,
+      "rust_passed": 8594,
+      "rust_failed": 0,
+      "rust_ignored": 105,
+      "web_passed": 423,
+      "web_files": 39
+    },
+    "stage_gate": "Close-out gate retained: stage source unchanged; see rereview2_20261030.quality_gate",
+    "sealed_hashes_rechecked": {
+      "inputs": 21,
+      "original_r2": 858,
+      "closeout": 1400,
+      "mismatches": 0
+    },
+    "evidence": "tier0-pr-submit-20261030/ (outside repository; earlier sealed evidence retained)",
+    "new_soak": false,
+    "new_loopback_run": false,
+    "hardware_contacted": false,
+    "merged": false
+  },
+  "rereview2_20261030": {
+    "recorded_at": "2026-10-30",
+    "timezone": "UTC+8",
+    "status": "local_repair_candidate_awaiting_independent_review",
+    "review": "tier0-stage1a-independent-review-20261029-r2/REVIEW.md (outside the repository)",
+    "reply": "REREVIEW2-RESPONSE-2026-10-30-tier0-stage-1a.md (outside the repository)",
+    "base_commit": "7d861f401c5dd5f2713485ecf16c03ae57ee45bf",
+    "branch": "fix/tier0-r3-audit-reconcile",
+    "source_state": "uncommitted working-tree candidate; no push or PR",
+    "fixes": {
+      "F1": "Check full combinations of group orders and retain cross-group dependencies; budget overruns remain unchecked.",
+      "F2": "Propagate both unexplained and newly unchecked results through handover checks, including effects on definitely owned writes.",
+      "F3": "Check one chronological handover shared across output variables; no valid split is a discrepancy, partial validity is incomplete."
+    },
+    "contract_version": "0.13",
+    "reconcile_tool_sha256": "8274acdfef3d8f88bb21a7fdd0f81f111e9fcf249c958c6eaa8fe581f25ec150",
+    "source_sha256": {
+      "tools/reconcile_report.py": "8274acdfef3d8f88bb21a7fdd0f81f111e9fcf249c958c6eaa8fe581f25ec150",
+      "tests/test_reconcile_report.py": "7af34eefd90ce279cb554bb4e44800152eaa09376ebe6d75f1db67b1c8f022fe",
+      "tools/check_reconcile_mutations.py": "1aec0884fdc7e561775cd6a71513433d20860c776b9f047625b8991a9081b688"
+    },
+    "takeover_changed_repair_code": false,
+    "evidence": "evidence/rereview2-closeout-20261030",
+    "prior_repair_evidence": "evidence/rereview2-20261029",
+    "python": {
+      "version": "3.9.6",
+      "isolated_flags": [
+        "-I",
+        "-B"
+      ],
+      "additional_dependencies": false
+    },
+    "python_tests": 335,
+    "python_suite_count": 28,
+    "python_suites_passed": true,
+    "reconcile_vectors": 69,
+    "reconcile_mutations": {
+      "variants": 64,
+      "detected_by_assertion": 64
+    },
+    "failsafe_controls": {
+      "variants": 3,
+      "detected_by_assertion": 3
+    },
+    "independent_review_scripts": {
+      "cases": 7,
+      "correct": 7,
+      "reproduce_exit": 0,
+      "counterexample_enumeration_exit": 0,
+      "new_independent_review": false
+    },
+    "previous_review_regression_scripts": [
+      {
+        "script": "previous-regressions/fix01/restart-boundary-vectors.py",
+        "exit_code": 0,
+        "adaptation": "Only TOOL points to frozen current code; all assertions unchanged."
+      },
+      {
+        "script": "previous-regressions/fix01/ring-order-vectors.py",
+        "exit_code": 0,
+        "adaptation": "Only TOOL points to frozen current code; all assertions unchanged."
+      },
+      {
+        "script": "previous-regressions/fix02/complete-log-before-intent.py",
+        "exit_code": 0,
+        "adaptation": "Only TOOL points to frozen current code; all assertions unchanged."
+      }
+    ],
+    "oracle_crosscheck": {
+      "tool_sha256": "8274acdfef3d8f88bb21a7fdd0f81f111e9fcf249c958c6eaa8fe581f25ec150",
+      "cases": {
+        "bounded/clean": 16048,
+        "bounded/unchecked": 18336,
+        "bounded/unexplained": 90788,
+        "random/capped": 459,
+        "random/clean": 2829,
+        "random/unchecked": 2107,
+        "random/unexplained": 14605
+      },
+      "mismatch_count": 0,
+      "mismatches": []
+    },
+    "oracle_provenance_correction": {
+      "previous_saved_tool_sha256": "b391378b6eec07c8ae455e71893f50e948f928dbfc6e002a5dc3008a2342beb3",
+      "previous_saved_result_retained": true,
+      "current_tool_rerun": true,
+      "oracle_functions_equal_to_review": true,
+      "random_cases_past_order_cap": 459,
+      "capped_case_policy": "Require every write unchecked; not an exhaustive oracle comparison.",
+      "reviewed_tool_mismatches_saved": 1722
+    },
+    "vectors_on_reviewed_program": {
+      "tests": 69,
+      "assertion_failures": 4,
+      "errors": 2,
+      "error_reason": "missing BRANCH_CAP / HANDOVER_CAP",
+      "rerun_during_takeover": false
+    },
+    "recompute": {
+      "recompute-soak-main-20261029.json": {
+        "verdict": "CLEAN",
+        "counts": {
+          "consistent": 2166,
+          "device_writes": 1878,
+          "executed_unaudited": 6,
+          "intents": 2179,
+          "no_effect_no_entry": 1,
+          "not_sent": 5,
+          "uncheckable_restart": 1,
+          "unchecked_device_writes": 0,
+          "unexplained_device_writes": 0,
+          "unknown_writes": 0
+        },
+        "semantic_fields_equal_to_saved": true
+      },
+      "recompute-soak-detached-20261029.json": {
+        "verdict": "CLEAN",
+        "counts": {
+          "consistent": 1125,
+          "device_writes": 941,
+          "intents": 1128,
+          "not_sent": 3,
+          "unchecked_device_writes": 0,
+          "unexplained_device_writes": 0,
+          "unknown_writes": 0
+        },
+        "semantic_fields_equal_to_saved": true
+      },
+      "recompute-A4-audit-archive.jsonl.json": {
+        "verdict": "CLEAN",
+        "counts": {
+          "consistent": 300,
+          "device_writes": 304,
+          "intents": 300,
+          "unchecked_device_writes": 0,
+          "unexplained_device_writes": 0,
+          "unknown_writes": 0
+        },
+        "semantic_fields_equal_to_saved": true
+      },
+      "recompute-A4-audit-final-only.jsonl.json": {
+        "verdict": "CLEAN",
+        "counts": {
+          "consistent": 256,
+          "device_writes": 304,
+          "intents": 300,
+          "uncheckable_turnover": 44,
+          "unchecked_device_writes": 0,
+          "unexplained_device_writes": 0,
+          "unknown_writes": 0
+        },
+        "semantic_fields_equal_to_saved": true
+      }
+    },
+    "order_stats": {
+      "recompute-soak-main-20261029.json": {
+        "with_device_bound": {
+          "verdict": "CLEAN",
+          "groups_open_order": 0,
+          "largest": 0,
+          "open_groups_action_ids": [],
+          "max_full_order_combinations_per_sequence": 1,
+          "group_budget_exceeded_calls": 0,
+          "unchecked_device_writes": 0,
+          "uncheckable_order": 0
+        },
+        "without_device_bound": {
+          "verdict": "CLEAN",
+          "groups_open_order": 0,
+          "largest": 0,
+          "open_groups_action_ids": [],
+          "max_full_order_combinations_per_sequence": 1,
+          "group_budget_exceeded_calls": 0,
+          "unchecked_device_writes": 0,
+          "uncheckable_order": 0
+        }
+      },
+      "recompute-soak-detached-20261029.json": {
+        "with_device_bound": {
+          "verdict": "CLEAN",
+          "groups_open_order": 0,
+          "largest": 0,
+          "open_groups_action_ids": [],
+          "max_full_order_combinations_per_sequence": 1,
+          "group_budget_exceeded_calls": 0,
+          "unchecked_device_writes": 0,
+          "uncheckable_order": 0
+        },
+        "without_device_bound": {
+          "verdict": "INCOMPLETE",
+          "groups_open_order": 1,
+          "largest": 2,
+          "open_groups_action_ids": [
+            [
+              "98f26d32ce7e38a503429b0972d34d52",
+              "bf4309d08a303fa361dc74f6fe10d5ea"
+            ]
+          ],
+          "max_full_order_combinations_per_sequence": 2,
+          "group_budget_exceeded_calls": 0,
+          "unchecked_device_writes": 1,
+          "uncheckable_order": 0
+        }
+      },
+      "recompute-A4-audit-archive.jsonl.json": {
+        "with_device_bound": {
+          "verdict": "CLEAN",
+          "groups_open_order": 0,
+          "largest": 0,
+          "open_groups_action_ids": [],
+          "max_full_order_combinations_per_sequence": 1,
+          "group_budget_exceeded_calls": 0,
+          "unchecked_device_writes": 0,
+          "uncheckable_order": 0
+        },
+        "without_device_bound": {
+          "verdict": "CLEAN",
+          "groups_open_order": 0,
+          "largest": 0,
+          "open_groups_action_ids": [],
+          "max_full_order_combinations_per_sequence": 1,
+          "group_budget_exceeded_calls": 0,
+          "unchecked_device_writes": 0,
+          "uncheckable_order": 0
+        }
+      },
+      "recompute-A4-audit-final-only.jsonl.json": {
+        "with_device_bound": {
+          "verdict": "CLEAN",
+          "groups_open_order": 0,
+          "largest": 0,
+          "open_groups_action_ids": [],
+          "max_full_order_combinations_per_sequence": 1,
+          "group_budget_exceeded_calls": 0,
+          "unchecked_device_writes": 0,
+          "uncheckable_order": 0
+        },
+        "without_device_bound": {
+          "verdict": "CLEAN",
+          "groups_open_order": 0,
+          "largest": 0,
+          "open_groups_action_ids": [],
+          "max_full_order_combinations_per_sequence": 1,
+          "group_budget_exceeded_calls": 0,
+          "unchecked_device_writes": 0,
+          "uncheckable_order": 0
+        }
+      }
+    },
+    "loopback": {
+      "WP6C": {
+        "verdict": "PASS",
+        "checks": 8,
+        "failed": 0,
+        "code_tree_matches": true,
+        "runtime_sha256": "c18b0aaab60425ef848e8e278b3ac60c1ec7a50dfb708ed25184a0a987018893",
+        "runtime_binary_matches": true,
+        "manifest": {
+          "manifest": "/Users/au73/Projects/soft-PLC/ia2-ir03-pr-20261028/examples/tier0-control/evidence/rereview2-20261029/loopback/WP6C-r1/MANIFEST.sha256",
+          "entries": 28,
+          "mismatches": []
+        },
+        "rerun_during_takeover": false
+      },
+      "A4": {
+        "verdict": "PASS",
+        "checks": 10,
+        "failed": 0,
+        "code_tree_matches": true,
+        "runtime_sha256": "c18b0aaab60425ef848e8e278b3ac60c1ec7a50dfb708ed25184a0a987018893",
+        "runtime_binary_matches": true,
+        "manifest": {
+          "manifest": "/Users/au73/Projects/soft-PLC/ia2-ir03-pr-20261028/examples/tier0-control/evidence/rereview2-20261029/loopback/A4-r1/MANIFEST.sha256",
+          "entries": 28,
+          "mismatches": []
+        },
+        "rerun_during_takeover": false
+      }
+    },
+    "runtime": {
+      "sha256": "c18b0aaab60425ef848e8e278b3ac60c1ec7a50dfb708ed25184a0a987018893",
+      "commit": "1cc16c0",
+      "changed_this_round": false,
+      "separate_branch": "fix/control-write-detached"
+    },
+    "quality_gate": [
+      {
+        "check": "adaptation",
+        "command": [
+          "./scripts/check-agent-adaptation.sh"
+        ],
+        "exit_code": 0,
+        "seconds": 0.09
+      },
+      {
+        "check": "format",
+        "command": [
+          "cargo",
+          "fmt",
+          "--all"
+        ],
+        "exit_code": 0,
+        "seconds": 0.81
+      },
+      {
+        "check": "clippy",
+        "command": [
+          "cargo",
+          "clippy",
+          "--workspace",
+          "--all-targets",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "exit_code": 0,
+        "seconds": 3.42
+      },
+      {
+        "check": "server-build",
+        "command": [
+          "cargo",
+          "build",
+          "-p",
+          "server"
+        ],
+        "exit_code": 0,
+        "seconds": 0.3
+      },
+      {
+        "check": "rust-tests",
+        "command": [
+          "cargo",
+          "test",
+          "--workspace"
+        ],
+        "exit_code": 0,
+        "seconds": 57.64
+      },
+      {
+        "check": "release",
+        "command": [
+          "cargo",
+          "build",
+          "--release",
+          "-p",
+          "server",
+          "-p",
+          "ia2-cli",
+          "-p",
+          "ia2-runtime",
+          "-p",
+          "lsp-launcher"
+        ],
+        "exit_code": 0,
+        "seconds": 24.75
+      },
+      {
+        "check": "web-build",
+        "command": [
+          "pnpm",
+          "--filter",
+          "@cs/web",
+          "build"
+        ],
+        "exit_code": 0,
+        "seconds": 1.25
+      },
+      {
+        "check": "web-tests",
+        "command": [
+          "pnpm",
+          "--filter",
+          "@cs/web",
+          "test"
+        ],
+        "exit_code": 0,
+        "seconds": 3.56
+      }
+    ],
+    "rust_tests": {
+      "passed": 8589,
+      "failed": 0,
+      "ignored": 105
+    },
+    "web_tests": {
+      "files": 39,
+      "passed": 423
+    },
+    "quality_gate_runtime_preservation": {
+      "before_sha256": "52160ab8ba63cd16852c66b5647f0a16844bdc45f410c48da2c589c2cc2e74de",
+      "gate_build_sha256": "fec37a22eb011b70cb3a35978647e9ca68084a0a97d89ad2f1a0752e8d6f5a09",
+      "after_sha256": "52160ab8ba63cd16852c66b5647f0a16844bdc45f410c48da2c589c2cc2e74de",
+      "restored": true
+    },
+    "closeout_harness_note": "Initial order-stats wrapper passed Path objects to a string-path API and stopped after the first CLI recompute. The wrapper was corrected to pass strings; only recompute/statistics resumed successfully. Initial log retained; product code unchanged.",
+    "new_soak": false,
+    "simulation_repeated": false,
+    "hardware_contacted": false,
+    "limitations": [
+      "This is repair close-out and replay of review scripts, not a new independent-review approval.",
+      "The main-soak CLEAN report retains one uncheckable_restart; A4 final-only CLEAN retains 44 uncheckable_turnover intents.",
+      "Saved loopback acceptance uses the separate runtime-fix branch; the repository gate builds this branch baseline."
+    ],
+    "delivery": {
+      "patch": "evidence/rereview2-closeout-20261030/rereview2.patch",
+      "release": "evidence/rereview2-closeout-20261030/RELEASE.txt",
+      "manifest": "evidence/rereview2-closeout-20261030/MANIFEST.sha256"
+    }
+  },
+  "rereview_20261029": {
+    "recorded_at": "2026-10-29",
+    "review": "tier0-stage1a-rereview-20261029/REVIEW.html (outside the repository); reply REREVIEW-RESPONSE-2026-10-29-tier0-stage-1a.md",
+    "fixes": {
+      "R1": "device-log coverage only over a finite, ordered stretch inside the log; no-link needs a stretch; non-finite record times make a log unusable",
+      "R2": "apply order from evidence (intent, bridge answer and journal order, first poll that saw the entry, first device receipt of a value only that write could have put there), never the ring; uncheckable_order and unchecked_device_writes are evidence gaps; device writes must be explained by every order the evidence allows",
+      "R3": "a delivery counts only while the write's own instance was surely live; without a lifecycle record the handover stretch is uncheckable_order, and a device write in it must be explained by every instance that may have made it",
+      "evidence_description": "the first repair's 21 of 48 was 21 of 43 (an earlier draft); the final 48 vectors fail 27 on the reviewed program, all by assertion"
+    },
+    "reconcile_tool_sha256": "d40c5ea39ebc28a50e432a6b0df652521a53db592c875e5e49da77aa7348f403",
+    "python_tests": 328,
+    "python_suites_passed": true,
+    "reconcile_vectors": 62,
+    "reconcile_mutations": {
+      "variants": 56,
+      "detected_by_assertion": 56
+    },
+    "vectors_on_reviewed_program": "62 tests, 16 fail: 14 assertion failures, 6 errors (missing unchecked_device_writes / check_device_sequence)",
+    "recompute": {
+      "final-20261029/A4-r1@archive": {
+        "changed_rows": 0,
+        "exit_code": 0,
+        "verdict_after": "CLEAN",
+        "verdict_before": "CLEAN"
+      },
+      "final-20261029/A4-r1@final-only": {
+        "changed_rows": 0,
+        "exit_code": 0,
+        "verdict_after": "CLEAN",
+        "verdict_before": "CLEAN"
+      },
+      "soak-detached-20261029": {
+        "changed_rows": 0,
+        "exit_code": 0,
+        "verdict_after": "CLEAN",
+        "verdict_before": "CLEAN"
+      },
+      "soak-main-20261029": {
+        "changed_rows": 4,
+        "exit_code": 0,
+        "verdict_after": "CLEAN",
+        "verdict_before": "CLEAN"
+      }
+    },
+    "loopback": {
+      "WP6C": {
+        "verdict": "PASS",
+        "checks": 8,
+        "failed": 0
+      },
+      "A4": {
+        "verdict": "PASS",
+        "checks": 10,
+        "failed": 0
+      }
+    },
+    "runtime": {
+      "binary": "ia2-runtime-detached-r2",
+      "sha256": "c18b0aaab60425ef848e8e278b3ac60c1ec7a50dfb708ed25184a0a987018893",
+      "commit": "1cc16c0",
+      "changed_this_round": false
+    }
+  },
+  "repair_20261029": {
+    "recorded_at": "2026-10-29",
+    "advice": "REPAIR-ADVICE-2026-10-29-tier0-stage-1a.md (outside the repository); reply REPAIR-RESPONSE-2026-10-29-tier0-stage-1a.md",
+    "fixes": {
+      "FIX01": "a value the device never got is explained only by a later write /audit shows applied, same instance, later in the ring, another value (superseded by the re-review: the ring order is not the apply order, see rereview_20261029.R2)",
+      "FIX02": "no-link inference needs device-log coverage and proof of recording (explicit mode interval or unbroken seq); verdict INCOMPLETE, exit 2",
+      "FIX03": "runtime branch commit 1cc16c0: pulse deadline taken once the write has landed",
+      "DOC01": "soak request counts named by what they count"
+    },
+    "reconcile_tool_sha256": "bc4c97b8608b696dfacdbce80b16c4312e1ef373a5ad082aa0708367a40d3aac",
+    "python_tests": 314,
+    "reconcile_mutations": {
+      "variants": 39,
+      "detected_by_assertion": 39
+    },
+    "vectors_failing_on_reviewed_program": "corrected 2026-10-29 after the re-review: the kept log is of an earlier draft, 21 of 43; the final 48 vectors fail 27, all by assertion (evidence/rereview-20261029/final-48-vectors-on-43671d7.log)",
+    "recompute": {
+      "final-20261029/A4-r1@archive": {
+        "changed_rows": 0,
+        "exit_code": 0,
+        "verdict_after": "CLEAN",
+        "verdict_before": "CLEAN"
+      },
+      "final-20261029/A4-r1@final-only": {
+        "changed_rows": 0,
+        "exit_code": 0,
+        "verdict_after": "CLEAN",
+        "verdict_before": "CLEAN"
+      },
+      "soak-detached-20261029": {
+        "changed_rows": 0,
+        "exit_code": 0,
+        "verdict_after": "CLEAN",
+        "verdict_before": "CLEAN"
+      },
+      "soak-main-20261029": {
+        "changed_rows": 7,
+        "exit_code": 0,
+        "verdict_after": "CLEAN",
+        "verdict_before": "CLEAN"
+      }
+    },
+    "runtime": {
+      "binary": "ia2-runtime-detached-r2",
+      "sha256": "c18b0aaab60425ef848e8e278b3ac60c1ec7a50dfb708ed25184a0a987018893",
+      "commit": "1cc16c0"
+    },
+    "pulse_hold": {
+      "verdict": "PASS",
+      "band_ms": {
+        "early": 10,
+        "late": 50
+      },
+      "held_ms": [
+        [
+          "under_test",
+          800,
+          801.159
+        ],
+        [
+          "under_test",
+          800,
+          809.189
+        ],
+        [
+          "under_test",
+          800,
+          809.948
+        ],
+        [
+          "under_test",
+          100,
+          110.062
+        ],
+        [
+          "under_test",
+          100,
+          109.299
+        ],
+        [
+          "under_test",
+          100,
+          108.971
+        ],
+        [
+          "main",
+          800,
+          809.521
+        ],
+        [
+          "main",
+          100,
+          110.356
+        ],
+        [
+          "first_fix",
+          800,
+          530.411
+        ],
+        [
+          "first_fix",
+          100,
+          9.518
+        ]
+      ]
+    },
+    "final_suite": {
+      "checks": 732,
+      "code_trees": [
+        "17a3e07624182b6c9324277fdb1758e9e69890e08e53e0691e1cc4fab0ba6a4a"
+      ],
+      "errors": [],
+      "failed_checks": 0,
+      "not_pass": [],
+      "pythons": [
+        "3.9.6"
+      ],
+      "r3_observed": {
+        "R3": [
+          {
+            "audit_entry": false,
+            "executed": false
+          },
+          {
+            "audit_entry": false,
+            "executed": false
+          },
+          {
+            "audit_entry": false,
+            "executed": false
+          }
+        ],
+        "R3T1": [
+          {
+            "audit_entry": true,
+            "executed": true
+          },
+          {
+            "audit_entry": true,
+            "executed": true
+          },
+          {
+            "audit_entry": true,
+            "executed": true
+          }
+        ],
+        "R3T1K": [
+          {
+            "audit_entry": true,
+            "executed": true
+          },
+          {
+            "audit_entry": true,
+            "executed": true
+          },
+          {
+            "audit_entry": true,
+            "executed": true
+          }
+        ],
+        "R3T1X": [
+          {
+            "audit_entry": true,
+            "executed": true
+          },
+          {
+            "audit_entry": true,
+            "executed": true
+          },
+          {
+            "audit_entry": true,
+            "executed": true
+          }
+        ],
+        "R3T2": [
+          {
+            "audit_entry": true,
+            "executed": true
+          },
+          {
+            "audit_entry": true,
+            "executed": true
+          },
+          {
+            "audit_entry": true,
+            "executed": true
+          }
+        ]
+      },
+      "runs": 55,
+      "runtime_bins": [
+        "c18b0aaab60425ef848e8e278b3ac60c1ec7a50dfb708ed25184a0a987018893"
+      ],
+      "verdicts": {
+        "PASS": 55
+      }
+    }
+  },
+  "stage_1a_closeout_20261029": {
+    "recorded_at": "2026-10-29T15:55:00+08:00",
+    "base": {
+      "merged_pr99": "a2dec2a",
+      "runtime_rust_sources_equal": "e6a38aa355cde1747114866b52c2e26f0e3ca724"
+    },
+    "python_tests": {
+      "suites": 28,
+      "tests": 288,
+      "failed_suites": []
+    },
+    "reconcile_mutations": "16/16 caught",
+    "final_suite": {
+      "verdicts": 54,
+      "by_verdict": {
+        "PASS": 54
+      },
+      "assertions": 727,
+      "failed_assertions": 0,
+      "errors": 0,
+      "code_tree_sha256": [
+        "255e1166af05f67fb3e3317409361fa974b8f1feff093740cf4d7158c76cbea2"
+      ],
+      "runtime_sha256": [
+        "52160ab8ba63cd16852c66b5647f0a16844bdc45f410c48da2c589c2cc2e74de"
+      ],
+      "python": [
+        "3.9.6"
+      ],
+      "evidence": "evidence/final-20261029"
+    },
+    "python314_r3_r1_r2": {
+      "verdicts": 7,
+      "by_verdict": {
+        "PASS": 7
+      },
+      "assertions": 122,
+      "failed_assertions": 0,
+      "errors": 0,
+      "code_tree_sha256": [
+        "7a88bcecc468459cd0a735b86c9147138db146e3c79cde251bd8b2a0609ee912"
+      ],
+      "runtime_sha256": [
+        "52160ab8ba63cd16852c66b5647f0a16844bdc45f410c48da2c589c2cc2e74de"
+      ],
+      "python": [
+        "3.14.8"
+      ],
+      "evidence": "evidence/postmerge-py314-20261029"
+    },
+    "bool_checks": {
+      "passed": 21,
+      "evidence": "evidence/bool-device-7"
+    },
+    "nullable_failsafe_controls_detected": 3,
+    "soak_main": {
+      "verdict": "FAIL",
+      "checks": {
+        "every authentic request got an answer": true,
+        "no bridge or runtime exited unless a fault made it": true,
+        "reconciliation is CLEAN (no unknown write, no unexplained difference)": false,
+        "the bridge never wrote `verified`": true,
+        "the journal hash chain verifies": true,
+        "the soak ran its full length": true
+      },
+      "minutes_run": 121.1,
+      "seed": 20261029,
+      "requests": {
+        "bad_type": 87,
+        "burst": 352,
+        "denied": 231,
+        "duplicate": 487,
+        "expired": 144,
+        "forged": 203,
+        "malformed": 159,
+        "out_of_range": 247,
+        "simulation": 99,
+        "unknown_key": 144,
+        "valid": 2343
+      },
+      "authentic_submitted": 3999,
+      "fault_counts": {
+        "bridge_kill": 0,
+        "device1_silent": 6,
+        "device2_outage": 10,
+        "latch": 2,
+        "r1_kill_after_intent": 5,
+        "r2_kill_after_response": 1,
+        "r3t1_stop_while_queued": 7,
+        "runtime_restart": 4,
+        "runtime_stop": 5
+      },
+      "unexpected_exits": 0,
+      "trace_statuses": {
+        "accepted/None": 1934,
+        "rejected/bad_request": 87,
+        "rejected/busy": 1024,
+        "rejected/device_unhealthy": 8,
+        "rejected/expired": 147,
+        "rejected/fieldbus_unhealthy": 42,
+        "rejected/governance_denied": 220,
+        "rejected/latched": 10,
+        "rejected/not_in_registry": 144,
+        "rejected/out_of_range": 247,
+        "rejected/runtime_unreachable": 12,
+        "rejected/simulation_mismatch": 99,
+        "undelivered/link_down": 13,
+        "unknown/bridge_restarted": 5,
+        "unknown/runtime_unreachable": 7
+      },
+      "journal_records": 10918,
+      "runtime_instances": 7,
+      "bridge_starts": 7,
+      "reconcile_in_run": {
+        "counts": {
+          "consistent": 2165,
+          "device_writes": 1878,
+          "executed_unaudited": 6,
+          "intents": 2179,
+          "no_effect_no_entry": 1,
+          "not_sent": 5,
+          "uncheckable_restart": 1,
+          "unexplained": 1,
+          "unexplained_device_writes": 0,
+          "unknown_writes": 0
+        },
+        "instances": 7,
+        "turnover_gaps": [],
+        "verdict": "DISCREPANCY"
+      },
+      "runtime_sha256": "52160ab8ba63cd16852c66b5647f0a16844bdc45f410c48da2c589c2cc2e74de",
+      "frozen_code_tree_sha256": "47499ab96b1c20e8b98790a13d841b11a59698d89d278a1a8c5e75dd3d1eb8f1",
+      "python": "3.9.6",
+      "reconcile_final_program": {
+        "verdict": "CLEAN",
+        "counts": {
+          "consistent": 2166,
+          "device_writes": 1878,
+          "executed_unaudited": 6,
+          "intents": 2179,
+          "no_effect_no_entry": 1,
+          "not_sent": 5,
+          "uncheckable_restart": 1,
+          "unexplained_device_writes": 0,
+          "unknown_writes": 0
+        },
+        "turnover_gaps": [],
+        "instances": 7,
+        "polls_used": 6500,
+        "polls_ignored": 11
+      },
+      "evidence": "evidence/soak-main-20261029",
+      "post_run_criterion_change": "The in-run verdict is FAIL because the reconciliation frozen with the soak reported one device-side discrepancy (journal and /audit agreed): a d2_sp write IA2 answered 200/ok 0.18 s after device 2 had closed its link was replaced by a newer write before the link returned, and the device answered no request in between. The final program accepts exactly that (no answered request from the write until the value is replaced or the log ends); with it the same data reconciles CLEAN and that write is the only one the rule applies to in either soak. See RESULT-1A.md section 3.",
+      "turnover_note": "The 12-minute archive pause covered about 216 entries, fewer than 256, so the soak did not turn the ring over; A4 covers turnover.",
+      "request_counts": {
+        "request_loop_iterations": 4496,
+        "request_file_lines": 4848,
+        "authenticated_lines_including_duplicates": 4486,
+        "duplicate_submissions": 487,
+        "new_authenticated_actions": 3999,
+        "answer_check_denominator": "new authenticated actions (soak.py `submitted`); duplicate submissions are not counted"
+      }
+    },
+    "soak_fixed_runtime": {
+      "verdict": "PASS",
+      "checks": {
+        "every authentic request got an answer": true,
+        "no bridge or runtime exited unless a fault made it": true,
+        "reconciliation is CLEAN (no unknown write, no unexplained difference)": true,
+        "the bridge never wrote `verified`": true,
+        "the journal hash chain verifies": true,
+        "the soak ran its full length": true
+      },
+      "minutes_run": 60.4,
+      "seed": 20261030,
+      "requests": {
+        "bad_type": 49,
+        "burst": 188,
+        "denied": 115,
+        "duplicate": 250,
+        "expired": 68,
+        "forged": 91,
+        "malformed": 60,
+        "out_of_range": 127,
+        "simulation": 39,
+        "unknown_key": 64,
+        "valid": 1201
+      },
+      "authentic_submitted": 2039,
+      "fault_counts": {
+        "bridge_kill": 2,
+        "device1_silent": 1,
+        "device2_outage": 6,
+        "latch": 0,
+        "r1_kill_after_intent": 3,
+        "r2_kill_after_response": 1,
+        "r3t1_stop_while_queued": 2,
+        "runtime_restart": 1,
+        "runtime_stop": 1
+      },
+      "unexpected_exits": 0,
+      "trace_statuses": {
+        "accepted/None": 994,
+        "rejected/bad_request": 49,
+        "rejected/busy": 528,
+        "rejected/device_unhealthy": 2,
+        "rejected/expired": 70,
+        "rejected/fieldbus_unhealthy": 29,
+        "rejected/governance_denied": 114,
+        "rejected/not_in_registry": 64,
+        "rejected/out_of_range": 127,
+        "rejected/runtime_unreachable": 3,
+        "rejected/simulation_mismatch": 39,
+        "undelivered/link_down": 15,
+        "unknown/bridge_restarted": 3,
+        "unknown/runtime_unreachable": 2
+      },
+      "journal_records": 5584,
+      "runtime_instances": 2,
+      "bridge_starts": 7,
+      "reconcile_in_run": {
+        "counts": {
+          "consistent": 1125,
+          "device_writes": 941,
+          "intents": 1128,
+          "not_sent": 3,
+          "unexplained_device_writes": 0,
+          "unknown_writes": 0
+        },
+        "instances": 2,
+        "turnover_gaps": [],
+        "verdict": "CLEAN"
+      },
+      "runtime_sha256": "b7e455d4cea078a567c53df47ca7ea470d49dbabe58c0788d63e8bfaebdb7c40",
+      "frozen_code_tree_sha256": "2657afb10e447878e569b1abccaa5c92edd3d829a4bc55c300db0b4f6d72a29e",
+      "python": "3.9.6",
+      "reconcile_final_program": {
+        "verdict": "CLEAN",
+        "counts": {
+          "consistent": 1125,
+          "device_writes": 941,
+          "intents": 1128,
+          "not_sent": 3,
+          "unexplained_device_writes": 0,
+          "unknown_writes": 0
+        },
+        "turnover_gaps": [],
+        "instances": 2,
+        "polls_used": 2892,
+        "polls_ignored": 2
+      },
+      "evidence": "evidence/soak-detached-20261029",
+      "request_counts": {
+        "request_loop_iterations": 2252,
+        "request_file_lines": 2440,
+        "authenticated_lines_including_duplicates": 2289,
+        "duplicate_submissions": 250,
+        "new_authenticated_actions": 2039,
+        "answer_check_denominator": "new authenticated actions (soak.py `submitted`); duplicate submissions are not counted"
+      }
+    },
+    "stage_1a_exit_criteria": "see RESULT-1A.md",
+    "hardware_contacted": false,
+    "bridge_rss_mb": {
+      "soak_main": {
+        "start": 22.6,
+        "max": 90.9
+      },
+      "soak_fixed_runtime": {
+        "start": 22.4,
+        "max": 58.9
+      }
+    },
+    "a4_rechecked_with_final_program": "unchanged counts (300 consistent; 256 consistent + 44 uncheckable_turnover), with a stop marker for the two shutdown zero writes",
+    "branches": {
+      "this": "fix/tier0-r3-audit-reconcile (local, not pushed)",
+      "runtime_fix": "fix/control-write-detached 48dec8a (local, not pushed)"
+    }
+  },
   "review_20261029": {
     "reviewed_head": "2d68f5b6976d35448084a6c922dcd51a83e4ca3c",
     "repair": "Manage the SIGSTOP-tested runtime with Popen and wait for exit off the event loop; keep R3 audit absence inconclusive.",
@@ -12,443 +1050,1261 @@
     "stage_1a_accepted": false,
     "hardware_contacted": false
   },
-  "recorded_date": "2026-10-28 UTC+8",
-  "base_commit": "e6a38aa355cde1747114866b52c2e26f0e3ca724",
-  "python_tests": {
-    "suites": [
+  "r3_round_20261029": {
+    "recorded_date": "2026-10-29 UTC+8",
+    "base_commit": "e6a38aa355cde1747114866b52c2e26f0e3ca724",
+    "initial_regression_reproduction": {
+      "tests": 7,
+      "assertion_failures": 44,
+      "errors": 0
+    },
+    "compiled_sources_unchanged_since_import_quality_gate": true,
+    "prior_import_validation": {
+      "historical_runtime_integration": {
+        "cases": 27,
+        "verdicts": {
+          "PASS": 26,
+          "FINDING": 1
+        },
+        "assertions": 395,
+        "failed_assertions": 0,
+        "runtime_sha256": [
+          "cf64e6a28d375496fb39664588cde25287d40c70e9bf3f23f0e857acfb7f4b27"
+        ],
+        "code_tree_sha256": [
+          "e1eaee825d2c50ad8a5206f647cc17ac1629ecdc1aeb9694caad80386dbd2572"
+        ]
+      },
+      "current_main_runtime_smoke": {
+        "cases": 7,
+        "failed": 7,
+        "reason": "startup refused: missing or invalid runtime evidence: status.failsafe_status",
+        "runtime_sha256": [
+          "8247e4525d89a273d0cff2d7fe525c7fe91c321d3c708b75afbcb11318c76483"
+        ]
+      },
+      "final_harness_exit_checks": [
+        {
+          "runtime": "current-main",
+          "exit_code": 1,
+          "expected": 1,
+          "verdict": "FAIL",
+          "assertions": 1,
+          "code_tree_sha256": "5974a70ab6a360686d0fea65aa681cfc4124a462074a7c2c8f8ed2a39dfa6bea"
+        },
+        {
+          "runtime": "pinned-baseline",
+          "exit_code": 0,
+          "expected": 0,
+          "verdict": "PASS",
+          "assertions": 24,
+          "code_tree_sha256": "5974a70ab6a360686d0fea65aa681cfc4124a462074a7c2c8f8ed2a39dfa6bea"
+        }
+      ]
+    },
+    "test_ports_released": true,
+    "real_devices": false,
+    "merged": false,
+    "prior_nullable_failsafe_validation": {
+      "python_tests": 247,
+      "integration": {
+        "runtime_commit": "e6a38aa355cde1747114866b52c2e26f0e3ca724",
+        "cases": 27,
+        "verdicts": {
+          "PASS": 26,
+          "FINDING": 1
+        },
+        "assertions": 395,
+        "failed_assertions": 0,
+        "runtime_sha256": [
+          "8247e4525d89a273d0cff2d7fe525c7fe91c321d3c708b75afbcb11318c76483"
+        ],
+        "code_tree_sha256": "d1b56f18dc1198bd59ce953ccf8a6828b9fdae8749b5bbdff5d2ff88c4e80d93",
+        "source_hash_matches_all_cases": true,
+        "setup_errors": 0
+      },
+      "bridge_sha256": {
+        "bridge/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "bridge/auth.py": "5d2e6e0b09e9c3191971716de27222ac2988331f6fbea3908a19f54852d62817",
+        "bridge/build_flavor.py": "8cbb1e8d6f266b36b22409f974fcfd5b2eb72f4b179ae83be6af8efadf04751a",
+        "bridge/classify.py": "24f109c26a4ef90fb1da699387f25a5c1fb59a71526ed4f8758be5ef85736640",
+        "bridge/durable.py": "55633d7931b3499ea67717ff22986a23f195db04f305f1e7a726a78f389fc45d",
+        "bridge/engine.py": "77699253ce4fba571424d410c0bf8174939975dbf177f3d6383290a7bc4fa5d6",
+        "bridge/errors.py": "3b963e9113aeb31fe1c4103f20a5f4e2e36b18db5a85ce96de8c8bc0fbb9a6c7",
+        "bridge/facts.py": "88d65b40fb2b1d55352cd6cde5fd18bd029e897f78308010828dce48253159de",
+        "bridge/gates.py": "b6fcc9ec4f5ecf93f4947f4815370b859905774cf99b02e03ef7042068f401c4",
+        "bridge/governance_check.py": "eb2338d6854ccad02bfea9ef95982ddb9a35a430da358a6d133f28ca54dccbb0",
+        "bridge/ia2client.py": "11b9d1ae61eac2bc3bec13a9c64b2b8b728a6bb384da8d6def9616560c49892a",
+        "bridge/journal.py": "12824b60783751ef78c37315320fc0e8a64d9a92e4fb8ca6a0a151b0088e459c",
+        "bridge/main.py": "7eecc0951c1a29aea8a77846ee7b2c231cdb62f273f084859922c64ee4b061e7",
+        "bridge/northbound_guard.py": "faf8fc02ed1c6f49d556de62c2dcf95f2eafbb9207a433fe0b21d910d4ae45b7",
+        "bridge/preflight.py": "3bd00056c5eaba6e0ff8fbdf716ff9df8ec82ce0af2247d83b803da1dd1ef33b",
+        "bridge/registry.py": "5f1a910073b598fd5e3ed53b5bddba5a93d3d1488dcfab8a909b66c87991d6b4",
+        "bridge/runtime_schema.py": "555fd35007000f0b87557b19f6847653508638753cd733eefbb8fa9689cf163a",
+        "bridge/strictjson.py": "6077ea038b33e6178ad40ba8cff8346f20cff3d9cf6a3e54ca61f698bbdfc178",
+        "bridge/tail.py": "367e14c566428cffb6745be83b4cfeffec01b92c7d03c89d17906e683832791d",
+        "bridge/testhooks_loader.py": "0a5a584a2f3f6d26a402f1819c1429a1f313b224bf2a209622eab86d13990e6f",
+        "bridge/trace.py": "0463c78721cce84f65d89906e50c18f5bd45563956e8e6f735919673bf866489",
+        "bridge/values.py": "5476728c5a2ed0599f39fac45262c822f3071aa0c51b986a3b77e7c6c8714d0f",
+        "bridge/vocab.py": "eef6450a9158903641864318ba137d72835aa3e5479d9af6392b59e6c1b99386",
+        "bridge_run.py": "7a4f6aaef61d71738be920bf7343de261daac23dbe7353a37c028246f57ee350",
+        "contract_vocab.json": "ba643211081f380440a6d905df4ea1d58508f96b7c30067e3662a73dc9833932"
+      }
+    },
+    "d6_toml": {
+      "regression_tests": 6,
+      "before": {
+        "tests": 3,
+        "failures": 18,
+        "errors": 0,
+        "old_guard_rejected_by_regressions": true
+      },
+      "python_versions": [
+        "3.9.6",
+        "3.14.8"
+      ],
+      "python314_passed": true,
+      "runtime_checks": [
+        {
+          "case": "escaped",
+          "flavor": "lab",
+          "bridge_exit": 3,
+          "ready": false,
+          "runtime_build_commit": "047e7c17ffda"
+        },
+        {
+          "case": "escaped",
+          "flavor": "prod",
+          "bridge_exit": 3,
+          "ready": false,
+          "runtime_build_commit": "047e7c17ffda"
+        },
+        {
+          "case": "inline",
+          "flavor": "lab",
+          "bridge_exit": 3,
+          "ready": false,
+          "runtime_build_commit": "047e7c17ffda"
+        },
+        {
+          "case": "inline",
+          "flavor": "prod",
+          "bridge_exit": 3,
+          "ready": false,
+          "runtime_build_commit": "047e7c17ffda"
+        },
+        {
+          "case": "safe",
+          "flavor": "lab",
+          "bridge_exit": null,
+          "ready": true,
+          "runtime_build_commit": "047e7c17ffda"
+        },
+        {
+          "case": "safe",
+          "flavor": "prod",
+          "bridge_exit": null,
+          "ready": true,
+          "runtime_build_commit": "047e7c17ffda"
+        }
+      ],
+      "runtime_checks_passed": true,
+      "parser_provenance": {
+        "package": "tomli",
+        "version": "2.2.1",
+        "source_url": "https://files.pythonhosted.org/packages/18/87/302344fed471e44a87289cf4967697d07e532f2421fdaf868a303cbae4ff/tomli-2.2.1.tar.gz",
+        "source_sha256": "cd45e1dc79c835ce60f7404ec8119f2eb06d38b1deba146f07ced3bbc44505ff",
+        "requires_python": ">=3.8",
+        "files_sha256": {
+          "__init__.py": "3e1370fdec8b81d9fb31c27a9eb00df32226ddd5c2ef9bebd6c546555c034a90",
+          "_parser.py": "f70f0b1b48c1edfc26659581d2f5576de7a30c7725e00348271076b1c1270e50",
+          "_re.py": "b21e2c0434603bde0a259c0d22b81d73257fa906acb79d18bf3380506a510ca0",
+          "_types.py": "f864c6d9552a929c7032ace654ee05ef26ca75d21b027b801d77e65907138b74",
+          "py.typed": "f0f8f2675695a10a5156fb7bd66bafbaae6a13e8d315990af862c792175e6e67",
+          "LICENSE": "b80816b0d530b8accb4c2211783790984a6e3b61922c2b5ee92f3372ab2742fe"
+        },
+        "changes": "None; package source and MIT license copied verbatim."
+      },
+      "prior_review_bypass_cases": 2,
+      "blocker_closed": true
+    },
+    "prior_d6_validation": {
+      "recorded_at": "2026-10-28 22:48:58 UTC+8",
+      "python_tests": {
+        "suites": [
+          {
+            "suite": "test_ar01_headers",
+            "exit_code": 0,
+            "tests": 8
+          },
+          {
+            "suite": "test_client",
+            "exit_code": 0,
+            "tests": 6
+          },
+          {
+            "suite": "test_d6_toml",
+            "exit_code": 0,
+            "tests": 6
+          },
+          {
+            "suite": "test_failsafe_compat",
+            "exit_code": 0,
+            "tests": 7
+          },
+          {
+            "suite": "test_fixes",
+            "exit_code": 0,
+            "tests": 24
+          },
+          {
+            "suite": "test_ir01_framing",
+            "exit_code": 0,
+            "tests": 4
+          },
+          {
+            "suite": "test_ir02_durable",
+            "exit_code": 0,
+            "tests": 4
+          },
+          {
+            "suite": "test_ir03_publication",
+            "exit_code": 0,
+            "tests": 14
+          },
+          {
+            "suite": "test_ir_process",
+            "exit_code": 0,
+            "tests": 7
+          },
+          {
+            "suite": "test_p0_f01",
+            "exit_code": 0,
+            "tests": 2
+          },
+          {
+            "suite": "test_p0_f02",
+            "exit_code": 0,
+            "tests": 4
+          },
+          {
+            "suite": "test_p0_f03",
+            "exit_code": 0,
+            "tests": 5
+          },
+          {
+            "suite": "test_p0_f04",
+            "exit_code": 0,
+            "tests": 7
+          },
+          {
+            "suite": "test_p0_process",
+            "exit_code": 0,
+            "tests": 4
+          },
+          {
+            "suite": "test_p1_client",
+            "exit_code": 0,
+            "tests": 10
+          },
+          {
+            "suite": "test_p1_client_clock",
+            "exit_code": 0,
+            "tests": 14
+          },
+          {
+            "suite": "test_p1_d01_trust_matrix",
+            "exit_code": 0,
+            "tests": 7
+          },
+          {
+            "suite": "test_p1_engine_http",
+            "exit_code": 0,
+            "tests": 3
+          },
+          {
+            "suite": "test_p1_f07",
+            "exit_code": 0,
+            "tests": 12
+          },
+          {
+            "suite": "test_p1_f07_process",
+            "exit_code": 0,
+            "tests": 3
+          },
+          {
+            "suite": "test_p1_numeric",
+            "exit_code": 0,
+            "tests": 16
+          },
+          {
+            "suite": "test_p1_recovery",
+            "exit_code": 0,
+            "tests": 22
+          },
+          {
+            "suite": "test_pure",
+            "exit_code": 0,
+            "tests": 39
+          },
+          {
+            "suite": "test_robustness",
+            "exit_code": 0,
+            "tests": 6
+          },
+          {
+            "suite": "test_verifier",
+            "exit_code": 0,
+            "tests": 19
+          }
+        ],
+        "tests": 253,
+        "passed": true
+      },
+      "runtime_integration": {
+        "runtime_commit": "047e7c17ffda1c52ac3d0f68726d9a15889a3cba",
+        "runtime_source_base_commit": "e6a38aa355cde1747114866b52c2e26f0e3ca724",
+        "runtime_sources_identical_to_base": true,
+        "cases": 27,
+        "verdicts": {
+          "PASS": 26,
+          "FINDING": 1
+        },
+        "assertions": 395,
+        "failed_assertions": 0,
+        "runtime_sha256": "52160ab8ba63cd16852c66b5647f0a16844bdc45f410c48da2c589c2cc2e74de",
+        "code_tree_sha256": "4b79f02cbca51474192941cf17496ca49f2a121451a66158e7ceea2225cb0e2b",
+        "source_hash_matches_all_cases": true,
+        "includes_bundled_parser": true,
+        "setup_errors": 0
+      },
+      "quality_gate": [
+        {
+          "check": "adaptation",
+          "exit_code": 0,
+          "seconds": 0.09
+        },
+        {
+          "check": "format",
+          "exit_code": 0,
+          "seconds": 0.69
+        },
+        {
+          "check": "clippy",
+          "exit_code": 0,
+          "seconds": 0.38
+        },
+        {
+          "check": "server-build",
+          "exit_code": 0,
+          "seconds": 0.2
+        },
+        {
+          "check": "rust-tests",
+          "exit_code": 0,
+          "seconds": 49.91
+        },
+        {
+          "check": "release",
+          "exit_code": 0,
+          "seconds": 0.21
+        },
+        {
+          "check": "web-build",
+          "exit_code": 0,
+          "seconds": 0.93
+        },
+        {
+          "check": "web-tests",
+          "exit_code": 0,
+          "seconds": 3.17
+        }
+      ],
+      "rust_tests": {
+        "passed": 8589,
+        "failed": 0,
+        "ignored": 105
+      },
+      "web_tests": {
+        "files": 39,
+        "passed": 423
+      },
+      "bridge_sha256": {
+        "bridge/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "bridge/_vendor/__init__.py": "3f9d244c34d97c50af9cab9340fcada57708978ddaaed10ecca93bdb06d8a0b8",
+        "bridge/_vendor/tomli/__init__.py": "3e1370fdec8b81d9fb31c27a9eb00df32226ddd5c2ef9bebd6c546555c034a90",
+        "bridge/_vendor/tomli/_parser.py": "f70f0b1b48c1edfc26659581d2f5576de7a30c7725e00348271076b1c1270e50",
+        "bridge/_vendor/tomli/_re.py": "b21e2c0434603bde0a259c0d22b81d73257fa906acb79d18bf3380506a510ca0",
+        "bridge/_vendor/tomli/_types.py": "f864c6d9552a929c7032ace654ee05ef26ca75d21b027b801d77e65907138b74",
+        "bridge/auth.py": "5d2e6e0b09e9c3191971716de27222ac2988331f6fbea3908a19f54852d62817",
+        "bridge/build_flavor.py": "8cbb1e8d6f266b36b22409f974fcfd5b2eb72f4b179ae83be6af8efadf04751a",
+        "bridge/classify.py": "24f109c26a4ef90fb1da699387f25a5c1fb59a71526ed4f8758be5ef85736640",
+        "bridge/durable.py": "55633d7931b3499ea67717ff22986a23f195db04f305f1e7a726a78f389fc45d",
+        "bridge/engine.py": "dff16c72bd619f342d8c9722e8b374a95fed8ea4ab3e0a2da3582c09e3231e69",
+        "bridge/errors.py": "3b963e9113aeb31fe1c4103f20a5f4e2e36b18db5a85ce96de8c8bc0fbb9a6c7",
+        "bridge/facts.py": "88d65b40fb2b1d55352cd6cde5fd18bd029e897f78308010828dce48253159de",
+        "bridge/gates.py": "b6fcc9ec4f5ecf93f4947f4815370b859905774cf99b02e03ef7042068f401c4",
+        "bridge/governance_check.py": "eb2338d6854ccad02bfea9ef95982ddb9a35a430da358a6d133f28ca54dccbb0",
+        "bridge/ia2client.py": "11b9d1ae61eac2bc3bec13a9c64b2b8b728a6bb384da8d6def9616560c49892a",
+        "bridge/journal.py": "12824b60783751ef78c37315320fc0e8a64d9a92e4fb8ca6a0a151b0088e459c",
+        "bridge/main.py": "7eecc0951c1a29aea8a77846ee7b2c231cdb62f273f084859922c64ee4b061e7",
+        "bridge/northbound_guard.py": "8552d7e686086c1ae8870d8134e24650eb625a1afebdbc3ae6dd3fcdc3a9ffe7",
+        "bridge/preflight.py": "3bd00056c5eaba6e0ff8fbdf716ff9df8ec82ce0af2247d83b803da1dd1ef33b",
+        "bridge/registry.py": "5f1a910073b598fd5e3ed53b5bddba5a93d3d1488dcfab8a909b66c87991d6b4",
+        "bridge/runtime_schema.py": "555fd35007000f0b87557b19f6847653508638753cd733eefbb8fa9689cf163a",
+        "bridge/strictjson.py": "6077ea038b33e6178ad40ba8cff8346f20cff3d9cf6a3e54ca61f698bbdfc178",
+        "bridge/tail.py": "367e14c566428cffb6745be83b4cfeffec01b92c7d03c89d17906e683832791d",
+        "bridge/testhooks_loader.py": "0a5a584a2f3f6d26a402f1819c1429a1f313b224bf2a209622eab86d13990e6f",
+        "bridge/trace.py": "0463c78721cce84f65d89906e50c18f5bd45563956e8e6f735919673bf866489",
+        "bridge/values.py": "5476728c5a2ed0599f39fac45262c822f3071aa0c51b986a3b77e7c6c8714d0f",
+        "bridge/vocab.py": "eef6450a9158903641864318ba137d72835aa3e5479d9af6392b59e6c1b99386",
+        "bridge_run.py": "7a4f6aaef61d71738be920bf7343de261daac23dbe7353a37c028246f57ee350",
+        "contract_vocab.json": "ba643211081f380440a6d905df4ea1d58508f96b7c30067e3662a73dc9833932"
+      },
+      "bool_checks": {
+        "cases": 21,
+        "passed": true
+      },
+      "crash_per_action_passed": true,
+      "nullable_failsafe_controls": [
+        {
+          "mutation": "reject-null",
+          "detected_by_assertion": true,
+          "exit_code": 1
+        },
+        {
+          "mutation": "ignore-other-report",
+          "detected_by_assertion": true,
+          "exit_code": 1
+        },
+        {
+          "mutation": "accept-falsy-malformed",
+          "detected_by_assertion": true,
+          "exit_code": 1
+        }
+      ],
+      "sim": {
+        "steps": 7,
+        "passed": true,
+        "program_stopped": true,
+        "forces": [],
+        "alarms": [],
+        "server_stopped": true
+      }
+    },
+    "recorded_at": "2026-10-29T12:08:21+08:00",
+    "pr_head_commit": "2d68f5b6976d35448084a6c922dcd51a83e4ca3c",
+    "uncommitted_changes_on_pr_head": true,
+    "python_tests": {
+      "suites": [
+        {
+          "suite": "test_ar01_headers",
+          "exit_code": 0,
+          "tests": 8
+        },
+        {
+          "suite": "test_client",
+          "exit_code": 0,
+          "tests": 6
+        },
+        {
+          "suite": "test_d6_toml",
+          "exit_code": 0,
+          "tests": 6
+        },
+        {
+          "suite": "test_failsafe_compat",
+          "exit_code": 0,
+          "tests": 7
+        },
+        {
+          "suite": "test_fixes",
+          "exit_code": 0,
+          "tests": 24
+        },
+        {
+          "suite": "test_ir01_framing",
+          "exit_code": 0,
+          "tests": 4
+        },
+        {
+          "suite": "test_ir02_durable",
+          "exit_code": 0,
+          "tests": 4
+        },
+        {
+          "suite": "test_ir03_publication",
+          "exit_code": 0,
+          "tests": 14
+        },
+        {
+          "suite": "test_ir_process",
+          "exit_code": 0,
+          "tests": 7
+        },
+        {
+          "suite": "test_p0_f01",
+          "exit_code": 0,
+          "tests": 2
+        },
+        {
+          "suite": "test_p0_f02",
+          "exit_code": 0,
+          "tests": 4
+        },
+        {
+          "suite": "test_p0_f03",
+          "exit_code": 0,
+          "tests": 5
+        },
+        {
+          "suite": "test_p0_f04",
+          "exit_code": 0,
+          "tests": 7
+        },
+        {
+          "suite": "test_p0_process",
+          "exit_code": 0,
+          "tests": 4
+        },
+        {
+          "suite": "test_p1_client",
+          "exit_code": 0,
+          "tests": 10
+        },
+        {
+          "suite": "test_p1_client_clock",
+          "exit_code": 0,
+          "tests": 14
+        },
+        {
+          "suite": "test_p1_d01_trust_matrix",
+          "exit_code": 0,
+          "tests": 7
+        },
+        {
+          "suite": "test_p1_engine_http",
+          "exit_code": 0,
+          "tests": 3
+        },
+        {
+          "suite": "test_p1_f07",
+          "exit_code": 0,
+          "tests": 12
+        },
+        {
+          "suite": "test_p1_f07_process",
+          "exit_code": 0,
+          "tests": 3
+        },
+        {
+          "suite": "test_p1_numeric",
+          "exit_code": 0,
+          "tests": 16
+        },
+        {
+          "suite": "test_p1_recovery",
+          "exit_code": 0,
+          "tests": 22
+        },
+        {
+          "suite": "test_pure",
+          "exit_code": 0,
+          "tests": 39
+        },
+        {
+          "suite": "test_r3_reconcile",
+          "exit_code": 0,
+          "tests": 9
+        },
+        {
+          "suite": "test_robustness",
+          "exit_code": 0,
+          "tests": 6
+        },
+        {
+          "suite": "test_trace_reload",
+          "exit_code": 0,
+          "tests": 4
+        },
+        {
+          "suite": "test_verifier",
+          "exit_code": 0,
+          "tests": 19
+        }
+      ],
+      "tests": 266,
+      "passed": true
+    },
+    "runtime_integration": {
+      "assertions": 471,
+      "cases": 31,
+      "code_tree_sha256": [
+        "a0311eb5e8adf1e9877276e7a645f8d0303aca662350a26ea87eccabb56d2e46"
+      ],
+      "errors": 0,
+      "failed_assertions": 0,
+      "python": [
+        "3.9.6"
+      ],
+      "runtime_sha256": [
+        "52160ab8ba63cd16852c66b5647f0a16844bdc45f410c48da2c589c2cc2e74de"
+      ],
+      "verdicts": {
+        "PASS": 31
+      },
+      "runtime_commit": "047e7c17ffda1c52ac3d0f68726d9a15889a3cba",
+      "runtime_source_base_commit": "e6a38aa355cde1747114866b52c2e26f0e3ca724",
+      "runtime_sources_identical_to_base": true,
+      "evidence": "evidence/r3fix-20261029-final2",
+      "superseded_evidence": "evidence/r3fix-20261029-final (code tree d5ed5fba..., before the trace fix and the R3T1X change)"
+    },
+    "r3_timing": {
+      "all_passes": {
+        "assertions": 261,
+        "cases": 15,
+        "code_tree_sha256": [
+          "a0311eb5e8adf1e9877276e7a645f8d0303aca662350a26ea87eccabb56d2e46"
+        ],
+        "errors": 0,
+        "failed_assertions": 0,
+        "python": [
+          "3.9.6"
+        ],
+        "runtime_sha256": [
+          "52160ab8ba63cd16852c66b5647f0a16844bdc45f410c48da2c589c2cc2e74de"
+        ],
+        "verdicts": {
+          "PASS": 15
+        }
+      },
+      "runs": [
+        {
+          "audit_rows": 0,
+          "checks": 15,
+          "executed": false,
+          "failed": 0,
+          "final_audit_entry": "absent",
+          "final_landed": null,
+          "final_pass": 2,
+          "finding": null,
+          "ia2_audit_gap": false,
+          "recv_q": 216,
+          "run": "R3-r1",
+          "verdict": "PASS"
+        },
+        {
+          "audit_rows": 0,
+          "checks": 15,
+          "executed": false,
+          "failed": 0,
+          "final_audit_entry": "absent",
+          "final_landed": null,
+          "final_pass": 2,
+          "finding": null,
+          "ia2_audit_gap": false,
+          "recv_q": 216,
+          "run": "R3-r2",
+          "verdict": "PASS"
+        },
+        {
+          "audit_rows": 0,
+          "checks": 15,
+          "executed": false,
+          "failed": 0,
+          "final_audit_entry": "absent",
+          "final_landed": null,
+          "final_pass": 2,
+          "finding": null,
+          "ia2_audit_gap": false,
+          "recv_q": 216,
+          "run": "R3-r3",
+          "verdict": "PASS"
+        },
+        {
+          "audit_rows": 0,
+          "checks": 20,
+          "executed": true,
+          "failed": 0,
+          "final_audit_entry": "absent",
+          "final_landed": null,
+          "final_pass": 2,
+          "finding": null,
+          "ia2_audit_gap": true,
+          "recv_q": 0,
+          "run": "R3T1-r1",
+          "verdict": "PASS"
+        },
+        {
+          "audit_rows": 0,
+          "checks": 20,
+          "executed": true,
+          "failed": 0,
+          "final_audit_entry": "absent",
+          "final_landed": null,
+          "final_pass": 2,
+          "finding": null,
+          "ia2_audit_gap": true,
+          "recv_q": 0,
+          "run": "R3T1-r2",
+          "verdict": "PASS"
+        },
+        {
+          "audit_rows": 0,
+          "checks": 20,
+          "executed": true,
+          "failed": 0,
+          "final_audit_entry": "absent",
+          "final_landed": null,
+          "final_pass": 2,
+          "finding": null,
+          "ia2_audit_gap": true,
+          "recv_q": 0,
+          "run": "R3T1-r3",
+          "verdict": "PASS"
+        },
+        {
+          "audit_rows": 1,
+          "checks": 20,
+          "executed": true,
+          "failed": 0,
+          "final_audit_entry": "found",
+          "final_landed": true,
+          "final_pass": 2,
+          "finding": null,
+          "ia2_audit_gap": false,
+          "recv_q": 0,
+          "run": "R3T1K-r1",
+          "verdict": "PASS"
+        },
+        {
+          "audit_rows": 1,
+          "checks": 20,
+          "executed": true,
+          "failed": 0,
+          "final_audit_entry": "found",
+          "final_landed": true,
+          "final_pass": 2,
+          "finding": null,
+          "ia2_audit_gap": false,
+          "recv_q": 0,
+          "run": "R3T1K-r2",
+          "verdict": "PASS"
+        },
+        {
+          "audit_rows": 1,
+          "checks": 20,
+          "executed": true,
+          "failed": 0,
+          "final_audit_entry": "found",
+          "final_landed": true,
+          "final_pass": 2,
+          "finding": null,
+          "ia2_audit_gap": false,
+          "recv_q": 0,
+          "run": "R3T1K-r3",
+          "verdict": "PASS"
+        },
+        {
+          "audit_rows": 0,
+          "checks": 17,
+          "executed": true,
+          "failed": 0,
+          "final_audit_entry": "absent",
+          "final_landed": null,
+          "final_pass": 2,
+          "finding": null,
+          "ia2_audit_gap": true,
+          "recv_q": null,
+          "run": "R3T1X-r1",
+          "verdict": "PASS"
+        },
+        {
+          "audit_rows": 0,
+          "checks": 17,
+          "executed": true,
+          "failed": 0,
+          "final_audit_entry": "absent",
+          "final_landed": null,
+          "final_pass": 2,
+          "finding": null,
+          "ia2_audit_gap": true,
+          "recv_q": null,
+          "run": "R3T1X-r2",
+          "verdict": "PASS"
+        },
+        {
+          "audit_rows": 0,
+          "checks": 17,
+          "executed": true,
+          "failed": 0,
+          "final_audit_entry": "absent",
+          "final_landed": null,
+          "final_pass": 2,
+          "finding": null,
+          "ia2_audit_gap": true,
+          "recv_q": null,
+          "run": "R3T1X-r3",
+          "verdict": "PASS"
+        },
+        {
+          "audit_rows": 1,
+          "checks": 15,
+          "executed": true,
+          "failed": 0,
+          "final_audit_entry": "found",
+          "final_landed": true,
+          "final_pass": 1,
+          "finding": null,
+          "ia2_audit_gap": false,
+          "recv_q": null,
+          "run": "R3T2-r1",
+          "verdict": "PASS"
+        },
+        {
+          "audit_rows": 1,
+          "checks": 15,
+          "executed": true,
+          "failed": 0,
+          "final_audit_entry": "found",
+          "final_landed": true,
+          "final_pass": 1,
+          "finding": null,
+          "ia2_audit_gap": false,
+          "recv_q": null,
+          "run": "R3T2-r2",
+          "verdict": "PASS"
+        },
+        {
+          "audit_rows": 1,
+          "checks": 15,
+          "executed": true,
+          "failed": 0,
+          "final_audit_entry": "found",
+          "final_landed": true,
+          "final_pass": 1,
+          "finding": null,
+          "ia2_audit_gap": false,
+          "recv_q": null,
+          "run": "R3T2-r3",
+          "verdict": "PASS"
+        }
+      ],
+      "expect": {
+        "R3": [
+          false,
+          false
+        ],
+        "R3T1": [
+          true,
+          false
+        ],
+        "R3T1K": [
+          true,
+          true
+        ],
+        "R3T1X": [
+          true,
+          false
+        ],
+        "R3T2": [
+          true,
+          true
+        ]
+      },
+      "expect_columns": [
+        "executed_on_vm_or_device",
+        "audit_entry_recorded"
+      ],
+      "ia2_runtime_audit_gap": "rt_write records /audit only after the queued write is acknowledged; a client disconnect drops the handler (hyper h1_half_close=false). Applied writes in R3T1/R3T1X have no /audit entry. Fixed on an unmerged branch outside this PR (see fixed_runtime).",
+      "exploratory_run_before_fix": {
+        "where": "~/Projects/soft-PLC/pr99-r3-timing-20261029/runs/final-3x (outside the repo)",
+        "cases_x3": [
+          "R3",
+          "R3T0",
+          "R3T1",
+          "R3T2",
+          "R3T1K",
+          "R3T1X"
+        ],
+        "bridge_final_landed_false_while_executed": [
+          "R3T1",
+          "R3T1X"
+        ]
+      },
+      "netstat_form": "macOS netstat -an -p tcp; Linux form untested",
+      "r3t1x_assertions": "follow /audit at the restart: no entry -> unknown/bridge_restarted + absent note; entry -> accepted from it (D8), no note, read side verified",
+      "fixed_runtime": {
+        "branch": "fix/control-write-detached",
+        "worktree": "~/Projects/soft-PLC/ia2-control-write-detached-20261029",
+        "base_commit": "e6a38aa355cde1747114866b52c2e26f0e3ca724",
+        "committed": false,
+        "runtime_sha256": "b7e455d4cea078a567c53df47ca7ea470d49dbabe58c0788d63e8bfaebdb7c40",
+        "all_passes": {
+          "assertions": 258,
+          "cases": 15,
+          "code_tree_sha256": [
+            "a0311eb5e8adf1e9877276e7a645f8d0303aca662350a26ea87eccabb56d2e46"
+          ],
+          "errors": 0,
+          "failed_assertions": 0,
+          "python": [
+            "3.9.6"
+          ],
+          "runtime_sha256": [
+            "b7e455d4cea078a567c53df47ca7ea470d49dbabe58c0788d63e8bfaebdb7c40"
+          ],
+          "verdicts": {
+            "FINDING": 6,
+            "PASS": 9
+          }
+        },
+        "runs": [
+          {
+            "audit_rows": 0,
+            "checks": 15,
+            "executed": false,
+            "failed": 0,
+            "final_audit_entry": "absent",
+            "final_landed": null,
+            "final_pass": 2,
+            "finding": null,
+            "ia2_audit_gap": false,
+            "recv_q": 216,
+            "run": "R3-r1",
+            "verdict": "PASS"
+          },
+          {
+            "audit_rows": 0,
+            "checks": 15,
+            "executed": false,
+            "failed": 0,
+            "final_audit_entry": "absent",
+            "final_landed": null,
+            "final_pass": 2,
+            "finding": null,
+            "ia2_audit_gap": false,
+            "recv_q": 216,
+            "run": "R3-r2",
+            "verdict": "PASS"
+          },
+          {
+            "audit_rows": 0,
+            "checks": 15,
+            "executed": false,
+            "failed": 0,
+            "final_audit_entry": "absent",
+            "final_landed": null,
+            "final_pass": 2,
+            "finding": null,
+            "ia2_audit_gap": false,
+            "recv_q": 216,
+            "run": "R3-r3",
+            "verdict": "PASS"
+          },
+          {
+            "audit_rows": 1,
+            "checks": 20,
+            "executed": true,
+            "failed": 0,
+            "final_audit_entry": "found",
+            "final_landed": true,
+            "final_pass": 2,
+            "finding": "R3T1 EXPECT (executed, audited) = (True, False); observed (True, True).  Update R3_EXPECT and the contract after checking why.",
+            "ia2_audit_gap": false,
+            "recv_q": 0,
+            "run": "R3T1-r1",
+            "verdict": "FINDING"
+          },
+          {
+            "audit_rows": 1,
+            "checks": 20,
+            "executed": true,
+            "failed": 0,
+            "final_audit_entry": "found",
+            "final_landed": true,
+            "final_pass": 2,
+            "finding": "R3T1 EXPECT (executed, audited) = (True, False); observed (True, True).  Update R3_EXPECT and the contract after checking why.",
+            "ia2_audit_gap": false,
+            "recv_q": 0,
+            "run": "R3T1-r2",
+            "verdict": "FINDING"
+          },
+          {
+            "audit_rows": 1,
+            "checks": 20,
+            "executed": true,
+            "failed": 0,
+            "final_audit_entry": "found",
+            "final_landed": true,
+            "final_pass": 2,
+            "finding": "R3T1 EXPECT (executed, audited) = (True, False); observed (True, True).  Update R3_EXPECT and the contract after checking why.",
+            "ia2_audit_gap": false,
+            "recv_q": 0,
+            "run": "R3T1-r3",
+            "verdict": "FINDING"
+          },
+          {
+            "audit_rows": 1,
+            "checks": 20,
+            "executed": true,
+            "failed": 0,
+            "final_audit_entry": "found",
+            "final_landed": true,
+            "final_pass": 2,
+            "finding": null,
+            "ia2_audit_gap": false,
+            "recv_q": 0,
+            "run": "R3T1K-r1",
+            "verdict": "PASS"
+          },
+          {
+            "audit_rows": 1,
+            "checks": 20,
+            "executed": true,
+            "failed": 0,
+            "final_audit_entry": "found",
+            "final_landed": true,
+            "final_pass": 2,
+            "finding": null,
+            "ia2_audit_gap": false,
+            "recv_q": 0,
+            "run": "R3T1K-r2",
+            "verdict": "PASS"
+          },
+          {
+            "audit_rows": 1,
+            "checks": 20,
+            "executed": true,
+            "failed": 0,
+            "final_audit_entry": "found",
+            "final_landed": true,
+            "final_pass": 2,
+            "finding": null,
+            "ia2_audit_gap": false,
+            "recv_q": 0,
+            "run": "R3T1K-r3",
+            "verdict": "PASS"
+          },
+          {
+            "audit_rows": 1,
+            "checks": 16,
+            "executed": true,
+            "failed": 0,
+            "final_audit_entry": null,
+            "final_landed": "missing",
+            "final_pass": null,
+            "finding": "R3T1X EXPECT (executed, audited) = (True, False); observed (True, True).  Update R3_EXPECT and the contract after checking why.",
+            "ia2_audit_gap": false,
+            "recv_q": null,
+            "run": "R3T1X-r1",
+            "verdict": "FINDING"
+          },
+          {
+            "audit_rows": 1,
+            "checks": 16,
+            "executed": true,
+            "failed": 0,
+            "final_audit_entry": null,
+            "final_landed": "missing",
+            "final_pass": null,
+            "finding": "R3T1X EXPECT (executed, audited) = (True, False); observed (True, True).  Update R3_EXPECT and the contract after checking why.",
+            "ia2_audit_gap": false,
+            "recv_q": null,
+            "run": "R3T1X-r2",
+            "verdict": "FINDING"
+          },
+          {
+            "audit_rows": 1,
+            "checks": 16,
+            "executed": true,
+            "failed": 0,
+            "final_audit_entry": null,
+            "final_landed": "missing",
+            "final_pass": null,
+            "finding": "R3T1X EXPECT (executed, audited) = (True, False); observed (True, True).  Update R3_EXPECT and the contract after checking why.",
+            "ia2_audit_gap": false,
+            "recv_q": null,
+            "run": "R3T1X-r3",
+            "verdict": "FINDING"
+          },
+          {
+            "audit_rows": 1,
+            "checks": 15,
+            "executed": true,
+            "failed": 0,
+            "final_audit_entry": "found",
+            "final_landed": true,
+            "final_pass": 1,
+            "finding": null,
+            "ia2_audit_gap": false,
+            "recv_q": null,
+            "run": "R3T2-r1",
+            "verdict": "PASS"
+          },
+          {
+            "audit_rows": 1,
+            "checks": 15,
+            "executed": true,
+            "failed": 0,
+            "final_audit_entry": "found",
+            "final_landed": true,
+            "final_pass": 1,
+            "finding": null,
+            "ia2_audit_gap": false,
+            "recv_q": null,
+            "run": "R3T2-r2",
+            "verdict": "PASS"
+          },
+          {
+            "audit_rows": 1,
+            "checks": 15,
+            "executed": true,
+            "failed": 0,
+            "final_audit_entry": "found",
+            "final_landed": true,
+            "final_pass": 1,
+            "finding": null,
+            "ia2_audit_gap": false,
+            "recv_q": null,
+            "run": "R3T2-r3",
+            "verdict": "PASS"
+          }
+        ],
+        "evidence": "~/Projects/soft-PLC/pr99-r3-timing-20261029/runs/detached-runtime-2 (outside the repo)",
+        "expected": "R3T1 and R3T1X FINDING with observed (True, True); update R3_EXPECT once the fix merges"
+      }
+    },
+    "r3_reconcile_regressions": {
+      "tests": 9,
+      "before_fix_on_2d68f5b": {
+        "tests": 9,
+        "assertion_failures": 2,
+        "errors": 7,
+        "note": "7 errors are the missing audit_entry field"
+      },
+      "evidence": "evidence/r3-reconcile-before"
+    },
+    "bool_checks": {
+      "cases": 21,
+      "passed": true,
+      "evidence": "evidence/bool-device-6"
+    },
+    "crash_per_action_passed": true,
+    "nullable_failsafe_controls": [
       {
-        "suite": "test_ar01_headers",
-        "exit_code": 0,
-        "tests": 8
+        "mutation": "reject-null",
+        "detected_by_assertion": true,
+        "exit_code": 1
       },
       {
-        "suite": "test_client",
-        "exit_code": 0,
-        "tests": 6
+        "mutation": "ignore-other-report",
+        "detected_by_assertion": true,
+        "exit_code": 1
       },
       {
-        "suite": "test_d6_toml",
-        "exit_code": 0,
-        "tests": 6
-      },
-      {
-        "suite": "test_failsafe_compat",
-        "exit_code": 0,
-        "tests": 7
-      },
-      {
-        "suite": "test_fixes",
-        "exit_code": 0,
-        "tests": 24
-      },
-      {
-        "suite": "test_ir01_framing",
-        "exit_code": 0,
-        "tests": 4
-      },
-      {
-        "suite": "test_ir02_durable",
-        "exit_code": 0,
-        "tests": 4
-      },
-      {
-        "suite": "test_ir03_publication",
-        "exit_code": 0,
-        "tests": 14
-      },
-      {
-        "suite": "test_ir_process",
-        "exit_code": 0,
-        "tests": 7
-      },
-      {
-        "suite": "test_p0_f01",
-        "exit_code": 0,
-        "tests": 2
-      },
-      {
-        "suite": "test_p0_f02",
-        "exit_code": 0,
-        "tests": 4
-      },
-      {
-        "suite": "test_p0_f03",
-        "exit_code": 0,
-        "tests": 5
-      },
-      {
-        "suite": "test_p0_f04",
-        "exit_code": 0,
-        "tests": 7
-      },
-      {
-        "suite": "test_p0_process",
-        "exit_code": 0,
-        "tests": 4
-      },
-      {
-        "suite": "test_p1_client",
-        "exit_code": 0,
-        "tests": 10
-      },
-      {
-        "suite": "test_p1_client_clock",
-        "exit_code": 0,
-        "tests": 14
-      },
-      {
-        "suite": "test_p1_d01_trust_matrix",
-        "exit_code": 0,
-        "tests": 7
-      },
-      {
-        "suite": "test_p1_engine_http",
-        "exit_code": 0,
-        "tests": 3
-      },
-      {
-        "suite": "test_p1_f07",
-        "exit_code": 0,
-        "tests": 12
-      },
-      {
-        "suite": "test_p1_f07_process",
-        "exit_code": 0,
-        "tests": 3
-      },
-      {
-        "suite": "test_p1_numeric",
-        "exit_code": 0,
-        "tests": 16
-      },
-      {
-        "suite": "test_p1_recovery",
-        "exit_code": 0,
-        "tests": 22
-      },
-      {
-        "suite": "test_pure",
-        "exit_code": 0,
-        "tests": 39
-      },
-      {
-        "suite": "test_robustness",
-        "exit_code": 0,
-        "tests": 6
-      },
-      {
-        "suite": "test_verifier",
-        "exit_code": 0,
-        "tests": 19
+        "mutation": "accept-falsy-malformed",
+        "detected_by_assertion": true,
+        "exit_code": 1
       }
     ],
-    "tests": 253,
-    "passed": true
-  },
-  "bool_checks": {
-    "cases": 21,
-    "passed": true
-  },
-  "crash_per_action_passed": true,
-  "nullable_failsafe_controls": [
-    {
-      "mutation": "reject-null",
-      "detected_by_assertion": true,
-      "exit_code": 1
-    },
-    {
-      "mutation": "ignore-other-report",
-      "detected_by_assertion": true,
-      "exit_code": 1
-    },
-    {
-      "mutation": "accept-falsy-malformed",
-      "detected_by_assertion": true,
-      "exit_code": 1
-    }
-  ],
-  "initial_regression_reproduction": {
-    "tests": 7,
-    "assertion_failures": 44,
-    "errors": 0
-  },
-  "compiled_sources_unchanged_since_import_quality_gate": true,
-  "bridge_sha256": {
-    "bridge/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    "bridge/_vendor/__init__.py": "3f9d244c34d97c50af9cab9340fcada57708978ddaaed10ecca93bdb06d8a0b8",
-    "bridge/_vendor/tomli/__init__.py": "3e1370fdec8b81d9fb31c27a9eb00df32226ddd5c2ef9bebd6c546555c034a90",
-    "bridge/_vendor/tomli/_parser.py": "f70f0b1b48c1edfc26659581d2f5576de7a30c7725e00348271076b1c1270e50",
-    "bridge/_vendor/tomli/_re.py": "b21e2c0434603bde0a259c0d22b81d73257fa906acb79d18bf3380506a510ca0",
-    "bridge/_vendor/tomli/_types.py": "f864c6d9552a929c7032ace654ee05ef26ca75d21b027b801d77e65907138b74",
-    "bridge/auth.py": "5d2e6e0b09e9c3191971716de27222ac2988331f6fbea3908a19f54852d62817",
-    "bridge/build_flavor.py": "8cbb1e8d6f266b36b22409f974fcfd5b2eb72f4b179ae83be6af8efadf04751a",
-    "bridge/classify.py": "24f109c26a4ef90fb1da699387f25a5c1fb59a71526ed4f8758be5ef85736640",
-    "bridge/durable.py": "55633d7931b3499ea67717ff22986a23f195db04f305f1e7a726a78f389fc45d",
-    "bridge/engine.py": "dff16c72bd619f342d8c9722e8b374a95fed8ea4ab3e0a2da3582c09e3231e69",
-    "bridge/errors.py": "3b963e9113aeb31fe1c4103f20a5f4e2e36b18db5a85ce96de8c8bc0fbb9a6c7",
-    "bridge/facts.py": "88d65b40fb2b1d55352cd6cde5fd18bd029e897f78308010828dce48253159de",
-    "bridge/gates.py": "b6fcc9ec4f5ecf93f4947f4815370b859905774cf99b02e03ef7042068f401c4",
-    "bridge/governance_check.py": "eb2338d6854ccad02bfea9ef95982ddb9a35a430da358a6d133f28ca54dccbb0",
-    "bridge/ia2client.py": "11b9d1ae61eac2bc3bec13a9c64b2b8b728a6bb384da8d6def9616560c49892a",
-    "bridge/journal.py": "12824b60783751ef78c37315320fc0e8a64d9a92e4fb8ca6a0a151b0088e459c",
-    "bridge/main.py": "7eecc0951c1a29aea8a77846ee7b2c231cdb62f273f084859922c64ee4b061e7",
-    "bridge/northbound_guard.py": "8552d7e686086c1ae8870d8134e24650eb625a1afebdbc3ae6dd3fcdc3a9ffe7",
-    "bridge/preflight.py": "3bd00056c5eaba6e0ff8fbdf716ff9df8ec82ce0af2247d83b803da1dd1ef33b",
-    "bridge/registry.py": "5f1a910073b598fd5e3ed53b5bddba5a93d3d1488dcfab8a909b66c87991d6b4",
-    "bridge/runtime_schema.py": "555fd35007000f0b87557b19f6847653508638753cd733eefbb8fa9689cf163a",
-    "bridge/strictjson.py": "6077ea038b33e6178ad40ba8cff8346f20cff3d9cf6a3e54ca61f698bbdfc178",
-    "bridge/tail.py": "367e14c566428cffb6745be83b4cfeffec01b92c7d03c89d17906e683832791d",
-    "bridge/testhooks_loader.py": "0a5a584a2f3f6d26a402f1819c1429a1f313b224bf2a209622eab86d13990e6f",
-    "bridge/trace.py": "0463c78721cce84f65d89906e50c18f5bd45563956e8e6f735919673bf866489",
-    "bridge/values.py": "5476728c5a2ed0599f39fac45262c822f3071aa0c51b986a3b77e7c6c8714d0f",
-    "bridge/vocab.py": "eef6450a9158903641864318ba137d72835aa3e5479d9af6392b59e6c1b99386",
-    "bridge_run.py": "7a4f6aaef61d71738be920bf7343de261daac23dbe7353a37c028246f57ee350",
-    "contract_vocab.json": "ba643211081f380440a6d905df4ea1d58508f96b7c30067e3662a73dc9833932"
-  },
-  "prior_import_validation": {
-    "historical_runtime_integration": {
-      "cases": 27,
-      "verdicts": {
-        "PASS": 26,
-        "FINDING": 1
-      },
-      "assertions": 395,
-      "failed_assertions": 0,
-      "runtime_sha256": [
-        "cf64e6a28d375496fb39664588cde25287d40c70e9bf3f23f0e857acfb7f4b27"
-      ],
-      "code_tree_sha256": [
-        "e1eaee825d2c50ad8a5206f647cc17ac1629ecdc1aeb9694caad80386dbd2572"
-      ]
-    },
-    "current_main_runtime_smoke": {
-      "cases": 7,
-      "failed": 7,
-      "reason": "startup refused: missing or invalid runtime evidence: status.failsafe_status",
-      "runtime_sha256": [
-        "8247e4525d89a273d0cff2d7fe525c7fe91c321d3c708b75afbcb11318c76483"
-      ]
-    },
-    "final_harness_exit_checks": [
-      {
-        "runtime": "current-main",
-        "exit_code": 1,
-        "expected": 1,
-        "verdict": "FAIL",
-        "assertions": 1,
-        "code_tree_sha256": "5974a70ab6a360686d0fea65aa681cfc4124a462074a7c2c8f8ed2a39dfa6bea"
-      },
-      {
-        "runtime": "pinned-baseline",
-        "exit_code": 0,
-        "expected": 0,
-        "verdict": "PASS",
-        "assertions": 24,
-        "code_tree_sha256": "5974a70ab6a360686d0fea65aa681cfc4124a462074a7c2c8f8ed2a39dfa6bea"
-      }
-    ]
-  },
-  "test_ports_released": true,
-  "real_devices": false,
-  "merged": false,
-  "prior_nullable_failsafe_validation": {
-    "python_tests": 247,
-    "integration": {
-      "runtime_commit": "e6a38aa355cde1747114866b52c2e26f0e3ca724",
-      "cases": 27,
-      "verdicts": {
-        "PASS": 26,
-        "FINDING": 1
-      },
-      "assertions": 395,
-      "failed_assertions": 0,
-      "runtime_sha256": [
-        "8247e4525d89a273d0cff2d7fe525c7fe91c321d3c708b75afbcb11318c76483"
-      ],
-      "code_tree_sha256": "d1b56f18dc1198bd59ce953ccf8a6828b9fdae8749b5bbdff5d2ff88c4e80d93",
-      "source_hash_matches_all_cases": true,
-      "setup_errors": 0
-    },
     "bridge_sha256": {
       "bridge/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bridge/_vendor/__init__.py": "3f9d244c34d97c50af9cab9340fcada57708978ddaaed10ecca93bdb06d8a0b8",
+      "bridge/_vendor/tomli/LICENSE": "b80816b0d530b8accb4c2211783790984a6e3b61922c2b5ee92f3372ab2742fe",
+      "bridge/_vendor/tomli/SOURCE.json": "4624a0a3a30f85078f523332ccf3a7d522e11b7c28be9f0dfa32e281f1800753",
+      "bridge/_vendor/tomli/__init__.py": "3e1370fdec8b81d9fb31c27a9eb00df32226ddd5c2ef9bebd6c546555c034a90",
+      "bridge/_vendor/tomli/_parser.py": "f70f0b1b48c1edfc26659581d2f5576de7a30c7725e00348271076b1c1270e50",
+      "bridge/_vendor/tomli/_re.py": "b21e2c0434603bde0a259c0d22b81d73257fa906acb79d18bf3380506a510ca0",
+      "bridge/_vendor/tomli/_types.py": "f864c6d9552a929c7032ace654ee05ef26ca75d21b027b801d77e65907138b74",
+      "bridge/_vendor/tomli/py.typed": "f0f8f2675695a10a5156fb7bd66bafbaae6a13e8d315990af862c792175e6e67",
       "bridge/auth.py": "5d2e6e0b09e9c3191971716de27222ac2988331f6fbea3908a19f54852d62817",
       "bridge/build_flavor.py": "8cbb1e8d6f266b36b22409f974fcfd5b2eb72f4b179ae83be6af8efadf04751a",
       "bridge/classify.py": "24f109c26a4ef90fb1da699387f25a5c1fb59a71526ed4f8758be5ef85736640",
       "bridge/durable.py": "55633d7931b3499ea67717ff22986a23f195db04f305f1e7a726a78f389fc45d",
-      "bridge/engine.py": "77699253ce4fba571424d410c0bf8174939975dbf177f3d6383290a7bc4fa5d6",
+      "bridge/engine.py": "bfbdba17133974044054d887a30c2c4c0efa1430012c35a0b922b765dea65cc9",
       "bridge/errors.py": "3b963e9113aeb31fe1c4103f20a5f4e2e36b18db5a85ce96de8c8bc0fbb9a6c7",
       "bridge/facts.py": "88d65b40fb2b1d55352cd6cde5fd18bd029e897f78308010828dce48253159de",
       "bridge/gates.py": "b6fcc9ec4f5ecf93f4947f4815370b859905774cf99b02e03ef7042068f401c4",
       "bridge/governance_check.py": "eb2338d6854ccad02bfea9ef95982ddb9a35a430da358a6d133f28ca54dccbb0",
       "bridge/ia2client.py": "11b9d1ae61eac2bc3bec13a9c64b2b8b728a6bb384da8d6def9616560c49892a",
-      "bridge/journal.py": "12824b60783751ef78c37315320fc0e8a64d9a92e4fb8ca6a0a151b0088e459c",
-      "bridge/main.py": "7eecc0951c1a29aea8a77846ee7b2c231cdb62f273f084859922c64ee4b061e7",
-      "bridge/northbound_guard.py": "faf8fc02ed1c6f49d556de62c2dcf95f2eafbb9207a433fe0b21d910d4ae45b7",
+      "bridge/journal.py": "85aeef86969f36427d96a5df66469e902435cea150518e163190ceba5f33fd3e",
+      "bridge/main.py": "b02a1612bee1106fc101a6d381f2e026de1d229bb5608a16058555f0c1062fa5",
+      "bridge/northbound_guard.py": "8552d7e686086c1ae8870d8134e24650eb625a1afebdbc3ae6dd3fcdc3a9ffe7",
       "bridge/preflight.py": "3bd00056c5eaba6e0ff8fbdf716ff9df8ec82ce0af2247d83b803da1dd1ef33b",
       "bridge/registry.py": "5f1a910073b598fd5e3ed53b5bddba5a93d3d1488dcfab8a909b66c87991d6b4",
       "bridge/runtime_schema.py": "555fd35007000f0b87557b19f6847653508638753cd733eefbb8fa9689cf163a",
       "bridge/strictjson.py": "6077ea038b33e6178ad40ba8cff8346f20cff3d9cf6a3e54ca61f698bbdfc178",
       "bridge/tail.py": "367e14c566428cffb6745be83b4cfeffec01b92c7d03c89d17906e683832791d",
       "bridge/testhooks_loader.py": "0a5a584a2f3f6d26a402f1819c1429a1f313b224bf2a209622eab86d13990e6f",
-      "bridge/trace.py": "0463c78721cce84f65d89906e50c18f5bd45563956e8e6f735919673bf866489",
+      "bridge/trace.py": "a6cfb35d5f8f26b041e19ab1ce86d94a929d937995586fb5628b66c11d1c5f1c",
       "bridge/values.py": "5476728c5a2ed0599f39fac45262c822f3071aa0c51b986a3b77e7c6c8714d0f",
       "bridge/vocab.py": "eef6450a9158903641864318ba137d72835aa3e5479d9af6392b59e6c1b99386",
       "bridge_run.py": "7a4f6aaef61d71738be920bf7343de261daac23dbe7353a37c028246f57ee350",
       "contract_vocab.json": "ba643211081f380440a6d905df4ea1d58508f96b7c30067e3662a73dc9833932"
-    }
-  },
-  "recorded_at": "2026-10-28 22:48:58 UTC+8",
-  "runtime_integration": {
-    "runtime_commit": "047e7c17ffda1c52ac3d0f68726d9a15889a3cba",
-    "runtime_source_base_commit": "e6a38aa355cde1747114866b52c2e26f0e3ca724",
-    "runtime_sources_identical_to_base": true,
-    "cases": 27,
-    "verdicts": {
-      "PASS": 26,
-      "FINDING": 1
     },
-    "assertions": 395,
-    "failed_assertions": 0,
-    "runtime_sha256": "52160ab8ba63cd16852c66b5647f0a16844bdc45f410c48da2c589c2cc2e74de",
-    "code_tree_sha256": "4b79f02cbca51474192941cf17496ca49f2a121451a66158e7ceea2225cb0e2b",
-    "source_hash_matches_all_cases": true,
-    "includes_bundled_parser": true,
-    "setup_errors": 0
-  },
-  "quality_gate": [
-    {
-      "check": "adaptation",
-      "exit_code": 0,
-      "seconds": 0.09
-    },
-    {
-      "check": "format",
-      "exit_code": 0,
-      "seconds": 0.69
-    },
-    {
-      "check": "clippy",
-      "exit_code": 0,
-      "seconds": 0.38
-    },
-    {
-      "check": "server-build",
-      "exit_code": 0,
-      "seconds": 0.2
-    },
-    {
-      "check": "rust-tests",
-      "exit_code": 0,
-      "seconds": 49.91
-    },
-    {
-      "check": "release",
-      "exit_code": 0,
-      "seconds": 0.21
-    },
-    {
-      "check": "web-build",
-      "exit_code": 0,
-      "seconds": 0.93
-    },
-    {
-      "check": "web-tests",
-      "exit_code": 0,
-      "seconds": 3.17
-    }
-  ],
-  "rust_tests": {
-    "passed": 8589,
-    "failed": 0,
-    "ignored": 105
-  },
-  "web_tests": {
-    "files": 39,
-    "passed": 423
-  },
-  "d6_toml": {
-    "regression_tests": 6,
-    "before": {
-      "tests": 3,
-      "failures": 18,
-      "errors": 0,
-      "old_guard_rejected_by_regressions": true
-    },
-    "python_versions": [
-      "3.9.6",
-      "3.14.8"
-    ],
-    "python314_passed": true,
-    "runtime_checks": [
+    "sim_repeated_this_round": false,
+    "quality_gate": [
       {
-        "case": "escaped",
-        "flavor": "lab",
-        "bridge_exit": 3,
-        "ready": false,
-        "runtime_build_commit": "047e7c17ffda"
+        "check": "adaptation",
+        "exit_code": 0,
+        "seconds": 0.08
       },
       {
-        "case": "escaped",
-        "flavor": "prod",
-        "bridge_exit": 3,
-        "ready": false,
-        "runtime_build_commit": "047e7c17ffda"
+        "check": "format",
+        "exit_code": 0,
+        "seconds": 0.67
       },
       {
-        "case": "inline",
-        "flavor": "lab",
-        "bridge_exit": 3,
-        "ready": false,
-        "runtime_build_commit": "047e7c17ffda"
+        "check": "clippy",
+        "exit_code": 0,
+        "seconds": 3.69
       },
       {
-        "case": "inline",
-        "flavor": "prod",
-        "bridge_exit": 3,
-        "ready": false,
-        "runtime_build_commit": "047e7c17ffda"
+        "check": "server-build",
+        "exit_code": 0,
+        "seconds": 0.3
       },
       {
-        "case": "safe",
-        "flavor": "lab",
-        "bridge_exit": null,
-        "ready": true,
-        "runtime_build_commit": "047e7c17ffda"
+        "check": "rust-tests",
+        "exit_code": 0,
+        "seconds": 58.02
       },
       {
-        "case": "safe",
-        "flavor": "prod",
-        "bridge_exit": null,
-        "ready": true,
-        "runtime_build_commit": "047e7c17ffda"
+        "check": "release",
+        "exit_code": 0,
+        "seconds": 23.5
+      },
+      {
+        "check": "web-build",
+        "exit_code": 0,
+        "seconds": 1.3
+      },
+      {
+        "check": "web-tests",
+        "exit_code": 0,
+        "seconds": 3.46
       }
     ],
-    "runtime_checks_passed": true,
-    "parser_provenance": {
-      "package": "tomli",
-      "version": "2.2.1",
-      "source_url": "https://files.pythonhosted.org/packages/18/87/302344fed471e44a87289cf4967697d07e532f2421fdaf868a303cbae4ff/tomli-2.2.1.tar.gz",
-      "source_sha256": "cd45e1dc79c835ce60f7404ec8119f2eb06d38b1deba146f07ced3bbc44505ff",
-      "requires_python": ">=3.8",
-      "files_sha256": {
-        "__init__.py": "3e1370fdec8b81d9fb31c27a9eb00df32226ddd5c2ef9bebd6c546555c034a90",
-        "_parser.py": "f70f0b1b48c1edfc26659581d2f5576de7a30c7725e00348271076b1c1270e50",
-        "_re.py": "b21e2c0434603bde0a259c0d22b81d73257fa906acb79d18bf3380506a510ca0",
-        "_types.py": "f864c6d9552a929c7032ace654ee05ef26ca75d21b027b801d77e65907138b74",
-        "py.typed": "f0f8f2675695a10a5156fb7bd66bafbaae6a13e8d315990af862c792175e6e67",
-        "LICENSE": "b80816b0d530b8accb4c2211783790984a6e3b61922c2b5ee92f3372ab2742fe"
-      },
-      "changes": "None; package source and MIT license copied verbatim."
+    "rust_tests": {
+      "passed": 8589,
+      "failed": 0,
+      "ignored": 105
     },
-    "prior_review_bypass_cases": 2,
-    "blocker_closed": true
-  },
-  "sim": {
-    "steps": 7,
-    "passed": true,
-    "program_stopped": true,
-    "forces": [],
-    "alarms": [],
-    "server_stopped": true
+    "web_tests": {
+      "files": 39,
+      "passed": 423
+    },
+    "quality_gate_release_side_effect": {
+      "relinked_runtime_sha256": "54df418344b2d8ed1e4ab086125a042777191436126820f9466be73335d4c067",
+      "restored_tested_runtime_sha256": "52160ab8ba63cd16852c66b5647f0a16844bdc45f410c48da2c589c2cc2e74de",
+      "why": "crates/runtime/build.rs reruns when .git/index changes; the tested binary was copied back to target/release afterwards"
+    },
+    "trace_reload_regressions": {
+      "tests": 4,
+      "before_fix": "all 4 detected (errors, assertion failures; bridge process exits with a traceback)",
+      "evidence": "evidence/trace-reload-before"
+    },
+    "quality_gate_note": "gate run earlier this round on the PR worktree; afterwards only Python and docs changed, not repeated"
   }
 }

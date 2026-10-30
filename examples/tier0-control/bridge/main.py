@@ -87,6 +87,10 @@ def main(argv=None):
     trace = None
     try:
         trace = TraceWriter(args.trace)
+        if trace.skipped:
+            shown = ', '.join(str(n) for n in trace.skipped[:10]) + (', ...' if len(trace.skipped) > 10 else '')
+            print('skipped %d trace line(s) that are not bridge records (lines %s); an event such a line held may be published again'
+                  % (len(trace.skipped), shown), file=sys.stderr)
         problem = journal.check_anchor(trace.last_anchor)
         if problem:
             print('startup refused: %s' % problem, file=sys.stderr)

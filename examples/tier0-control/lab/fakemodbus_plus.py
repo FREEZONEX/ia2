@@ -2,10 +2,13 @@
 
   FC01/FC02 read coils / discrete inputs from one coil table (bit i of the reply = coil addr+i)
   FC05 write single coil (0xFF00 on, 0x0000 off; anything else is exception 0x03);  FC15 write multiple coils
-  the log of a write carries `words` (every register written by FC16) or `bits` (coils written by FC15)."""
+  the log of a write carries `words` (every register written by FC16) or `bits` (coils written by FC15)
+  every log record carries `seq` (1, 2, ...), so a reader can tell that no record is missing between two others, and `mono`
+  (time.monotonic() when the record is written, after the reply was sent) for durations a clock step cannot bend."""
 import os
 import struct
 import sys
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'vendor-copies'))
 from fakemodbus import FakeSlave  # noqa: E402
@@ -15,6 +18,17 @@ class FakeSlavePlus(FakeSlave):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.coils = {}
+        self._seq = 0
+
+    def emit(self, ev, **fields):
+        self._seq += 1
+        super().emit(ev, seq=self._seq, mono=round(time.monotonic(), 6), **fields)
+
+    async def stop(self):
+        # Recent asyncio versions wait for client connections in Server.wait_closed(). Close our connections first,
+        # otherwise restarting the fake device waits forever while the runtime keeps polling it.
+        self._abort_all('stop')
+        await super().stop()
 
     @staticmethod
     def _describe(pdu):

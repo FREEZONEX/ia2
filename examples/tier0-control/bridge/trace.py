@@ -7,6 +7,20 @@ import tempfile
 from . import durable
 
 
+def _record_of(line):
+    """(event_id, anchor) of a complete line this bridge could have written, else None.  The bridge writes ASCII JSON objects with a
+    string event ID, so any other complete line (foreign or damaged) is skipped the same way, whatever it fails on."""
+    try:
+        rec = json.loads(line.decode('ascii'))            # a UnicodeDecodeError is a ValueError
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(rec, dict) or not isinstance(rec.get('event_id'), str):
+        return None
+    seq, digest = rec.get('journal_seq'), rec.get('journal_hash')
+    anchor = (seq, digest) if type(seq) is int and seq >= 0 and isinstance(digest, str) else None
+    return rec['event_id'], anchor
+
+
 class TraceWriter:
     def __init__(self, path):
         self.path = path
@@ -14,16 +28,19 @@ class TraceWriter:
         self.last_anchor = None            # (journal_seq, journal_hash) with the highest seq found in the file
         self._dirty_offset = None
         self.torn_copy = None
+        self.skipped = []                  # 1-based numbers of complete lines that are not bridge records
         # Unbuffered bytes make short writes and failed flushes recoverable at a
         # known file offset; no hidden text buffer can append an old failed line.
         self._fh = open(path, 'a+b', buffering=0)
         try:
             self._fh.seek(0)
+            number = 0
             while True:
                 offset = self._fh.tell()
                 line = self._fh.readline()
                 if not line:
                     break
+                number += 1
                 if not line.endswith(b'\n'):
                     with tempfile.NamedTemporaryFile(prefix=os.path.basename(path) + '.torn.',
                             dir=os.path.dirname(os.path.abspath(path)), delete=False) as backup:
@@ -32,14 +49,14 @@ class TraceWriter:
                     self._fh.truncate(offset)
                     break
                 else:
-                    text = line.decode('ascii')
-                    try:
-                        rec = json.loads(text)
-                        self.seen.add(rec['event_id'])
-                        if isinstance(rec.get('journal_seq'), int) and (self.last_anchor is None or rec['journal_seq'] > self.last_anchor[0]):
-                            self.last_anchor = (rec['journal_seq'], rec['journal_hash'])
-                    except (ValueError, KeyError):
-                        pass
+                    record = _record_of(line)
+                    if record is None:
+                        self.skipped.append(number)
+                    else:
+                        self.seen.add(record[0])
+                        anchor = record[1]
+                        if anchor is not None and (self.last_anchor is None or anchor[0] > self.last_anchor[0]):
+                            self.last_anchor = anchor
             # A complete line may have survived a previous sync failure. Confirm
             # it now before treating it as published and suppressing a retry.
             durable.sync(self._fh.fileno())
