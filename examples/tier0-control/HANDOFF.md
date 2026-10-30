@@ -2,6 +2,8 @@
 
 **最新接手入口：2026-10-30 UTC+8。** D11／控制 MCP 分支已同步 `origin/main` `f0fa410`（本地合并提交 `9eaa24b`），集成验证与 PR 交付状态见 [最新验证记录](VALIDATION-D11-INTEGRATED.md)，详细运行边界见 [专项交接](HANDOFF-D11-MCP-20261030.md)。#100、#101 已于同日 13:10 UTC+8 合并；下方「尚待合并／未推送」及旧分支／测试数量是历史阶段记录。
 
+**D11 PR 已提交：** [PR #102](https://github.com/FREEZONEX/ia2/pull/102)，目标 `main`，开放待审核、尚未合并。已验证代码提交 `2824b6a`；366 项 Python、50 类回环、72 个变异、7 步模拟及全仓检查通过。测试范围仍为本地模拟，没有连接真实 Tier0 或硬件。
+
 **本地后续工作：2026-10-30 UTC+8。** 用户确认保留 D11 签名；`feat/tier0-signed-control-mcp` 在 #101 提交基础上实现独立采样、强制验签和真实本地 stdio MCP。此增量尚未推送，不改变 #100/#101；交付与验证见 [LOCAL-CONTROL.md](LOCAL-CONTROL.md)、[VALIDATION-D11.md](VALIDATION-D11.md)。
 
 **PR 提交状态：2026-10-30 UTC+8。** 运行时修复已提交为 [PR #100](https://github.com/FREEZONEX/ia2/pull/100)（`1cc16c0`）；本阶段 1a 工作已提交为 [PR #101](https://github.com/FREEZONEX/ia2/pull/101)，F1–F3 修复与封存文档提交为 `7a8f59a`，树与此前封存候选一致。两条分支均推送至 `FREEZONEX/ia2`；**先合 #100，再合 #101**。本次没有合并 PR，仍待审阅。提交前又重跑了 335 项 Python 测试、64 + 3 个变异及第二轮复核的 7 个 CLI 用例，全部通过；运行时分支全仓检查也通过（Rust 8594 通过 / 105 忽略 / 0 失败，Web 423 项）。新证据位于仓库外 `tier0-pr-submit-20261030/`。

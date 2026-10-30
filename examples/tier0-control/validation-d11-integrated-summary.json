@@ -3,6 +3,8 @@
   "timezone": "UTC+8",
   "conclusion": "OFFLINE PASS",
   "branch": "feat/tier0-signed-control-mcp",
+  "pull_request": "https://github.com/FREEZONEX/ia2/pull/102",
+  "validated_code_commit": "2824b6a25bc0c878a9668b177787bcb07cacaeda",
   "main_integrated": "f0fa410bc8c22263aba7de0bc5400d0273d61c13",
   "merge_commit": "9eaa24bea7e70f44aba8f655d29afc10e60032df",
   "runtime": {

@@ -2,6 +2,8 @@
 
 2026-10-30 UTC+8. This record covers the tree prepared for the D11/control MCP PR, after integrating `origin/main`. Earlier implementation and rereview evidence remains in [VALIDATION-D11.md](VALIDATION-D11.md) and [the handoff](HANDOFF-D11-MCP-20261030.md).
 
+Submitted as [PR #102](https://github.com/FREEZONEX/ia2/pull/102) against `main`, open for review and not merged. Validated code is committed in `2824b6a25bc0c878a9668b177787bcb07cacaeda`; the following handoff/status update changes documentation only. GitHub reports a mergeable PR with all 61 changed files under `examples/tier0-control/`.
+
 ## Source and review scope
 
 | Item | Revision |
