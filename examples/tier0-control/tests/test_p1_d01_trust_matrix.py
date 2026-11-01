@@ -5,8 +5,10 @@ said it and that it was not changed, not that it is true.  So a wrong `verified`
 the other end -- and the read side cannot tell the difference.
 
 This is a design check: it reads the design document (override the path with P1_DESIGN_D11 to check another copy), and it shows the limitation
-the document states on the REAL verifier, using booleans for "authenticated" and "facts correct" -- no signature, key, envelope or protocol
-payload is created.  D11 itself is not implemented, and a last test says so."""
+the document states on the REAL verifier, using booleans for "authenticated" and "facts correct" -- fixture records are now signed before entering the real verifier. D11 authentication itself is tested in test_d11_auth.py."""
+import sys
+sys.path.insert(0, __import__('os').path.dirname(__file__))
+from signing_fixtures import event_keys_path
 import itertools
 import os
 import re
@@ -19,7 +21,7 @@ HERE = Path(__file__).resolve().parent
 SRC = HERE.parent
 sys.path[:0] = [str(HERE), str(SRC / 'lab')]
 import test_verifier as tv  # noqa: E402
-import verifier  # noqa: E402
+import signing_fixtures as verifier  # noqa: E402
 
 DOC = Path(os.environ.get('P1_DESIGN_D11') or SRC / 'contract' / 'DESIGN-D11-signed-events.md')
 
@@ -60,16 +62,15 @@ class Document(unittest.TestCase):
         for piece in ('识别不了', '独立密钥不是双人授权', '不作保证的事', '签名有效但事实错误', '两把密钥互相制衡'):
             self.assertIn(piece, self.s7)
 
-    def test_d11_is_still_only_a_design(self):
-        self.assertIn('D11 仍然没有实现', self.text)
-        for rel in ('lab/verifier.py', 'bridge/trace.py'):
-            code = (SRC / rel).read_text(encoding='utf-8').lower()
-            self.assertNotIn('hmac', code, '%s must not contain signing: D11 is not implemented here' % rel)
+    def test_d11_is_implemented_without_changing_the_trust_limit(self):
+        self.assertIn('本地实现状态', self.text)
+        from readside.verifier import derive
+        with self.assertRaises(TypeError):
+            derive(tv.REQ, tv.ENTRY, [], [], tv.AS_OF)
 
 
 class Matrix(unittest.TestCase):
-    """The four 'authenticated' rows of the matrix, on the real verifier.  Today the verifier has no authentication at all, so every input counts
-    as authenticated -- which is exactly the situation of the rows with a valid-but-false report."""
+    """The four 'authenticated' rows of the matrix, on the real verifier.  Every fixture is correctly signed; the truth of a signed report is still outside the verifier's knowledge."""
 
     @staticmethod
     def received(event_true, sample_true):

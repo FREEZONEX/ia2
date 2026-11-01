@@ -43,6 +43,13 @@ def feedback(st, name):
     return [(s['scan_timestamp_us'], v.get('decoded_value')) for s in st.samples() for v in s['variables'] if v.get('name') == name]
 
 
+def nonfinite_tail_is(st, expected_bits, n=3):
+    """Wait for this bit pattern; null alone cannot distinguish +inf from -inf."""
+    rows = [v for s in st.samples() for v in s['variables'] if v.get('name') == 'sp_flow_fb'][-n:]
+    return len(rows) == n and all(v.get('decoded_value') is None and
+                                 (v.get('bits', 0) & 0xffffffff) == expected_bits for v in rows)
+
+
 def action_posts(st, p):
     label = 'tier0.lab.%s' % p['action_id'][:8]
     return [r for r in posts(st) if r['origin'] == label]
@@ -53,7 +60,7 @@ async def settle(st, p, key, timeout=14):
     seen, res = [], None
     end = time.time() + timeout
     while time.time() < end:
-        res = verifier.derive(p, st.entry(key), st.trace(), st.samples(), now_ms())
+        res = verifier.derive(p, st.entry(key), st.event_envelopes(), st.sample_envelopes(), now_ms(), event_keys=st.event_keys, sample_keys=st.sample_keys)
         seen.append(res['status'])
         if res['status'] != 'accepted':
             break
@@ -85,13 +92,15 @@ async def case_P1F5(st, ck, notes):
     regs = FrozenRegs(st.slave.regs)
     st.slave.regs = regs
     runs = []
-    for name, words, positive, request in (('+inf', (0x7F80, 0x0000), True, 12.5), ('-inf', (0xFF80, 0x0000), False, 13.5)):
+    for name, words, request in (('+inf', (0x7F80, 0x0000), 12.5), ('-inf', (0xFF80, 0x0000), 13.5)):
         regs.freeze({100: words[0], 101: words[1]})
-        seen_on_the_wire = await wait_until(lambda: tail_is(feedback(st, 'sp_flow_fb'), lambda v: isinstance(v, float) and math.isinf(v) and (v > 0) == positive), 10)
-        ck('%s: the sampler decoded the device\'s bit pattern as %s before the write' % (name, name), seen_on_the_wire, feedback(st, 'sp_flow_fb')[-3:])
+        seen_on_the_wire = await wait_until(lambda: nonfinite_tail_is(st, (words[0] << 16) | words[1]), 10)
+        ck('%s: the sampler marks the non-finite device value as null before the write' % name, seen_on_the_wire, feedback(st, 'sp_flow_fb')[-3:])
         sc, status = await st.rt('GET', '/status')
         row = st.var_row(status, 'sp_flow_fb')
         notes['runtime_row_%s' % name] = row
+        ck('%s: runtime raw bits retain the non-finite device value' % name,
+           row is not None and (row.get('bits', 0) & 0xffffffff) == ((words[0] << 16) | words[1]), row)
         p, ev = await submit_wait(st, 'flow_setpoint', request, ttl_ms=20000)
         ck('%s: the bridge accepted a normal, finite request (%s)' % (name, request),
            short(ev) == ('accepted', None) and ev.get('applied_bits') == f32bits(request), short(ev))
@@ -101,8 +110,8 @@ async def case_P1F5(st, ck, notes):
         ck('%s: after the window it says unknown / no_proof_by_deadline, with a diagnosis' % name,
            (res['status'], res.get('reason')) == ('unknown', 'no_proof_by_deadline') and bool(res.get('detail')), res)
         after = [v for t, v in feedback(st, 'sp_flow_fb') if ev.get('post_scan_us') is not None and t > ev['post_scan_us']]
-        ck('%s: samples taken after the write all carry the non-finite value (the bad observation was really in the window)' % name,
-           len(after) >= 3 and all(isinstance(v, float) and math.isinf(v) for v in after), after[:5])
+        ck('%s: samples taken after the write carry null for non-finite feedback (bad observations really in the window)' % name,
+           len(after) >= 3 and all(v is None for v in after), after[:5])
         mine = action_posts(st, p)
         ck('%s: exactly one POST /write for this action' % name, len(mine) == 1, len(mine))
         writes = [e for e in st.slave_writes(100, p['requested_at_ms'] / 1000.0 - 1) if e.get('words') == words_of(f32bits(request) & 0xFFFFFFFF)]
@@ -111,7 +120,7 @@ async def case_P1F5(st, ck, notes):
         await clear_window(ev)
     # bad samples first, then the device reports the requested value: the good sample proves it, the bad ones are skipped
     regs.freeze({100: 0x7F80, 101: 0x0000})
-    await wait_until(lambda: tail_is(feedback(st, 'sp_flow_fb'), lambda v: isinstance(v, float) and math.isinf(v)), 10)
+    await wait_until(lambda: nonfinite_tail_is(st, 0x7F800000), 10)
     p, ev = await submit_wait(st, 'flow_setpoint', 14.5, ttl_ms=20000)
     ck('bad then good: accepted', short(ev) == ('accepted', None), short(ev))
     await asyncio.sleep(1.0)
@@ -122,7 +131,7 @@ async def case_P1F5(st, ck, notes):
     ck('bad then good: the verifier says verified', res['status'] == 'verified', res)
     ck('bad then good: the proof is a finite sample of the feedback variable that carries 14.5', refs.get('variable') == 'sp_flow_fb' and refs.get('value') == 14.5, refs)
     skipped = [v for t, v in feedback(st, 'sp_flow_fb') if ev.get('post_scan_us') is not None and ev['post_scan_us'] < t < (refs.get('scan_timestamp_us') or 0)]
-    ck('bad then good: non-finite samples really came first inside the window', any(isinstance(v, float) and math.isinf(v) for v in skipped), skipped[:6])
+    ck('bad then good: non-finite samples really came first inside the window', any(v is None for v in skipped), skipped[:6])
     ck('bad then good: exactly one POST /write for this action', len(action_posts(st, p)) == 1, len(action_posts(st, p)))
     notes['result_bad_then_good'] = res
     w = wire_summary(st.wire())

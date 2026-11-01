@@ -3,13 +3,15 @@ import json
 from pathlib import Path
 import sys
 SRC=Path(__file__).resolve().parents[1]
+sys.path.insert(0,str(SRC))
+from readside.auth import load_keys, verify
 RUNS=Path(sys.argv[1]) if len(sys.argv)>1 else SRC.parent/'runs-final'
 
 def rows(path):return [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
 
 out=[]
 for case,expected in [('R1',0),('R2',1)]:
-    root=RUNS/(case+'-r1');journal=rows(root/'journal.jsonl');trace=rows(root/'trace.jsonl')
+    root=RUNS/(case+'-r1');journal=rows(root/'journal.jsonl');trace=[verify(e,load_keys(root/'event-keys.json'),'event') for e in rows(root/'trace.jsonl')]
     wire=rows(root/'wire.jsonl');audit=json.loads((root/'final.json').read_text())['audit']['body']
     intents=[r for r in journal if r['kind']=='intent']
     assert len(intents)==(1 if case=='R1' else 2)

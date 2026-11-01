@@ -1,4 +1,7 @@
 """Local in-memory IA2 fixture for P0 regression tests; no external connections."""
+import sys
+sys.path.insert(0, __import__('os').path.dirname(__file__))
+from signing_fixtures import event_keys_path
 import copy
 import hashlib
 import json
@@ -13,7 +16,7 @@ sys.path[:0] = [str(SRC), str(SRC / 'lab')]
 from bridge import auth, registry, northbound_guard
 from bridge.engine import Engine
 from bridge.journal import Journal, DAY_MS
-from bridge.trace import TraceWriter
+from signing_fixtures import TraceWriter
 
 KEYS = {'k': {'secret': b'independent-review-fixture-key-32', 'not_before_ms': 0, 'not_after_ms': 2**60}}
 AID = '0123456789abcdef0123456789abcdef'

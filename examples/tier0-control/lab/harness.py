@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Slice harness: runs TEST-CASES A1, B1, B3, C1 against a sandbox ia2-runtime, a fake Modbus slave, the real bridge
-process, a recording proxy, a sampler thread and the independent verifier.  Loopback only; the only processes it signals
+process, a recording proxy, a sampler process and the independent verifier.  Loopback only; the only processes it signals
 are its own children.  Python >= 3.8, stdlib.
 
   python3 -I lab/harness.py --bin <ia2-runtime> --out runs [--cases A1,B1,B3,C1]
@@ -30,7 +30,8 @@ from fakemodbus_plus import FakeSlavePlus  # noqa: E402
 from recproxy import RecordingProxy  # noqa: E402
 from sampler import Sampler  # noqa: E402
 from stubia2 import StubIA2  # noqa: E402
-from standin import Standin, read_jsonl, read_trace  # noqa: E402
+from standin import Standin, read_jsonl, read_trace
+from readside import auth as evidence_auth  # noqa: E402
 
 # Loopback ports; IA2_LAB_PORT_BASE moves the whole set (default 13500) so two labs can run side by side.
 _BASE = int(os.environ.get('IA2_LAB_PORT_BASE', '13500'))
@@ -177,10 +178,17 @@ class Stack:
         with open(self.p('keys.json'), 'w') as f:
             json.dump({'k1': {'secret_hex': secret.hex(), 'not_before_ms': 0, 'not_after_ms': now_ms() + 86400000}}, f)
         os.chmod(self.p('keys.json'), 0o600)
+        for role in ('event', 'sample'):
+            path = self.p(role + '-keys.json')
+            with open(path, 'w') as f:
+                json.dump({role + '-1': dict(secret_hex=os.urandom(32).hex(), not_before_ms=0,
+                                            not_after_ms=now_ms() + 86400000)}, f)
+            os.chmod(path, 0o600)
+            setattr(self, role + '_keys', evidence_auth.load_keys(path))
         self.secret = secret
         self.standin = Standin(self.p('requests.jsonl'), secret)
         if not self.stub:
-            self.sampler = Sampler(RT_PORT, self.p('samples.jsonl'))
+            self.sampler = Sampler(RT_PORT, self.p('samples.jsonl'), self.p('sample-keys.json'))
             self.sampler.start()
         await self.start_bridge(hooks, env)
 
@@ -225,7 +233,7 @@ class Stack:
     def bridge_cmd(self, registry=None, registry_sha=None, journal=None, hooks=None):
         port = STUB_PORT if self.stub else PROXY_PORT
         cmd = [sys.executable, '-I', self.bridge_run, '--registry', registry or self.p('registry.json'),
-               '--registry-sha256', registry_sha or self.registry_sha, '--keys', self.p('keys.json'),
+               '--registry-sha256', registry_sha or self.registry_sha, '--keys', self.p('keys.json'), '--event-keys', self.p('event-keys.json'),
                '--runtime', '127.0.0.1:%d' % port, '--journal', journal or self.p('journal.jsonl'),
                '--requests', self.p('requests.jsonl'), '--trace', self.p('trace.jsonl'),
                '--project-dir', self.p('project'), '--poll-ms', '100', '--reconcile-recheck-ms', '2000'] + self.bridge_args
@@ -318,10 +326,19 @@ class Stack:
         return await asyncio.get_running_loop().run_in_executor(None, self._rt_sync, method, path, body, timeout)
 
     def trace(self):
-        return read_trace(self.p('trace.jsonl'))
+        return read_trace(self.p('trace.jsonl'), self.event_keys)
 
     def samples(self):
+        return evidence_auth.verified_records(self.sample_envelopes(), self.sample_keys, 'sample')[0]
+
+    def event_envelopes(self):
+        return read_jsonl(self.p('trace.jsonl'))
+
+    def sample_envelopes(self):
         return read_jsonl(self.p('samples.jsonl'))
+
+    def signed_event(self, event):
+        return evidence_auth.sign(event, self.event_keys, 'event')
 
     def wire(self):
         """What the bridge sent to IA2 (or to the stub) while serving requests: the recording proxy's log, without the reads a bridge
@@ -388,7 +405,7 @@ async def case_A1(st, ck, notes):
     ck('label is tier0.<agent>.<id8>', ev.get('label') == label, ev.get('label'))
     res = None
     for _ in range(80):
-        res = verifier.derive(req, st.entry('flow_setpoint'), st.trace(), st.samples(), now_ms())
+        res = verifier.derive(req, st.entry('flow_setpoint'), st.event_envelopes(), st.sample_envelopes(), now_ms(), event_keys=st.event_keys, sample_keys=st.sample_keys)
         if res['status'] != 'accepted':
             break
         await asyncio.sleep(0.2)
@@ -401,9 +418,9 @@ async def case_A1(st, ck, notes):
        (refs.get('scan_timestamp_us'), ev.get('post_scan_us')))
     ck('...and the bridge recorded the offset between its wall clock and that scan clock', isinstance(ev.get('scan_anchor_ms'), int), ev.get('scan_anchor_ms'))
     ck('the verifier accepts the bridge\'s registry hash and refuses another one',
-       verifier.derive(req, st.entry('flow_setpoint'), st.trace(), st.samples(), now_ms(), registry_sha256=st.registry_sha)['status'] == 'verified'
-       and verifier.derive(req, st.entry('flow_setpoint'), st.trace(), st.samples(), now_ms(), registry_sha256='0' * 64)['status'] == 'unknown')
-    later = verifier.derive(req, st.entry('flow_setpoint'), st.trace(), st.samples(), req['deadline_ms'] + 1000)
+       verifier.derive(req, st.entry('flow_setpoint'), st.event_envelopes(), st.sample_envelopes(), now_ms(), registry_sha256=st.registry_sha, event_keys=st.event_keys, sample_keys=st.sample_keys)['status'] == 'verified'
+       and verifier.derive(req, st.entry('flow_setpoint'), st.event_envelopes(), st.sample_envelopes(), now_ms(), registry_sha256='0' * 64, event_keys=st.event_keys, sample_keys=st.sample_keys)['status'] == 'unknown')
+    later = verifier.derive(req, st.entry('flow_setpoint'), st.event_envelopes(), st.sample_envelopes(), req['deadline_ms'] + 1000, event_keys=st.event_keys, sample_keys=st.sample_keys)
     ck('the verdict is stable after the deadline', later['status'] == 'verified', later)
     ck('no `verified` anywhere in the bridge trace',
        all(e.get('status') != 'verified' for e in st.trace()), [e.get('status') for e in st.trace()])
@@ -578,13 +595,13 @@ def tree_hash(paths):
 
 def code_files():
     out = []
-    for base in ('bridge', 'lab'):
+    for base in ('bridge', 'lab', 'readside'):
         for directory, dirs, names in os.walk(os.path.join(ROOT, base)):
             dirs[:] = sorted(d for d in dirs if d != '__pycache__')
             for name in sorted(names):
                 if name.endswith('.py'):
                     out.append(os.path.relpath(os.path.join(directory, name), ROOT).replace(os.sep, '/'))
-    return out + ['bridge_run.py', 'contract_vocab.json']
+    return out + ['bridge_run.py', 'sampler_run.py', 'control_mcp_run.py', 'control_mcp.py', 'contract_vocab.json']
 
 
 async def run_case(case_id, args):
@@ -618,11 +635,12 @@ async def run_case(case_id, args):
     if hasattr(st, 'secret'):
         for base, _, files in os.walk(case_dir):
             for name in files:
-                if name in ('keys.json', 'MANIFEST.sha256'):
+                if name in ('keys.json', 'event-keys.json', 'sample-keys.json', 'MANIFEST.sha256'):
                     continue
                 with open(os.path.join(base, name), 'rb') as f:
                     data = f.read()
-                if st.secret.hex().encode() in data or st.secret in data:
+                if any(secret.hex().encode() in data or secret in data for secret in
+                       [st.secret] + [key['secret'] for role in ('event_keys', 'sample_keys') for key in getattr(st, role, {}).values()]):
                     leaked.append(os.path.relpath(os.path.join(base, name), case_dir))
     ck('no signing-secret material anywhere in the evidence', not leaked, leaked)
     verdict = 'FAIL' if (error or ck.failed) else ('FINDING' if notes.get('finding') else 'PASS')

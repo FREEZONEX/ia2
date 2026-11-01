@@ -18,8 +18,10 @@ BLOCK = re.compile(r'^[ \t]*# --- lab-only begin\n.*?^[ \t]*# --- lab-only end\n
 def build(dest):
     shutil.rmtree(dest, ignore_errors=True)
     os.makedirs(os.path.join(dest, 'bridge'))
-    for name in ('bridge_run.py', 'contract_vocab.json'):
+    for name in ('bridge_run.py', 'sampler_run.py', 'control_mcp_run.py', 'control_mcp.py', 'contract_vocab.json'):
         shutil.copy(os.path.join(ROOT, name), os.path.join(dest, name))
+    shutil.copytree(os.path.join(ROOT, 'readside'), os.path.join(dest, 'readside'),
+                    ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
     # Preserve the pinned parser, provenance and license in the standalone copy.
     shutil.copytree(os.path.join(ROOT, 'bridge', '_vendor'), os.path.join(dest, 'bridge', '_vendor'),
                     ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))

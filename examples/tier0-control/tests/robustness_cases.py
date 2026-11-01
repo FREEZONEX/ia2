@@ -1,5 +1,8 @@
 """Shared by tests/test_robustness.py and review/author-probes/fuzz_engine.py: odd-but-validly-signed payloads, a fake healthy
 IA2 client, and a runner that returns what happened to each input."""
+import sys
+sys.path.insert(0, __import__('os').path.dirname(__file__))
+from signing_fixtures import event_keys_path
 import json
 import os
 import sys
@@ -12,7 +15,7 @@ sys.path.insert(0, ROOT)
 from bridge import auth, registry  # noqa: E402
 from bridge.engine import Engine  # noqa: E402
 from bridge.journal import Journal  # noqa: E402
-from bridge.trace import TraceWriter  # noqa: E402
+from signing_fixtures import TraceWriter  # noqa: E402
 
 GOLDEN = os.path.join(ROOT, 'tests', 'fixtures', 'golden')
 

@@ -65,9 +65,10 @@ def read_jsonl(path):
     return out
 
 
-def read_trace(path):
+def read_trace(path, event_keys):
+    from readside.auth import verified_records
     seen, out = set(), []
-    for e in read_jsonl(path):
+    for e in verified_records(read_jsonl(path), event_keys, 'event')[0]:
         if e.get('event_id') not in seen:
             seen.add(e.get('event_id'))
             out.append(e)

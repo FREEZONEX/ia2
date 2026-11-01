@@ -330,7 +330,8 @@ class Finishing(unittest.TestCase):
             self.assertEqual(len(client.posts), 1)
             self.assertEqual(e.counters['internal_errors'], 1)
             e.handle_line(line)                                       # the repeat re-emits the recorded event now that the trace works
-            lines = [json.loads(l) for l in (Path(tmp) / 'trace.jsonl').read_text().splitlines()]
+            from signing_fixtures import decode_event
+            lines = [decode_event(json.loads(l)) for l in (Path(tmp) / 'trace.jsonl').read_text().splitlines()]
             self.assertEqual([l['status'] for l in lines if l.get('action_id') == AID], ['accepted'])
             self.assertEqual(len(client.posts), 1)
             close(e)

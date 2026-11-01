@@ -4,6 +4,9 @@ synthetic observations, with nothing from the bridge involved.
 Clock layout used below (all in the runtime's SCAN clock, microseconds, unless named _ms):
   the bridge's first post-write /status read showed scan time 5_000_000 (post_scan_us) at wall 6_000 ms  -> anchor 1_000 ms
   settle 5_000 ms  -> the proof window is (5_000_000, 10_000_000];  deadline 21_000 ms -> 20_000_000 us"""
+import sys
+sys.path.insert(0, __import__('os').path.dirname(__file__))
+from signing_fixtures import event_keys_path
 import os
 import sys
 import unittest
@@ -11,7 +14,7 @@ import unittest
 sys.dont_write_bytecode = True
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, 'lab'))
-import verifier  # noqa: E402
+import signing_fixtures as verifier  # noqa: E402
 
 AID = 'a' * 32
 REQ = {'action_id': AID}

@@ -1,4 +1,7 @@
 """F02: lifetime inode lock; real processes, no network."""
+import sys
+sys.path.insert(0, __import__('os').path.dirname(__file__))
+from signing_fixtures import event_keys_path, EVENT_KEYS
 import contextlib
 import io
 import json
@@ -77,10 +80,11 @@ class Lock(unittest.TestCase):
         from p0_support import KEYS, reg_for
         with tempfile.TemporaryDirectory() as tmp:
             path=Path(tmp)/'j'
-            args=['--registry','unused','--registry-sha256','unused','--keys','unused',
+            args=['--registry','unused','--registry-sha256','unused','--keys','unused', '--event-keys', event_keys_path('unused'),
                   '--runtime','127.0.0.1:1','--journal',str(path),'--trace',str(Path(tmp)/'t'),
                   '--requests',str(Path(tmp)/'q'),'--project-dir',tmp,'--governance-check','off']
             with patch.object(main.auth,'load_keys',return_value=KEYS), \
+                 patch.object(main.eventauth,'load_keys',return_value=EVENT_KEYS), \
                  patch.object(main.registry_mod,'load_pinned',return_value=reg_for()), \
                  patch.object(main.northbound_guard,'check',return_value='absent'), \
                  patch.object(main.preflight,'check',return_value={'reachable':True,'problems':['test missing field']}), \

@@ -4,14 +4,14 @@ import json
 import os
 import tempfile
 
-from . import durable
+from . import durable, eventauth
 
 
-def _record_of(line):
+def _record_of(line, keys, revoked):
     """(event_id, anchor) of a complete line this bridge could have written, else None.  The bridge writes ASCII JSON objects with a
     string event ID, so any other complete line (foreign or damaged) is skipped the same way, whatever it fails on."""
     try:
-        rec = json.loads(line.decode('ascii'))            # a UnicodeDecodeError is a ValueError
+        rec = eventauth.verify(line.decode('ascii'), keys, revoked)
     except (ValueError, RecursionError):
         return None
     if not isinstance(rec, dict) or not isinstance(rec.get('event_id'), str):
@@ -22,7 +22,10 @@ def _record_of(line):
 
 
 class TraceWriter:
-    def __init__(self, path):
+    def __init__(self, path, event_keys, revoked=()):
+        if not event_keys:
+            raise ValueError('event keys are required')
+        self.event_keys, self.revoked = event_keys, frozenset(revoked)
         self.path = path
         self.seen = set()
         self.last_anchor = None            # (journal_seq, journal_hash) with the highest seq found in the file
@@ -49,7 +52,7 @@ class TraceWriter:
                     self._fh.truncate(offset)
                     break
                 else:
-                    record = _record_of(line)
+                    record = _record_of(line, self.event_keys, self.revoked)
                     if record is None:
                         self.skipped.append(number)
                     else:
@@ -73,7 +76,8 @@ class TraceWriter:
             return False
         if anchor is not None:
             event = dict(event, journal_seq=anchor[0], journal_hash=anchor[1])
-        data = (json.dumps(event, sort_keys=True, separators=(',', ':'), ensure_ascii=True) + '\n').encode('ascii')
+        envelope = eventauth.sign(event, self.event_keys, self.revoked)
+        data = (json.dumps(envelope, sort_keys=True, separators=(',', ':'), ensure_ascii=True) + '\n').encode('ascii')
         if self._dirty_offset is not None:
             # The previous append may be empty, partial or complete but unsynced.
             # Remove only that uncommitted suffix before any new append.

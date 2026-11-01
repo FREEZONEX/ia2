@@ -1,4 +1,7 @@
 """IR03: recover durable results through real request, startup and periodic paths."""
+import sys
+sys.path.insert(0, __import__('os').path.dirname(__file__))
+from signing_fixtures import event_keys_path, decode_event, event_record
 import errno
 import json
 import os
@@ -14,7 +17,7 @@ from p0_support import AID, Client, SRC, close, engine, envelope, payload
 from bridge import durable
 from bridge.engine import sha256_text
 from bridge.journal import JournalWriteError
-from bridge.trace import TraceWriter
+from signing_fixtures import TraceWriter
 import test_p1_f07_process as proc
 
 START = 1800000000000
@@ -47,7 +50,7 @@ def events(path):
     if raw and not raw.endswith(b'\n'):
         raise AssertionError('trace contains an incomplete final line')
     try:
-        return [json.loads(line) for line in raw.splitlines()]
+        return [decode_event(json.loads(line)) for line in raw.splitlines()]
     except ValueError as exc:
         raise AssertionError('trace contains a corrupt JSON line: %s' % exc)
 
@@ -175,11 +178,11 @@ class Publication(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             e = engine(tmp, [START]); client = e.client
             try:
-                e.trace.emit({'event_id': 'prior', 'kind': 'test'})
+                e.trace.emit({'event_id': 'prior', 'kind': 'bridge_notice'})
                 original = e.trace._fh; e.trace._fh = FileFault(original, 'partial')
                 e.safe_handle_line(envelope(payload(START))); saved = e.journal.final_event(AID)
                 e.trace._fh = original
-                e.trace.emit({'event_id': 'later', 'kind': 'test'})
+                e.trace.emit({'event_id': 'later', 'kind': 'bridge_notice'})
                 self.retry(e); self.retry(e)
                 self.check(e, tmp, saved, client)
                 self.assertEqual([r['event_id'] for r in events(Path(tmp) / 'trace.jsonl')], ['prior', 'later', saved['event_id']])
@@ -209,7 +212,7 @@ class Publication(unittest.TestCase):
             try:
                 writer._fh = FileFault(writer._fh, 'short')
                 writer.emit({'event_id': 'short', 'value': 'abcdef'})
-                self.assertEqual(events(writer.path), [{'event_id': 'short', 'value': 'abcdef'}])
+                self.assertEqual(events(writer.path), [event_record({'event_id': 'short', 'value': 'abcdef'})])
             finally: writer.close()
 
     def test_restart_preserves_torn_tail_and_republishes_complete_result(self):
