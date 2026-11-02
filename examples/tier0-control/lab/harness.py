@@ -612,8 +612,10 @@ async def run_case(case_id, args):
     entry = CASES[case_id]
     fn, targets = entry[0], entry[1]
     opts = entry[2] if len(entry) > 2 else {}
-    st = Stack(case_dir, args.bin, targets, stub=opts.get('stub', False), bridge_args=opts.get('bridge_args'), prod=opts.get('prod', False),
-               project_opts=opts.get('project'))
+    stack_type = opts.get('stack', Stack)
+    extra = {'server_bin': args.server_bin, 'cs_bin': args.cs_bin} if 'stack' in opts else {}
+    st = stack_type(case_dir, args.bin, targets, stub=opts.get('stub', False), bridge_args=opts.get('bridge_args'), prod=opts.get('prod', False),
+                    project_opts=opts.get('project'), **extra)
     ck, notes = Checks(), {}
     started = time.time()
     error = None
@@ -677,9 +679,16 @@ async def main_async(args):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--bin', required=True)
+    ap.add_argument('--server-bin', help='IDE server binary (required for A3b)')
+    ap.add_argument('--cs-bin', help='cs binary for the A3b agent session wrapper')
     ap.add_argument('--out', required=True)
     ap.add_argument('--cases', default='A1,B1,B3,C1')
     args = ap.parse_args()
+    if 'A3b' in args.cases.split(',') and not (args.server_bin and args.cs_bin):
+        ap.error('A3b requires --server-bin and --cs-bin')
+    for name in ('bin', 'server_bin', 'cs_bin'):
+        if getattr(args, name):
+            setattr(args, name, os.path.abspath(getattr(args, name)))
     args.out = os.path.abspath(args.out)
     results = asyncio.run(main_async(args))
     if any(r['verdict'] == 'FAIL' or r['error'] for r in results):
