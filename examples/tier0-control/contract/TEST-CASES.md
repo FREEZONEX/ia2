@@ -4,6 +4,10 @@
 
 **阶段 1a 历史状态（2026-10-29，PR #99 合并之后）：** 28 个 P0、`PROD`、两个复核回归与 13 个 P1 在最终代码上 54/54 PASS（R3 组三遍），727 条断言无失败；WP6 对账程序与 2 小时浸泡已完成。**第 4 节的五条退出条件都有了证据**，逐条见 [`RESULT-1A.md`](../RESULT-1A.md)；其中 R3、B5、C5、C10、R5、F4 的 EXPECT 与浸泡对账的一条判据是运行后修订的，均有登记。
 
+**2026-11-02 UTC+8 补测：** C11 已在本机独立 runtime／临时 rumqttd／假设备上 42/42 PASS，独立 C10 回归 9/9 PASS，详见 [`VALIDATION-C11.md`](../VALIDATION-C11.md)。下表“P2 未做”为 2026-10-29 的历史状态；A3b 由其独立任务维护，本次只更新 C11。
+
+**2026-11-02 UTC+8 审核修复复验：** C11 增加关闭观察窗口的 runtime MQTT 活性判据后为 **43/43 PASS**，C10 仍为 **9/9 PASS**；断线／错误权限组合与 broker 端口占用的六项真实进程回归通过。原始 C11 与增强对照的范围未合并，详见 [`VALIDATION-C11.md`](../VALIDATION-C11.md#审核修复复验)。
+
 ## 0 阶段划分
 
 | 段 | 内容 | 触碰 | 状态 |
@@ -85,7 +89,7 @@
 | C8 | P0 | `accepted` 后 `kill` 并重启沙箱 runtime（新 `runtime_id` / PID） | `/audit` 清空；新实例变量回到工程初值 | `unknown runtime_restarted`；不重发；新实例上匹配目标的反馈**不**使旧动作 `verified` |
 | C9 | P1 | 对 #98 头 `5ca976e` 构建重复 C1、C3、C8 | 锁存时 `/health` 与 `/status` 含 `failsafe_status`；其余同 `1c42df7` | `failsafe_status` 非空时 G8 拒；与 `1c42df7` 的差异列表写进结果。字段名先读该 PR 头确认再动手 |
 | C10 | P1 | 沙箱工程的 `northbound.toml`：(a) `[mqtt]` 里 `allow_write=true`；(b) 文件无法解析 / 无法读取；(c) 文件不存在；(d) `allow_write=false`；(e) 桥运行中把文件改成 `allow_write=true` 并令 runtime 重启（新 `runtime_id`） | D6：`/health`、`/status` 不暴露北向状态，只能读文件。runtime 把「文件不存在」「无法读取」都当作北向关闭，桥对「无法读取 / 解析不了」更保守 | (a)(b) 桥拒绝启动；(c)(d) 可启动；(e) 桥发现 `runtime_id` 变化后重读文件，之后的请求 `rejected northbound_write_enabled`，且不触达 IA2 |
-| C11 | P2 | 沙箱 runtime 的 `allow_write=true` 且有本机 MQTT broker 时，向 `<prefix>/write` 发一条（只作表征；桥不参与） | MQTT 写被应用，审计 `origin=mqtt`，**无任何响应通道**，且绕过桥的全部闸门 | 记录。需要 broker（Mac 上没有 mosquitto，见 `DESIGN-1A.md` §5），可推迟到 P0/P1 之后 |
+| C11 | P2 | 沙箱 runtime 的 `allow_write=true` 且有本机 MQTT broker 时，向 `<prefix>/write` 发一条（只作表征；桥不参与） | MQTT 写被应用，审计 `origin=mqtt`，无逐请求应用结果主题，且绕过桥的全部闸门；runtime 治理仍有效，PUBACK 与 status/snapshot 不等于应用结果响应 | 2026-11-02 UTC+8 已补本机运行；`lab/cases_c11.py`、临时 rumqttd、独立 runtime 与假 Modbus。原始 C11 与治理／关闭增强对照分开；结果及观察窗口见 [`VALIDATION-C11.md`](../VALIDATION-C11.md) |
 
 ### R 桥自身故障
 
@@ -199,7 +203,7 @@ P1 由 `lab/cases_p1_table.py` 端到端运行（结果见 [`RESULT-1A.md`](../R
 2. 新的工程生成器（新文件，不改 `mkproject.py`）：`[governance]` allowlist + min/max；REAL / DINT / BOOL 目标；被程序赋值的输出；带 `input.stale` 的反馈 Input 映射；多个 Modbus 设备。
 3. 桩 IA2 HTTP 服务（B11）。
 4. 桥参考实现及其 `--test-hooks`（G8 与发送之间停顿、意图后崩溃、关闭某闸门）。
-5. 最小 MQTT broker 或本机 mosquitto（C10）。
+5. 最小 MQTT broker（C11；2026-11-02 UTC+8 已补 `crates/runtime/examples/test_broker.rs`，复用现有 rumqttd dev-dependency，无需系统 mosquitto）。
 6. 对账程序（journal ↔ `/audit` ↔ 假从站日志）。
 7. 假 ssh 包装（A3b；#75 部署健康检查用过同类做法）。
 8. 注册表静态检查工具（C6、F4）。
@@ -210,6 +214,7 @@ P1 由 `lab/cases_p1_table.py` 端到端运行（结果见 [`RESULT-1A.md`](../R
 
 | 版本 | 日期 | 内容 |
 |---|---|---|
+| C11 补测 | 2026-11-02 UTC+8 | 增补独立 runtime／临时 rumqttd／假 Modbus 的 MQTT 直写表征与治理、关闭增强对照；“无任何响应通道”收窄为实现本来就有的“无逐请求应用结果主题”，并限定为实际主题前缀和观察窗口。开发轮快照未等扫描前进、把 inactive/acked 预置告警当成未清告警两处测试断言已修正，原失败留证。未改变产品实现或合法写入判据。 |
 | v0 草案 | 2026-10-27 | 首版；全部用例未运行；EXPECT 来自对 `1c42df7` 的读码。 |
 | v0.1 | 2026-10-27 | 用户定 D1–D8（`CONTRACT.md` §10）。C3、R1 只剩一个分支（D1(a)、D8(a)）；C10 改为 D6 的自检（P1），原 MQTT 表征拆为 C11（P2）；F2 增加「占坑」与密钥扫描；新增 F5（D3 fail closed）；退出条件 4 改写；夹具缺口 1 已核对。EXPECT 其余未变，仍无任何运行。 |
 | v0.2 | 2026-10-27 | 用户定 D9（JSON 注册表）、D10（对 payload 精确字节签名）：F2 增加「签名正确但 payload 非法」变体。其余未变，仍无任何运行。 |

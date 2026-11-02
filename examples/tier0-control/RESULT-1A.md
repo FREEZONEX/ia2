@@ -54,7 +54,11 @@
 | F5 | PASS | `enabled` 且 `requires_approval`：退出码 2 并指明该项；改成禁用后能启动，该项的请求在 IA2 之前被拒 |
 | PROD | PASS | 生产包，见 P0 运行 |
 
-P2 的 C11（MQTT 写的表征，要 broker）与 A3b（经 IDE server 代理，要假 ssh）没做。
+2026-10-29 当时，P2 的 C11（MQTT 写的表征，要 broker）与 A3b（经 IDE server 代理，要假 ssh）没做。
+
+**2026-11-02 UTC+8，C11 补测：** 本机独立 runtime、临时 rumqttd 与两台假 Modbus 设备已完成 MQTT 直写表征，见 [VALIDATION-C11.md](VALIDATION-C11.md)。合法 REAL `12.5` 应用并回读，审计 `origin=mqtt`；增强对照覆盖未列入治理白名单的写入拒绝、`50.0` 限幅至 `40.0`，以及正常重启后 `allow_write=false` 不应用写入。观察仅覆盖本轮唯一主题前缀及有界窗口，不把 PUBACK 当作应用结果，也不宣称不存在任何 MQTT 响应。C11 中不启动控制桥；桥的北向写保护由独立 C10 回归核对。本补测不改变 A3b 的独立记录或现场验收状态。
+
+**2026-11-02 UTC+8，C11 审核修复复验：** 关闭写权限对照增加 runtime MQTT 全窗口活性检查，临时 broker 修正占用端口的就绪误报；C10 **9/9**、C11 **43/43**，六项真实进程回归通过。原 42/42 为修复前历史结果。新证据与质量检查见 [VALIDATION-C11.md](VALIDATION-C11.md#审核修复复验)。
 
 ## 3 浸泡（WP9）
 

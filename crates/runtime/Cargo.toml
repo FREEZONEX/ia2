@@ -9,6 +9,10 @@ publish.workspace = true
 name = "ia2-runtime"
 path = "src/main.rs"
 
+[[example]]
+name = "test_broker"
+path = "examples/test_broker.rs"
+
 [dependencies]
 tokio.workspace = true
 tokio-stream.workspace = true
