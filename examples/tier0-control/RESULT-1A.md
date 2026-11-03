@@ -37,7 +37,7 @@
 
 | 用例 | 结果 | 说明 |
 |---|---|---|
-| A3 | PASS（表征） | 直连 runtime 时 `origin` 原样记录：`.` `-` `_`、`:`、空格、70 个字符都保留；空串和不带头都记 `anonymous`。桥只发 `[A-Za-z0-9._-]{1,64}`。经 IDE server 代理的 A3b（P2）没做 |
+| A3 | PASS（表征） | 直连 runtime 时 `origin` 原样记录：`.` `-` `_`、`:`、空格、70 个字符都保留；空串和不带头都记 `anonymous`。桥只发 `[A-Za-z0-9._-]{1,64}`。当时经 IDE server 代理的 A3b（P2）未做；2026-11-02 追加结果见下文 |
 | A4 | PASS | 经桥写 300 次（全部 `accepted`），`/audit` 只剩最新 256 条、最早 44 条丢失。只凭最后一次读取，对账程序把这 44 个判为 `uncheckable_turnover`，既不说没写过、也不说一致；每秒归档的版本 300 个全部 `consistent` |
 | B5 | PASS（EXPECT 已改，见 §1） | |
 | B10 | PASS | 两个方向都 `rejected simulation_mismatch`，不触达 IA2 |
@@ -54,7 +54,11 @@
 | F5 | PASS | `enabled` 且 `requires_approval`：退出码 2 并指明该项；改成禁用后能启动，该项的请求在 IA2 之前被拒 |
 | PROD | PASS | 生产包，见 P0 运行 |
 
-P2 的 C11（MQTT 写的表征，要 broker）与 A3b（经 IDE server 代理，要假 ssh）没做。
+历史运行时，P2 的 C11（MQTT 写的表征，要 broker）与 A3b（经 IDE server 代理，要假 ssh）未做。
+
+**2026-11-02 UTC+8 追加 A3b：OFFLINE PASS。** 在 `61f695b` 基线上，经真实 IDE `POST /api/edges/a3b/runtime/write`、限定目标的假 SSH、原始代理 curl 和本机沙箱 runtime，九种标签的直连／代理对照全部符合预期：`tier0.lab.1234abcd`、`.`/`-`/`_` 组合和 64 字符合规标签均原样保留；冒号与空格仅在代理路径被删除，70 字符仅在代理路径被截为 64；空串／缺省为 `anonymous`，`!!!` 仅在代理路径变为 `anonymous`。每条核对 HTTP 响应、恰一条审计增量、`op/name/requested/applied/result/origin`、推进扫描后的变量位值，且未产生 `http_origin`。
+
+原始 A3b 的最小关闭范围是合规标签代理端到端及直连对照；完整标签矩阵与限幅／治理拒绝属于追加覆盖。增强项的 200 限幅和 403 文本经代理完整返回。原 A3 同轮复跑 PASS；A3b 为 166 条检查、零失败。测试工程检查和既有 7 步模拟场景也通过。代码、命令、边界与原始证据索引见 [VALIDATION-A3B.md](VALIDATION-A3B.md)。C11 本轮未运行，继续独立跟踪。本机结果不证明真实 SSH 网络、物理效果或来源认证。
 
 ## 3 浸泡（WP9）
 

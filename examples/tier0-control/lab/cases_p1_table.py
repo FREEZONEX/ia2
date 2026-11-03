@@ -108,7 +108,7 @@ async def case_A3(st, ck, notes):
     if got != expect:
         notes['finding'] = 'A3: the direct path did not record the raw non-empty header (or anonymous for none): %r' % notes['origins']
     notes['note'] = ('The bridge only ever sends [A-Za-z0-9._-]{1,64} (CONTRACT 8.1), so the characters the two paths treat differently '
-                     'never occur in its labels. The IDE-server proxy path (A3b) is not exercised in 1a.')
+                     'never occur in its labels. This A3 case only exercises the direct path; run A3b separately for the IDE proxy.')
 
 
 async def archive_audit(st, path, stop):

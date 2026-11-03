@@ -74,6 +74,25 @@ python3 -I -B lab/p0_bool_acceptance.py --bin ../../target/release/ia2-runtime
 python3 -I -B lab/check_pulse_hold.py --bin ../../target/release/ia2-runtime --out evidence/pulse-hold
 ```
 
+A3b additionally needs the IDE server and CLI binaries. From this directory, after
+`cargo build --locked --release -p server -p ia2-runtime -p ia2-cli` at the repository root:
+
+```sh
+IA2_LAB_PORT_BASE=24500 python3 -I -B lab/run_cases.py \
+  --bin ../../target/release/ia2-runtime --server-bin ../../target/release/server \
+  --cs-bin ../../target/release/cs --out evidence/a3b-NEW-RUN --cases A3,A3b
+```
+
+A3b opens only a copied device-free test project in a disposable IDE with its own user state.
+It runs under `cs agent run`. A fake `ssh`, visible only on that IDE child's PATH,
+validates the placeholder host and this run's command/port, then executes the generated
+curl against the loopback recording proxy and real runtime. It never falls back to real SSH.
+The case checks nine labels on both paths, exact audit increments and variable bits;
+clamp and governance-denial pairs are extra coverage. It also validates the copied project
+and runs its existing simulator scenario. This POSIX helper requires `/bin/sh` and
+`/usr/bin/curl`; no SSH daemon, broker, signing bridge, Tier0 or hardware is needed.
+Use a fresh evidence directory; see [VALIDATION-A3B.md](VALIDATION-A3B.md) for results and limits.
+
 `lab/check_pulse_hold.py` measures, from the fake device's own log, how long a `pulse_ms` write holds the coil after it waited behind a 300 ms scan stall. The band is fixed in advance: `pulse_ms` minus 10 ms to `pulse_ms` plus 50 ms.
 
 Use a new output directory for each integration run. Run integration suites serially: they own loopback ports 13501, 13502, 13503, 13511 and 13512. Setting `IA2_LAB_PORT_BASE` (default 13500) moves the whole set, so a second lab can run beside the first on other ports. The runner exits nonzero for a FAIL or setup error and records source-tree and binary hashes. See [VALIDATION.md](VALIDATION.md) for the exact tested runtime revision and results; the historical R3 finding remains visible. The R3 timing cases inject a single 1 s scan stall, signal only the harness's own runtime child, and read the runtime socket's receive queue with `netstat` (`-an -p tcp` on macOS, where they were recorded; the Linux `-tan` form is untested). The recording proxy can hold the runtime's `/write` answer, or keep the runtime connection open after the bridge disconnects; neither control is used unless a case enables it.
