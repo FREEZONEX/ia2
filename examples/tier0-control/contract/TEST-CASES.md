@@ -12,7 +12,7 @@
 
 | 段 | 内容 | 触碰 | 状态 |
 |---|---|---|---|
-| **1a** | Mac 本机：沙箱 IA2 runtime + 假 Modbus TCP 从站 + 桥参考实现 + Tier0 替身（本地 JSONL）。本文第 3 节的全部用例 | 只用本机回环端口；不连 grey0、不连真 Tier0 | 退出条件都有了证据（`RESULT-1A.md`）；P2 的 C11、A3b 未做 |
+| **1a** | Mac 本机：沙箱 IA2 runtime + 假 Modbus TCP 从站 + 桥参考实现 + Tier0 替身（本地 JSONL）。本文第 3 节的全部用例 | 只用本机回环端口；不连 grey0、不连真 Tier0 | 退出条件都有了证据（`RESULT-1A.md`）；历史 P2 的 C11、A3b 未做；A3b 于 2026-11-02 追加 OFFLINE PASS（见 `VALIDATION-A3B.md`），C11 独立跟踪 |
 | **1b** | 真 Tier0（grey0 上已在跑的六个容器）+ grey0 上**另起的**沙箱 runtime。第 5 节只列入口条件和追加用例 | 触碰 grey0 | **需要用户另行授权，本文不授权** |
 
 1a 是 1b 的前置：真 Tier0 只会让问题更难定位，契约本身的错先在本机排掉。
@@ -57,6 +57,7 @@
 | A1 | P0 | 注册 REAL 目标 `sp_flow`（0–50，治理规则同范围）；假从站把写入值镜像到一个 Input 通道（约 200 ms 延迟）；提交 12.5 | 200，`undelivered_device:null`，`value` = 请求；`/audit` 1 条 `ok`，标签含 action 前 8 位；反馈在 settle 内到达 | 桥 `accepted`；读侧重建 `verified`，`observation_refs` 指向反馈事件；journal 完整；`/audit` 恰 1 条 |
 | A2 | P0 | REAL / DINT / BOOL 各取 {min, max, 中间值}；REAL 取 f32 舍入敏感值（贴近 max 的小数）；再试 LREAL 目标、min−ε、max+ε | IA2 按类型解释位编码：REAL 读回逐位相同；BOOL 0/1；LREAL 与越界在 G3 就被拒。BOOL 读回要线圈夹具（F-2）：现有假从站的 FC01 恒返回全零，WP0 里 `lamp_fb` 一直是 FALSE | 读回值等于请求（REAL 比位型）；LREAL/越界 `rejected` 且 IA2 无条目 |
 | A3 | P1 | 直连沙箱 runtime，标签分别为：含 `.` `-` `_`、含 `:`、含空格、70 字符、空串 | 直连时 `origin` 为原样非空头值；空串 → `anonymous` | 记录实际行为；若与"合规字符集在直连和代理两条路径一致"的假设不符 → FINDING。（A3b，P2：经 IDE server 代理一条，需假 ssh 夹具，见第 6 节） |
+| A3b | P2 | 经真实 IDE edge runtime 写代理、限定目标的假 SSH 与原始 curl，写入本机沙箱 runtime；同标签直连对照 | 合规 `[A-Za-z0-9._-]{1,64}` 标签两路原样保留；代理过滤字符并截为 64，清理后为空则 `anonymous` | 合规 Tier0 标签端到端及直连对照为原始最小关闭范围；逐次恰一条对应审计并核对变量位值。2026-11-02 完整九标签矩阵 PASS，另加限幅／403 透传增强覆盖，见 `../VALIDATION-A3B.md` |
 | A4 | P1 | 向沙箱 runtime 写 300 次（不同标签）后读 `/audit` | 只剩最近 256 条，最早 44 条已丢 | 对账程序对丢失条目报"不可核对"，**不**报"没写过"，也不报成功；journal 300 条完整 |
 
 ### B 拒绝路径
@@ -205,7 +206,7 @@ P1 由 `lab/cases_p1_table.py` 端到端运行（结果见 [`RESULT-1A.md`](../R
 4. 桥参考实现及其 `--test-hooks`（G8 与发送之间停顿、意图后崩溃、关闭某闸门）。
 5. 最小 MQTT broker（C11；2026-11-02 UTC+8 已补 `crates/runtime/examples/test_broker.rs`，复用现有 rumqttd dev-dependency，无需系统 mosquitto）。
 6. 对账程序（journal ↔ `/audit` ↔ 假从站日志）。
-7. 假 ssh 包装（A3b；#75 部署健康检查用过同类做法）。
+7. 假 ssh 包装（A3b；#75 部署健康检查用过同类做法）。**2026-11-02 已补**：`lab/fake_ssh_a3b.py` 限定 SSH 参数、占位 host、本轮回环端口与写命令语法，实际执行代理生成的 curl；`lab/cases_a3b.py` 管理独立 IDE／runtime 和逐项审计。
 8. 注册表静态检查工具（C6、F4）。
 
 各缺口的现状证据、补法、规模和依赖见 [`DESIGN-1A.md`](DESIGN-1A.md) §5–§6。
@@ -226,6 +227,10 @@ P1 由 `lab/cases_p1_table.py` 端到端运行（结果见 [`RESULT-1A.md`](../R
 | v0.10 | 2026-10-29 | 审核修复：R3T1、R3T1X 的 EXPECT 改为修复后 runtime 的「执行且有条目」（`main` 修复前的 runtime 上为 FINDING）；新增 §3.3（WP6C、脉冲保持回环）；浸泡的请求数按口径分开写（`RESULT-1A.md` §3）。对账判据见 `CONTRACT.md` v0.11 §8.3。 |
 | v0.9 | 2026-10-29 | P1 端到端（`lab/cases_p1_table.py`：A3 A4 B5 B10 C2 C5 C7 C10 R4 R5 F3 F4 F5），**运行后改 EXPECT** 的地方见 §3.2（B5、C5、C10、R5、F4）；A4 的判据由 WP6 对账程序检验；新增 WP9 浸泡（`lab/soak.py`），退出条件 3 的证据见 `RESULT-1A.md` §3。浸泡后**对账程序加了一条判据**（设备日志显示链路一直断着直到值被替换，则旧值没到设备不算差异），理由与两份报告见 `RESULT-1A.md` §3。判定标准未变。 |
 | v0.8 | 2026-10-29 | R3 时序覆盖（HANDOFF 待办）：**运行后改 EXPECT**——R3 原 EXPECT「排队的请求在 CONT 后落地」与 3 遍实测不符，改为实测的「请求未读走时不执行」，并加 `Recv-Q`、VM、设备日志的核对；新增 R3T1、R3T1K、R3T1X、R3T2（P0）。实测发现 runtime 读完并排队的写在客户端断开后照样执行却不进 `/audit`（CONTRACT §11.5），所以 R1、R3、B11 的「最终对账 `landed: false`」判据改为 `audit_entry: absent`、`landed: null`（CONTRACT v0.9 M10）。历史 FINDING 的留证保留不动。同日补：R3T1X 的桥侧判据改为跟随重启时 `/audit` 的实际内容（此前只写了无条目一种，在修好审计的 runtime 上会误报 FAIL 而不是 FINDING）。 |
+
+## A3b 追加记录（2026-11-02 UTC+8）
+
+新增 A3b 独立运行入口和九标签矩阵；不修改产品代码、标签规则或 HMAC 决策。开发轮曾因夹具误读 `/status` 的运行状态形状而在就绪检查失败，后改用 `mode.kind`、工程身份和扫描计数；增强项的拒绝审计断言补全代码已有的 `(write_mode = allowlist, no rule allows it)` 原因文本。原始 A3b 合规标签判据和非合规标签清理预期未改。首次失败及修正后的原始记录均保留在 `evidence/a3b-20261102/`；最终复跑与质量检查见 `../VALIDATION-A3B.md`。
 
 ## D11 与本地 MCP 增量（2026-10-30 UTC+8）
 

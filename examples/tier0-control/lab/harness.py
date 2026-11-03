@@ -621,7 +621,8 @@ async def run_case(case_id, args):
     entry = CASES[case_id]
     fn, targets = entry[0], entry[1]
     opts = entry[2] if len(entry) > 2 else {}
-    stack_cls, extra = Stack, {}
+    stack_cls = opts.get('stack', Stack)
+    extra = {'server_bin': args.server_bin, 'cs_bin': args.cs_bin} if 'stack' in opts else {}
     if case_id == 'C11':
         from cases_c11 import MqttStack
         stack_cls = MqttStack
@@ -693,12 +694,14 @@ async def main_async(args):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--bin', required=True)
+    ap.add_argument('--server-bin', help='IDE server binary (required for A3b and C11)')
+    ap.add_argument('--cs-bin', help='cs binary for the A3b and C11 agent session wrappers')
     ap.add_argument('--out', required=True)
     ap.add_argument('--cases', default='A1,B1,B3,C1')
     ap.add_argument('--broker-bin', help='C11: explicitly selected test_broker example binary')
-    ap.add_argument('--server-bin', help='C11: isolated IDE server for agent session and simulation')
-    ap.add_argument('--cs-bin', help='C11: CLI used for agent session and simulation')
     args = ap.parse_args()
+    if 'A3b' in args.cases.split(',') and not (args.server_bin and args.cs_bin):
+        ap.error('A3b requires --server-bin and --cs-bin')
     args.out = os.path.abspath(args.out)
     args.bin = os.path.abspath(args.bin)
     for name in ('broker_bin', 'server_bin', 'cs_bin'):
