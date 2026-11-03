@@ -156,6 +156,14 @@ class ControlTools:
         if type(ttl_ms) is not int or not 1 <= ttl_ms <= entry['max_deadline_ms']:
             raise ValueError('ttl_ms is outside the registered deadline budget')
         values.validate_and_encode(entry, target)
+        # A request that cannot subsequently be queried must not be appended.
+        # These logs keep growing independently: operators still need to drain
+        # and rotate the complete session before a budget is exhausted.
+        self.trace.refresh()
+        self.samples.refresh()
+        for index in (self.trace, self.samples):
+            if len(index.rows) + index.rejected >= MAX_RECORDS:
+                raise ValueError('evidence history is full; drain and rotate the complete session')
         now = int(time.time() * 1000)
         kid, key = auth.select_key(self.keys, now, self.revoked)
         p = dict(event_id=secrets.token_hex(16), action_id=secrets.token_hex(16), session_id=self.session,
@@ -173,6 +181,11 @@ class ControlTools:
                 f.seek(-1, os.SEEK_END)
                 if f.read(1) != b'\n':
                     raise ValueError('request log has an incomplete tail; recover it before submitting')
+            # Count under the append lock so concurrent local MCP writers
+            # cannot both consume the final request slot.
+            self._load_requests()
+            if self._request_lines >= MAX_RECORDS:
+                raise ValueError('request history is full; drain and rotate the complete session')
             # A failure after bytes are visible is ambiguous: never auto-retry.
             try:
                 remaining = memoryview(data)

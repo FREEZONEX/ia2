@@ -1,6 +1,7 @@
 """Real stdio protocol, persistent requests, authentication and sampler process."""
 import argparse
 import copy
+import concurrent.futures
 import hashlib
 import io
 import json
@@ -193,6 +194,72 @@ class Control(unittest.TestCase):
             for _ in range(2):
                 with self.assertRaises(ValueError):
                     self.tools.get_action_status(aid)
+
+    def test_real_sample_budget_queries_boundary_but_refuses_new_writes(self):
+        aid = self.tools.ia2_set('flow', 12.5)['action_id']
+        self.evidence(aid)
+        path = Path(self.args.samples)
+        sample = path.read_bytes()
+        path.write_bytes(sample * 19999)
+        self.assertEqual(self.tools.get_action_status(aid)['status'], 'verified')
+        with path.open('ab') as stream:
+            stream.write(sample)
+        self.assertEqual(self.tools.get_action_status(aid)['status'], 'verified')
+        before = Path(self.args.requests).read_bytes()
+        for tools in (self.tools, mcp.ControlTools(self.args)):
+            with self.assertRaisesRegex(ValueError, 'history is full'):
+                tools.ia2_set('flow', 13.5)
+        self.assertEqual(Path(self.args.requests).read_bytes(), before)
+        with path.open('ab') as stream:
+            stream.write(sample)
+        for tools in (self.tools, mcp.ControlTools(self.args)):
+            for _ in range(2):
+                with self.assertRaisesRegex(ValueError, 'record limit'):
+                    tools.get_action_status(aid)
+                with self.assertRaisesRegex(ValueError, 'record limit'):
+                    tools.ia2_set('flow', 13.5)
+        self.assertEqual(Path(self.args.requests).read_bytes(), before)
+
+    def test_request_capacity_counts_bad_rows_and_two_writers_share_last_slot(self):
+        # Bad rows consume the budget too; authentication does not let a writer
+        # evade it. Both clients have already cached the same history.
+        path = Path(self.args.requests)
+        path.write_bytes(b'bad\n' * 19999)
+        other = mcp.ControlTools(self.args)
+        self.tools._load_requests()
+        other._load_requests()
+        aid = self.tools.ia2_set('flow', 12.5)['action_id']
+        self.assertEqual(self.tools.get_action_status(aid)['status'], 'requested')
+        before = path.read_bytes()
+        for tools in (other, mcp.ControlTools(self.args)):
+            with self.assertRaisesRegex(ValueError, 'request history is full'):
+                tools.ia2_set('flow', 13.5)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_full_rejected_event_history_refuses_append(self):
+        Path(self.args.trace).write_bytes(b'bad\n' * 20000)
+        for tools in (self.tools, mcp.ControlTools(self.args)):
+            with self.assertRaisesRegex(ValueError, 'evidence history is full'):
+                tools.ia2_set('flow', 12.5)
+        self.assertFalse(Path(self.args.requests).exists())
+
+    def test_two_stdio_processes_cannot_overfill_last_request_slot(self):
+        path = Path(self.args.requests)
+        path.write_bytes(b'bad\n' * 19999)
+        processes = [self.process(), self.process()]
+        for p in processes:
+            self.initialize(p)
+        barrier = threading.Barrier(2)
+        def submit(p):
+            barrier.wait(timeout=5)
+            return self.send(p, 'tools/call', dict(name='ia2_set',
+                arguments=dict(target_key='flow', target=12.5)))['result']
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            replies = list(pool.map(submit, processes))
+        self.assertEqual(sorted(r['isError'] for r in replies), [False, True])
+        self.assertEqual(len(path.read_bytes().splitlines()), 20000)
+        refused = next(r for r in replies if r['isError'])
+        self.assertIn('request history is full', json.loads(refused['content'][0]['text'])['error']['message'])
 
     def test_missing_unsigned_or_conflicting_requests_cannot_bind_action(self):
         aid = self.tools.ia2_set('flow', 12.5)['action_id']
