@@ -101,6 +101,41 @@ The harness manages the deliberately paused runtime with `subprocess.Popen` and 
 
 The F1 case checks the pinned archived read-only tool schema in `tests/fixtures/`. It does not audit a live read-only MCP deployment or its delivery bundle. Golden HTTP fixtures come from the earlier loopback fake-device experiment.
 
+## C11 MQTT direct-write characterization
+
+C11 runs an independent runtime, temporary loopback-only rumqttd broker and fake Modbus devices. It requires Python 3.9+ (validated with a project-local uv environment on Python 3.14.8), with no extra Python dependencies. The broker uses the existing Rust dev-dependency; no system broker is installed. From the repository root, select all binaries explicitly:
+
+```sh
+cargo build --locked --release -p server -p ia2-cli -p ia2-runtime
+cargo build --locked --release -p ia2-runtime --example test_broker
+IA2_LAB_PORT_BASE=25600 .venv/bin/python -I -B examples/tier0-control/lab/run_cases.py \
+  --bin target/release/ia2-runtime --broker-bin target/release/examples/test_broker \
+  --server-bin target/release/server --cs-bin target/release/cs \
+  --out examples/tier0-control/evidence/c11-local --cases C11
+```
+
+If needed, create the stdlib-only environment with `uv venv --python 3.14 .venv`; preserve an existing environment. Choose a fresh output directory for each acceptance run. Ports are the lab base plus 1, 2, 11, 12 and 83, and a free loopback IDE port. The IDE has an isolated home and disabled demo listener; the MQTT exercise, compile checks and seven-step simulation run inside `cs agent run`. The parent keeps the fake devices alive and performs one requested normal runtime restart. No grey0, real Tier0 or real devices participate.
+
+The original C11 verifies one legitimate write, `origin=mqtt`, snapshot and fake-device feedback, without a control bridge. Additional rows cover governance denial, clamping and a two-second disabled-write observation after restart. The observer requires SUBACK, periodic snapshots and PINGRESP; it records messages under a unique prefix and checks for unexpected result/error topics within the recorded window. A broker PUBACK proves delivery only. A separate `--cases C10` run checks the bridge's existing MQTT-write guard.
+
+The disabled-write comparison requires advancing, non-retained runtime snapshots throughout the observation (at most 600 ms between advancing samples, including both window edges). It compares scan/time bounds with HTTP snapshots from the same runtime instance, requires usable feedback, and rejects offline/degraded status even if it later recovers. Observer PINGRESP alone does not satisfy this condition. The broker drives rumqttd's listener directly: its bind/serve error takes priority over readiness, so an occupied TCP or MQTT port exits nonzero without `READY`.
+
+Run the helper tests and the real-process regressions with freshly built binaries. The latter verifies both occupied-port cases and a healthy broker, then checks that runtime MQTT loss is rejected with either write setting and that a connected, incorrectly enabled writer fails the disabled comparison. The intentionally faulty inner C11 runs must report FAIL; the regression runner succeeds only when it finds the expected failed assertion and no infrastructure error. All evidence directories below are inside this project; choose new names for later runs.
+
+```sh
+mkdir -p examples/tier0-control/evidence/c11-regression-tmp
+export TMPDIR="$PWD/examples/tier0-control/evidence/c11-regression-tmp"
+.venv/bin/python -I -B examples/tier0-control/tests/test_c11_helpers.py
+IA2_LAB_PORT_BASE=26700 .venv/bin/python -I -B examples/tier0-control/tools/check_c11_regressions.py \
+  --bin target/release/ia2-runtime --broker-bin target/release/examples/test_broker \
+  --server-bin target/release/server --cs-bin target/release/cs \
+  --out examples/tier0-control/evidence/c11-regressions-local
+```
+
+The regression proxy additionally uses the lab base plus 84. The normal C10/C11 runner still uses the ports listed above. Stop neither an unknown process nor another test to free a port; choose another base.
+
+Evidence includes requests, PUBACK times, broker messages, HTTP reads, audit deltas, fake-device logs, enabled/disabled configuration, binary hashes, session command/exit, final state and cleanup. See [VALIDATION-C11.md](VALIDATION-C11.md) for results, retained development failures and precise limits. The lab runner exits nonzero on failed checks; C11 does not change product MQTT semantics.
+
 ## Device-free simulator smoke
 
 `sim/` is a small IA2 project and scenario for the underlying typed, governed setpoint API. It complements the Python fault tests; it does not test IR03 publication by itself. With a disposable loopback server at `http://127.0.0.1:23231`, run from the repository root:

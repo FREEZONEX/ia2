@@ -11,12 +11,14 @@ import cases_p0  # noqa: E402
 import cases_p1  # noqa: E402
 import cases_p1_table  # noqa: E402
 import cases_d11  # noqa: E402
+import cases_c11  # noqa: E402
 import cases_a3b  # noqa: E402
 
 harness.CASES.update(cases_p0.CASES)
 harness.CASES.update(cases_p1.CASES)
 harness.CASES.update(cases_p1_table.CASES)
 harness.CASES.update(cases_d11.CASES)
+harness.CASES.update(cases_c11.CASES)
 harness.CASES.update(cases_a3b.CASES)
 if __name__ == '__main__':
     harness.main()

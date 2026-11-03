@@ -36,6 +36,7 @@ from readside import auth as evidence_auth  # noqa: E402
 # Loopback ports; IA2_LAB_PORT_BASE moves the whole set (default 13500) so two labs can run side by side.
 _BASE = int(os.environ.get('IA2_LAB_PORT_BASE', '13500'))
 RT_PORT, PROXY_PORT, SLAVE_PORT, SLAVE2_PORT, STUB_PORT = _BASE + 1, _BASE + 2, _BASE + 11, _BASE + 12, _BASE + 3
+MQTT_PORT = _BASE + 83
 BRIDGE_RUN = os.path.join(ROOT, 'bridge_run.py')
 HOOKS_SKIP_G8 = os.path.join(ROOT, 'lab', 'hooks_skip_g8.py')
 
@@ -112,11 +113,15 @@ class Stack:
     """One complete lab: slaves, sandbox runtime, recording proxy, registry, keys, bridge process, sampler.
     `stub=True` replaces slaves/runtime/proxy/sampler by a scripted stand-in for the runtime's HTTP API (case B11)."""
 
-    def __init__(self, case_dir, binpath, targets, northbound_text=None, stub=False, bridge_args=None, prod=False, project_opts=None):
+    def __init__(self, case_dir, binpath, targets, northbound_text=None, stub=False, bridge_args=None, prod=False, project_opts=None,
+                 no_bridge=False, with_broker=False):
         self.dir, self.bin, self.targets, self.northbound_text, self.stub = case_dir, binpath, targets, northbound_text, stub
         self.prod, self.bridge_run = prod, BRIDGE_RUN
         self.project_opts = dict(project_opts or {})       # extra mkproject_ctl.render() arguments (P1 cases)
         self.bridge_args = list(bridge_args or [])
+        self.no_bridge = no_bridge
+        self.with_broker = with_broker
+        self.broker = None
         self.startup_windows = []          # (spawn, ready) of every bridge start: its preflight and recovery reads are not request traffic
         self.proc = self.bridge = self.sampler = self.proxy = self.stub_srv = None
         self.slaves, self.slave_events, self.slave_files = {}, {1: [], 2: []}, {}
@@ -144,7 +149,7 @@ class Stack:
             if problems:
                 raise RuntimeError('production package: %s' % problems)
             self.bridge_run = self.p('prod-package/bridge_run.py')
-        ports = (STUB_PORT,) if self.stub else (RT_PORT, PROXY_PORT, SLAVE_PORT, SLAVE2_PORT)
+        ports = (STUB_PORT,) if self.stub else ((RT_PORT, PROXY_PORT, SLAVE_PORT, SLAVE2_PORT) + ((MQTT_PORT,) if self.with_broker else ()))
         for port in ports:
             if not port_free(port):
                 raise RuntimeError('port %d is not free; refusing to run' % port)
@@ -187,10 +192,11 @@ class Stack:
             setattr(self, role + '_keys', evidence_auth.load_keys(path))
         self.secret = secret
         self.standin = Standin(self.p('requests.jsonl'), secret)
-        if not self.stub:
+        if not self.stub and not self.no_bridge:
             self.sampler = Sampler(RT_PORT, self.p('samples.jsonl'), self.p('sample-keys.json'))
             self.sampler.start()
-        await self.start_bridge(hooks, env)
+        if not self.no_bridge:
+            await self.start_bridge(hooks, env)
 
     async def _spawn_runtime(self):
         self.runtime_n += 1
@@ -283,7 +289,8 @@ class Stack:
             await self.bridge.wait()
 
     async def stop(self):
-        await self.stop_bridge()
+        if not self.no_bridge:
+            await self.stop_bridge()
         if self.sampler:
             self.sampler.stop()
         if self.proc and self.proc.poll() is None:
@@ -303,6 +310,8 @@ class Stack:
         for f in list(self.slave_files.values()) + [getattr(self, 'rtlog', None), getattr(self, 'bridge_err', None)]:
             if f:
                 f.close()
+        if self.broker:
+            self.broker.stop()
 
     # ---- helpers ----------------------------------------------------------------------------------------------------------
     def _rt_sync(self, method, path, body, timeout):
@@ -612,10 +621,16 @@ async def run_case(case_id, args):
     entry = CASES[case_id]
     fn, targets = entry[0], entry[1]
     opts = entry[2] if len(entry) > 2 else {}
-    stack_type = opts.get('stack', Stack)
+    stack_cls = opts.get('stack', Stack)
     extra = {'server_bin': args.server_bin, 'cs_bin': args.cs_bin} if 'stack' in opts else {}
-    st = stack_type(case_dir, args.bin, targets, stub=opts.get('stub', False), bridge_args=opts.get('bridge_args'), prod=opts.get('prod', False),
-                    project_opts=opts.get('project'), **extra)
+    if case_id == 'C11':
+        from cases_c11 import MqttStack
+        stack_cls = MqttStack
+        extra = dict(broker_bin=args.broker_bin, server_bin=args.server_bin, cs_bin=args.cs_bin)
+    st = stack_cls(case_dir, args.bin, targets, northbound_text=opts.get('northbound_text'),
+               stub=opts.get('stub', False), bridge_args=opts.get('bridge_args'), prod=opts.get('prod', False),
+               project_opts=opts.get('project'), no_bridge=opts.get('no_bridge', False),
+               with_broker=opts.get('with_broker', False), **extra)
     ck, notes = Checks(), {}
     started = time.time()
     error = None
@@ -679,17 +694,22 @@ async def main_async(args):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--bin', required=True)
-    ap.add_argument('--server-bin', help='IDE server binary (required for A3b)')
-    ap.add_argument('--cs-bin', help='cs binary for the A3b agent session wrapper')
+    ap.add_argument('--server-bin', help='IDE server binary (required for A3b and C11)')
+    ap.add_argument('--cs-bin', help='cs binary for the A3b and C11 agent session wrappers')
     ap.add_argument('--out', required=True)
     ap.add_argument('--cases', default='A1,B1,B3,C1')
+    ap.add_argument('--broker-bin', help='C11: explicitly selected test_broker example binary')
     args = ap.parse_args()
     if 'A3b' in args.cases.split(',') and not (args.server_bin and args.cs_bin):
         ap.error('A3b requires --server-bin and --cs-bin')
-    for name in ('bin', 'server_bin', 'cs_bin'):
-        if getattr(args, name):
-            setattr(args, name, os.path.abspath(getattr(args, name)))
     args.out = os.path.abspath(args.out)
+    args.bin = os.path.abspath(args.bin)
+    for name in ('broker_bin', 'server_bin', 'cs_bin'):
+        path = getattr(args, name)
+        if 'C11' in args.cases.split(',') and not path:
+            ap.error('C11 requires --' + name.replace('_', '-'))
+        if path:
+            setattr(args, name, os.path.abspath(path))
     results = asyncio.run(main_async(args))
     if any(r['verdict'] == 'FAIL' or r['error'] for r in results):
         raise SystemExit(1)
