@@ -50,9 +50,15 @@ with a local executor while the socket uses the existing reactor for I/O
 readiness. A native timer failure trips the gate,
 and the worker continues safe-zero exchange using the asynchronous timer.
 An operator can explicitly set `IA2_EC_SYNC_RT_PRIORITY` to 1–20 to run
-this one thread under Linux `SCHED_RR` after bus initialization. Omit it
+this one thread under Linux `SCHED_RR` after socket registration, including
+startup exchanges. Omit it
 for the normal OS scheduling policy. The service needs permission to set
 the requested scheduling policy. A rejected request fails initialization.
+
+During synchronized startup the worker follows the reference clock while
+sending zero outputs. It waits for four adjacent DC slots with all devices
+in OP and the expected working counter, then retains the next deadline
+when handing the bus clock to the PLC.
 
 The input image is fixed for the entire scan. Output channel writes affect a
 private staging image until the whole scan commits. Channel errors fail the
