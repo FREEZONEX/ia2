@@ -234,6 +234,32 @@ const WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 // room for those temporaries and the pinned master future on this worker.
 const LINUX_SYNC_WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
 
+/// Consecutive healthy DC slots with zero outputs before handing the
+/// synchronized bus clock to the PLC.
+const DC_STARTUP_SLOTS: u8 = 4;
+
+#[derive(Default)]
+struct DcStartup {
+    last_slot: Option<u64>,
+    consecutive: u8,
+}
+
+impl DcStartup {
+    fn observe(&mut self, slot: u64, healthy: bool) -> bool {
+        if !healthy {
+            *self = Self::default();
+            return false;
+        }
+        self.consecutive = if self.last_slot.and_then(|prev| prev.checked_add(1)) == Some(slot) {
+            self.consecutive.saturating_add(1)
+        } else {
+            1
+        };
+        self.last_slot = Some(slot);
+        self.consecutive >= DC_STARTUP_SLOTS
+    }
+}
+
 pub struct RealEthercat {
     cycle: Option<Arc<crate::cycle::Gate<PdiMirror>>>,
     staged: Option<(crate::cycle::Ticket, PdiMirror)>,
@@ -1103,6 +1129,18 @@ fn smol_main(
                 return;
             }
         };
+        // Socket registration has initialized the shared reactor and its
+        // helper thread. Only this worker receives the opt-in scheduling
+        // policy, including during the startup exchanges.
+        let mut timer = match crate::cycle_timer::CycleTimer::new(cycle.is_some(), rt_priority) {
+            Ok(timer) => timer,
+            Err(error) => {
+                let _ = init_tx.send(InitResult::Err(format!(
+                    "configure EtherCAT cycle timer: {error}"
+                )));
+                return;
+            }
+        };
 
         // ===== RTSO-HOLD-0731 fix: supervised re-walk loop =====
         // Everything from bus enumeration through the cyclic exchange sits
@@ -1502,47 +1540,48 @@ fn smol_main(
                         return;
                     }
 
-                    // Pump tx_rx_dc until every SubDevice reaches OP (zero
-                    // outputs / controlword 0 — nothing moves). Bounded.
+                    // Pump zero outputs until OP. In synchronized mode,
+                    // follow the DC phase during startup and preserve the
+                    // next deadline across the transition to the scan loop.
+                    let mut first_deadline = None;
                     {
                         let deadline = std::time::Instant::now() + Duration::from_secs(10);
                         let mut reached_op = false;
+                        let mut startup = DcStartup::default();
                         while !shutdown.load(Ordering::Relaxed)
                             && std::time::Instant::now() < deadline
                         {
-                            match group.tx_rx_dc(&maindevice).await {
+                            let sent_at = Instant::now();
+                            let next = match group.tx_rx_dc(&maindevice).await {
                                 Ok(resp) => {
-                                    if resp.all_op() {
+                                    if cycle.is_some() {
+                                        let slot =
+                                            resp.extra.dc_system_time / sync0.as_nanos() as u64;
+                                        let next = sent_at + resp.extra.next_cycle_wait;
+                                        let healthy = resp.all_op()
+                                            && resp.working_counter == expected_wkc
+                                            && Instant::now() < next;
+                                        if startup.observe(slot, healthy) {
+                                            reached_op = true;
+                                            first_deadline = Some(next);
+                                            break;
+                                        }
+                                        next
+                                    } else if resp.all_op() {
                                         reached_op = true;
                                         break;
+                                    } else {
+                                        Instant::now() + sync0
                                     }
                                 }
-                                Err(e) => tracing::warn!(?e, "tx_rx_dc while waiting for OP"),
-                            }
-                            smol::Timer::after(sync0).await;
-                        }
-                        if !reached_op {
-                            if walk_fail(
-                            first_init,
-                            &init_tx,
-                            &mut reinit_attempt,
-                            "SubDevices did not reach OP within 10s (SyncManager watchdog / DC?)"
-                                .into(),
-                        ) {
-                            return;
-                        }
-                            continue 'supervise;
-                        }
-                        tracing::info!("all subdevices reached OP (dc=sync0)");
-                    }
-
-                    // The socket reactor is initialized during the walk. Apply
-                    // the opt-in scheduling policy after its helper starts.
-                    let mut timer =
-                        match crate::cycle_timer::CycleTimer::new(cycle.is_some(), rt_priority) {
-                            Ok(timer) => timer,
-                            Err(error) => {
-                                let message = format!("configure EtherCAT cycle timer: {error}");
+                                Err(e) => {
+                                    startup = DcStartup::default();
+                                    tracing::warn!(?e, "tx_rx_dc while waiting for OP");
+                                    Instant::now() + sync0
+                                }
+                            };
+                            if let Err(error) = timer.wait(next).await {
+                                let message = format!("EtherCAT startup timer: {error}");
                                 if let Some(clock) = &cycle {
                                     clock.trip(&message);
                                 }
@@ -1550,7 +1589,24 @@ fn smol_main(
                                     walk_fail(first_init, &init_tx, &mut reinit_attempt, message);
                                 return;
                             }
-                        };
+                        }
+                        if !reached_op {
+                            if walk_fail(
+                                first_init,
+                                &init_tx,
+                                &mut reinit_attempt,
+                                "SubDevices did not establish OP/DC readiness within 10s".into(),
+                            ) {
+                                return;
+                            }
+                            continue 'supervise;
+                        }
+                        tracing::info!(
+                            consecutive_dc_slots = startup.consecutive,
+                            "all subdevices reached OP (dc=sync0)"
+                        );
+                    }
+
                     tracing::info!(
                         native_clock = timer.uses_native_clock(),
                         local_pump = local_pump.is_some(),
@@ -1586,6 +1642,15 @@ fn smol_main(
                     let mut shape_edges: u64 = 0;
                     let mut previous_wait: Option<(Instant, Instant, Instant)> = None;
                     crate::sdo::run(&sdo_rx, &reinits, async {
+                    if let Some(deadline) = first_deadline {
+                        if let Err(error) = timer.wait(deadline).await {
+                            if let Some(clock) = &cycle {
+                                clock.trip("EtherCAT monotonic wait failed; restart required");
+                            }
+                            tracing::error!(%error, "EtherCAT cycle timer failed");
+                            smol::Timer::at(deadline).await;
+                        }
+                    }
                     while !shutdown.load(Ordering::Relaxed) {
                         cycles.fetch_add(1, Ordering::Relaxed);
                         let cycle_start = std::time::Instant::now();
@@ -1894,6 +1959,25 @@ fn smol_main(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_needs_four_consecutive_healthy_dc_slots() {
+        let mut ready = DcStartup::default();
+        for (slot, healthy) in [
+            (10, true),
+            (11, true),
+            (11, true),
+            (12, true),
+            (13, false),
+            (14, true),
+            (16, true),
+            (17, true),
+            (18, true),
+        ] {
+            assert!(!ready.observe(slot, healthy));
+        }
+        assert!(ready.observe(19, true));
+    }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
