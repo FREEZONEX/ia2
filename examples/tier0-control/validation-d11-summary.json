@@ -1,0 +1,61 @@
+{
+  "validated_at": "2026-10-30T13:10:45.121750+08:00",
+  "scope": "local simulation only; no Tier0, grey0, hardware or client configuration changed",
+  "branch": "feat/tier0-signed-control-mcp",
+  "base_commit": "a5e4a851044f9fa6462e6eff71576d9de82a00b2",
+  "evidence_root": "evidence/d11-local-20261030",
+  "source_manifest_sha256": "1a8d71a19771bcc8d971a558d01b11efdf73a2d2f390c78139dd1c14e2ecaa9d",
+  "runtime_sha256": "c18b0aaab60425ef848e8e278b3ac60c1ec7a50dfb708ed25184a0a987018893",
+  "runtime_dependency": "PR #100 detached-write fix; separate pinned test binary",
+  "python": {
+    "passed": 362,
+    "suites": 30
+  },
+  "integration": {
+    "covered_case_types": 50,
+    "full_r2": {
+      "passed": 49,
+      "failed": 1,
+      "failure": "P1F5 test setup race; corrected and retested"
+    },
+    "followups": {
+      "p1f5-final": {
+        "runs": 3,
+        "passed": true
+      },
+      "r3-repeat": {
+        "runs": 10,
+        "passed": true
+      },
+      "mcp-final": {
+        "runs": 2,
+        "passed": true
+      }
+    }
+  },
+  "mutations_detected": {
+    "d11": 5,
+    "reconciliation": 64,
+    "failsafe": 3
+  },
+  "crash_boundary_actions_checked": 3,
+  "repository_gate": {
+    "commands_passed": 8,
+    "rust_passed": 8589,
+    "rust_ignored": 105,
+    "web_passed": 423,
+    "web_files": 39
+  },
+  "device_free_simulator": {
+    "steps_passed": 7,
+    "final_runtime_running": false,
+    "server_stopped": true
+  },
+  "remaining": [
+    "real Tier0 transport and permissions",
+    "hardware timing and physical feedback",
+    "sampler load on grey0/#65",
+    "power-loss validation",
+    "long-running indexed storage beyond the local 20000-record budget"
+  ]
+}

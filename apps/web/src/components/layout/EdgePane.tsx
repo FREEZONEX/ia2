@@ -41,11 +41,14 @@ import {
   type EdgeStatus,
   type EdgeSystem,
 } from "@/lib/api"
+import { deployOutcome } from "@/lib/deploy-outcome"
 import { useRuntime } from "@/state/runtime"
 import { DocumentReloadButton, useDocumentDraft } from "@/lib/use-document-draft"
 import type { DeployReport } from "@/types/generated/DeployReport"
 import type { Edge } from "@/types/generated/Edge"
 import type { EdgeProbe } from "@/types/generated/EdgeProbe"
+import { outputLatchMessage } from "@/lib/output-latch"
+import { edgeReach } from "@/lib/edge-reach"
 
 type EdgeTab = "config" | "logs" | "discover" | "system" | "debug"
 
@@ -149,6 +152,11 @@ function Editor({
         fieldbus_healthy: null,
         unhealthy_devices: [],
         watchdog_tripped: null,
+        latch_reason: null,
+        failsafe_status: null,
+        fault: null,
+        snapshot_tap: null,
+        supervision: null,
         error: String(e),
       })
     } finally {
@@ -363,11 +371,7 @@ function Editor({
               <ErrorBox className="max-w-full p-3 text-xs">{deployError}</ErrorBox>
             ) : deployLog ? (
               <div>
-                <div className="mb-1 inline-flex items-center gap-1.5 text-[12px] text-highlight">
-                  <CheckCircle2 className="size-3.5" />
-                  Version{" "}
-                  <span className="font-mono">{deployLog.version}</span> live
-                </div>
+                <DeployVerdict report={deployLog} />
                 <pre className="max-h-64 max-w-full overflow-auto rounded-md border border-border bg-muted/40 p-3 text-xs text-muted-foreground">
                   {deployLog.log}
                 </pre>
@@ -853,6 +857,64 @@ function DebugPanel({ name }: { name: string }) {
   )
 }
 
+/** The headline of the last deploy: live, installed but not running, or
+ *  failed — see `deployOutcome` — plus the report's warning. */
+function DeployVerdict({ report }: { report: DeployReport }) {
+  const outcome = deployOutcome(report)
+  return (
+    <div className="mb-1 flex flex-col gap-1 text-[12px]">
+      {outcome.kind === "live" ? (
+        <div className="inline-flex items-center gap-1.5 text-highlight">
+          <CheckCircle2 className="size-3.5" />
+          <span>
+            Version <span className="font-mono">{outcome.version}</span> live
+            {outcome.detail && <span className="text-muted-foreground"> — {outcome.detail}</span>}
+          </span>
+        </div>
+      ) : outcome.kind === "unconfirmed" ? (
+        <div className="inline-flex items-center gap-1.5 text-warn">
+          <AlertCircle className="size-3.5" />
+          <span>
+            Version <span className="font-mono">{outcome.version}</span> installed;
+            program state unconfirmed: {outcome.detail}. Check runtime and plant state
+            before restarting or rolling back.
+          </span>
+        </div>
+      ) : outcome.kind === "unprotected" ? (
+        <ErrorBox className="max-w-full whitespace-pre-wrap break-words p-2 text-xs">
+          Version <span className="font-mono">{outcome.version}</span> is installed and
+          current, but the alarm-supervision policy the project declares is not in force on
+          this edge: {outcome.detail}. Inspect runtime and plant state before restarting or
+          rolling back — the log names the previous version.
+        </ErrorBox>
+      ) : outcome.kind === "unmonitored" ? (
+        <ErrorBox className="max-w-full whitespace-pre-wrap break-words p-2 text-xs">
+          Version <span className="font-mono">{outcome.version}</span> is installed and
+          current, but the runtime is not recording history or evaluating alarms:{" "}
+          {outcome.detail}. Inspect runtime and plant state before restarting or rolling
+          back — the log names the previous version.
+        </ErrorBox>
+      ) : outcome.kind === "not_running" ? (
+        <ErrorBox className="max-w-full whitespace-pre-wrap break-words p-2 text-xs">
+          Version <span className="font-mono">{outcome.version}</span> is installed and
+          current, but continuous operation failed: {outcome.detail}. Inspect runtime and
+          plant state before restarting or rolling back — the log names the previous version.
+        </ErrorBox>
+      ) : (
+        <ErrorBox className="max-w-full whitespace-pre-wrap p-2 text-xs">
+          Deploy failed — read the log below.
+        </ErrorBox>
+      )}
+      {report.warning && (
+        <div className="inline-flex items-center gap-1.5 text-warn">
+          <AlertCircle className="size-3.5" />
+          {report.warning}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function ReachBadge({
   probe,
   probing,
@@ -875,44 +937,36 @@ function ReachBadge({
       </StatusBadge>
     )
   }
-  if (probe.reachable) {
-    // Reachable is not the same as working: the runtime answers /health
-    // and keeps scanning while a fieldbus is down. Say so, rather than
-    // showing the same green as a fully healthy edge.
-    const down = probe.unhealthy_devices
-    if (down.length > 0) {
+  const reach = edgeReach(probe)
+  switch (reach.kind) {
+    case "running":
       return (
-        <StatusBadge
-          className="bg-warn/15 text-warn"
-          title={`Runtime is up, but ${down.length === 1 ? "this device is" : "these devices are"} down (inputs frozen, outputs dropped): ${down.join(", ")}`}
-        >
+        <StatusBadge className="bg-highlight/15 text-highlight" title={reach.detail}>
+          <CheckCircle2 className="size-3" />
+          running
+        </StatusBadge>
+      )
+    case "degraded":
+      return (
+        <StatusBadge className="bg-warn/15 text-warn" title={reach.detail}>
           <AlertCircle className="size-3" />
           degraded
         </StatusBadge>
       )
-    }
-    return (
-      <StatusBadge
-        className="bg-highlight/15 text-highlight"
-        title="Edge runtime is responding"
-      >
-        <CheckCircle2 className="size-3" />
-        running
-      </StatusBadge>
-    )
+    case "faulted":
+    case "locked":
+    case "unreachable":
+      return (
+        <StatusBadge className="bg-destructive/15 text-destructive" title={reach.detail}>
+          <AlertCircle className="size-3" />
+          {reach.kind === "locked" ? "output phase inhibited" : reach.kind}
+        </StatusBadge>
+      )
   }
-  return (
-    <StatusBadge
-      className="bg-destructive/15 text-destructive"
-      title={probe.error ?? ""}
-    >
-      <AlertCircle className="size-3" />
-      unreachable
-    </StatusBadge>
-  )
 }
 
 function StatusGrid({ probe }: { probe: EdgeProbe }) {
+  const latch = outputLatchMessage(probe)
   return (
     <dl className="ia2-field-grid text-[13px]">
       <Stat
@@ -933,6 +987,16 @@ function StatusGrid({ probe }: { probe: EdgeProbe }) {
       {!probe.reachable && probe.error && (
         <div className="col-span-full">
           <ErrorBox>{probe.error}</ErrorBox>
+        </div>
+      )}
+      {probe.reachable && probe.fault && (
+        <div className="col-span-full">
+          <ErrorBox>Program stopped: {probe.fault}</ErrorBox>
+        </div>
+      )}
+      {probe.reachable && latch && (
+        <div className="col-span-full">
+          <ErrorBox>{latch}</ErrorBox>
         </div>
       )}
     </dl>

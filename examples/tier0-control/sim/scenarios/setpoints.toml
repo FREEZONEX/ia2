@@ -1,0 +1,22 @@
+description = "Device-free contract smoke: governed REAL clamp, signed DINT and BOOL. IR03 publication faults are tested by the Python process suite."
+
+[[steps]]
+expect = { var = "ticks", op = "gt", value = 0, within_ms = 3000 }
+
+[[steps]]
+set = { var = "sp_flow", value = 45.0 }
+
+[[steps]]
+expect = { var = "sp_flow", op = "eq", value = 40.0, within_ms = 3000 }
+
+[[steps]]
+set = { var = "big", value = -5 }
+
+[[steps]]
+expect = { var = "big", op = "eq", value = -5, within_ms = 3000 }
+
+[[steps]]
+set = { var = "lamp", value = true }
+
+[[steps]]
+expect = { var = "lamp", op = "is_true", within_ms = 3000 }

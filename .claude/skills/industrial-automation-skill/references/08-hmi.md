@@ -226,3 +226,11 @@ Alarm lists show active or unacknowledged alarms by default. **Show all** includ
 cleared and never-raised definitions; a never-raised timestamp is a dash. Check
 both themes, the smallest intended window, trend bounds, and real changing values
 before calling an HMI visually validated. Software simulation is not fieldbus proof.
+
+
+Runtime output-latch status carries `failsafe_status` separately from
+`watchdog_tripped`: pending attempts, adapter acknowledgements, and unconfirmed
+device/error rows. Panels show these results alongside the latch cause; a
+healthy transport or latch flag is not proof of physical safety. Simulated
+acknowledgement verifies the software contract only. An omitted/null report
+means acknowledgement is unavailable, not that every device was confirmed.

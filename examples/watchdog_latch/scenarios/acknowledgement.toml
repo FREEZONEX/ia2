@@ -1,0 +1,16 @@
+description = "software output inhibition survives continued scanning; inspect adapter acknowledgement separately"
+
+[[steps]]
+wait_ms = 100
+
+[[steps]]
+expect_watchdog = { tripped = false, during_ms = 300 }
+
+[[steps]]
+inject = { scan_stall_ms = 25 }
+
+[[steps]]
+expect_watchdog = { tripped = true, within_ms = 3000 }
+
+[[steps]]
+expect_watchdog = { tripped = true, during_ms = 300 }

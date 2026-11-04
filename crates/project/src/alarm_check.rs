@@ -20,6 +20,12 @@ use crate::types::AlarmDef;
 /// Reserved for runtime-generated device-health alarms, not project definitions.
 pub const DEVICE_ALARM_PREFIX: &str = "__device/";
 
+/// Reserved for the runtime's own "alarm evaluation is lost" alarm.
+pub const SUPERVISION_ALARM_PREFIX: &str = "__supervision/";
+
+/// The id of that alarm in the edge runtime's alarm list.
+pub const SUPERVISION_ALARM_ID: &str = "__supervision/snapshot_tap";
+
 /// One finding, keyed to its position in `alarms.toml` (0-based) so a caller
 /// can cite the offending entry. Every finding is an error: an alarm that
 /// cannot fire is not a style question.
@@ -64,6 +70,16 @@ pub fn validate_alarms(
                 id: def.id.clone(),
                 message: format!(
                     "alarm id '{}' uses the reserved device-health prefix '{DEVICE_ALARM_PREFIX}'",
+                    def.id
+                ),
+            });
+        }
+        if def.id.starts_with(SUPERVISION_ALARM_PREFIX) {
+            issues.push(AlarmIssue {
+                alarm_index: index,
+                id: def.id.clone(),
+                message: format!(
+                    "alarm id '{}' uses the reserved supervision prefix '{SUPERVISION_ALARM_PREFIX}'",
                     def.id
                 ),
             });
@@ -136,6 +152,18 @@ mod tests {
         let issues = check(&[alarm("__device/bus0", "level")], &["level"], &["main"]);
         assert_eq!(issues.len(), 1);
         assert!(issues[0].message.contains("reserved"));
+    }
+
+    #[test]
+    fn the_supervision_alarm_id_is_reserved() {
+        for id in [SUPERVISION_ALARM_ID, "__supervision/anything"] {
+            let issues = check(&[alarm(id, "level")], &["level"], &["main"]);
+            assert_eq!(issues.len(), 1, "{id}");
+            assert!(
+                issues[0].message.contains("reserved supervision prefix"),
+                "{id}"
+            );
+        }
     }
 
     #[test]

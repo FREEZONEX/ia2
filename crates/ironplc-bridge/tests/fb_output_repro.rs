@@ -19,6 +19,7 @@ fn run_and_dump(container: &Container, rounds: u32) -> Vec<(String, i64)> {
     let mut bufs = VmBuffers::from_container(container);
     let mut running = Vm::new()
         .load(container, &mut bufs)
+        .expect("vm loads")
         .start()
         .expect("vm starts");
     for r in 0..rounds {

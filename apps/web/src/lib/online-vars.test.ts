@@ -103,17 +103,36 @@ describe("onlineVars", () => {
 })
 
 describe("runtimeStringLiteral", () => {
-  // Mirrors ironplc's `encode_string_literal` (low byte per character) and
-  // ironplc's `VariableRenderer` narrow-string rendering.
+  // Mirrors ironplc's `VariableRenderer` narrow-string rendering, and the
+  // low byte per character older runtimes stored.
   it.each([
     ["idle", "'idle'"],
     ["等待", "'I$85'"], // U+7B49 → 0x49, U+5F85 → 0x85
     ["café", "'caf$E9'"],
     ["a$b", "'a$$b'"],
     ["it's", "'it$'s'"],
+    ["say \"go\"", "'say \"go\"'"],
     ["a\tb", "'a$Tb'"],
     ["", "'$01'"],
   ])("%j is shown as %s", (text, shown) => {
     expect(runtimeStringLiteral(text)).toBe(shown)
+    expect(runtimeStringLiteral(text, "STRING[31]")).toBe(shown)
+  })
+
+  // Mirrors `VariableRenderer`'s wide rendering: one escape per UTF-16 code
+  // unit, `$"` instead of `$'`.
+  it.each([
+    ["idle", "\"idle\""],
+    ["加料", "\"$52A0$6599\""],
+    ["café", "\"caf$00E9\""],
+    ["a$b", "\"a$$b\""],
+    ["it's", "\"it's\""],
+    ["say \"go\"", "\"say $\"go$\"\""],
+    ["a\tb", "\"a$Tb\""],
+    ["🚚", "\"$D83D$DE9A\""],
+  ])("%j in a WSTRING is shown as %s", (text, shown) => {
+    expect(runtimeStringLiteral(text, "WSTRING[31]")).toBe(shown)
+    expect(runtimeStringLiteral(text, "WSTRING")).toBe(shown)
+    expect(runtimeStringLiteral(text, "wstring[254]")).toBe(shown)
   })
 })

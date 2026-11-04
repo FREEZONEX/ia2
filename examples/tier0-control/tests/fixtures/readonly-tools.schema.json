@@ -1,0 +1,369 @@
+{
+  "api_version": "ia2.observation/v1",
+  "tools": [
+    {
+      "name": "list_devices",
+      "description": "List registered device IDs, sources, sessions, freshness thresholds and explicit result policies.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "api_version": {
+            "type": "string"
+          },
+          "read_only": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "api_version",
+          "read_only"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "query_observations",
+      "description": "Read device observations in [start_time,end_time), by platform ingestion time. Source observation time is separate. Summary by default; full preserves raw envelopes.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "device_id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Stable registered device ID from list_devices"
+          },
+          "start_time": {
+            "type": "string",
+            "minLength": 1,
+            "description": "RFC3339 time with explicit UTC offset, e.g. 2026-10-22T13:57:46+08:00"
+          },
+          "end_time": {
+            "type": "string",
+            "minLength": 1,
+            "description": "RFC3339 time with explicit UTC offset, e.g. 2026-10-22T13:57:46+08:00"
+          },
+          "source_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "minItems": 1,
+            "maxItems": 16,
+            "uniqueItems": true
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 200,
+            "default": 50
+          },
+          "cursor": {
+            "type": "string",
+            "minLength": 1
+          },
+          "detail": {
+            "type": "string",
+            "enum": [
+              "summary",
+              "full"
+            ],
+            "default": "summary"
+          }
+        },
+        "required": [
+          "device_id",
+          "start_time",
+          "end_time"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "api_version": {
+            "type": "string"
+          },
+          "read_only": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "api_version",
+          "read_only"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "get_source_states",
+      "description": "Evaluate each source at a current or historical time. Unknown, stale, failed and disconnected never mean normal. Reads up to 24 hours of preceding history.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "device_id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Stable registered device ID from list_devices"
+          },
+          "at_time": {
+            "type": "string",
+            "minLength": 1,
+            "description": "RFC3339 time with explicit UTC offset, e.g. 2026-10-22T13:57:46+08:00"
+          }
+        },
+        "required": [
+          "device_id"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "api_version": {
+            "type": "string"
+          },
+          "read_only": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "api_version",
+          "read_only"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "list_images",
+      "description": "List image observations and stable image_ref values by device and ingestion interval. Does not return image bytes.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "device_id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Stable registered device ID from list_devices"
+          },
+          "start_time": {
+            "type": "string",
+            "minLength": 1,
+            "description": "RFC3339 time with explicit UTC offset, e.g. 2026-10-22T13:57:46+08:00"
+          },
+          "end_time": {
+            "type": "string",
+            "minLength": 1,
+            "description": "RFC3339 time with explicit UTC offset, e.g. 2026-10-22T13:57:46+08:00"
+          },
+          "source_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "minItems": 1,
+            "maxItems": 16,
+            "uniqueItems": true
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 200,
+            "default": 50
+          },
+          "cursor": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "device_id",
+          "start_time",
+          "end_time"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "api_version": {
+            "type": "string"
+          },
+          "read_only": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "api_version",
+          "read_only"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "read_image",
+      "description": "Resolve an image_ref against registered persisted observation history, read via Tier0 API key and verify SHA256. Returns original image bytes; no host file or arbitrary URL access.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "device_id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Stable registered device ID from list_devices"
+          },
+          "image_ref": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "device_id",
+          "image_ref"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "api_version": {
+            "type": "string"
+          },
+          "read_only": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "api_version",
+          "read_only"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "query_action_results",
+      "description": "Find action requests by device and ingestion interval, then fetch result evidence beyond that interval. Accepted is not verified; missing proof is unknown after deadline. Evaluation uses an explicit numeric-target policy.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "device_id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Stable registered device ID from list_devices"
+          },
+          "start_time": {
+            "type": "string",
+            "minLength": 1,
+            "description": "RFC3339 time with explicit UTC offset, e.g. 2026-10-22T13:57:46+08:00"
+          },
+          "end_time": {
+            "type": "string",
+            "minLength": 1,
+            "description": "RFC3339 time with explicit UTC offset, e.g. 2026-10-22T13:57:46+08:00"
+          },
+          "as_of": {
+            "type": "string",
+            "minLength": 1,
+            "description": "RFC3339 time with explicit UTC offset, e.g. 2026-10-22T13:57:46+08:00"
+          },
+          "detail": {
+            "type": "string",
+            "enum": [
+              "summary",
+              "full"
+            ],
+            "default": "summary"
+          }
+        },
+        "required": [
+          "device_id",
+          "start_time",
+          "end_time"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "api_version": {
+            "type": "string"
+          },
+          "read_only": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "api_version",
+          "read_only"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "describe_connections",
+      "description": "Identify upstream capabilities, prior r3 patches and new adapter logic, plus all reused and new logical connections.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "api_version": {
+            "type": "string"
+          },
+          "read_only": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "api_version",
+          "read_only"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    }
+  ]
+}

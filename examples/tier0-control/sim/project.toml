@@ -1,0 +1,18 @@
+name = "control_bridge_smoke"
+version = "0.1"
+
+[governance]
+write_mode = "allowlist"
+
+[[governance.rules]]
+variable = "sp_flow"
+min = 0.0
+max = 40.0
+
+[[governance.rules]]
+variable = "big"
+min = -1000.0
+max = 1000.0
+
+[[governance.rules]]
+variable = "lamp"

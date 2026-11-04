@@ -9,7 +9,7 @@ Each entry: the symptom you'll see, the cause, the fix.
 **Fix:** read it before changing anything. Examples: `missing field `application`` (an iomap mapping lacks the POU name) → add it; `duplicate alarm id "…"` (two `alarms.toml` entries share an id) → rename one. Usage errors (unknown flag, bad path) exit 2 the same way. (Exit 1 = problems in your content — diagnostics, failed probe, remote deploy failure, sim expectation failed; `≥3` = infrastructure, server down / 5xx.)
 
 ### `409` Conflict
-**Cause:** a create-only or read-only path. Devices/edges don't hit this — `cs set` is upsert, so reconfiguring replaces in place. What does 409: `cs hmi generate <slug>` on a screen that already exists (curated by a human — pass `--force` only if you mean to overwrite), or writing a `pous/lib/<name>/…` block imported from a library (read-only through the generic POU routes — copy it out of `lib/` to own it).
+**Cause:** a create-only or read-only path. Devices/edges don't hit this — `cs set` is upsert, so reconfiguring replaces in place. What does 409: `cs hmi generate <slug>` on a screen that already exists (curated by a human — pass `--force` only if you mean to overwrite), or writing a `pous/lib/<name>/…` block imported from a library (read-only through the generic POU routes — copy it out of `lib/` and rename the block in your copy to own it; two blocks with one name are rejected, P4013).
 **Fix:** for a rewrite you intend, read the document with `cs get <path> --etag-file version`, edit that content, then `cs set <path> --from - --if-match @version` (or `--force` for a deliberately replacing generate).
 
 ### `412` Precondition Failed / `set` asks for `--if-match`
@@ -63,7 +63,7 @@ Each entry: the symptom you'll see, the cause, the fix.
 **Fix:** confirm the `VAR RETAIN` declaration sits in a `PROGRAM` or `VAR_GLOBAL` block — an FB-internal one is warned about at compile time and ignored (`grep` the runtime log for `VAR RETAIN inside a FUNCTION_BLOCK`). Note the flush cadence is 5 s + on clean stop — up to 5 s of change can be lost on an unclean kill. Values themselves are stored as raw 64-bit slots and do not truncate.
 
 ### The run stopped by itself — snapshots frozen, nothing obvious in the way
-**Cause:** the program faulted. A VM trap (divide by zero, bad array index, …) in any scheduled instance stops the whole plant and zeroes outputs (failsafe), by design. A VM that fails to start never runs a scan and is reported the same way, as `VM failed to start in <instance>: <trap>`. On a binary predating that, a failed start instead shows `running: true` with `scan_count` stuck at 0 and no error anywhere but the log line `vm failed to start`.
+**Cause:** the program faulted. A VM trap (divide by zero, bad array index, …) in any scheduled instance stops all scan tasks and attempts each adapter's configured safe values. Those attempts can fail; `failsafe_status` and teardown logs carry the results, without confirming physical outputs. A VM that fails to start never runs a scan and is reported the same way, as `VM failed to start in <instance>: <trap>`. On a binary predating that, a failed start instead shows `running: true` with `scan_count` stuck at 0 and no error anywhere but the log line `vm failed to start`.
 **Fix:** read the reason instead of re-running blind: `/api/runtime/status` reports `running: false` with `last_error` carrying the trap message (e.g. `VM trap in main_inst: DivideByZero`), and the SSE stream emitted `error` then `stopped` at the moment it died. On an edge, the runtime's own `/status` carries the same message in `fault`. Fix the arithmetic (guard divisors, clamp indices) and run again — the next `cs run` clears `last_error`.
 
 ### Ran `cs run --program X`, but the snapshot shows a different POU's variables (e.g. the template's `counter`/`blink`)
@@ -124,5 +124,5 @@ An `init_sdo` entry targets a CoE object the drive doesn't have. A failed startu
 - **Real EtherCAT is Linux-only** (`CAP_NET_RAW`). On macOS use `nic: "_sim"`.
 - **RETAIN works in `PROGRAM` / `VAR_GLOBAL` blocks only** — an FB-internal `VAR RETAIN` is ignored (compile-time warning). Values are raw 64-bit slots; nothing truncates.
 - **No per-entry iomap/tasks/device-channel edits.** Whole-document get → edit → set.
-- **WSTRING** is upstream-WIP; don't author WSTRING programs expecting them to run.
+- **Non-Latin-1 text must be `WSTRING`.** A `STRING` literal with e.g. Chinese is a compile error (P4052); use `WSTRING` and a double-quoted literal. Assignment and comparison are verified; the Monitor and HMI show it as an escaped literal (`"$52A0$6599"`). `cs check` any string function on `WSTRING` and watch a run before relying on it. See `05-iec-61131.md` § quirks.
 - **No FB instances inside a FUNCTION_BLOCK** (e.g. a TON declared in an FB's `VAR` block) — compile-time error; hoist the instance into the calling PROGRAM. See `05-iec-61131.md` § quirks.

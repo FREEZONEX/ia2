@@ -15,9 +15,10 @@
 //!
 //!   1. Two internal variables: `__sfc_step` (current state) and
 //!      `__sfc_prev` (previous-scan state, for entry-edge detection).
-//!      Both are STRING values holding the step name.
+//!      Both hold the step name: STRING, or WSTRING when a name needs it
+//!      (see below).
 //!   2. **Per-step action block**: one `IF __sfc_step = 'name' THEN …`
-//!      for each step. Inside, action bodies render in author order
+//!      for each step (`"name"` in a WSTRING chart, here and below). Inside, action bodies render in author order
 //!      according to their qualifier:
 //!      - N → unconditional body
 //!      - S → `IF __sfc_prev <> 'name' THEN body END_IF;` (entry edge)
@@ -33,32 +34,37 @@
 //!           __sfc_step := '<to>';
 //!       ELSIF …`
 //!
-//! Why STRING (not DINT enum)
-//! --------------------------
+//! Why a string (not DINT enum)
+//! ----------------------------
 //! Monitor / `cs check` round-trips show the actual step name, which
-//! is enormously easier to debug than `4`. STRING comparison in
+//! is enormously easier to debug than `4`. String comparison in
 //! ironplc is fine for the scan-rate workload we target (≤ 100 ms
 //! cycle); if profiling ever flags it we switch to DINT IDs with a
 //! commented-out lookup table.
 //!
 //! What STRING costs, and the guards that pay for it
 //! -------------------------------------------------
-//! ironplc stores STRING as Latin-1 and encodes a literal by keeping each
-//! character's low byte (`encode_string_literal`, ADR-0016). It does not
-//! process `$` escapes. Three consequences, each enforced here rather than
-//! left to surface at runtime:
+//! ironplc stores STRING as Latin-1 and WSTRING as UCS-2 (ADR-0016), and
+//! rejects a literal holding a character its type cannot represent (P4052).
+//! It does not process `$` escapes. So the state type follows the names:
 //!
-//!   * **Length.** A value longer than the declared STRING length is
-//!     truncated, so a longer step name never compares equal to its own
-//!     literal — the chart enters that step and silently stops: no action
-//!     runs, no transition leaves. The state variables are sized to the
-//!     longest name (at least 31). ironplc's comparison also misbehaves at
-//!     a declared length of 255 or more, so names are capped at 254.
-//!   * **Collisions.** Two names whose characters share low bytes (`等` is
-//!     U+7B49, stored as `I`) are the same value: both steps are active at
-//!     once. Such pairs are rejected.
-//!   * **`$`** is the IEC escape character; a raw one is malformed ST that
-//!     ironplc happens to accept. Rejected, like `'`.
+//!   * **Type.** A chart whose step names are all Latin-1 keeps STRING and
+//!     single-quoted literals, producing the same ST as before. A chart with
+//!     any other character switches both state variables to WSTRING and
+//!     double-quoted literals. Either way every name is stored exactly, so
+//!     two distinct names are always two distinct values. (Before ironplc
+//!     rejected such literals it kept each character's low byte, and `等`,
+//!     U+7B49, was the same value as `I`.) WSTRING holds only the Basic
+//!     Multilingual Plane, so a name beyond it is rejected.
+//!   * **Length.** A value longer than the declared length is truncated, so
+//!     a longer step name never compares equal to its own literal — the
+//!     chart enters that step and silently stops: no action runs, no
+//!     transition leaves. The state variables are sized to the longest name
+//!     (at least 31). ironplc's STRING comparison also misbehaves at a
+//!     declared length of 255 or more, so names are capped at 254.
+//!   * **Delimiters and `$`.** `$` is the IEC escape character; a raw one is
+//!     malformed ST that ironplc happens to accept. Rejected in every chart,
+//!     like `'`. A WSTRING chart also rejects `"`, its literal delimiter.
 //!
 //! Limitations (deferred for later phases)
 //! ---------------------------------------
@@ -157,6 +163,7 @@ pub fn transpile_to_st_with_map(prog: &SfcProgram) -> Result<(String, SfcSourceM
             prog.name
         )));
     }
+    let state = StateType::for_steps(&prog.steps);
     let mut step_names: HashSet<&str> = HashSet::new();
     for s in &prog.steps {
         if s.name.is_empty() {
@@ -164,7 +171,7 @@ pub fn transpile_to_st_with_map(prog: &SfcProgram) -> Result<(String, SfcSourceM
         }
         if s.name.contains('\'') {
             return Err(BridgeError::Parse(format!(
-                "SFC step name '{}' contains a single quote — that breaks the STRING literal we lower to",
+                "SFC step name '{}' contains a single quote — that breaks the string literal we lower to",
                 s.name
             )));
         }
@@ -173,6 +180,23 @@ pub fn transpile_to_st_with_map(prog: &SfcProgram) -> Result<(String, SfcSourceM
                 "SFC step name '{}' contains '$', the IEC string escape character — rename the step",
                 s.name
             )));
+        }
+        if state == StateType::Wide {
+            if s.name.contains('"') {
+                return Err(BridgeError::Parse(format!(
+                    "SFC step name '{}' contains a double quote — this chart's step names are not \
+                     all Latin-1, so it lowers them to WSTRING literals, which a double quote ends",
+                    s.name
+                )));
+            }
+            if let Some(c) = s.name.chars().find(|&c| u32::from(c) > 0xFFFF) {
+                return Err(BridgeError::Parse(format!(
+                    "SFC step name '{}' contains '{c}' (U+{:X}), outside the Basic Multilingual \
+                     Plane that WSTRING can hold — rename the step",
+                    s.name,
+                    u32::from(c)
+                )));
+            }
         }
         let chars = s.name.chars().count();
         if chars > MAX_STEP_NAME_CHARS {
@@ -184,17 +208,6 @@ pub fn transpile_to_st_with_map(prog: &SfcProgram) -> Result<(String, SfcSourceM
         if !step_names.insert(s.name.as_str()) {
             return Err(BridgeError::Parse(format!(
                 "SFC step name '{}' duplicated",
-                s.name
-            )));
-        }
-    }
-    let mut stored_as: std::collections::HashMap<Vec<u8>, &str> = std::collections::HashMap::new();
-    for s in &prog.steps {
-        if let Some(other) = stored_as.insert(runtime_bytes(&s.name), s.name.as_str()) {
-            return Err(BridgeError::Parse(format!(
-                "SFC steps '{other}' and '{}' are the same value to the runtime — it stores STRING as \
-                 Latin-1 and keeps only the low byte of other characters — so both would be active at \
-                 once; rename one",
                 s.name
             )));
         }
@@ -253,13 +266,19 @@ pub fn transpile_to_st_with_map(prog: &SfcProgram) -> Result<(String, SfcSourceM
         .max(MIN_STATE_LEN);
 
     em.line(None, format_args!("{} {}", head, prog.name));
-    write_variable_blocks(&mut em, &prog.variables, &prog.initial_step, state_len);
+    write_variable_blocks(
+        &mut em,
+        &prog.variables,
+        &prog.initial_step,
+        state,
+        state_len,
+    );
     em.blank();
 
     // --- Per-step action dispatch ---
     em.line(None, format_args!("    (* === SFC actions === *)"));
     for step in &prog.steps {
-        emit_step_actions(&mut em, step);
+        emit_step_actions(&mut em, step, state);
     }
     em.blank();
 
@@ -275,14 +294,21 @@ pub fn transpile_to_st_with_map(prog: &SfcProgram) -> Result<(String, SfcSourceM
     em.line(None, format_args!("    (* === SFC transitions === *)"));
     if !prog.transitions.is_empty() {
         for (i, t) in prog.transitions.iter().enumerate() {
-            let cond_clause = format!("__sfc_step = '{}' AND ({})", t.from, t.condition.trim());
+            let cond_clause = format!(
+                "__sfc_step = {} AND ({})",
+                state.literal(&t.from),
+                t.condition.trim()
+            );
             let span = Some(SfcLocation::Transition { index: i });
             if i == 0 {
                 em.line(span.clone(), format_args!("    IF {cond_clause} THEN"));
             } else {
                 em.line(span.clone(), format_args!("    ELSIF {cond_clause} THEN"));
             }
-            em.line(span, format_args!("        __sfc_step := '{}';", t.to));
+            em.line(
+                span,
+                format_args!("        __sfc_step := {};", state.literal(&t.to)),
+            );
         }
         em.line(None, format_args!("    END_IF;"));
     }
@@ -303,16 +329,50 @@ const MAX_STEP_NAME_CHARS: usize = 254;
 /// at the historical 31 so existing charts produce unchanged ST.
 const MIN_STATE_LEN: usize = 31;
 
-/// The bytes ironplc stores for a STRING literal of `name`: one byte per
-/// character, its low eight bits (`encode_string_literal`).
-fn runtime_bytes(name: &str) -> Vec<u8> {
-    name.chars().map(|c| (u32::from(c) & 0xFF) as u8).collect()
+/// The IEC type of the two state variables, chosen so ironplc can store
+/// every step name exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StateType {
+    /// Every name is Latin-1: STRING, the historical lowering.
+    Narrow,
+    /// Some name is not: WSTRING (UCS-2).
+    Wide,
+}
+
+impl StateType {
+    fn for_steps(steps: &[SfcStep]) -> Self {
+        if steps
+            .iter()
+            .all(|s| s.name.chars().all(|c| u32::from(c) <= 0xFF))
+        {
+            StateType::Narrow
+        } else {
+            StateType::Wide
+        }
+    }
+
+    fn type_name(self) -> &'static str {
+        match self {
+            StateType::Narrow => "STRING",
+            StateType::Wide => "WSTRING",
+        }
+    }
+
+    /// A literal of this type. Names were validated not to contain the
+    /// delimiter or `$`, so no escaping is needed.
+    fn literal(self, name: &str) -> String {
+        match self {
+            StateType::Narrow => format!("'{name}'"),
+            StateType::Wide => format!("\"{name}\""),
+        }
+    }
 }
 
 fn write_variable_blocks(
     em: &mut StEmitter,
     vars: &[LdVariable],
     initial_step: &str,
+    state: StateType,
     state_len: usize,
 ) {
     for section in [
@@ -341,29 +401,37 @@ fn write_variable_blocks(
         }
         // The internal VAR block also carries the two SFC state vars.
         if section == LdVarSection::Internal {
+            let ty = state.type_name();
             em.line(
                 None,
-                format_args!("        __sfc_step : STRING[{state_len}] := '{initial_step}';"),
+                format_args!(
+                    "        __sfc_step : {ty}[{state_len}] := {};",
+                    state.literal(initial_step)
+                ),
             );
             em.line(
                 None,
-                format_args!("        __sfc_prev : STRING[{state_len}] := '';"),
+                format_args!(
+                    "        __sfc_prev : {ty}[{state_len}] := {};",
+                    state.literal("")
+                ),
             );
         }
         em.line(None, format_args!("    END_VAR"));
     }
 }
 
-fn emit_step_actions(em: &mut StEmitter, step: &SfcStep) {
+fn emit_step_actions(em: &mut StEmitter, step: &SfcStep, state: StateType) {
     if step.actions.is_empty() {
         return;
     }
     let step_span = Some(SfcLocation::Step {
         name: step.name.clone(),
     });
+    let name = state.literal(&step.name);
     em.line(
         step_span.clone(),
-        format_args!("    IF __sfc_step = '{}' THEN", step.name),
+        format_args!("    IF __sfc_step = {name} THEN"),
     );
     for (ai, action) in step.actions.iter().enumerate() {
         let action_span = Some(SfcLocation::Action {
@@ -382,8 +450,8 @@ fn emit_step_actions(em: &mut StEmitter, step: &SfcStep) {
                 em.line(
                     action_span.clone(),
                     format_args!(
-                        "        IF __sfc_prev <> '{}' THEN  (* qualifier: {:?} *)",
-                        step.name, action.qualifier
+                        "        IF __sfc_prev <> {name} THEN  (* qualifier: {:?} *)",
+                        action.qualifier
                     ),
                 );
                 emit_action_body(em, &action.body, action_span.clone(), /*indent*/ 12);
@@ -767,6 +835,7 @@ mod tests {
             "wait_for_operator_confirmation_x", // 32: one past the old limit
             &"s".repeat(254),
             "等待操作员确认后开始加料", // non-ASCII: counted in characters
+            &"料".repeat(254),          // WSTRING at the same cap
         ] {
             let st = transpile_to_st(&chain_through(name)).unwrap();
             let v = crate::test_vm::run_st(&st, 10);
@@ -791,18 +860,93 @@ mod tests {
         assert!(err.to_string().contains("at most 254"), "{err}");
     }
 
-    /// `等` is U+7B49; ironplc stores its low byte, `I`. Both steps used to
-    /// be active at once.
+    /// `等` is U+7B49. When ironplc kept a STRING literal's low byte it
+    /// stored `等` as `I`, so both steps were active at once and such pairs
+    /// had to be refused. As WSTRING they are two values: `I` never runs
+    /// while the chart is in `等`.
     #[test]
-    fn names_the_runtime_stores_identically_are_refused() {
+    fn names_that_once_collided_are_distinct_steps() {
         let mut prog = chain_through("等");
+        prog.variables.push(var("i_scans", "INT", None));
         prog.steps.push(SfcStep {
             name: "I".into(),
-            actions: vec![],
+            actions: vec![SfcAction {
+                qualifier: SfcQualifier::N,
+                body: "i_scans := i_scans + 1;".into(),
+            }],
         });
-        let err = transpile_to_st(&prog).unwrap_err().to_string();
-        assert!(err.contains("'等' and 'I'"), "{err}");
-        assert!(err.contains("same value"), "{err}");
+        let st = transpile_to_st(&prog).unwrap();
+        let v = crate::test_vm::run_st(&st, 10);
+        assert_eq!(
+            (v["middle_scans"], v["i_scans"], v["reached_done"]),
+            (1, 0, 1),
+            "{st}"
+        );
+    }
+
+    #[test]
+    fn latin1_charts_keep_string_and_others_switch_to_wstring() {
+        let st = transpile_to_st(&chain_through("café")).unwrap();
+        assert!(st.contains("__sfc_step : STRING[31] := 'idle';"), "{st}");
+        assert!(st.contains("__sfc_prev : STRING[31] := '';"), "{st}");
+        assert!(st.contains("__sfc_step := 'café';"), "{st}");
+        let v = crate::test_vm::run_st(&st, 10);
+        assert_eq!((v["middle_scans"], v["reached_done"]), (1, 1), "{st}");
+
+        // One non-Latin-1 name moves every literal of the chart, including
+        // the Latin-1 ones, to WSTRING: a STRING and a WSTRING never compare.
+        let st = transpile_to_st(&chain_through("加料")).unwrap();
+        assert!(st.contains("__sfc_step : WSTRING[31] := \"idle\";"), "{st}");
+        assert!(st.contains("__sfc_prev : WSTRING[31] := \"\";"), "{st}");
+        assert!(st.contains("__sfc_step := \"加料\";"), "{st}");
+        assert!(st.contains("__sfc_step := \"done\";"), "{st}");
+        assert!(!st.contains("= '") && !st.contains("<> '"), "{st}");
+        let v = crate::test_vm::run_st(&st, 10);
+        assert_eq!((v["middle_scans"], v["reached_done"]), (1, 1), "{st}");
+    }
+
+    /// The S/R entry edge compares `__sfc_prev` with the step's literal; in a
+    /// WSTRING chart that must fire once per entry, not every scan or never.
+    #[test]
+    fn a_stored_action_fires_once_on_entry_to_a_wide_step() {
+        let mut prog = chain_through("加料");
+        prog.variables.push(var("entries", "INT", None));
+        prog.variables.push(var("release", "BOOL", None));
+        prog.steps[1].actions.push(SfcAction {
+            qualifier: SfcQualifier::S,
+            body: "entries := entries + 1;".into(),
+        });
+        prog.transitions[1].condition = "release".into();
+        // Stay in 加料 for several scans, then leave.
+        prog.steps[1].actions.push(SfcAction {
+            qualifier: SfcQualifier::N,
+            body: "release := middle_scans >= 4;".into(),
+        });
+        let st = transpile_to_st(&prog).unwrap();
+        let v = crate::test_vm::run_st(&st, 10);
+        assert_eq!(
+            (v["middle_scans"], v["entries"], v["reached_done"]),
+            (4, 1, 1),
+            "{st}"
+        );
+    }
+
+    #[test]
+    fn a_double_quote_is_refused_only_where_it_ends_the_literal() {
+        let st = transpile_to_st(&chain_through("say \"go\"")).unwrap();
+        let v = crate::test_vm::run_st(&st, 10);
+        assert_eq!((v["middle_scans"], v["reached_done"]), (1, 1), "{st}");
+
+        let err = transpile_to_st(&chain_through("加料\"")).unwrap_err();
+        assert!(err.to_string().contains("double quote"), "{err}");
+    }
+
+    #[test]
+    fn a_name_wstring_cannot_hold_is_refused() {
+        let err = transpile_to_st(&chain_through("加料🚚")).unwrap_err();
+        let err = err.to_string();
+        assert!(err.contains("U+1F69A"), "{err}");
+        assert!(err.contains("Basic Multilingual Plane"), "{err}");
     }
 
     #[test]

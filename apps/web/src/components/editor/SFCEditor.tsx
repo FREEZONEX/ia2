@@ -127,15 +127,19 @@ export function SFCEditor({
     })
 
   // Online-mode current step, from THIS program's `__sfc_step`. The value
-  // is the runtime's STRING — each character's low byte, printed as an IEC
-  // literal — so it is matched against each step name encoded the same
-  // way. Stripping the quotes and comparing to the name used to miss every
+  // is the runtime's STRING or WSTRING (the transpiler picks WSTRING when a
+  // step name is not Latin-1), printed as an IEC literal — so it is matched
+  // against each step name encoded the same way, per the variable's own
+  // type. Stripping the quotes and comparing to the name used to miss every
   // step with a non-ASCII or `$` in its name, and with several charts
   // running the bare `__sfc_step` was not even this chart's.
   const activeStep = useMemo<string | null>(() => {
     const v = online?.("__sfc_step")
     if (!v || parsed.kind !== "ok") return null
-    return parsed.program.steps.find((st) => runtimeStringLiteral(st.name) === v.value)?.name ?? null
+    return (
+      parsed.program.steps.find((st) => runtimeStringLiteral(st.name, v.type_name) === v.value)
+        ?.name ?? null
+    )
   }, [online, parsed])
 
   const [sel, setSel] = useState<Selection>(null)

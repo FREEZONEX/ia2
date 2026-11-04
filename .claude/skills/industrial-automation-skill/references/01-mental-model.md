@@ -76,7 +76,12 @@ The one thing multi-PROGRAM projects cannot do is share a `VAR_GLOBAL` across in
 `spawn_with_options()` starts a dedicated `std::thread` running a tokio current-thread runtime. Each scan:
 - Input phase: every iomap'd `direction: input` reads its channel
 - Force phase: pinned values overwrite VM state
-- VM `run_round(now_us)` executes the bytecode
+- VM executes one scan through its instruction hook, bounded to 10,000,000
+  opcodes / one second. The opcode ceiling is host-independent and is the one
+  a runaway hits first (tens of ms on a fast CPU); a legitimately heavy scan
+  must be split across scans or tasks. Stop takes effect at the scan boundary (a scan still
+  running 250 ms after Stop is discarded as hung). Exhaustion ends the run
+  with a visible fault and device failsafe/shutdown.
 - Output phase: every iomap'd `direction: output` writes its channel
 - Sleep until `next_scan_at` (cadence from `tasks.toml interval_ms`)
 

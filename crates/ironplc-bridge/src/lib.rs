@@ -3,6 +3,7 @@
 //! API intended for downstream consumption by the server crate.
 
 mod errors;
+mod execution;
 mod fbd_transpile;
 mod ld_transpile;
 pub mod monitor;
@@ -29,9 +30,10 @@ pub use sfc_transpile::{
 
 pub use errors::BridgeError;
 pub use runtime::{
-    spawn_units, DeviceHealth, DeviceReport, DeviceSpec, DiscoveredSlave, InputQuality,
-    ProgramHandle, ProgramUnit, RuntimeMode, RuntimeWriteError, VarSnapshot, VarValue,
-    WriteOutcome, DEFAULT_SCAN_INTERVAL_MS, RETAIN_FLUSH_INTERVAL, WATCHDOG_OVERRUN_THRESHOLD,
+    spawn_units, DeviceFailsafeError, DeviceHealth, DeviceReport, DeviceSpec, DiscoveredSlave,
+    FailsafeStatus, InputQuality, OutputLatchError, ProgramHandle, ProgramUnit, RuntimeMode,
+    RuntimeWriteError, VarSnapshot, VarValue, WriteOutcome, DEFAULT_SCAN_INTERVAL_MS,
+    RETAIN_FLUSH_INTERVAL, WATCHDOG_OVERRUN_THRESHOLD,
 };
 
 // Re-exported so downstream crates (server / runtime) can name the
@@ -129,12 +131,11 @@ fn compile_library(library: &Library, sources: &Sources) -> Result<Container, Br
     let (analyzed, context) = ironplc_analyzer::stages::analyze(&[library], &options)
         .map_err(|ds| BridgeError::Analyze(format!("{ds:?}")))?;
 
-    if context.has_diagnostics() {
-        return Err(BridgeError::Analyze(format!("{:?}", context.diagnostics())));
-    }
+    let analysis = ironplc_analyzer::CleanAnalysis::new(&analyzed, &context)
+        .map_err(|ds| BridgeError::Analyze(format!("{ds:?}")))?;
 
     let codegen_options = ironplc_codegen::CodegenOptions::default();
-    ironplc_codegen::compile(&analyzed, &context, &codegen_options, sources)
+    ironplc_codegen::compile(analysis, &codegen_options, sources)
         .map_err(|d| BridgeError::Codegen(format!("{d:?}")))
 }
 
@@ -216,6 +217,68 @@ pub fn compile_project(store: &project::ProjectStore) -> Result<Vec<ProgramUnit>
         .map_err(|e| BridgeError::Parse(format!("reading tasks.toml: {e}")))?
         .unwrap_or_default();
     compile_project_units(store, &tasks)
+}
+
+/// A project directory loaded and compiled exactly the way `ia2-runtime`
+/// does at startup, with everything the runtime goes on to use.
+pub struct EdgeProject {
+    pub store: project::ProjectStore,
+    pub tasks: project::Tasks,
+    pub devices: Vec<project::Device>,
+    pub iomap: project::IoMap,
+    pub units: Vec<ProgramUnit>,
+    /// What the project says the runtime does when it can no longer evaluate
+    /// alarms (`[supervision]` in `alarms.toml`); `report` unless declared.
+    pub supervision: project::SupervisionConfig,
+}
+
+/// Load and compile the project at `project_dir` the way `ia2-runtime`
+/// does at startup: open it (which validates `[governance]`), require
+/// `tasks.toml`, read devices and the iomap, apply the ADR-0001
+/// shared-globals rule, compile one unit per scheduled PROGRAM. An error
+/// is what the runtime would exit with.
+///
+/// The edge runtime starts through this, and the IDE server's deploy runs
+/// it on the project BEFORE uploading, so a project the runtime would
+/// refuse is refused without touching the edge. Only the compiler differs
+/// when a deploy carries the edge's existing runtime binary forward.
+pub fn load_edge_project(project_dir: &std::path::Path) -> Result<EdgeProject, String> {
+    let store = project::ProjectStore::open(project_dir.to_path_buf())
+        .map_err(|e| format!("opening project at {}: {e}", project_dir.display()))?;
+    let tasks = store
+        .read_tasks()
+        .map_err(|e| format!("reading tasks.toml: {e}"))?
+        .ok_or_else(|| {
+            "tasks.toml missing from project — run the IDE's 'Migrate to tasks' once, or \
+             hand-author tasks.toml, then redeploy"
+                .to_string()
+        })?;
+    let devices = store
+        .list_devices()
+        .map_err(|e| format!("listing devices: {e}"))?;
+    let iomap = store
+        .read_iomap()
+        .map_err(|e| format!("reading iomap: {e}"))?;
+    reject_shared_globals(&store, &tasks).map_err(|msg| format!("{msg} Then redeploy."))?;
+    // alarms.toml is read here, not only by the runtime afterwards, because
+    // the runtime tolerates an unreadable file (it logs and runs without
+    // alarms). That is the wrong answer for a project whose `[supervision]`
+    // asks for protection: a misspelt key or a bad value would deploy fine and
+    // protect nothing. An unreadable file is refused BEFORE it reaches the edge.
+    let alarms = store
+        .read_alarms()
+        .map_err(|e| format!("reading alarms.toml: {e}"))?;
+    let supervision = alarms.supervision.unwrap_or_default();
+    let units =
+        compile_project_units(&store, &tasks).map_err(|e| format!("compiling project: {e}"))?;
+    Ok(EdgeProject {
+        store,
+        tasks,
+        devices,
+        iomap,
+        units,
+        supervision,
+    })
 }
 
 /// Compile one container per `tasks.toml` PROGRAM instance — the
@@ -563,13 +626,19 @@ fn source_to_st(source: &str, language: project::PouLanguage) -> Result<String, 
     }
 }
 
+/// Name of the synthesized CONFIGURATION. ironplc reports a configuration
+/// and a type or POU with the same name as a duplicate declaration, so a
+/// plain name like `config` would reject a user's `TYPE Config`. The
+/// `__ia2_` prefix keeps it out of any name a project would choose.
+const SYNTHESIZED_CONFIGURATION: &str = "__ia2_configuration";
+
 /// Build a single CONFIGURATION block from the project's task / program
 /// bindings. Currently emits one fixed RESOURCE — multi-RESOURCE projects
 /// aren't supported yet (the IEC standard allows them; not a frequent need
 /// for single-edge deployments).
 fn synthesize_configuration(tasks: &project::Tasks) -> String {
     let mut s = String::new();
-    s.push_str("CONFIGURATION config\n");
+    s.push_str(&format!("CONFIGURATION {SYNTHESIZED_CONFIGURATION}\n"));
     s.push_str("    RESOURCE plc_res ON PLC\n");
     for t in &tasks.tasks {
         s.push_str(&format!(
@@ -1026,7 +1095,9 @@ pub struct VariableInfo {
 /// Dispatches on `language`:
 ///
 /// - `St`  — runs the ironplc parser and emits one `PouDecl` per
-///   top-level PROGRAM / FUNCTION_BLOCK / FUNCTION.
+///   top-level PROGRAM / FUNCTION_BLOCK / FUNCTION. Empty when the source
+///   does not parse, and also when the compiler panics on it (logged at
+///   ERROR; see `list_or_empty_on_compiler_panic`).
 /// - `Ld`  — parses the `.ld.json` source and emits a single `PouDecl`
 ///   built from the `LdProgram`'s name + pou_type. LD files are
 ///   single-declaration by design (see `crates/project/src/ld.rs`).
@@ -1100,28 +1171,62 @@ pub fn extract_pou_declarations(
 
 fn extract_st_declarations(source: &str) -> Vec<project::PouDecl> {
     use project::{PouDecl, PouLanguage, PouType};
-    let file_id = FileId::default();
-    let options = parser_options();
-    let Ok(library) = ironplc_parser::parse_program(source, &file_id, &options) else {
-        return vec![];
-    };
-    let mut out = Vec::new();
-    for element in &library.elements {
-        let (name, type_) = match element {
-            LibraryElementKind::ProgramDeclaration(p) => (p.name.to_string(), PouType::Program),
-            LibraryElementKind::FunctionBlockDeclaration(fb) => {
-                (fb.name.to_string(), PouType::FunctionBlock)
-            }
-            LibraryElementKind::FunctionDeclaration(f) => (f.name.to_string(), PouType::Function),
-            _ => continue,
+    list_or_empty_on_compiler_panic("POU declarations", || {
+        let file_id = FileId::default();
+        let options = parser_options();
+        let Ok(library) = ironplc_parser::parse_program(source, &file_id, &options) else {
+            return vec![];
         };
-        out.push(PouDecl {
-            name,
-            type_,
-            language: PouLanguage::St,
-        });
+        let mut out = Vec::new();
+        for element in &library.elements {
+            let (name, type_) = match element {
+                LibraryElementKind::ProgramDeclaration(p) => (p.name.to_string(), PouType::Program),
+                LibraryElementKind::FunctionBlockDeclaration(fb) => {
+                    (fb.name.to_string(), PouType::FunctionBlock)
+                }
+                LibraryElementKind::FunctionDeclaration(f) => {
+                    (f.name.to_string(), PouType::Function)
+                }
+                _ => continue,
+            };
+            out.push(PouDecl {
+                name,
+                type_,
+                language: PouLanguage::St,
+            });
+        }
+        out
+    })
+}
+
+/// Run one of the listing extractors (`extract_pou_declarations`,
+/// `extract_variables`, and through it `extract_symbols`) so that a
+/// compiler panic on the source yields an empty list instead of unwinding
+/// into the caller.
+///
+/// These feed the project tree, the POU reader and the variable pickers,
+/// and their contract is already "nothing to list when the source does
+/// not parse". The vendored compiler still has input-dependent panics; a
+/// source that hits one is, for a listing, one more source that could not
+/// be parsed, and the tree and the file have to stay readable so it can be
+/// opened and fixed. The panic is logged at ERROR.
+///
+/// Whether a source is VALID is not answered here: `check` and the compile
+/// paths do not go through this, and they still report the panic.
+fn list_or_empty_on_compiler_panic<T>(what: &'static str, list: impl FnOnce() -> Vec<T>) -> Vec<T> {
+    // The closure only reads the source and builds a fresh Vec, so an
+    // unwind leaves no half-updated state behind.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(list)) {
+        Ok(items) => items,
+        Err(payload) => {
+            let detail = runtime::panic_message(payload.as_ref());
+            tracing::error!(
+                %detail,
+                "the compiler panicked while listing {what}; treating the source as unparseable"
+            );
+            Vec::new()
+        }
     }
-    out
 }
 
 /// Language-agnostic symbol extraction. Same role as `extract_variables`
@@ -1131,7 +1236,7 @@ fn extract_st_declarations(source: &str) -> Vec<project::PouDecl> {
 ///
 /// Returns `[]` for unsupported languages and for malformed sources —
 /// callers shouldn't fall over when the user is mid-edit and the JSON
-/// is briefly invalid.
+/// is briefly invalid. An ST source the compiler panics on is `[]` too.
 pub fn extract_symbols(source: &str, language: project::PouLanguage) -> Vec<VariableInfo> {
     use project::PouLanguage;
     match language {
@@ -1198,34 +1303,38 @@ fn ld_section_str(s: project::LdVarSection) -> &'static str {
 
 /// Parse an ST source (no full compile required) and pull out the declared
 /// variables of any PROGRAM or FUNCTION_BLOCK at the top level. Returns an
-/// empty list if parsing fails — the frontend can fall back to free text.
+/// empty list if parsing fails — the frontend can fall back to free text —
+/// and also if the compiler panics on the source (logged at ERROR; see
+/// `list_or_empty_on_compiler_panic`).
 pub fn extract_variables(source: &str) -> Vec<VariableInfo> {
-    let file_id = FileId::default();
-    // `allow_empty_var_blocks` mirrors the ironplc CLI flag. POU templates
-    // we ship intentionally start with empty VAR / VAR_INPUT / VAR_OUTPUT
-    // blocks — those should compile, not error.
-    let options = parser_options();
-    let library = match ironplc_parser::parse_program(source, &file_id, &options) {
-        Ok(l) => l,
-        Err(_) => return vec![],
-    };
-
-    let mut out: Vec<VariableInfo> = Vec::new();
-    for element in &library.elements {
-        let vars = match element {
-            LibraryElementKind::ProgramDeclaration(p) => Some(&p.variables),
-            LibraryElementKind::FunctionBlockDeclaration(fb) => Some(&fb.variables),
-            _ => None,
+    list_or_empty_on_compiler_panic("variables", || {
+        let file_id = FileId::default();
+        // `allow_empty_var_blocks` mirrors the ironplc CLI flag. POU templates
+        // we ship intentionally start with empty VAR / VAR_INPUT / VAR_OUTPUT
+        // blocks — those should compile, not error.
+        let options = parser_options();
+        let library = match ironplc_parser::parse_program(source, &file_id, &options) {
+            Ok(l) => l,
+            Err(_) => return vec![],
         };
-        if let Some(vars) = vars {
-            for v in vars {
-                if let Some(info) = var_decl_to_info(v) {
-                    out.push(info);
+
+        let mut out: Vec<VariableInfo> = Vec::new();
+        for element in &library.elements {
+            let vars = match element {
+                LibraryElementKind::ProgramDeclaration(p) => Some(&p.variables),
+                LibraryElementKind::FunctionBlockDeclaration(fb) => Some(&fb.variables),
+                _ => None,
+            };
+            if let Some(vars) = vars {
+                for v in vars {
+                    if let Some(info) = var_decl_to_info(v) {
+                        out.push(info);
+                    }
                 }
             }
         }
-    }
-    out
+        out
+    })
 }
 
 fn var_decl_to_info(v: &VarDecl) -> Option<VariableInfo> {
@@ -1360,6 +1469,66 @@ fn lookup_locations(
         SourceMapKind::Ld(m) => (m.lookup(line).cloned(), None, None),
         SourceMapKind::Fbd(m) => (None, m.lookup(line).cloned(), None),
         SourceMapKind::Sfc(m) => (None, None, m.lookup(line).cloned()),
+    }
+}
+
+#[cfg(test)]
+mod listing_panic_tests {
+    use super::{
+        extract_pou_declarations, extract_symbols, extract_variables,
+        list_or_empty_on_compiler_panic,
+    };
+    use project::PouLanguage;
+
+    #[test]
+    fn list_or_empty_when_listing_returns_then_items_pass_through() {
+        let items = list_or_empty_on_compiler_panic("test items", || vec![1, 2, 3]);
+        assert_eq!(items, vec![1, 2, 3]);
+        let none = list_or_empty_on_compiler_panic("test items", Vec::<u8>::new);
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn list_or_empty_when_listing_panics_then_empty_list_not_unwind() {
+        let n = 2;
+        let items: Vec<u8> =
+            list_or_empty_on_compiler_panic("test items", || panic!("no group at index '{n}'"));
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn list_or_empty_when_panic_payload_is_not_text_then_empty_list() {
+        let items: Vec<u8> =
+            list_or_empty_on_compiler_panic("test items", || std::panic::panic_any(42_u32));
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn listings_when_source_is_ordinary_then_declarations_and_variables_are_listed() {
+        let source = "PROGRAM main\nVAR\n  level : INT;\nEND_VAR\nEND_PROGRAM\n";
+        let decls = extract_pou_declarations(source, PouLanguage::St);
+        assert_eq!(
+            decls.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            ["main"]
+        );
+        let names = |vars: Vec<super::VariableInfo>| -> Vec<String> {
+            vars.into_iter().map(|v| v.name).collect()
+        };
+        assert_eq!(names(extract_variables(source)), ["level"]);
+        assert_eq!(names(extract_symbols(source, PouLanguage::St)), ["level"]);
+    }
+
+    /// A direct address with no size letter makes the vendored compiler
+    /// (v0.248.0) panic inside its parser. The listings have to come back
+    /// anyway, or the project tree and the file itself cannot be read. If a
+    /// later vendor version parses this source, these calls return for the
+    /// ordinary reason and the test only pins that.
+    #[test]
+    fn listings_when_compiler_panics_on_the_source_then_they_still_return() {
+        let source = "PROGRAM main\nVAR\n  x AT %I1 : BOOL;\nEND_VAR\nEND_PROGRAM\n";
+        assert!(extract_pou_declarations(source, PouLanguage::St).len() <= 1);
+        assert!(extract_variables(source).len() <= 1);
+        assert!(extract_symbols(source, PouLanguage::St).len() <= 1);
     }
 }
 
@@ -1516,6 +1685,62 @@ mod project_units_tests {
             "sibling PROGRAM vars must not bleed into the isolated debug \
              section: {names:?}"
         );
+    }
+
+    /// A project's own `TYPE Config` used to collide with the synthesized
+    /// `CONFIGURATION config` once ironplc began reporting a configuration
+    /// and a type of the same name as a duplicate (P4013) — Run failed on
+    /// a declaration the user never wrote. Both compile paths synthesize
+    /// it. The type sits in a types-only file, so the isolated run meets it
+    /// as sibling context next to its own synthesized configuration.
+    fn store_with_a_type_named_config(dir: &std::path::Path) -> (ProjectStore, Tasks) {
+        let store = fixture_store(dir);
+        let write = |path: &str, source: &str| {
+            store
+                .create_pou_file(path, PouType::Program, PouLanguage::St)
+                .unwrap();
+            store.write_pou_source(path, source).unwrap();
+        };
+        write(
+            "config_types",
+            "TYPE Config : STRUCT gain : INT; END_STRUCT; END_TYPE",
+        );
+        write(
+            "configured",
+            "PROGRAM configured\n\
+                 VAR c : Config; y : INT; END_VAR\n\
+                 c.gain := 3;\n\
+                 y := c.gain;\n\
+             END_PROGRAM",
+        );
+        let tasks = Tasks {
+            tasks: vec![Task {
+                name: "t".into(),
+                interval_ms: 20,
+                priority: 1,
+            }],
+            programs: vec![ProgramInstance {
+                instance: "configured_inst".into(),
+                program: "configured".into(),
+                task: "t".into(),
+            }],
+        };
+        (store, tasks)
+    }
+
+    #[test]
+    fn a_scheduled_program_may_declare_a_type_named_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, tasks) = store_with_a_type_named_config(dir.path());
+        compile_project_units(&store, &tasks).expect("scheduled units compile");
+    }
+
+    #[test]
+    fn an_isolated_run_may_declare_a_type_named_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, tasks) = store_with_a_type_named_config(dir.path());
+        compile_isolated_in_project_full(&store, "configured", &tasks)
+            .expect("isolated run compiles");
     }
 
     /// ironplc's codegen compiles the FIRST ProgramDeclaration it sees.
@@ -1773,5 +1998,156 @@ mod retain_tests {
         );
         let (_container, meta) = compile_with_metadata(&src).unwrap();
         assert!(meta.retain_vars.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod edge_project_tests {
+    use super::load_edge_project;
+    use project::{PouLanguage, PouType, ProgramInstance, ProjectStore, Task, Tasks};
+
+    fn project(dir: &std::path::Path) -> ProjectStore {
+        ProjectStore::create(dir.to_path_buf(), "edge").expect("create project")
+    }
+
+    #[test]
+    fn a_fresh_project_loads_with_one_unit() {
+        let dir = tempfile::tempdir().unwrap();
+        project(dir.path());
+        let loaded = load_edge_project(dir.path()).expect("the seeded project loads");
+        assert_eq!(loaded.units.len(), 1);
+        assert_eq!(loaded.tasks.programs[0].instance, "main_inst");
+    }
+
+    /// The policy is declared by the project and read before anything runs. A
+    /// project that does not say gets the one that stops nothing.
+    #[test]
+    fn the_supervision_policy_is_read_from_alarms_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        project(dir.path());
+        let loaded = load_edge_project(dir.path()).unwrap();
+        assert_eq!(loaded.supervision, project::SupervisionConfig::default());
+        assert_eq!(
+            loaded.supervision.on_loss,
+            project::SupervisionAction::Report
+        );
+
+        std::fs::write(
+            dir.path().join("alarms.toml"),
+            "[supervision]\non_loss = \"safe_state\"\ngrace_secs = 45\n",
+        )
+        .unwrap();
+        let loaded = load_edge_project(dir.path()).unwrap();
+        assert_eq!(
+            loaded.supervision.on_loss,
+            project::SupervisionAction::SafeState
+        );
+        assert_eq!(loaded.supervision.grace_secs, 45);
+    }
+
+    /// A protective setting that does not parse must fail the deploy; it must
+    /// not deploy, log a warning on the edge, and protect nothing.
+    #[test]
+    fn an_alarms_file_the_runtime_could_not_read_is_refused() {
+        for bad in [
+            "[supervision]\non_los = \"safe_state\"\n",
+            "[supervision]\non_loss = \"safe-state\"\n",
+            "[supervision]\non_loss = \"safe_state\"\ngrace_secs = 0\n",
+            "this is not toml [",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            project(dir.path());
+            std::fs::write(dir.path().join("alarms.toml"), bad).unwrap();
+            let err = load_edge_project(dir.path()).err().expect("refused");
+            assert!(err.starts_with("reading alarms.toml:"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_program_that_does_not_compile_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = project(dir.path());
+        store
+            .write_pou_source(
+                "main",
+                "PROGRAM main\n VAR x : INT; END_VAR\n x := ghost;\nEND_PROGRAM",
+            )
+            .unwrap();
+        let err = load_edge_project(dir.path()).err().expect("refused");
+        assert!(
+            err.starts_with("compiling project:") && err.contains("ghost"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_project_without_tasks_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        project(dir.path());
+        std::fs::remove_file(dir.path().join("tasks.toml")).unwrap();
+        let err = load_edge_project(dir.path()).err().expect("refused");
+        assert!(err.contains("tasks.toml missing"), "{err}");
+    }
+
+    /// ADR-0001: two scheduled PROGRAMs cannot share a VAR_GLOBAL.
+    #[test]
+    fn shared_globals_across_programs_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = project(dir.path());
+        store
+            .create_pou_file("second", PouType::Program, PouLanguage::St)
+            .unwrap();
+        store
+            .write_pou_source(
+                "second",
+                "VAR_GLOBAL shared : INT; END_VAR\n\
+                 PROGRAM second\n VAR y : INT; END_VAR\n y := 1;\nEND_PROGRAM",
+            )
+            .unwrap();
+        store
+            .write_tasks(&Tasks {
+                tasks: vec![Task {
+                    name: "plc_task".into(),
+                    interval_ms: 100,
+                    priority: 1,
+                }],
+                programs: vec![
+                    ProgramInstance {
+                        instance: "main_inst".into(),
+                        program: "main".into(),
+                        task: "plc_task".into(),
+                    },
+                    ProgramInstance {
+                        instance: "second_inst".into(),
+                        program: "second".into(),
+                        task: "plc_task".into(),
+                    },
+                ],
+            })
+            .unwrap();
+        let err = load_edge_project(dir.path()).err().expect("refused");
+        assert!(
+            err.contains("VAR_GLOBAL") && err.ends_with("Then redeploy."),
+            "{err}"
+        );
+    }
+
+    /// Opening validates `[governance]`, as the runtime's start does.
+    #[test]
+    fn an_invalid_governance_table_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        project(dir.path());
+        let manifest = dir.path().join("project.toml");
+        let text = std::fs::read_to_string(&manifest).unwrap();
+        std::fs::write(
+            &manifest,
+            format!("{text}\n[[governance.rules]]\nvariable = \"x\"\nmin = 5.0\nmax = 1.0\n"),
+        )
+        .unwrap();
+        let err = load_edge_project(dir.path()).err().expect("refused");
+        assert!(
+            err.starts_with("opening project at") && err.contains("greater than max"),
+            "{err}"
+        );
     }
 }

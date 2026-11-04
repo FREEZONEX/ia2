@@ -100,12 +100,16 @@ cs set alarms --from alarms.json --if-match @alarms.etag
 
 # run · simulate · debug
 cs run                                  # schedule everything in tasks.toml
+# Waits for the previous run's device cleanup, including late reconnects.
+# A 409 after 10 s starts nothing; retry after cleanup finishes.
 cs sim run scenarios/fill.toml          # PROVE behaviour against the sim device layer — CI-ready
+# Terminal-fault scenarios use expect_fault = { contains = "...", within_ms = 5000 }.
+# See examples/execution_budget for an ST infinite-loop regression.
 cs runtime snapshot --vars level,pump   # live values
 cs runtime force pump_pct 50.0          # type-aware: REAL bit-packed, BOOL as 0/1
 cs get runtime/alarms && cs runtime ack level_high
 cs get runtime/history --query vars=level   # 1 Hz historian, ~2 h window
-cs stop
+cs stop                                 # requests stop immediately; cleanup continues
 
 # ship it
 cs set edges/field_pi --host pi@plc.local
@@ -118,6 +122,11 @@ cs agent run --label "build my_line" -- bash -c 'cs project create my_line; cs s
 
 Every command's `--help` explains when to call it and
 what to call next — written for agent readers.
+
+After an output latch, inspect `cs get runtime/status` or `cs probe <edge>`:
+normal output publication is inhibited, while `failsafe_status` separately
+reports pending, acknowledged and unconfirmed adapter safe-value attempts.
+An adapter acknowledgement does not confirm wire delivery or physical outputs.
 
 Existing documents require the ETag from the original read, or explicit
 `cs set --force` for an intentional full replacement. A stale version gets
@@ -204,6 +213,8 @@ the same playbook. Skim `SKILL.md` to see what an agent is told. Run
 `AGENTS.md`, skill metadata, repository discovery, and the skill-only
 installer; the check never contacts a server, network, or hardware.
 
+
+The [Tier0 control bridge reference](examples/tier0-control/README.md) demonstrates authenticated local setpoint requests, durable result recovery, and loopback fault-injection tests. It is a laboratory example; event/sample authentication and hardware acceptance remain pending.
 
 ## License
 

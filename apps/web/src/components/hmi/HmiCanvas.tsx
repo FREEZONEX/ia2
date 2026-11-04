@@ -417,8 +417,12 @@ export function HmiCanvas({
       // island dropped. The runtime scopes it to the mapping and reports
       // the caveat below; everything else here is genuinely runtime-wide.
       const state = status
+      // Alarm blindness is a banner, not a gate, for the same reason: it
+      // would take away every control, Stop included, at the moment an
+      // operator most needs one. A feed that has really stopped is already
+      // refused by the snapshot-freshness check below.
       const health = derivePanelHealth(
-        { ...state, unhealthyDevices: [] },
+        { ...state, unhealthyDevices: [], alarmsBlind: null },
         STATUS_READ_JUST_SUCCEEDED,
       )
       if (health.kind !== "running") throw new Error(`${health.text} — action not sent`)

@@ -19,6 +19,17 @@ port to one directly — every interaction goes through SSH. You add an
 and the IDE bundles the project + a runtime binary, scp's it over,
 atomically swaps the live version, and restarts the systemd unit.
 
+The runtime claims its HTTP listening socket before starting device connections
+or creating its state directory. If the address cannot be bound (for example,
+another instance already holds the port), it exits with a `binding ...` error
+without touching devices. Binding successfully is not proof of healthy devices;
+check `/health` and `/status` after startup.
+
+Pause stops program scans, not adapter workers or physical motion. Variable
+writes still update the VM while paused; force commands register overrides
+that apply on the next scan. Output synchronization resumes with `resume` or
+`step`. Stopping the program runs the failsafe pass; pause does not.
+
 ## One-time edge setup
 
 You need a Linux box reachable over SSH with key-based auth (no password
@@ -80,7 +91,41 @@ prompts — the IDE runs `ssh -o BatchMode=yes`).
    bus is down — hover it for the device names. That state is easy to
    misread from the outside: the scan count keeps climbing and values keep
    updating, but the down device's inputs are frozen at last-known values
-   and its outputs are dropped.
+   and its outputs are dropped. A red `faulted` badge means the runtime
+   answers but its program stopped (a VM trap, say) — hover it, or read
+   the status grid, for the reason. A red `output phase inhibited` badge means the
+   outputs are latched off, by the scan watchdog or by the project's
+   alarm-supervision policy (the badge says which): normal output publication is
+   inhibited until restart. The badge also reports pending/unconfirmed device
+   safe-value attempts; adapter acknowledgements do not establish physical safety.
+   An ochre `degraded` badge also covers a runtime
+   whose snapshot task has ended or is stuck on one snapshot: the program and
+   the buses are fine, but history is not recording and process alarms are not
+   being evaluated (`/health`'s `snapshot_tap.running` is `false`, or
+   `stalled_for_ms` is set; restart the runtime). The
+   badge only judges that persistent state; whether `snapshot_tap.faults` is
+   still climbing is for `cs probe` and a second look.
+
+   ST scans are also bounded to 10,000,000 opcodes or one second (a shorter
+   explicit container watchdog wins). The opcode ceiling is independent of
+   the host and is normally the first one a runaway meets; reaching it takes
+   tens of milliseconds on a fast CPU and longer on a slow edge board, so
+   the time ceiling is only the backstop. Time is sampled every 256
+   opcodes; this is not a hard real-time interrupt. A loop exceeding either
+   ceiling ends the program with `VM execution budget exceeded in <instance>:
+   instruction limit (10000000 opcodes per scan)` (or `time limit (<n> ms per
+   scan)`), visible in
+   `/health`'s `fault`, then attempts device failsafe/shutdown. Unlike the
+   five-overrun latch, this does not keep the VM computing. Partial scan
+   outputs and final RETAIN state are discarded. A normal stop (deploy,
+   SIGTERM) lets the scan in flight finish and writes the final RETAIN
+   checkpoint; only a scan still running 250 ms after the stop request is
+   discarded as hung, with no fault and no final RETAIN write. Fault exit
+   stops reconnect attempts while keeping delivered devices' I/O tasks alive
+   through drain. Stopping while a device is still mid-connect delays the
+   scan thread's exit by at most 2 s; the late adapter is failsafed by its
+   own worker, and if that did not finish in time the closing log line says
+   the outcome is unconfirmed rather than "exited cleanly".
 
 3. **Deploy**. Click `Deploy`. The IDE:
    - `tar`s your project directory + (if found) a freshly-built
@@ -91,6 +136,21 @@ prompts — the IDE runs `ssh -o BatchMode=yes`).
    - Streams the remote script's output back into the pane
 
    Deploy REFUSES to lie about the outcome:
+   - deploy first copies regular project files into a private temporary snapshot.
+     The shared runtime pre-check and upload both consume that same copy, so
+     edits after the check cannot alter the upload. The snapshot is cleaned up
+     after success, failure or cancellation. Symlinks and special files are
+     refused before upload; replace them with regular project files;
+   - a project the edge runtime would refuse at startup is refused before
+     upload, and nothing on the edge changes: deploy first runs the
+     runtime's own start path on it (open the project, which validates
+     `[governance]`; require `tasks.toml`; the multi-PROGRAM `VAR_GLOBAL`
+     rule; compile every scheduled PROGRAM). The report is `ok: false`
+     with an empty `version` and the reason in `log`. It compiles with
+     this server's compiler — the edge's too when the deploy ships a
+     runtime binary built from the same tree. A deploy that ships none
+     keeps the edge's own binary, whose compiler may differ; the
+     post-restart check below stays the authority;
    - a broken tar stream or a local tar failure fails the deploy (no
      silently-truncated uploads);
    - a failed `systemctl restart` fails the deploy (`ok: false` + the
@@ -98,13 +158,44 @@ prompts — the IDE runs `ssh -o BatchMode=yes`).
      install; staged files remain for inspection. Unique version directories
      keep same-second deployments from overwriting the rollback payload.
      Runtime state is unconfirmed: a failed restart may already have stopped
-     the old process. File rollback does not prove that it is running;
+     the old process. File rollback does not prove that it is running.
+     Whether an automatic restart that systemd had already scheduled can
+     later start the version the link was restored to (R11) is **pending real
+     systemd verification**; a device-free, opt-in fixture and its execution
+     instructions are in [R11 offline verification](recovery-r11-offline.md).
+     Preparing it does not change deploy behavior or establish a reproduction;
    - a missing `VERSION=` line from the remote script fails the deploy
      (script drift = state unknown);
-   - a project whose `[governance]` table is invalid (unknown key,
-     `min > max`, non-finite bound) fails at edge runtime start with a
-     loud load error — governance is validated on load, never silently
-     ignored;
+   - a restart systemd accepted is not a running program: the check requires
+     continuous mode and advancing positive scan counts in consecutive `/status`
+     reads. Counter/uptime resets and changed `runtime_id` restart the observation;
+     unchanged counts are waited for, since long-cycle tasks may not advance each
+     second. New runtimes provide a per-process `runtime_id`; older ones fall back
+     to counter/uptime evidence, which cannot exclude every fast restart;
+   - the entire check, including SSH reads and poll sleeps, has a 30 s deadline.
+     A fault/watchdog is `faulted`, paused/single-step mode is `not_running`, and
+     failure to confirm progress before the deadline is `unknown`. A runtime whose
+     snapshot task has stopped, is stuck on one snapshot (`snapshot_tap.stalled_for_ms`),
+     or whose `snapshot_tap.faults` rose between two reads, is `unmonitored`: nothing is recorded, no process alarm can be raised,
+     and `scan_count` freezes with the task, so progress cannot be confirmed
+     either. A fault count that is steady does not change the verdict but is
+     named in it. `faulted`, `not_running`, `unmonitored` and `unknown` all fail
+     the deploy (`ok:false`). **Unknown does not prove stopped or physically safe.**
+     A project that declares `[supervision] on_loss = "safe_state"` is also held
+     to it: the check compares the declaration with the `supervision` the
+     runtime reports it is enforcing, and `unprotected` (also `ok:false`) means
+     they differ, typically because the edge runs an older runtime that ignores
+     the table.
+     A task with a period longer than the observation window may remain unknown;
+   - the new version stays installed and current. No automatic rollback or
+     restart of the previous program occurs after a failed health check. Inspect
+     runtime and plant state before choosing manual recovery; the log names the
+     previous version. A down device on a running program remains a warning.
+     If nothing was restarted or the install directory differs from the service,
+     `not_checked` retains installation success (`ok:true`), while the IDE shows
+     program state unconfirmed, never green live;
+   - invalid `[governance]` (unknown keys, `min > max`, non-finite bounds)
+     is refused during snapshot preflight, before upload;
    - install_dir vs systemd-unit drift stays a deploy-level `warning`
      field in the report (structured, plus a WARNING line in the log) —
      the files land, but the service will not see them until you
@@ -173,6 +264,26 @@ rollback is just "point `current` at an older version and restart".
 - The runtime binds **127.0.0.1** on the edge — only ever reachable via
   the SSH tunnel the IDE sets up. Don't poke a hole in the firewall to
   expose `:13001` directly.
+- A forwarded port is also reachable by every web page open in the browser on
+  the dev machine, so the runtime refuses any request that names a foreign
+  `Origin` or (while bound to loopback) a non-loopback `Host`, and answers a
+  cross-origin page only for the IDE's `GET /events` (or an explicitly named
+  origin). Without `Origin`, Fetch Metadata blocks requests from another
+  origin, including GET/HEAD; only top-level navigations to the panel's HTML
+  entries are excepted, never API navigations or frames. Tools with neither
+  header (curl, `cs`, the IDE server) still work; older browsers sending neither
+  remain a residual blind-GET exposure. Mapped IPv6 loopback binds enforce the
+  same Host restriction. Details in the **Auth**
+  notes of `docs/api.md` (an operator panel behind a reverse proxy needs
+  `--allow-origin <its public origin>` on the unit's `ExecStart`). Don't paste
+  the forwarded address into pages you don't trust; the guard is the backstop,
+  not the plan.
+- The runtime validates `--allow-origin` / `IA2_ALLOWED_ORIGINS` before it loads
+  or compiles the project, claims the socket, connects devices or starts scans.
+  A malformed value therefore cannot briefly drive outputs and then skip the
+  normal shutdown drain. IPv6 origin literals are compared in normalized form.
+  Browser local-network permission requirements are independent of this guard;
+  the former PNA preflight response header alone does not determine access.
 - The systemd unit grants `CAP_NET_RAW` so that EtherCAT (when wired)
   works. If you only use Modbus, you can drop it and run as a dedicated
   user; see the comments in `ia2.service`.
@@ -185,7 +296,10 @@ rollback is just "point `current` at an older version and restart".
 ## Shutdown and failsafe evidence
 
 A completed bridge drain means the failsafe and teardown **attempts**
-finished, not that every physical output was confirmed safe. The scan
+finished for the scan thread; a reconnect worker beyond its two-second
+grace is still unconfirmed. The server waits for that worker too before
+allowing another run; the edge process keeps its existing bounded exit.
+Neither proves that every physical output was confirmed safe. The scan
 loop's final log includes `failsafe_failed` and `shutdown_failed` device
 counts; inspect the preceding device/channel errors whenever either is
 nonzero. Even zero counts do not replace physical readback or a hardware
@@ -199,7 +313,44 @@ the remaining writes to keep shutdown bounded. A later transport failure
 takes precedence over an earlier protocol rejection. Neither case is
 reported as “outputs in failsafe”.
 
+For a live run, `/health` and `/status` expose `failsafe_status` separately from
+`watchdog_tripped`: `pending` device names, `acknowledged` adapter names, and
+`unconfirmed` entries with `device` and `error`. The probe, CLI and operator
+views carry the same report. `null` means no report, not confirmed safe. Check
+`device_health` for configured devices that never connected. Acknowledgement
+has the adapter's scope: for EtherCAT it confirms mirror preparation for a
+later exchange, not a transmission fence. Safe values for opted-in OPC UA or
+CANopen channels may be nonzero. No physical readback is implied.
+
+A rejected explicit latch request still inhibits normal outputs and returns an
+error. Another explicit request retries only unconfirmed devices, preserving
+the original latch reason. This does not add automatic retries or re-arming.
+The IDE clears its live report when it releases a stopped handle; teardown
+logs remain the evidence for that run.
+
 ## EtherCAT mode selection
+
+Each real EtherCAT transport owns its TX/RX socket task. On shutdown the
+cyclic worker attempts its final zero-output exchange, then cancels and
+waits for the socket task to release its resources before the worker exits.
+Initialization errors and worker panics also drain that task. A subsequent
+Run therefore does not inherit a detached socket from a joined worker;
+the existing bounded worker-join timeout still applies.
+
+Worker/socket closure and output delivery are reported separately. Only
+a final exchange of an entirely zero output image, returning the expected
+LRW working counter and all configured subdevices in OP, is logged as
+`final zero-output exchange acknowledged`. This is protocol evidence,
+not measured voltage, torque, or actuator position. DC and free-run modes
+use the same check, including PDI split across multiple LRWs.
+
+During an unhealthy bus or re-walk/backoff, failsafe still disengages gears
+and zeros the local mirror, but reports that delivery is unconfirmed. Stop
+does not start a new re-walk just to flush outputs. If no final cyclic
+exchange ran, it failed, returned partial WKC/non-OP states, or the worker
+did not join successfully, shutdown returns an error to the shared bridge.
+The final failure counts and closing log therefore preserve unconfirmed
+delivery even when the worker and socket closed normally.
 
 `iomap-ethercat` picks between two implementations based on the device
 config's `nic` field:
@@ -271,6 +422,83 @@ one carrying your SSH / management traffic.
   still required for an unacknowledged occurrence. The existing `/alarms`,
   `/alarms-journal`, and encoded-id ack endpoint expose it. Process alarms do
   not evaluate stale field inputs, and persisted history marks stale buckets.
+
+### Alarm supervision
+
+The alarm engine, the history and the live feed all hang off one task in the
+edge runtime. When it stops, is stuck inside one snapshot, or keeps failing,
+the alarm list is quiet because nothing is looking, which on a panel reads as
+"nothing is wrong". The runtime reports that state (`snapshot_tap` in
+`/health` and `/status`, `cs probe`, the edge badge, the operator panel's
+`ALARMS OFF`, and a failed `unmonitored` post-restart check), and the project
+says what the runtime does about it in `alarms.toml`:
+
+```toml
+[supervision]
+on_loss = "report"      # default: report it and keep running
+# on_loss = "safe_state"  # latch the outputs off if alarm evaluation stays lost
+grace_secs = 30         # 1..=3600; ignored for "report"
+```
+
+- **`report` is the default, and stops nothing.** Whether stopping is the safe
+  direction depends on the plant (an unplanned stop can itself be the
+  hazard), so the runtime does not decide it. Choose `safe_state` only where
+  losing alarm evaluation is the more dangerous of the two.
+- **`safe_state`** latches the outputs off once alarm evaluation has been lost
+  for `grace_secs` in a row, exactly like a scan-watchdog trip: normal output
+  publication is inhibited and each owned device receives a failsafe attempt,
+  while the loop keeps scanning so the live state stays visible. Safe writes
+  can be pending or rejected; `/health` and `/status` expose `failsafe_status`
+  and say why (`latch_reason`). It is never undone automatically and never done by
+  restarting the process: a person restarts the program to re-arm.
+  A loss that clears inside the grace starts the clock over.
+- **Deploy refuses an `alarms.toml` it cannot read**, and a `[supervision]`
+  table with an unknown key (`on_los`), an unknown `on_loss` or a `grace_secs`
+  outside 1..=3600: a misspelt protective setting must not deploy and protect
+  nothing. (An unreadable `alarms.toml` used to deploy, with the runtime
+  logging a warning and running without alarms.)
+- **The runtime refuses to start on one too.** It reads the project through the
+  same loader as the deploy preflight, so an `alarms.toml` it cannot read makes
+  `ia2-runtime` exit at startup with the reason, instead of running without
+  alarms as it used to. The case that can surface this is an edge whose project
+  was deployed by an older server and whose runtime is then upgraded. The
+  service retries a few times (`Restart=on-failure`, `StartLimitBurst=5` in 60 s)
+  and then stays `failed`, with the reason in the journal; the program does not
+  run, and what the outputs do meanwhile is the I/O side's own failsafe, as for
+  any stopped runtime. Fix the file and redeploy.
+- **Logging is not proportional to time.** Losing alarm evaluation is logged
+  at ERROR the moment it is seen, with the policy in the line; reminders then
+  back off (1, 2, 4, 8 ... minutes into the episode, at most hourly), and
+  recovery is one INFO line. A task that flaps is announced at the 1st, 2nd,
+  4th, 8th ... episode. The state itself is always in `snapshot_tap`.
+- **The runtime says which policy it is enforcing** (`supervision` on `/health`
+  and `/status`, and in `cs probe` beside any alarm-evaluation warning). It is
+  what the process read at startup, so a later edit of `alarms.toml` shows up
+  only after a restart. A runtime built before `[supervision]` ignores the table
+  and omits the key.
+- **While it is lost, the same object says how long and how long is left**
+  (`lost_for_ms`, and under `safe_state` `latch_in_ms` until a latch is requested).
+  `cs probe` prints both on the policy line. While the loss continues,
+  `lost_for_ms` remains available under `report` and after a latch; only
+  `latch_in_ms` is `null` under `report`, once a latch is requested, or when
+  outputs are already latched (`latch_reason` explains a completed latch).
+  Both are `null` when nothing is lost or the supervisor has not looked for
+  several seconds, so an old countdown is never shown as a live one.
+- **It is also a standing alarm.** While alarm evaluation is lost, `GET /alarms`
+  lists `__supervision/snapshot_tap` (Critical) beside the process alarms,
+  `alarms_standing` counts it, the journal records it, and after it returns it
+  stays standing until an operator acknowledges it, so the alarm list is not
+  quiet in exactly the case it must not be. The supervisor raises it, not a
+  snapshot, so it works when snapshots have stopped. If the alarm engine's own
+  lock is wedged it cannot be listed (that is logged, and the policy, the log,
+  `/health`, the panel and MQTT carry on). The id is reserved like `__device/`.
+- **The northbound MQTT feed follows it.** While alarm evaluation is lost the
+  runtime's latest snapshot is frozen, so publishing it would hand the platform
+  the same old values every interval next to a retained `online`. Instead the
+  retained `<prefix>/status` becomes `degraded` (once, logged) and no snapshot is
+  published until it recovers, when `online` is asserted again; a broker
+  reconnect re-asserts whichever is current.
+- Edge runtime only: the IDE server's local run has no such task to supervise.
 
 - **No EtherCAT hardware on the dev machine**: leave `nic = "_sim"`. The
   IDE will let you configure PDOs and the bridge will respond in sim

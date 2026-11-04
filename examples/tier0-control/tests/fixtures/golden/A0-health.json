@@ -1,0 +1,49 @@
+{
+ "body": {
+  "devices": [
+   {
+    "healthy": true,
+    "name": "coupler"
+   },
+   {
+    "healthy": true,
+    "name": "second"
+   }
+  ],
+  "fault": null,
+  "fieldbus_healthy": true,
+  "latch_reason": null,
+  "scan_count": 11,
+  "snapshot_tap": {
+   "faults": 0,
+   "last_fault": null,
+   "last_fault_age_ms": null,
+   "running": true,
+   "stalled_for_ms": null
+  },
+  "status": "ok",
+  "supervision": {
+   "grace_secs": 30,
+   "latch_in_ms": null,
+   "lost_for_ms": null,
+   "on_loss": "report"
+  },
+  "uptime_secs": 0,
+  "watchdog_tripped": false
+ },
+ "headers": {
+  "content-length": "405",
+  "content-type": "application/json",
+  "date": "Tue, 27 Oct 2026 10:06:32 GMT",
+  "vary": "sec-fetch-site, sec-fetch-mode, sec-fetch-dest"
+ },
+ "label": "A0-health",
+ "method": "GET",
+ "origin": null,
+ "path": "/health",
+ "raw": null,
+ "request": null,
+ "status": 200,
+ "t_recv": 1793095592.855122,
+ "t_send": 1793095592.854731
+}

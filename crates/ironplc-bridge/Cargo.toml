@@ -27,6 +27,9 @@ ts-rs.workspace = true
 # FutureExt::catch_unwind — the scan loop wraps run_loop_async in a
 # panic guard so a panic inside the VM glue still triggers failsafe.
 futures-util.workspace = true
+# The historian is shared by the IDE server and the edge runtime; a lock that
+# does not poison keeps one panicking caller from taking every later one down.
+parking_lot.workspace = true
 
 iocore = { path = "../iocore" }
 project = { path = "../project" }
@@ -36,6 +39,7 @@ iomap-opcua = { path = "../iomap-opcua" }
 iomap-canopen = { path = "../iomap-canopen" }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 blake3 = "1"
 tempfile = "3"
 # Implement the `IoDevice` trait (which is `#[async_trait]`) for the mock

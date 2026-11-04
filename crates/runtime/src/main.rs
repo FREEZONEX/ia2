@@ -13,7 +13,7 @@ use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -32,16 +32,19 @@ use ironplc_bridge::{
     DeviceHealth, DeviceReport, DeviceSpec, ProgramHandle, RuntimeMode, RuntimeWriteError,
     VarSnapshot, WriteOutcome,
 };
+use parking_lot::Mutex;
 use project::{ProjectStore, ProtocolConfig, StoreError};
 use serde::Serialize;
 use tokio::signal;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt as _;
-use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
 
 mod northbound;
+mod panic_guard;
+mod supervisor;
+mod tap;
 
 const DEFAULT_BIND: &str = "127.0.0.1:13001";
 
@@ -80,7 +83,7 @@ impl LogCapture {
 
     fn push_line(&self, line: String) {
         {
-            let mut b = self.buf.lock().expect("log buffer");
+            let mut b = self.buf.lock();
             while b.len() >= self.cap {
                 b.pop_front();
             }
@@ -92,7 +95,7 @@ impl LogCapture {
 
     /// Most recent `n` captured lines, oldest-first.
     fn tail(&self, n: usize) -> Vec<String> {
-        let b = self.buf.lock().expect("log buffer");
+        let b = self.buf.lock();
         let start = b.len().saturating_sub(n);
         b.iter().skip(start).cloned().collect()
     }
@@ -158,6 +161,10 @@ struct Args {
     /// sibling `web/` is auto-served if it holds the built panel — see
     /// `sibling_web_dir`.
     static_dir: Option<PathBuf>,
+    /// Extra origins (`http://host[:port]`) whose pages may call the API, for a
+    /// panel reached through a reverse proxy whose public name differs from the
+    /// `Host` it forwards. Same-origin pages need nothing; see `panic_guard.rs`.
+    allow_origins: Vec<String>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -165,6 +172,7 @@ fn parse_args() -> Result<Args> {
     let mut bind = DEFAULT_BIND.to_string();
     let mut state_dir: Option<PathBuf> = None;
     let mut static_dir: Option<PathBuf> = None;
+    let mut allow_origins: Vec<String> = Vec::new();
 
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -186,6 +194,9 @@ fn parse_args() -> Result<Args> {
                 static_dir = Some(PathBuf::from(
                     iter.next().context("--static-dir requires a value")?,
                 ));
+            }
+            "--allow-origin" => {
+                allow_origins.push(iter.next().context("--allow-origin requires a value")?);
             }
             // Legacy flag from the pre-tasks-refactor builds. Accept but
             // ignore so existing systemd unit files keep launching.
@@ -226,6 +237,7 @@ fn parse_args() -> Result<Args> {
         bind,
         state_dir,
         static_dir,
+        allow_origins,
     })
 }
 
@@ -233,7 +245,8 @@ fn print_help() {
     eprintln!(
         "ia2-runtime — headless edge runtime\n\n\
          USAGE:\n  \
-         ia2-runtime --project-dir <path> [--bind <addr>] [--state-dir <path>] [--static-dir <path>]\n\n\
+         ia2-runtime --project-dir <path> [--bind <addr>] [--state-dir <path>] [--static-dir <path>]\n  \
+         [--allow-origin <origin>]...\n\n\
          FLAGS:\n  \
          --project-dir <path>   Path to the project directory (containing project.toml).\n  \
          --bind <addr>          Local socket for the monitor server (default {DEFAULT_BIND}).\n  \
@@ -242,7 +255,10 @@ fn print_help() {
          --static-dir <path>    Built web assets. When set, operator clients can open the\n                         \
          project's HMI screens at http://<edge>:<port>/hmi/<screen>.\n                         \
          Default: web/ next to the project dir, when it holds the\n                         \
-         built panel (the deploy layout).\n\n\
+         built panel (the deploy layout).\n  \
+         --allow-origin <o>     Also let pages served from this origin (http://host[:port]) call\n                         \
+         the API; repeatable, or comma-separated in IA2_ALLOWED_ORIGINS. Only\n                         \
+         for a panel behind a reverse proxy; same-origin pages need nothing.\n\n\
          The runtime exposes:\n  \
          GET  /health           Liveness check.\n  \
          GET  /status           Project + runtime metadata + last-known scan count.\n  \
@@ -303,12 +319,29 @@ struct AppState {
     /// Bounded ring of every write attempt (HTTP + MQTT northbound)
     /// with its origin — backs GET /audit (ADR-0002 attribution).
     audit: AuditLog,
+    /// The task feeding history, alarms and `latest` — reported on /health
+    /// and /status so its failure is not silent.
+    tap: Arc<tap::TapStatus>,
+    /// The alarm-supervision policy this process is enforcing, and where its
+    /// supervisor says alarm evaluation stands.
+    supervision: Arc<supervisor::SupervisionStatus>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let log_capture = init_logging();
     let args = parse_args()?;
+
+    // Invalid browser-access configuration must fail before compilation,
+    // binding, device connections, scan threads or northbound tasks. A `?`
+    // after spawn_units would bypass the safety-critical shutdown below.
+    let allowed_origins = ia2_http_guard::configured_origins(
+        &args.allow_origins,
+        std::env::var(ia2_http_guard::ALLOWED_ORIGINS_ENV)
+            .ok()
+            .as_deref(),
+    );
+    let browser_guard = panic_guard::browser_guard(args.bind, &allowed_origins)?;
 
     tracing::info!(
         project_dir = %args.project_dir.display(),
@@ -318,22 +351,19 @@ async fn main() -> Result<()> {
     );
 
     // ---- Load + compile the whole project ----
-    let store = ProjectStore::open(args.project_dir.clone())
-        .with_context(|| format!("opening project at {}", args.project_dir.display()))?;
+    // The same function the IDE server's deploy runs on the project before
+    // uploading it, so whatever it refuses here was refused there first.
+    let ironplc_bridge::EdgeProject {
+        store,
+        tasks,
+        devices,
+        iomap,
+        units,
+        supervision,
+    } = ironplc_bridge::load_edge_project(&args.project_dir).map_err(|e| anyhow!(e))?;
     let project_name = store.name().to_string();
-    let tasks = store
-        .read_tasks()
-        .context("reading tasks.toml")?
-        .ok_or_else(|| {
-            anyhow!(
-                "tasks.toml missing from project — run the IDE's 'Migrate to tasks' \
-                 once, or hand-author tasks.toml, then redeploy"
-            )
-        })?;
     let program_instances: Vec<String> =
         tasks.programs.iter().map(|p| p.instance.clone()).collect();
-    let devices = store.list_devices().context("listing devices")?;
-    let iomap = store.read_iomap().context("reading iomap")?;
     let device_names = devices.iter().map(|d| d.name.clone()).collect::<Vec<_>>();
     let device_specs: Vec<DeviceSpec> = devices
         .into_iter()
@@ -362,18 +392,6 @@ async fn main() -> Result<()> {
             }
         }
     }
-
-    // ADR-0001 gate — the same bridge implementation the IDE server
-    // enforces, so the rule and its message can't drift between the
-    // desktop and edge surfaces.
-    if let Err(msg) = ironplc_bridge::reject_shared_globals(&store, &tasks) {
-        anyhow::bail!("{msg} Then redeploy.");
-    }
-
-    // One container + VM per scheduled PROGRAM instance; the bridge's
-    // single scan thread rotates them at their own task intervals.
-    let units =
-        ironplc_bridge::compile_project_units(&store, &tasks).context("compiling project")?;
     let retain_var_count: usize = units.iter().map(|u| u.retain_vars.len()).sum();
     tracing::info!(
         devices = device_specs.len(),
@@ -412,6 +430,19 @@ async fn main() -> Result<()> {
         }
         Some(p)
     };
+
+    // ---- Claim the API socket before anything touches a field device ----
+    // `spawn_units` starts the thread that connects the devices and begins
+    // driving outputs. If the bind fails after that (the port is held, the
+    // address is not ours), `main` returns an error straight past the safety
+    // shutdown below: no failsafe pass, and a fieldbus thread that may be
+    // mid-bring-up is simply killed with the process. Binding first means a
+    // runtime that cannot be reached never starts driving the plant — and a
+    // second instance started over a live one (say, a system unit and a user
+    // unit on the same port) fails here instead of contending for the bus.
+    let listener = tokio::net::TcpListener::bind(args.bind)
+        .await
+        .with_context(|| format!("binding {}", args.bind))?;
 
     // ---- Spawn the bridge ----
     let handle: ProgramHandle = ironplc_bridge::spawn_units(
@@ -455,24 +486,26 @@ async fn main() -> Result<()> {
     let latest: Arc<Mutex<Option<VarSnapshot>>> = Arc::new(Mutex::new(None));
     let shutdown = Arc::new(tokio::sync::Notify::new());
 
-    {
-        let snapshot_tx = snapshot_tx.clone();
-        let latest = latest.clone();
-        let historian = historian.clone();
-        let alarms = alarms.clone();
-        let mut rx = handle.subscribe();
-        tokio::spawn(async move {
-            while let Ok(snap) = rx.recv().await {
-                historian.note_snapshot(&snap);
-                alarms
-                    .lock()
-                    .expect("alarms mutex")
-                    .note_snapshot(&snap, ironplc_bridge::monitor::wall_now_us());
-                *latest.lock().expect("latest mutex") = Some(snap.clone());
-                let _ = snapshot_tx.send(snap);
-            }
-        });
-    }
+    let tap = tap::TapStatus::new();
+    let supervision = supervisor::Policy::from(&supervision);
+    tracing::info!(policy = %supervision.describe(), "alarm supervision policy");
+    let supervision = supervisor::SupervisionStatus::new(supervision);
+    tokio::spawn(supervisor::supervise(
+        tap.clone(),
+        handle.clone(),
+        alarms.clone(),
+        supervision.clone(),
+    ));
+    tokio::spawn(tap::run(
+        handle.subscribe(),
+        tap::standard_stages(
+            historian.clone(),
+            alarms.clone(),
+            latest.clone(),
+            snapshot_tx.clone(),
+        ),
+        tap.clone(),
+    ));
 
     let store = Arc::new(store);
     let state = AppState {
@@ -489,6 +522,8 @@ async fn main() -> Result<()> {
         historian,
         alarms,
         audit: AuditLog::default(),
+        tap,
+        supervision,
     };
 
     // ---- Northbound (MQTT -> supOS/Tier0) ----
@@ -501,6 +536,7 @@ async fn main() -> Result<()> {
                     latest: state.latest.clone(),
                     handle: handle.clone(),
                     audit: state.audit.clone(),
+                    tap: state.tap.clone(),
                 });
             } else {
                 tracing::info!("northbound disabled (no enabled [mqtt] in northbound.toml)");
@@ -510,36 +546,39 @@ async fn main() -> Result<()> {
     }
 
     // ---- HTTP server ----
-    // Permissive CORS: the only path to this socket on a real edge box is
-    // through an SSH port-forward we (the dev) opened. The audience here
-    // is "whatever dev tool is on the other end of the tunnel" — making
-    // the IDE / curl / browser direct EventSource all work is the goal.
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/status", get(status))
-        .route("/events", get(events))
-        .route("/logs", get(logs))
-        .route("/logs/stream", get(logs_stream))
-        .route("/discover", get(discover))
-        .route("/sdo", get(sdo_upload))
-        .route("/system", get(system))
-        .route("/pause", post(rt_pause))
-        .route("/resume", post(rt_resume))
-        .route("/step", post(rt_step))
-        .route("/write", post(rt_write))
-        .route("/force", post(rt_force))
-        .route("/unforce", post(rt_unforce))
-        .route("/inject-scan-stall", post(rt_inject_scan_stall))
-        .route("/audit", get(rt_audit))
-        .route("/history", get(history))
-        .route("/alarms", get(alarms_state))
-        .route("/alarms/{id}/ack", post(alarms_ack))
-        .route("/alarms-journal", get(alarms_journal))
-        .route("/stop", post(stop_handler))
-        .route("/api/hmi", get(hmi_list))
-        .route("/api/hmi/{path}", get(hmi_get))
-        .layer(CorsLayer::permissive())
-        .with_state(state);
+    // No CORS opening: the only path to this socket on a real edge box is an
+    // SSH port-forward the developer opened, but a forwarded loopback port is
+    // also reachable by every web page in that developer's browser. The guard
+    // (below, around the finished router) answers same-origin requests and
+    // loopback `Host` names only; the one cross-origin door is the web IDE's
+    // `EventSource` on `/events`. See `panic_guard.rs` and `ia2-http-guard`.
+    let app = panic_guard::with_api_layers(
+        Router::new()
+            .route("/health", get(health))
+            .route("/status", get(status))
+            .route("/events", get(events))
+            .route("/logs", get(logs))
+            .route("/logs/stream", get(logs_stream))
+            .route("/discover", get(discover))
+            .route("/sdo", get(sdo_upload))
+            .route("/system", get(system))
+            .route("/pause", post(rt_pause))
+            .route("/resume", post(rt_resume))
+            .route("/step", post(rt_step))
+            .route("/write", post(rt_write))
+            .route("/force", post(rt_force))
+            .route("/unforce", post(rt_unforce))
+            .route("/inject-scan-stall", post(rt_inject_scan_stall))
+            .route("/audit", get(rt_audit))
+            .route("/history", get(history))
+            .route("/alarms", get(alarms_state))
+            .route("/alarms/{id}/ack", post(alarms_ack))
+            .route("/alarms-journal", get(alarms_journal))
+            .route("/stop", post(stop_handler))
+            .route("/api/hmi", get(hmi_list))
+            .route("/api/hmi/{path}", get(hmi_get)),
+    )
+    .with_state(state);
 
     // ---- Standalone HMI panel (optional) ----
     // With `--static-dir` pointing at the built web assets, operator
@@ -590,9 +629,9 @@ async fn main() -> Result<()> {
         app
     };
 
-    let listener = tokio::net::TcpListener::bind(args.bind)
-        .await
-        .with_context(|| format!("binding {}", args.bind))?;
+    // Around everything, the standalone panel and its static files included.
+    let app = panic_guard::guard_browsers(app, &browser_guard);
+
     tracing::info!(addr = %args.bind, "monitor server listening");
 
     // Run the HTTP server as a background task. We deliberately do NOT gate
@@ -613,12 +652,11 @@ async fn main() -> Result<()> {
     wait_for_shutdown(shutdown).await;
 
     // ---- Safety-critical shutdown ----
-    // Stop the scan loop, drive every device to failsafe (zero outputs —
-    // for a servo that's controlword=0 / Disable Voltage), and JOIN the
-    // EtherCAT cyclic thread so that zeroed frame is actually on the wire
-    // before we exit. `handle.shutdown()` blocks until the scan thread has
-    // done all of that. Bounded so a wedged bus can't hold us past the
-    // service supervisor's kill timeout.
+    // Stop the scan loop, attempt each adapter's configured safe values,
+    // and join its owned workers before exiting. Completion is not wire
+    // delivery or physical readback; failures remain in the report and logs.
+    // Bounded so a wedged bus can't hold us past the service supervisor's
+    // kill timeout.
     tracing::info!(
         "shutdown signalled; draining bridge (stop scan loop -> failsafe -> join fieldbus)"
     );
@@ -701,25 +739,75 @@ struct Health {
     /// probe that only checks `status: "ok"` would otherwise call a latched
     /// runtime healthy — it is still serving HTTP and still scanning.
     watchdog_tripped: bool,
+    /// Why the program stopped, if it did — the same message as `/status`'s
+    /// `fault`, `null` while it runs. `status` stays `"ok"` because it only
+    /// says the process answers, and a runtime whose program died still
+    /// does: without this field a probe of `/health` called such an edge
+    /// healthy while it ran nothing.
+    fault: Option<String>,
+    /// Why the outputs are latched off, once `watchdog_tripped` is true: the
+    /// scan watchdog, an execution-budget trap, or the project's
+    /// alarm-supervision policy (see `alarms.toml`). `null` while they are
+    /// not latched.
+    latch_reason: Option<String>,
+    /// Per-adapter pending/acknowledged/unconfirmed safe-value attempts.
+    /// Adapter acknowledgement does not establish physical safety.
+    failsafe_status: Option<ironplc_bridge::FailsafeStatus>,
+    /// Whether history, process alarms and `scan_count` are still being fed
+    /// from the scan loop. The scan loop is a separate thread: when this
+    /// task stops, or fails on every snapshot, the program keeps running and
+    /// `status` stays `"ok"`, while history stops recording, process alarms
+    /// stop being evaluated and `scan_count` freezes. `running: false` means
+    /// the task ended; a `faults` count that climbs between two polls means a
+    /// stage is failing now.
+    snapshot_tap: monitor::SnapshotTapHealth,
+    /// The alarm-supervision policy this process is enforcing (what it read at
+    /// startup, not what `alarms.toml` says now): what happens if alarm
+    /// evaluation is lost. A reader compares it with what the project declares;
+    /// a runtime built before the field omits it, which for a project that
+    /// declares `safe_state` means that protection is NOT in force.
+    supervision: monitor::SupervisionInForce,
 }
 
 async fn health(State(state): State<AppState>) -> Json<Health> {
     let scan_count = state
         .latest
         .lock()
-        .expect("latest")
         .as_ref()
         .map(|s| s.scan_count)
         .unwrap_or(0);
-    let devices = state.handle.device_health();
-    Json(Health {
+    Json(health_of(
+        &state.handle,
+        scan_count,
+        state.start_time.elapsed().as_secs(),
+        state.tap.health(),
+        state.supervision.in_force(),
+    ))
+}
+
+/// The `/health` body for the run behind `handle`. Split out of the
+/// handler so the contract is testable without a whole `AppState`.
+fn health_of(
+    handle: &ProgramHandle,
+    scan_count: u64,
+    uptime_secs: u64,
+    snapshot_tap: monitor::SnapshotTapHealth,
+    supervision: monitor::SupervisionInForce,
+) -> Health {
+    let devices = handle.device_health();
+    Health {
         status: "ok",
-        uptime_secs: state.start_time.elapsed().as_secs(),
+        uptime_secs,
         scan_count,
         fieldbus_healthy: devices.iter().all(|d| d.healthy),
         devices,
-        watchdog_tripped: state.handle.watchdog_tripped(),
-    })
+        watchdog_tripped: handle.watchdog_tripped(),
+        fault: handle.fault(),
+        latch_reason: handle.latch_reason(),
+        failsafe_status: handle.failsafe_status(),
+        snapshot_tap,
+        supervision,
+    }
 }
 
 use ironplc_bridge::monitor::{self, ForceEntry, ModeResponse};
@@ -765,6 +853,102 @@ mod write_response_tests {
 }
 
 #[cfg(test)]
+mod hmi_read_error_tests {
+    use super::{hmi_read_error, StatusCode, StoreError};
+    use project::ProjectStore;
+
+    /// A store with one deployed screen `ok`, one unparseable screen
+    /// `broken`, and a nested slug `loops/overview`.
+    fn store_with_screens() -> (tempfile::TempDir, ProjectStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProjectStore::create(dir.path().join("p"), "p").unwrap();
+        store.create_hmi("ok", "Ok").unwrap();
+        store.create_hmi("loops/overview", "Overview").unwrap();
+        store.create_hmi("broken", "Broken").unwrap();
+        std::fs::write(dir.path().join("p/hmi/broken.hmi.json"), "{ not json").unwrap();
+        (dir, store)
+    }
+
+    /// What `GET /api/hmi/{path}` answers when `read_hmi` fails for `path`.
+    fn answer(store: &ProjectStore, path: &str) -> (StatusCode, String) {
+        let e = store
+            .read_hmi(path)
+            .err()
+            .unwrap_or_else(|| panic!("'{path}' unexpectedly read"));
+        hmi_read_error(path, &e)
+    }
+
+    #[test]
+    fn a_screen_name_the_store_rejects_is_a_bad_request() {
+        let (_dir, store) = store_with_screens();
+        // Every shape `validate_path` refuses: empty, empty segment (leading,
+        // trailing, doubled), dot-prefixed segment, backslash, colon.
+        for bad in [
+            "", "/a", "a/", "a//b", ".x", "..", "a/.x", "a/../b", "a\\b", "a:b",
+        ] {
+            let (status, body) = answer(&store, bad);
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "'{bad}' is the caller's mistake, not a server bug"
+            );
+            assert!(
+                body.contains("invalid name") && body.contains("must be non-empty"),
+                "the body must state the naming rule, got: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_well_formed_name_with_no_screen_is_still_404_with_its_text() {
+        let (_dir, store) = store_with_screens();
+        for absent in ["ghost", "loops/ghost", "ok/child"] {
+            let (status, body) = answer(&store, absent);
+            assert_eq!(status, StatusCode::NOT_FOUND, "'{absent}'");
+            assert_eq!(
+                body,
+                format!("no HMI screen '{absent}' in the deployed project"),
+                "the 404 text is unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn a_deployed_screen_that_will_not_parse_is_a_server_fault() {
+        // The request is fine; the file on the edge box is bad. Deliberately
+        // 500 here although the IDE server answers 400 for the same error.
+        let (_dir, store) = store_with_screens();
+        let (status, body) = answer(&store, "broken");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.contains("not a valid document"), "got: {body}");
+    }
+
+    #[test]
+    fn other_store_failures_stay_500() {
+        let io = StoreError::Io(std::io::Error::other("disk gone"));
+        let (status, body) = hmi_read_error("ok", &io);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.contains("disk gone"), "got: {body}");
+        // A variant `read_hmi` never returns still lands on the fall-through,
+        // not on 400/404 by accident.
+        let other = StoreError::PouNotFound("x".into());
+        assert_eq!(
+            hmi_read_error("ok", &other).0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn the_valid_screens_the_other_cases_rely_on_do_read() {
+        // Guards the fixtures above: if `ok` / the nested slug stopped
+        // reading, the "absent" and "broken" cases would prove nothing.
+        let (_dir, store) = store_with_screens();
+        assert!(store.read_hmi("ok").is_ok());
+        assert!(store.read_hmi("loops/overview").is_ok());
+    }
+}
+
+#[cfg(test)]
 mod build_stamp_tests {
     /// A provenance stamp that silently degrades to an empty string is worse
     /// than none — `/status` would serve a field that looks answered. Assert
@@ -783,8 +967,24 @@ mod build_stamp_tests {
     }
 }
 
+/// Per-process identity, stable across requests and different after restart.
+fn runtime_instance_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock precedes Unix epoch")
+                .as_nanos()
+        )
+    })
+}
+
 #[derive(Serialize)]
 struct Status {
+    runtime_id: &'static str,
     version: &'static str,
     /// What built this binary: the source commit (suffixed `-dirty` when the
     /// tree had uncommitted changes) and the compiler version, stamped in at
@@ -805,13 +1005,9 @@ struct Status {
     /// entry means that device's input variables in `last_snapshot` are
     /// frozen at last-known values (link down or connect failed).
     device_health: Vec<DeviceHealth>,
-    /// `true` once the scan watchdog tripped: the program lost real-time
-    /// guarantees, every output was zeroed and the output phase is latched
-    /// off until this process restarts.
-    ///
-    /// Check this before reading `last_snapshot` as plant state. The VM keeps
-    /// computing and `scan_count` keeps climbing after a trip, so a poller
-    /// watching only values sees a healthy plant while the bus holds zeros.
+    /// Normal output publication is inhibited until this run is restarted.
+    /// The VM may keep computing; safe-value attempts are reported separately
+    /// in `failsafe_status` and do not prove physical safety.
     watchdog_tripped: bool,
     /// Fastest task interval in ms — the cadence at which `scan_count` can
     /// advance, since it is the max across units. A client judging "is this
@@ -852,20 +1048,31 @@ struct Status {
     /// The full list is one GET /alarms away; the count rides on
     /// /status so panels see it on their existing poll.
     alarms_standing: usize,
+    /// Why the outputs are latched off; see `/health`.
+    latch_reason: Option<String>,
+    /// Same per-adapter acknowledgement report as `/health`.
+    failsafe_status: Option<ironplc_bridge::FailsafeStatus>,
+    /// The alarm-supervision policy in force; see `/health`.
+    supervision: monitor::SupervisionInForce,
+    /// Same as `/health`'s `snapshot_tap`. Read it before trusting
+    /// `last_snapshot`, `scan_count` and `alarms_standing`: if the tap has
+    /// ended they stop moving, and `alarms_standing: 0` then means "nothing
+    /// is evaluating alarms", not "no alarms".
+    snapshot_tap: monitor::SnapshotTapHealth,
 }
 
 async fn status(State(state): State<AppState>) -> Json<Status> {
-    let last_snapshot = state.latest.lock().expect("latest").clone();
+    let last_snapshot = state.latest.lock().clone();
     let scan_count = last_snapshot.as_ref().map(|s| s.scan_count).unwrap_or(0);
     let alarms_standing = state
         .alarms
         .lock()
-        .expect("alarms mutex")
         .states()
         .iter()
         .filter(|a| a.standing())
         .count();
     Json(Status {
+        runtime_id: runtime_instance_id(),
         version: env!("CARGO_PKG_VERSION"),
         build_commit: env!("IA2_BUILD_COMMIT"),
         build_rustc: env!("IA2_BUILD_RUSTC"),
@@ -884,6 +1091,10 @@ async fn status(State(state): State<AppState>) -> Json<Status> {
         forces: monitor::force_entries(&state.handle),
         fault: state.handle.fault(),
         alarms_standing,
+        latch_reason: state.handle.latch_reason(),
+        failsafe_status: state.handle.failsafe_status(),
+        supervision: state.supervision.in_force(),
+        snapshot_tap: state.tap.health(),
     })
 }
 
@@ -926,7 +1137,7 @@ async fn history(
 async fn alarms_state(
     State(state): State<AppState>,
 ) -> Json<Vec<ironplc_bridge::monitor::AlarmState>> {
-    Json(state.alarms.lock().expect("alarms mutex").states())
+    Json(state.alarms.lock().states())
 }
 
 async fn alarms_ack(
@@ -937,7 +1148,6 @@ async fn alarms_ack(
     state
         .alarms
         .lock()
-        .expect("alarms mutex")
         .ack(&id, now_us)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, e))
@@ -957,7 +1167,7 @@ async fn alarms_journal(
     State(state): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<JournalQuery>,
 ) -> Json<Vec<ironplc_bridge::monitor::AlarmJournalEntry>> {
-    Json(state.alarms.lock().expect("alarms mutex").journal(q.limit))
+    Json(state.alarms.lock().journal(q.limit))
 }
 
 /// Same row shape as the IDE server's `HmiListEntry` (whose ts-rs export
@@ -995,12 +1205,30 @@ async fn hmi_list(State(state): State<AppState>) -> Response {
 async fn hmi_get(State(state): State<AppState>, AxumPath(path): AxumPath<String>) -> Response {
     match state.store.read_hmi(&path) {
         Ok(doc) => Json(doc).into_response(),
-        Err(StoreError::HmiNotFound(_)) => (
+        Err(e) => hmi_read_error(&path, &e).into_response(),
+    }
+}
+
+/// Status and body for a failed `read_hmi` of the screen `path`.
+///
+/// - `InvalidName` (the screen name breaks the store's path grammar:
+///   empty, an empty or dot-prefixed segment, `\` or `:`) is the caller's
+///   mistake → 400, with the store's own message stating the rule. Same
+///   status the IDE server answers for it.
+/// - `HmiNotFound` → 404.
+/// - `HmiCorrupt` stays 500, unlike the IDE server (which answers 400
+///   because there the broken file is the user's own saved document):
+///   here the request is fine and the DEPLOYED file is bad — a fault on
+///   the edge box, not something the caller can fix by changing the request.
+/// - Anything else (I/O, …) is a genuine server-side failure → 500.
+fn hmi_read_error(path: &str, e: &StoreError) -> (StatusCode, String) {
+    match e {
+        StoreError::InvalidName(_) => (StatusCode::BAD_REQUEST, e.to_string()),
+        StoreError::HmiNotFound(_) => (
             StatusCode::NOT_FOUND,
             format!("no HMI screen '{path}' in the deployed project"),
-        )
-            .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        ),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
 
@@ -1189,7 +1417,17 @@ struct VarNameReq {
 struct AuditEntry {
     /// Seconds since UNIX epoch (wall clock, like the historian).
     ts_unix_secs: u64,
+    /// What the caller SAYS it is (`X-IA2-Origin`: `gui`, `cs`, …, or
+    /// `anonymous`). Anyone who can reach the socket can claim any label;
+    /// read it as a label, not as proof.
     origin: String,
+    /// The HTTP `Origin` header the request actually carried, when it had
+    /// one. A browser sets it and a page cannot change it, so it says which
+    /// page a browser-made write came from (the operator panel served by this
+    /// runtime shows up as its own address); curl, `cs` and the IDE server's
+    /// proxy send none. Absent for MQTT northbound writes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    http_origin: Option<String>,
     op: String,
     name: String,
     /// What the caller asked to write, as bit-packed i32 (REAL =
@@ -1219,23 +1457,69 @@ fn record_audit(
     applied: Option<i32>,
     result: &str,
 ) {
+    push_audit(
+        log,
+        audit_entry(origin, None, op, name, requested, applied, result),
+    );
+}
+
+/// [`record_audit`] for a request that came in over HTTP: the self-declared
+/// label from `X-IA2-Origin` plus the real `Origin` header, if any.
+fn record_audit_http(
+    log: &AuditLog,
+    headers: &axum::http::HeaderMap,
+    op: &str,
+    name: &str,
+    requested: Option<i32>,
+    applied: Option<i32>,
+    result: &str,
+) {
+    let http_origin = http_origin_of(headers);
+    push_audit(
+        log,
+        audit_entry(
+            origin_of(headers),
+            http_origin.as_deref(),
+            op,
+            name,
+            requested,
+            applied,
+            result,
+        ),
+    );
+}
+
+fn audit_entry(
+    origin: &str,
+    http_origin: Option<&str>,
+    op: &str,
+    name: &str,
+    requested: Option<i32>,
+    applied: Option<i32>,
+    result: &str,
+) -> AuditEntry {
     let ts_unix_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let mut g = log.lock().expect("audit mutex");
-    if g.len() >= AUDIT_CAP {
-        g.pop_front();
-    }
-    g.push_back(AuditEntry {
+    AuditEntry {
         ts_unix_secs,
         origin: origin.to_string(),
+        http_origin: http_origin.map(str::to_string),
         op: op.to_string(),
         name: name.to_string(),
         requested,
         applied,
         result: result.to_string(),
-    });
+    }
+}
+
+fn push_audit(log: &AuditLog, entry: AuditEntry) {
+    let mut g = log.lock();
+    if g.len() >= AUDIT_CAP {
+        g.pop_front();
+    }
+    g.push_back(entry);
 }
 
 /// Audit outcome for one write/force attempt: `(applied, result)`
@@ -1289,6 +1573,19 @@ fn origin_of(headers: &axum::http::HeaderMap) -> &str {
         .unwrap_or("anonymous")
 }
 
+/// The HTTP `Origin` header of a request, for the audit ring: only text, with
+/// anything that is not printable ASCII replaced, and cut at 200 characters
+/// (a header can be 8 KB; the ring keeps 256 entries).
+fn http_origin_of(headers: &axum::http::HeaderMap) -> Option<String> {
+    let raw = headers.get(axum::http::header::ORIGIN)?.to_str().ok()?;
+    Some(
+        raw.chars()
+            .take(200)
+            .map(|c| if c.is_ascii_graphic() { c } else { '?' })
+            .collect(),
+    )
+}
+
 fn write_err(e: RuntimeWriteError) -> (StatusCode, String) {
     match e {
         RuntimeWriteError::UnknownVariable(n) => {
@@ -1324,27 +1621,59 @@ fn write_response(name: &str, outcome: &WriteOutcome) -> serde_json::Value {
     })
 }
 
+/// Runs a control command and records its audit entry in a task of its own.
+/// hyper drops a handler's future when its client disconnects, but a command
+/// already queued to the scan loop still runs; recorded from the handler, its
+/// audit entry was lost with the future, leaving an applied write with no
+/// `/audit` row. A panic in the task still reaches the handler's panic layer.
+async fn run_detached<T: Send + 'static>(
+    work: impl std::future::Future<Output = Result<T, (StatusCode, String)>> + Send + 'static,
+) -> Result<T, (StatusCode, String)> {
+    match tokio::spawn(work).await {
+        Ok(result) => result,
+        Err(e) => match e.try_into_panic() {
+            Ok(payload) => std::panic::resume_unwind(payload),
+            Err(_) => Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "runtime is shutting down".to_string(),
+            )),
+        },
+    }
+}
+
 async fn rt_write(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Json(req): Json<VarWriteReq>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // The momentary-pulse reset guarantee lives in the shared monitor
-    // core — one implementation for IDE server and edge runtime.
-    let origin = origin_of(&headers).to_string();
-    let result = monitor::write_with_pulse(&state.handle, &req.name, req.value, req.pulse_ms).await;
-    let (applied, outcome) = write_audit_outcome(req.value, &result);
-    record_audit(
-        &state.audit,
-        &origin,
-        "write",
-        &req.name,
-        Some(req.value),
-        applied,
-        &outcome,
-    );
-    let outcome = result.map_err(write_err)?;
-    Ok(Json(write_response(&req.name, &outcome)))
+    let name = req.name.clone();
+    let outcome = audited_write(state.handle.clone(), state.audit.clone(), headers, req).await?;
+    Ok(Json(write_response(&name, &outcome)))
+}
+
+async fn audited_write(
+    handle: ProgramHandle,
+    audit: AuditLog,
+    headers: axum::http::HeaderMap,
+    req: VarWriteReq,
+) -> Result<WriteOutcome, (StatusCode, String)> {
+    run_detached(async move {
+        // The momentary-pulse reset guarantee lives in the shared monitor
+        // core — one implementation for IDE server and edge runtime.
+        let result = monitor::write_with_pulse(&handle, &req.name, req.value, req.pulse_ms).await;
+        let (applied, outcome) = write_audit_outcome(req.value, &result);
+        record_audit_http(
+            &audit,
+            &headers,
+            "write",
+            &req.name,
+            Some(req.value),
+            applied,
+            &outcome,
+        );
+        result.map_err(write_err)
+    })
+    .await
 }
 
 async fn rt_force(
@@ -1352,25 +1681,37 @@ async fn rt_force(
     headers: axum::http::HeaderMap,
     Json(req): Json<VarWriteReq>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let origin = origin_of(&headers).to_string();
-    let result = state.handle.force_variable(&req.name, req.value).await;
-    // Forces bypass governance (ADR-0002), so `applied == requested`
-    // on success — audit_outcome would still expose a regression that
-    // ever clamped a force, as a "clamped" entry.
-    let (applied, outcome) = audit_outcome(req.value, &result);
-    record_audit(
-        &state.audit,
-        &origin,
-        "force",
-        &req.name,
-        Some(req.value),
-        applied,
-        &outcome,
-    );
-    let v = result.map_err(write_err)?;
+    let name = req.name.clone();
+    let v = audited_force(state.handle.clone(), state.audit.clone(), headers, req).await?;
     Ok(Json(
-        serde_json::json!({ "ok": true, "name": req.name, "value": v }),
+        serde_json::json!({ "ok": true, "name": name, "value": v }),
     ))
+}
+
+async fn audited_force(
+    handle: ProgramHandle,
+    audit: AuditLog,
+    headers: axum::http::HeaderMap,
+    req: VarWriteReq,
+) -> Result<i32, (StatusCode, String)> {
+    run_detached(async move {
+        let result = handle.force_variable(&req.name, req.value).await;
+        // Forces bypass governance (ADR-0002), so `applied == requested`
+        // on success — audit_outcome would still expose a regression that
+        // ever clamped a force, as a "clamped" entry.
+        let (applied, outcome) = audit_outcome(req.value, &result);
+        record_audit_http(
+            &audit,
+            &headers,
+            "force",
+            &req.name,
+            Some(req.value),
+            applied,
+            &outcome,
+        );
+        result.map_err(write_err)
+    })
+    .await
 }
 
 async fn rt_unforce(
@@ -1378,30 +1719,27 @@ async fn rt_unforce(
     headers: axum::http::HeaderMap,
     Json(req): Json<VarNameReq>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let origin = origin_of(&headers).to_string();
-    let result = state.handle.unforce_variable(&req.name).await;
-    match &result {
-        Ok(()) => record_audit(
-            &state.audit,
-            &origin,
-            "unforce",
-            &req.name,
-            None,
-            None,
-            "ok",
-        ),
-        Err(e) => record_audit(
-            &state.audit,
-            &origin,
-            "unforce",
-            &req.name,
-            None,
-            None,
-            &e.to_string(),
-        ),
-    }
-    result.map_err(write_err)?;
-    Ok(Json(serde_json::json!({ "ok": true, "name": req.name })))
+    let name = req.name.clone();
+    audited_unforce(state.handle.clone(), state.audit.clone(), headers, req).await?;
+    Ok(Json(serde_json::json!({ "ok": true, "name": name })))
+}
+
+async fn audited_unforce(
+    handle: ProgramHandle,
+    audit: AuditLog,
+    headers: axum::http::HeaderMap,
+    req: VarNameReq,
+) -> Result<(), (StatusCode, String)> {
+    run_detached(async move {
+        let result = handle.unforce_variable(&req.name).await;
+        let outcome = match &result {
+            Ok(()) => "ok".to_string(),
+            Err(e) => e.to_string(),
+        };
+        record_audit_http(&audit, &headers, "unforce", &req.name, None, None, &outcome);
+        result.map_err(write_err)
+    })
+    .await
 }
 
 #[derive(serde::Deserialize)]
@@ -1437,13 +1775,7 @@ async fn rt_inject_scan_stall(
 /// and every MQTT northbound write lands here with its origin and
 /// outcome — denied and failed writes included.
 async fn rt_audit(State(state): State<AppState>) -> Json<Vec<AuditEntry>> {
-    let entries: Vec<AuditEntry> = state
-        .audit
-        .lock()
-        .expect("audit mutex")
-        .iter()
-        .cloned()
-        .collect();
+    let entries: Vec<AuditEntry> = state.audit.lock().iter().cloned().collect();
     Json(entries)
 }
 
@@ -1455,9 +1787,538 @@ async fn stop_handler(State(state): State<AppState>) -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        audit_outcome, origin_of, record_audit, sibling_web_dir, write_err, AuditLog,
-        RuntimeWriteError, StatusCode, AUDIT_CAP,
+        audit_outcome, audited_force, audited_unforce, audited_write, health_of, http_origin_of,
+        origin_of, record_audit, record_audit_http, sibling_web_dir, write_err, AuditLog,
+        RuntimeWriteError, StatusCode, VarNameReq, VarWriteReq, AUDIT_CAP,
     };
+
+    /// The policy a project that declares nothing runs with.
+    fn default_policy() -> ironplc_bridge::monitor::SupervisionInForce {
+        crate::supervisor::Policy::from(&project::SupervisionConfig::default()).in_force()
+    }
+
+    /// Spawn a one-unit run of `body` (the statements of PROGRAM main,
+    /// which declares `x` and `z : INT`).
+    fn spawn_main(body: &str) -> ironplc_bridge::ProgramHandle {
+        let container = ironplc_bridge::compile(&format!(
+            "PROGRAM main\n VAR x : INT; z : INT; END_VAR\n {body}\nEND_PROGRAM"
+        ))
+        .expect("program compiles");
+        ironplc_bridge::spawn_units(
+            vec![ironplc_bridge::ProgramUnit {
+                instance: "main_inst".into(),
+                task_name: "t".into(),
+                interval_ms: 10,
+                priority: 1,
+                container,
+                retain_vars: Vec::new(),
+            }],
+            Vec::new(),
+            Vec::new(),
+            None,
+            project::WriteGovernance::default(),
+        )
+    }
+
+    /// `/health` said `"status": "ok"` and nothing else for a runtime whose
+    /// program had died, so `cs probe` and the IDE's edge badge reported a
+    /// dead edge as running. It now carries the fault, `status` unchanged.
+    #[tokio::test]
+    async fn health_carries_the_fault_of_a_program_that_died() {
+        let handle = spawn_main("x := 1 / z;");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle.fault_watch().wait_for(|f| f.is_some()),
+        )
+        .await
+        .expect("the division by zero traps within 5 s")
+        .expect("the trap is recorded as a fault");
+
+        let body = serde_json::to_value(health_of(
+            &handle,
+            0,
+            1,
+            crate::tap::TapStatus::new().health(),
+            default_policy(),
+        ))
+        .unwrap();
+        assert_eq!(body["status"], "ok", "the process still answers");
+        let fault = body["fault"].as_str().expect("fault is a string");
+        assert!(fault.contains("main_inst"), "{fault}");
+    }
+
+    #[tokio::test]
+    async fn health_of_a_running_program_has_a_null_fault() {
+        let handle = spawn_main("x := x + 1;");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let body = serde_json::to_value(health_of(
+            &handle,
+            0,
+            1,
+            crate::tap::TapStatus::new().health(),
+            default_policy(),
+        ))
+        .unwrap();
+        assert_eq!(body["status"], "ok");
+        assert!(
+            body.get("fault").is_some_and(|f| f.is_null()),
+            "present and null, so clients can rely on the key: {body}"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
+    /// A snapshot task that has ended, watched by the real supervisor against a
+    /// real run: under `safe_state` the outputs are latched off once the grace
+    /// runs out, and say why; under `report` (the default) nothing is stopped,
+    /// however long it stays lost.
+    #[tokio::test]
+    async fn the_supervisor_latches_the_outputs_only_when_the_project_asks_for_it() {
+        use ironplc_bridge::monitor::SnapshotTapHealth;
+        use project::SupervisionAction;
+        use std::time::Duration;
+
+        async fn lost_tap() -> std::sync::Arc<crate::tap::TapStatus> {
+            // A tap that ended: `run` clears `running` as it goes away.
+            let (tx, rx) = tokio::sync::broadcast::channel::<ironplc_bridge::VarSnapshot>(2);
+            let status = crate::tap::TapStatus::new();
+            let task = tokio::spawn(crate::tap::run(rx, vec![], status.clone()));
+            tokio::task::yield_now().await;
+            task.abort();
+            let _ = task.await;
+            drop(tx);
+            let health: SnapshotTapHealth = status.health();
+            assert!(!health.running, "the tap is lost");
+            status
+        }
+
+        for (on_loss, expect_latched) in [
+            (SupervisionAction::SafeState, true),
+            (SupervisionAction::Report, false),
+        ] {
+            let handle = spawn_main("x := x + 1;");
+            let tap = lost_tap().await;
+            let alarms = std::sync::Arc::new(parking_lot::Mutex::new(
+                ironplc_bridge::monitor::AlarmEngine::default(),
+            ));
+            let supervisor = tokio::spawn(crate::supervisor::supervise_every(
+                Duration::from_millis(20),
+                tap,
+                handle.clone(),
+                alarms.clone(),
+                crate::supervisor::SupervisionStatus::new(crate::supervisor::Policy {
+                    on_loss,
+                    grace: Duration::from_millis(100),
+                }),
+            ));
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert_eq!(handle.watchdog_tripped(), expect_latched, "{on_loss:?}");
+            // Whatever the policy, the loss is a standing alarm in the list.
+            let listed = alarms.lock().states();
+            let sup = listed
+                .iter()
+                .find(|a| a.id == project::SUPERVISION_ALARM_ID)
+                .unwrap_or_else(|| panic!("{on_loss:?}: not in the alarm list: {listed:?}"));
+            assert!(sup.active && sup.standing(), "{on_loss:?}: {sup:?}");
+            assert!(sup.message.contains("has stopped"), "{sup:?}");
+            if expect_latched {
+                let reason = handle.latch_reason().expect("a latched run says why");
+                assert!(
+                    reason.contains("alarm supervision lost") && reason.contains("has stopped"),
+                    "{reason}"
+                );
+            } else {
+                assert_eq!(handle.latch_reason(), None, "report stops nothing");
+            }
+            supervisor.abort();
+            tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+                .await
+                .expect("shutdown");
+        }
+    }
+
+    /// The alarm engine being wedged is one way alarm evaluation gets lost, and
+    /// the supervisor must not be taken down with it: the policy still acts on
+    /// time while the engine's lock is held elsewhere, and the alarm appears as
+    /// soon as the lock is free.
+    #[tokio::test]
+    async fn a_wedged_alarm_engine_does_not_stop_the_supervisor_or_its_policy() {
+        use std::time::Duration;
+
+        let handle = spawn_main("x := x + 1;");
+        let (tx, rx) = tokio::sync::broadcast::channel::<ironplc_bridge::VarSnapshot>(2);
+        let tap = crate::tap::TapStatus::new();
+        let task = tokio::spawn(crate::tap::run(rx, vec![], tap.clone()));
+        tokio::task::yield_now().await;
+        task.abort();
+        let _ = task.await;
+        drop(tx);
+
+        let alarms = std::sync::Arc::new(parking_lot::Mutex::new(
+            ironplc_bridge::monitor::AlarmEngine::default(),
+        ));
+        // Another thread holds the engine's lock for 700 ms, as if it were stuck.
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let wedge = {
+            let alarms = alarms.clone();
+            std::thread::spawn(move || {
+                let _guard = alarms.lock();
+                held_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(700));
+            })
+        };
+        held_rx.recv().expect("the other thread holds the lock");
+        let supervisor = tokio::spawn(crate::supervisor::supervise_every(
+            Duration::from_millis(20),
+            tap,
+            handle.clone(),
+            alarms.clone(),
+            crate::supervisor::SupervisionStatus::new(crate::supervisor::Policy {
+                on_loss: project::SupervisionAction::SafeState,
+                grace: Duration::from_millis(100),
+            }),
+        ));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            handle.watchdog_tripped(),
+            "the policy must act even though the alarm engine cannot be locked"
+        );
+
+        wedge.join().unwrap(); // the lock is free again
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            alarms
+                .lock()
+                .states()
+                .iter()
+                .any(|a| a.id == project::SUPERVISION_ALARM_ID && a.active),
+            "and the alarm appears once the engine is free"
+        );
+        supervisor.abort();
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
+    /// While alarm evaluation is lost, `/health` says for how long and, under
+    /// `safe_state`, how long is left before the outputs are latched; both are
+    /// `null` while nothing is lost, and after the latch (the latch itself, and
+    /// its reason, are then the answer). A panel shows these to the operator.
+    #[tokio::test]
+    async fn health_says_how_long_alarms_have_been_lost_and_when_the_policy_acts() {
+        use crate::supervisor::{Policy, SupervisionStatus};
+        use project::SupervisionAction;
+        use std::time::Duration;
+
+        async fn lost_tap() -> std::sync::Arc<crate::tap::TapStatus> {
+            let (tx, rx) = tokio::sync::broadcast::channel::<ironplc_bridge::VarSnapshot>(2);
+            let status = crate::tap::TapStatus::new();
+            let task = tokio::spawn(crate::tap::run(rx, vec![], status.clone()));
+            tokio::task::yield_now().await;
+            task.abort();
+            let _ = task.await;
+            drop(tx);
+            status
+        }
+        let alarms = || {
+            std::sync::Arc::new(parking_lot::Mutex::new(
+                ironplc_bridge::monitor::AlarmEngine::default(),
+            ))
+        };
+
+        // safe_state with a long grace: lost, and a countdown that has not run out.
+        let handle = spawn_main("x := x + 1;");
+        let status = SupervisionStatus::new(Policy {
+            on_loss: SupervisionAction::SafeState,
+            grace: Duration::from_secs(60),
+        });
+        let nothing = status.in_force();
+        assert_eq!((nothing.lost_for_ms, nothing.latch_in_ms), (None, None));
+        let supervisor = tokio::spawn(crate::supervisor::supervise_every(
+            Duration::from_millis(20),
+            lost_tap().await,
+            handle.clone(),
+            alarms(),
+            status.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let body = serde_json::to_value(health_of(
+            &handle,
+            0,
+            1,
+            crate::tap::TapStatus::new().health(),
+            status.in_force(),
+        ))
+        .unwrap();
+        let lost_for = body["supervision"]["lost_for_ms"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("lost_for_ms: {body}"));
+        let latch_in = body["supervision"]["latch_in_ms"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("latch_in_ms: {body}"));
+        assert!((100..5_000).contains(&lost_for), "{body}");
+        assert!(
+            (55_000..60_000).contains(&latch_in),
+            "60 s grace, a fraction of a second used: {body}"
+        );
+        assert!(!handle.watchdog_tripped(), "the grace has not run out");
+        supervisor.abort();
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+
+        // The same loss under `report`: how long, and nothing pending. Then a
+        // short-grace `safe_state`: once it has latched there is nothing pending
+        // either, while it is still lost.
+        for (on_loss, grace) in [
+            (SupervisionAction::Report, Duration::from_secs(30)),
+            (SupervisionAction::SafeState, Duration::from_millis(100)),
+        ] {
+            let handle = spawn_main("x := x + 1;");
+            let status = SupervisionStatus::new(Policy { on_loss, grace });
+            let supervisor = tokio::spawn(crate::supervisor::supervise_every(
+                Duration::from_millis(20),
+                lost_tap().await,
+                handle.clone(),
+                alarms(),
+                status.clone(),
+            ));
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let now = status.in_force();
+            assert!(
+                now.lost_for_ms.is_some(),
+                "{on_loss:?}: still lost: {now:?}"
+            );
+            assert_eq!(
+                now.latch_in_ms, None,
+                "{on_loss:?}: nothing pending: {now:?}"
+            );
+            assert_eq!(
+                handle.watchdog_tripped(),
+                on_loss == SupervisionAction::SafeState
+            );
+            supervisor.abort();
+            tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+                .await
+                .expect("shutdown");
+        }
+
+        // Latched by someone else already (the scan watchdog, say): alarm
+        // evaluation is lost, but there is nothing left for the policy to do.
+        let handle = spawn_main("x := x + 1;");
+        assert!(handle.latch_outputs_off("scan watchdog").await.unwrap());
+        let status = SupervisionStatus::new(Policy {
+            on_loss: SupervisionAction::SafeState,
+            grace: Duration::from_secs(60),
+        });
+        let supervisor = tokio::spawn(crate::supervisor::supervise_every(
+            Duration::from_millis(20),
+            lost_tap().await,
+            handle.clone(),
+            alarms(),
+            status.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let now = status.in_force();
+        assert!(now.lost_for_ms.is_some(), "still lost: {now:?}");
+        assert_eq!(now.latch_in_ms, None, "already latched: {now:?}");
+        assert_eq!(handle.latch_reason().as_deref(), Some("scan watchdog"));
+        supervisor.abort();
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
+    /// `/health` says which alarm-supervision policy this process is enforcing.
+    /// A reader compares it with what the project declares: a runtime that does
+    /// not know the setting omits the key, and a declared `safe_state` is then
+    /// not in force.
+    #[tokio::test]
+    async fn health_reports_the_alarm_supervision_policy_in_force() {
+        use project::{SupervisionAction, SupervisionConfig};
+
+        let handle = spawn_main("x := x + 1;");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let tap = crate::tap::TapStatus::new().health();
+
+        let report =
+            serde_json::to_value(health_of(&handle, 0, 1, tap.clone(), default_policy())).unwrap();
+        assert_eq!(report["supervision"]["on_loss"], "report", "{report}");
+        assert_eq!(report["supervision"]["grace_secs"], 30);
+        // Present and null while nothing is lost: absent would read as a runtime
+        // that predates the fields.
+        for key in ["lost_for_ms", "latch_in_ms"] {
+            assert!(
+                report["supervision"].get(key).is_some_and(|v| v.is_null()),
+                "{key}: {report}"
+            );
+        }
+
+        let safe = crate::supervisor::Policy::from(&SupervisionConfig {
+            on_loss: SupervisionAction::SafeState,
+            grace_secs: 45,
+        })
+        .in_force();
+        let body = serde_json::to_value(health_of(&handle, 0, 1, tap, safe)).unwrap();
+        assert_eq!(body["supervision"]["on_loss"], "safe_state", "{body}");
+        assert_eq!(body["supervision"]["grace_secs"], 45);
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
+    /// The latch is one flag, `watchdog_tripped`, whoever set it. `/health`
+    /// says why, so a reader does not blame the scan watchdog for a latch the
+    /// project's supervision policy asked for.
+    #[tokio::test]
+    async fn health_says_why_the_outputs_are_latched() {
+        let handle = spawn_main("x := x + 1;");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let healthy = crate::tap::TapStatus::new().health();
+        let before =
+            serde_json::to_value(health_of(&handle, 0, 1, healthy.clone(), default_policy()))
+                .unwrap();
+        assert_eq!(before["watchdog_tripped"], false);
+        assert!(before["failsafe_status"].is_null());
+        assert!(
+            before["latch_reason"].is_null(),
+            "present and null: {before}"
+        );
+
+        assert!(handle
+            .latch_outputs_off("alarm supervision lost for 30 s")
+            .await
+            .unwrap());
+        let after =
+            serde_json::to_value(health_of(&handle, 0, 1, healthy, default_policy())).unwrap();
+        assert_eq!(after["watchdog_tripped"], true);
+        assert_eq!(after["failsafe_status"]["pending"], serde_json::json!([]));
+        assert_eq!(
+            after["failsafe_status"]["unconfirmed"],
+            serde_json::json!([])
+        );
+        assert_eq!(after["latch_reason"], "alarm supervision lost for 30 s");
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
+    /// `/health` says whether history and alarms are still being fed: a
+    /// program that keeps scanning while its tap is gone must not read as
+    /// healthy, and an older client that ignores the key must still parse
+    /// the rest (it is a new key, not a changed one).
+    #[tokio::test]
+    async fn health_carries_the_snapshot_tap_state() {
+        let handle = spawn_main("x := x + 1;");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let tap = ironplc_bridge::monitor::SnapshotTapHealth {
+            running: false,
+            faults: 7,
+            last_fault: Some("the alarms stage panicked on scan 12: boom".into()),
+            stalled_for_ms: Some(2500),
+            last_fault_age_ms: Some(300),
+        };
+        let body = serde_json::to_value(health_of(&handle, 12, 1, tap, default_policy())).unwrap();
+        assert_eq!(body["status"], "ok", "the process still answers");
+        assert_eq!(body["snapshot_tap"]["running"], false);
+        assert_eq!(body["snapshot_tap"]["faults"], 7);
+        assert_eq!(body["snapshot_tap"]["stalled_for_ms"], 2500);
+        assert_eq!(body["snapshot_tap"]["last_fault_age_ms"], 300);
+        assert!(body["snapshot_tap"]["last_fault"]
+            .as_str()
+            .is_some_and(|t| t.contains("alarms stage panicked")));
+
+        let healthy = crate::tap::TapStatus::new().health();
+        let body =
+            serde_json::to_value(health_of(&handle, 0, 1, healthy, default_policy())).unwrap();
+        assert_eq!(body["snapshot_tap"]["running"], true);
+        assert!(body["snapshot_tap"]["last_fault"].is_null(), "{body}");
+        assert!(body["snapshot_tap"]["stalled_for_ms"].is_null(), "{body}");
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
+    /// hyper drops a handler's future when its client disconnects, yet a
+    /// command already queued to the scan loop still runs. Its audit entry
+    /// was recorded after the `await`, so it went with the future: `/audit`
+    /// had no row for a write the plant received.
+    #[tokio::test]
+    async fn control_writes_dropped_while_queued_are_still_audited() {
+        use std::time::Duration;
+        let handle = spawn_main("z := x;");
+        let log = AuditLog::default();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-ia2-origin", "tier0".parse().unwrap());
+        // Hold the scan loop so each command is still queued when dropped.
+        handle
+            .inject_scan_stall(300, 1)
+            .await
+            .expect("stall injected");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let write = VarWriteReq {
+            name: "x".into(),
+            value: 7,
+            pulse_ms: None,
+        };
+        let force = VarWriteReq {
+            name: "x".into(),
+            value: 9,
+            pulse_ms: None,
+        };
+        let unforce = VarNameReq { name: "x".into() };
+        let drop_soon = Duration::from_millis(20);
+        let queued = [
+            tokio::time::timeout(
+                drop_soon,
+                audited_write(handle.clone(), log.clone(), headers.clone(), write),
+            )
+            .await
+            .is_err(),
+            tokio::time::timeout(
+                drop_soon,
+                audited_force(handle.clone(), log.clone(), headers.clone(), force),
+            )
+            .await
+            .is_err(),
+            tokio::time::timeout(
+                drop_soon,
+                audited_unforce(handle.clone(), log.clone(), headers, unforce),
+            )
+            .await
+            .is_err(),
+        ];
+        assert_eq!(queued, [true; 3], "each command was dropped while queued");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while log.lock().len() < 3 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let snap = handle
+            .subscribe()
+            .recv()
+            .await
+            .expect("a scan after the stall");
+        handle.shutdown().await;
+        let x = snap.vars.iter().find(|v| v.name == "x").expect("x").bits;
+        // The force and unforce drain in the same pass, before any scan
+        // applies the force, so the VM keeps the write's value.
+        assert_eq!(x, 7, "the queued write landed");
+        let rows: Vec<_> = log
+            .lock()
+            .iter()
+            .map(|e| (e.origin.clone(), e.op.clone(), e.applied, e.result.clone()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("tier0".into(), "write".into(), Some(7), "ok".into()),
+                ("tier0".into(), "force".into(), Some(9), "ok".into()),
+                ("tier0".into(), "unforce".into(), None, "ok".into()),
+            ]
+        );
+    }
 
     #[test]
     fn audit_ring_is_bounded_and_keeps_the_newest() {
@@ -1473,11 +2334,56 @@ mod tests {
                 "ok",
             );
         }
-        let g = log.lock().unwrap();
+        let g = log.lock();
         assert_eq!(g.len(), AUDIT_CAP);
         // Oldest entries were evicted: the first survivor is v10.
         assert_eq!(g.front().unwrap().name, "v10");
         assert_eq!(g.back().unwrap().name, format!("v{}", AUDIT_CAP + 9));
+    }
+
+    /// The audit ring and the log buffer are shared by every request and by
+    /// the snapshot task. A panic under one of their locks must free it: if it
+    /// poisoned, the next write would panic in `record_audit`, and then the
+    /// one after that.
+    #[test]
+    fn a_panic_under_a_shared_lock_does_not_fail_later_callers() {
+        let log = AuditLog::default();
+        record_audit(&log, "gui", "write", "before", Some(1), Some(1), "ok");
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = log.lock();
+            panic!("a caller died holding the audit lock");
+        }));
+        assert!(caught.is_err());
+        record_audit(&log, "gui", "write", "after", Some(2), Some(2), "ok");
+        let names: Vec<String> = log.lock().iter().map(|e| e.name.clone()).collect();
+        assert_eq!(names, ["before", "after"]);
+
+        let capture = super::LogCapture::new(10);
+        capture.push_line("before".into());
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = capture.buf.lock();
+            panic!("a caller died holding the log buffer");
+        }));
+        assert!(caught.is_err());
+        capture.push_line("after".into());
+        assert_eq!(capture.tail(10), ["before", "after"]);
+    }
+
+    /// `tail` is what `GET /logs?tail=` asks for: any count, including none
+    /// and more than exists, is a bound on the answer and nothing else.
+    #[test]
+    fn log_tail_is_a_bound_not_a_size() {
+        let capture = super::LogCapture::new(3);
+        for i in 0..5 {
+            capture.push_line(format!("line {i}"));
+        }
+        assert_eq!(capture.tail(0), Vec::<String>::new());
+        assert_eq!(capture.tail(2), ["line 3", "line 4"]);
+        assert_eq!(
+            capture.tail(usize::MAX),
+            ["line 2", "line 3", "line 4"],
+            "the ring keeps its cap; a huge request gets what there is"
+        );
     }
 
     /// A clamped write records BOTH sides of the story — the audit
@@ -1490,7 +2396,7 @@ mod tests {
 
         let log = AuditLog::default();
         record_audit(&log, "mqtt", "write", "sp", Some(150), applied, &outcome);
-        let g = log.lock().unwrap();
+        let g = log.lock();
         let e = g.back().unwrap();
         assert_eq!(e.requested, Some(150));
         assert_eq!(e.applied, Some(100));
@@ -1518,7 +2424,7 @@ mod tests {
 
         let log = AuditLog::default();
         record_audit(&log, "curl", "write", "sp", Some(150), applied, &outcome);
-        let g = log.lock().unwrap();
+        let g = log.lock();
         let e = g.back().unwrap();
         assert_eq!(e.requested, Some(150));
         assert_eq!(e.applied, None);
@@ -1559,6 +2465,53 @@ mod tests {
         assert_eq!(origin_of(&headers), "my-bridge");
         headers.insert("x-ia2-origin", "".parse().unwrap());
         assert_eq!(origin_of(&headers), "anonymous");
+    }
+
+    /// The audit's `origin` is whatever the caller wrote in `X-IA2-Origin`; the
+    /// `Origin` header a browser sets is recorded beside it, so a write a page
+    /// made while claiming to be `gui` is told apart from one the IDE made.
+    #[test]
+    fn audit_records_the_real_http_origin_next_to_the_claimed_label() {
+        let log = AuditLog::default();
+        let mut forged = axum::http::HeaderMap::new();
+        forged.insert("x-ia2-origin", "gui".parse().unwrap());
+        forged.insert("origin", "http://edge-1.plant.local:13001".parse().unwrap());
+        record_audit_http(&log, &forged, "force", "valve", Some(1), Some(1), "ok");
+        // curl, `cs` and the IDE server's proxy send no Origin.
+        let mut cli = axum::http::HeaderMap::new();
+        cli.insert("x-ia2-origin", "cs".parse().unwrap());
+        record_audit_http(&log, &cli, "write", "valve", Some(0), Some(0), "ok");
+        // MQTT northbound writes have no HTTP request at all.
+        record_audit(&log, "mqtt", "write", "sp", Some(5), Some(5), "ok");
+
+        let json = serde_json::to_value(log.lock().iter().cloned().collect::<Vec<_>>()).unwrap();
+        assert_eq!(json[0]["origin"], "gui");
+        assert_eq!(json[0]["http_origin"], "http://edge-1.plant.local:13001");
+        assert_eq!(json[1]["origin"], "cs");
+        assert!(json[1].get("http_origin").is_none(), "{}", json[1]);
+        assert!(json[2].get("http_origin").is_none(), "{}", json[2]);
+    }
+
+    #[test]
+    fn http_origin_is_bounded_printable_text_or_nothing() {
+        let mut headers = axum::http::HeaderMap::new();
+        assert_eq!(http_origin_of(&headers), None);
+        headers.insert("origin", "https://evil.example".parse().unwrap());
+        assert_eq!(
+            http_origin_of(&headers).as_deref(),
+            Some("https://evil.example")
+        );
+        headers.insert("origin", "x".repeat(5000).parse().unwrap());
+        assert_eq!(http_origin_of(&headers).unwrap().len(), 200);
+        headers.insert(
+            "origin",
+            axum::http::HeaderValue::from_bytes(b"http://a\xffb").unwrap(),
+        );
+        assert_eq!(
+            http_origin_of(&headers),
+            None,
+            "not text: nothing is better than a guess"
+        );
     }
 
     #[test]

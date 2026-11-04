@@ -7,6 +7,26 @@ counts as abnormal (alarms), and answer "what happened at 03:00"
 
 ## `cs sim run` — prove behaviour before hardware
 
+For a terminal fault, use
+`expect_fault = { contains = "VM execution budget exceeded", within_ms = 5000 }`.
+`contains` must be nonempty; `within_ms` defaults to 5000. The step polls
+`/api/runtime/status` and requires both `running=false` and a matching
+`last_error`. It does not accept a stale snapshot, a healthy run or an
+unrelated fault. With `--no-run`, the caller is responsible for starting the
+intended run first, as a previous matching fault may still be present.
+
+The device-free `examples/execution_budget/scenarios/bounded.toml` first
+proves finite scans and an arming alarm, then triggers an ST infinite loop
+and requires the terminal budget fault. Each scan is limited to 10,000,000
+opcodes or one second (a shorter explicit VM watchdog also applies); the
+fault names the ceiling it hit, e.g. `instruction limit (10000000 opcodes per
+scan)`, and the opcode one is host-independent and normally the first.
+Time checks occur every 256 opcodes, not as hard real-time interrupts.
+Stop takes effect at the scan boundary; only a scan still running 250 ms
+after Stop is discarded as hung. Unlike the five-overrun latch, this fault
+ends execution and triggers the device failsafe/shutdown pass. Partial
+output/RETAIN state is not committed.
+
 The program runs on the server against the simulated device layer (the
 demo Modbus slave, `_sim` EtherCAT/CANopen NICs, the fake OPC UA
 server); a scenario file plays the plant. This is the step between
@@ -103,8 +123,13 @@ Device loss also has a zero-config alarm: `__device/<device-name>` raises at
 high severity after 1 s continuously unhealthy, including a device that never
 connected. It uses the same alarm journal and acknowledgement commands;
 recovery alone does not dismiss an unacknowledged occurrence. Do not define
-ids beginning `__device/` in `alarms.toml` (reserved). These alerts do not change
+ids beginning `__device/` or `__supervision/` in `alarms.toml` (reserved). These alerts do not change
 the scan program or failsafe policy.
+
+The edge runtime also raises `__supervision/snapshot_tap` (Critical, at once) when ITS OWN alarm
+evaluation is lost: the task behind the alarm list, history and live feed stopped, stuck or failing. A
+quiet alarm list is then not an all-clear, and this alarm says so in the list itself. It counts in
+`alarms_standing`, is journalled, and stays standing after it returns until acknowledged.
 
 Inspect `snapshot.vars[].input` for mapped field inputs: `{device, channel,
 stale}`. A stale value is last-known, not live; a link recovering while paused
@@ -113,6 +138,24 @@ all configured devices. Internal/output values do not inherit this metadata.
 Process alarms neither raise nor clear on stale inputs; debounce restarts on
 valid input. History buckets containing stale samples carry `stale: true`,
 including persisted edge history: graph them as gaps, not healthy flat lines.
+
+**`[supervision]` (edge only) is a hazard decision, not a tuning knob.** The
+edge runtime's alarm evaluation can stop (its snapshot task ends, sticks or
+keeps failing); a quiet alarm list then means nothing is looking. `alarms.toml`
+may declare what the runtime does about it:
+
+```toml
+[supervision]
+on_loss = "report"        # default: report it, keep running
+# on_loss = "safe_state"  # latch the outputs off after grace_secs of lost alarm evaluation
+grace_secs = 30
+```
+
+Leave it at `report` unless you know the plant: an unplanned stop can be the
+more dangerous direction. `safe_state` latches like a scan-watchdog trip and only
+a person restarting the program re-arms it. A body for `cs set alarms` that
+omits `supervision` KEEPS the declared one; say `report` explicitly to drop it.
+A misspelt key or bad value fails the deploy, and an `alarms.toml` the runtime cannot read also stops `ia2-runtime` from starting (it no longer runs without alarms). See `docs/edge-deploy.md`.
 
 Definitions are project config (`alarms.toml`), authored like any other
 doc — and YOU should author them alongside the control logic; a program
@@ -208,3 +251,11 @@ session. Use `--keep-running` for the first scenario and `--no-run` for the seco
 when inspecting status between them, then stop explicitly. These 50 ms scenarios
 do not establish 2 ms hardware scheduling performance. The deterministic 2 ms
 state-machine and actual PDO staging checks live in Rust tests.
+
+
+Runtime output-latch status carries `failsafe_status` separately from
+`watchdog_tripped`: pending attempts, adapter acknowledgements, and unconfirmed
+device/error rows. Panels show these results alongside the latch cause; a
+healthy transport or latch flag is not proof of physical safety. Simulated
+acknowledgement verifies the software contract only. An omitted/null report
+means acknowledgement is unavailable, not that every device was confirmed.

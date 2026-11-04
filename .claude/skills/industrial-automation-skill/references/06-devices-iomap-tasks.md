@@ -109,7 +109,7 @@ The adapter merges channels into contiguous **read spans** per function code and
 - `dc_static_sync_iterations` (def `0`): init-time drift compensation (FRMW burst). `0` is right for short buses; on a non-RT host one lost frame aborts init with `Timeout(Pdu)`. Raise to `1000`–`10000` on long DC buses.
 - `slaves[].init_sdo`: CoE writes applied in **PRE-OP on every connect**, in order, before PDO mapping — how non-persisting drives get set each power-up (SV660N needs `0x6060 = 8`; PDO remap goes here too). Each entry `{ index, sub_index, value, bits (8|16|32) }`, decimal (`24672` = `0x6060`). A failed write aborts init.
 - `direction`: `tx_pdo` (slave→master = **input**) | `rx_pdo` (master→slave = **output**). `data_type`: `bool` `u8` `i8` `u16` `i16` `u32` `i32` `real`.
-- `pdi_byte_offset`/`pdi_bit_offset`: the entry's spot in the process image — **required for real hardware** (from the ESI/datasheet; sim ignores them; `bit_length < 8` uses the bit offset). `pdo_index`/`sub_index` are documentation-only.
+- `pdi_byte_offset`/`pdi_bit_offset`: the entry's spot in the process image — **required for real hardware** (from the ESI/datasheet; sim ignores them; `bit_length < 8` uses the bit offset, which must be 0–7 — whole bytes go in `pdi_byte_offset`; `POST /api/project/validate` flags a larger value on a real NIC; a `_sim` NIC is not checked). `pdo_index`/`sub_index` are documentation-only.
 - **Capacity**: up to **128 subdevices / 4 KiB image** per device (a 1000-point project ≈ 660 B). One device = one NIC = one bus.
 
 ### Bring-up mode (`bringup`)
@@ -192,7 +192,7 @@ physical timing, PDO layout, or machine safety; those remain bench gates.
 }
 ```
 
-- `tasks[].interval_ms` → `TASK fast(INTERVAL := T#50ms, PRIORITY := 1)` in the synthesized CONFIGURATION. Periodic only, and **the real scan-cadence knob** (the bridge throttles there; the vendored ironplc doesn't populate the VM task table from CONFIGURATION).
+- `tasks[].interval_ms` → `TASK fast(INTERVAL := T#50ms, PRIORITY := 1)` in the synthesized CONFIGURATION. Periodic only, and **the real scan-cadence knob** (the bridge throttles there; ironplc's own task timer is neutralized at load so it can never skip a scan the bridge counted).
 - `programs[].program` is a **PROGRAM**-kind POU; `instance` names it; `task` references a `tasks[].name`. Several instances run round-robin (`cs run` runs them all); the one rejected shape is 2+ PROGRAMs sharing a `VAR_GLOBAL` (see `01-mental-model.md` fact 2).
 
 ---
@@ -262,5 +262,5 @@ How the **edge runtime** publishes live data up to the plant platform. MQTT only
 ```
 
 - `topic_prefix` defaults to `ia2/<project>`; `client_id` to `ia2-<project>`.
-- Topics: `<prefix>/status` (retained `online`/`offline` via LWT — the platform sees crashes), `<prefix>/snapshot` (periodic `{"ts_us":…,"scan":…,"values":{…}}` typed JSON), `<prefix>/write` (only when `allow_write`; `{"name":"sp_flow","value":12.5}` → one-shot write).
+- Topics: `<prefix>/status` (retained `online`/`offline` via LWT — the platform sees crashes — and `degraded` while the runtime's snapshot task is lost: the program runs but alarms, history and the live values are not being updated, so NO snapshot is published until it is back; an absent snapshot with `degraded` is a stated condition, not silence; a broker reconnect re-asserts the CURRENT status, never a stale `online`), `<prefix>/snapshot` (periodic `{"ts_us":…,"scan":…,"values":{…}}` typed JSON), `<prefix>/write` (only when `allow_write`; `{"name":"sp_flow","value":12.5}` → one-shot write).
 - `allow_write` is **off by default** — making the link a control path is an explicit decision. Writes are one-shot (program can overwrite next scan); latch setpoints in program logic.

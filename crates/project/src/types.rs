@@ -844,6 +844,16 @@ pub enum EthercatBringup {
     },
 }
 
+/// The `nic` value that selects the in-memory simulator instead of a real bus.
+pub const ETHERCAT_SIM_NIC: &str = "_sim";
+
+/// Whether `nic` selects the simulator: the sentinel, or empty. Owned here so
+/// the author-time lint and the adapter agree on which devices a rule about
+/// the real bus applies to; `iomap-ethercat` delegates to it.
+pub fn is_ethercat_sim_nic(nic: &str) -> bool {
+    nic == ETHERCAT_SIM_NIC || nic.is_empty()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct EthercatConfig {
@@ -1112,9 +1122,11 @@ pub struct EthercatChannel {
     /// 0 for back-compat with existing sim-only configs (those ignore it).
     #[serde(default)]
     pub pdi_byte_offset: u16,
-    /// Bit offset *within* the byte at `pdi_byte_offset`. 0 is the LSB.
-    /// Only meaningful for `bit_length < 8` channels (e.g. digital I/O
-    /// where 8 channels share one byte). Defaults to 0.
+    /// Bit offset *within* the byte at `pdi_byte_offset`. 0 is the LSB;
+    /// valid values are 0..=7 (whole bytes go in `pdi_byte_offset`, and
+    /// real-mode connect rejects anything else). Only meaningful for
+    /// `bit_length < 8` channels (e.g. digital I/O where 8 channels share
+    /// one byte). Defaults to 0.
     #[serde(default)]
     pub pdi_bit_offset: u8,
 }
@@ -1513,6 +1525,65 @@ pub struct Tasks {
 pub struct AlarmConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub alarms: Vec<AlarmDef>,
+    /// What the edge runtime does when it can no longer evaluate alarms.
+    /// `None` = the file does not say, which means [`SupervisionAction::Report`];
+    /// kept distinct from an explicit `report` so that an edit that only
+    /// touches `alarms` (`PUT /api/alarms` with a body that omits this)
+    /// cannot silently remove a declared `safe_state`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub supervision: Option<SupervisionConfig>,
+}
+
+/// `[supervision]` in `alarms.toml`: the project's own answer to "what
+/// should the runtime do if it stops being able to evaluate alarms?" (its
+/// snapshot task stopped, is stuck, or keeps failing). A missing alarm
+/// reads as "nothing is wrong", so this is a hazard question, and whether
+/// stopping the plant is the safe direction depends on the plant: the
+/// runtime cannot decide it, the project declares it. The default does NOT
+/// stop anything.
+///
+/// Unknown keys are refused, not ignored: a typo in a protective setting
+/// (`on_los = "safe_state"`) must fail the deploy, not silently leave the
+/// project unprotected.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisionConfig {
+    #[serde(default)]
+    pub on_loss: SupervisionAction,
+    /// How long alarm evaluation may stay lost before `on_loss` is carried
+    /// out, in seconds (1..=3600). Ignored for `report`.
+    #[serde(default = "default_supervision_grace_secs")]
+    pub grace_secs: u32,
+}
+
+impl Default for SupervisionConfig {
+    fn default() -> Self {
+        Self {
+            on_loss: SupervisionAction::Report,
+            grace_secs: default_supervision_grace_secs(),
+        }
+    }
+}
+
+fn default_supervision_grace_secs() -> u32 {
+    30
+}
+
+/// What to do when alarm evaluation is lost for longer than the grace.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisionAction {
+    /// Say so (logs, `/health`, `/status`, the panel, `cs probe`) and keep
+    /// running. The default.
+    #[default]
+    Report,
+    /// Latch the outputs off, as the scan watchdog does: every device into
+    /// failsafe, no further output writes, until a person restarts the
+    /// program. Never undone automatically.
+    SafeState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

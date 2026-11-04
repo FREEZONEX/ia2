@@ -5,7 +5,7 @@
 //!
 //! The scan thread is a dedicated `std::thread` that hosts a single-thread
 //! tokio runtime; everything bus-related runs inside it. ironplc's
-//! `VmRunning::run_round` itself is sync.
+//! VM execution is synchronous but interruptible through its instruction hook.
 //!
 //! Multi-PROGRAM execution (ADR-0001): the one scan thread hosts N
 //! `VmRunning` instances ("units"), one per scheduled PROGRAM instance,
@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::execution::{run_scan, ScanOutcome};
 use crate::retain;
 use iocore::{ChannelValue, IoDevice};
 use ironplc_container::debug_format::VariableRenderer;
@@ -153,12 +154,20 @@ pub struct DeviceSpec {
 ///
 /// This is transport health only. A healthy link does NOT prove the value
 /// took effect: a slave can sit in SAFEOP, mask its own outputs, or hold
-/// the failsafe zeros after a watchdog trip. The HMI's Stop is not a
+/// configured safe values after a watchdog trip. The HMI's Stop is not a
 /// safety function under any of these outcomes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteOutcome {
     pub value: i32,
     pub undelivered_device: Option<String>,
+}
+
+/// Identity of one accepted pulse. The scan thread records it against the
+/// resolved VM slot, so bare/qualified aliases share ownership. Arc identity
+/// avoids wrapping generations and is private to this run's command queue.
+pub(crate) struct PulseToken {
+    name: String,
+    owner: Arc<()>,
 }
 
 /// Reasons a variable write can't be honoured.
@@ -178,6 +187,38 @@ pub enum RuntimeWriteError {
     GovernanceDenied(String),
 }
 
+/// One adapter whose requested safe-value operation did not acknowledge success.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DeviceFailsafeError {
+    pub device: String,
+    pub error: String,
+}
+
+/// Safe-value attempts for this run, distinct from its software output inhibit.
+/// An acknowledgement describes the adapter call only: it does not establish
+/// transmission on the wire, physical state, or a universally safe value.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct FailsafeStatus {
+    /// Attempts queued or currently awaiting an adapter response.
+    pub pending: Vec<String>,
+    pub acknowledged: Vec<String>,
+    /// A previous failure remains here while its explicit retry is pending.
+    pub unconfirmed: Vec<DeviceFailsafeError>,
+}
+
+/// The output inhibit remains set even when safe-value calls fail.
+#[derive(Debug, thiserror::Error)]
+pub enum OutputLatchError {
+    #[error("scan loop has stopped — output latch acknowledgement unavailable")]
+    Disconnected,
+    #[error("outputs inhibited, but adapter failsafe acknowledgement failed: {errors:?}")]
+    FailsafeUnconfirmed { errors: Vec<DeviceFailsafeError> },
+}
+
+type SharedFailsafeStatus = Arc<std::sync::Mutex<Option<FailsafeStatus>>>;
+
 /// Out-of-band commands the scan loop drains between rounds. Used so
 /// HTTP handlers (in the server's tokio runtime) can poke the VM (which
 /// lives on a dedicated std::thread + current_thread runtime).
@@ -194,14 +235,18 @@ enum RuntimeCommand {
     },
     /// One-shot variable write — applied once, may be overwritten by
     /// the program in subsequent scans. Use `ForceVariable` to keep a
-    /// value pinned. `governed: false` marks the runtime's OWN internal
-    /// writes (the monitor's pulse reset), which bypass the project's
-    /// write governance — see `ProgramHandle::write_variable_ungoverned`.
+    /// value pinned. A successful write replaces any earlier pulse owner.
     WriteVariable {
         name: String,
         value: i32,
-        governed: bool,
+        pulse_owner: Option<Arc<()>>,
         ack: tokio::sync::oneshot::Sender<Result<WriteOutcome, RuntimeWriteError>>,
+    },
+    /// Runtime-owned write-zero, conditional on this pulse still owning the
+    /// slot. Validation and application happen together on the scan thread.
+    ResetPulse {
+        token: PulseToken,
+        ack: tokio::sync::oneshot::Sender<Result<Option<WriteOutcome>, RuntimeWriteError>>,
     },
     /// Pin a variable's value: every scan begins by writing `value`
     /// into the VM after the input phase but before `run_round`, so the
@@ -218,6 +263,14 @@ enum RuntimeCommand {
     UnforceVariable {
         name: String,
         ack: tokio::sync::oneshot::Sender<Result<(), RuntimeWriteError>>,
+    },
+    /// Inhibit ordinary outputs, then request adapter safe values. Failure
+    /// leaves inhibition in place and returns per-device errors. An explicit
+    /// repeat retries only unconfirmed adapters; the first reason stands.
+    /// Success says whether this command newly inhibited the outputs.
+    LatchOutputsOff {
+        reason: String,
+        ack: tokio::sync::oneshot::Sender<Result<bool, OutputLatchError>>,
     },
     /// Fault injection: stall each of the next `scans` **ticks** by
     /// `stall_ms` of real wall-clock time. The stall happens INSIDE the
@@ -243,17 +296,52 @@ enum RuntimeCommand {
 pub enum RuntimeMode {
     /// Default — run continuously at the configured cycle rate.
     Running,
-    /// Halt scan execution. IO inputs are NOT read, outputs are NOT
-    /// written, the program does NOT advance. Variable writes /
-    /// force commands still take effect (they're delivered between
-    /// rounds, not inside a round), so an operator can manually
-    /// stage a state while paused. This is "freeze the plant"
-    /// semantics — safer than "freeze the program but keep the bus
-    /// running".
+    /// Halt scan execution: no inputs are read into the program, the
+    /// program does NOT advance, and the scan loop pushes no new
+    /// outputs. Variable writes still update the VM between rounds.
+    /// Force commands register overrides while paused; those overrides
+    /// are applied to the VM on the next scan. Output synchronization
+    /// resumes on the first round after `resume` / `step`.
+    ///
+    /// This is NOT a safe state and does not stop the plant. Only the scan
+    /// loop pauses: each adapter's own worker (the EtherCAT cyclic thread
+    /// with its gear tick, the Modbus poll task) keeps running and keeps
+    /// sending whatever it was last given, so a drive that was moving keeps
+    /// the last target it had. Latching inhibits normal output publication
+    /// and requests configured safe values; inspect the acknowledgement
+    /// report rather than treating that request as de-energisation.
     Paused,
     /// Run `remaining` scan cycles then automatically transition to
     /// `Paused`. Decremented atomically at the bottom of each cycle.
     Step { remaining: u32 },
+}
+
+/// Lock the execution mode. A thread that panicked while holding the lock
+/// cannot have left the value half-written — every writer replaces a `Copy`
+/// enum in one assignment — so a poisoned lock still holds the last mode
+/// anyone set, and taking it anyway keeps `mode()` truthful and `pause`
+/// effective. Reading a poisoned lock as `Running` instead would turn a
+/// requested pause into a running program, and skipping the write would drop
+/// the request without a word.
+fn lock_mode(mode: &std::sync::Mutex<RuntimeMode>) -> std::sync::MutexGuard<'_, RuntimeMode> {
+    mode.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Book one finished scheduler tick against a `Step` request. Decides from the
+/// mode as it is NOW, not as the tick began: a `pause` or `resume` that
+/// arrived during the tick stands, instead of being overwritten with a stale
+/// `Step { remaining - 1 }` that would keep a paused program stepping.
+fn finish_step_tick(mode: &std::sync::Mutex<RuntimeMode>) {
+    let mut m = lock_mode(mode);
+    if let RuntimeMode::Step { remaining } = *m {
+        *m = if remaining <= 1 {
+            RuntimeMode::Paused
+        } else {
+            RuntimeMode::Step {
+                remaining: remaining - 1,
+            }
+        };
+    }
 }
 
 /// Cheap-to-clone handle to a running scan loop. Multiple clones share the
@@ -269,7 +357,7 @@ pub struct ProgramHandle {
     /// it once per cycle and the HTTP layer writes to it from an
     /// arbitrary tokio thread — a Mutex is cheap relative to a scan
     /// round, and atomicity over the `Step { remaining }` payload
-    /// matters.
+    /// matters. Always take it through [`lock_mode`].
     mode: Arc<std::sync::Mutex<RuntimeMode>>,
     /// Currently-forced variables: name → pinned i32 value. The scan
     /// loop applies these in order on every cycle (after input read,
@@ -310,9 +398,9 @@ pub struct ProgramHandle {
     /// refreshed by the scan loop each round. Shared so the HTTP layer can
     /// serve health without a scan-loop round-trip.
     device_health: Arc<std::sync::Mutex<Vec<DeviceHealth>>>,
-    /// Latched `true` once the scan watchdog has tripped: outputs are held
-    /// at the zeros `enter_failsafe` wrote and the output phase no longer
-    /// runs. Monotonic — only a restart clears it.
+    /// Latched `true` once output writes are inhibited. This remains true
+    /// even when adapter safe-value calls fail; it does not establish the
+    /// field's actual state. Monotonic — only a restart clears it.
     ///
     /// Shared for the same reason `device_health` is: after a trip the VM
     /// keeps computing, `scan_count` keeps advancing and every variable
@@ -320,6 +408,14 @@ pub struct ProgramHandle {
     /// stopped being driven. Without this flag a UI cannot tell a healthy
     /// run from a latched one.
     watchdog_tripped: Arc<AtomicBool>,
+    /// Why the outputs are latched off, once they are: the scan watchdog
+    /// (with the unit and the streak), an execution-budget trap, or an
+    /// explicit [`ProgramHandle::latch_outputs_off`] request. Written BEFORE
+    /// `watchdog_tripped` is set, so a reader that sees the latch sees its
+    /// reason; the first reason stands.
+    latch_reason: Arc<std::sync::Mutex<Option<String>>>,
+    /// Adapter acknowledgements are tracked independently of output inhibition.
+    failsafe_status: SharedFailsafeStatus,
     /// Why the scan loop died, if it died: set exactly once — to the trap
     /// message when a VM trap stops the plant, or to the panic payload if
     /// the loop panicked — and never on a clean stop. A `watch` channel
@@ -334,11 +430,19 @@ pub struct ProgramHandle {
     /// is how a caller waits for the always-run failsafe pass + per-device
     /// teardown (EtherCAT thread join) to actually finish.
     thread: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
+    /// Never sends a value. Closes only after the reconnect worker has
+    /// dropped its adapters and I/O runtime, including on panic.
+    reconnect_done: tokio::sync::watch::Receiver<()>,
 }
 
 impl ProgramHandle {
-    /// Cooperative stop. The scan loop checks the flag at the top of each
-    /// round; expect a few extra rounds before it actually exits.
+    /// Cooperative stop. The scan loop checks the flag between rounds, so a
+    /// healthy scan in flight finishes, publishes, and the final RETAIN
+    /// checkpoint is written. A scan still running `STOP_GRACE` after the flag
+    /// was first sampled (sampled every 256 VM opcodes) is treated as hung and
+    /// discarded: nothing of it is published and the final RETAIN flush is
+    /// skipped. Adapter calls still finish under their own timeout/teardown
+    /// policies.
     ///
     /// Fire-and-forget: returns immediately, doesn't wait for the failsafe
     /// pass. Use `shutdown` to wait for the bounded failsafe/teardown
@@ -349,29 +453,56 @@ impl ProgramHandle {
 
     /// Graceful, awaitable stop for a clean process exit. Requests stop,
     /// then JOINS the scan thread — which runs its always-on failsafe pass
-    /// (zero every device's outputs) and each device's `shutdown` (joining
-    /// the EtherCAT cyclic worker so the zeroed controlword is on the wire)
-    /// before it returns. Device failures are logged; completion is not
-    /// a guarantee that physical outputs reached their safe state.
+    /// (request each adapter's configured safe values) and each device's
+    /// `shutdown` before it returns. Safe-value results remain available in
+    /// [`Self::failsafe_status`]; device failures are also logged. Completion
+    /// does not establish transmission or physical output state.
+    ///
+    /// The scan thread waits at most `RECONNECT_JOIN_GRACE` for the background
+    /// reconnect worker, so a device still mid-connect delays this by at most
+    /// that long; the closing log line then says the worker's outcome is
+    /// unconfirmed rather than "exited cleanly".
+    /// Use [`Self::wait_for_teardown`] before starting a replacement run;
+    /// a worker beyond this grace may still write its late failsafe.
     ///
     /// Unlike `stop`, this waits for completion, so the runtime can drive
     /// the plant safe before exiting rather than racing the service
-    /// supervisor's kill timeout. The join runs on a blocking thread so
-    /// this is safe to call from any async runtime. Idempotent: the first
-    /// caller joins; later calls are no-ops.
+    /// supervisor's kill timeout. Polling completion before joining keeps
+    /// cancellation safe: a caller's timeout cannot leave a blocking join
+    /// behind that wedges Tokio runtime destruction. Concurrent callers all
+    /// wait for completion; one joins the finished thread.
     pub async fn shutdown(&self) {
         self.stop.store(true, Ordering::Relaxed);
-        let handle = self.thread.lock().ok().and_then(|mut g| g.take());
-        let Some(handle) = handle else { return };
-        match tokio::task::spawn_blocking(move || handle.join()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => {
-                tracing::error!(
-                    "scan thread panicked during shutdown; inspect preceding failsafe errors"
-                )
+        loop {
+            let finished = {
+                let mut slot = self.thread.lock().unwrap_or_else(|e| e.into_inner());
+                match slot.as_ref() {
+                    None => return,
+                    Some(thread) if thread.is_finished() => slot.take(),
+                    Some(_) => None,
+                }
+            };
+            if let Some(thread) = finished {
+                if thread.join().is_err() {
+                    tracing::error!(
+                        "scan thread panicked during shutdown; inspect preceding failsafe errors"
+                    );
+                }
+                return;
             }
-            Err(e) => tracing::error!(%e, "failed to join scan thread on shutdown"),
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+
+    /// Stop and wait for both the scan thread and any late reconnect cleanup.
+    /// Unlike `shutdown`, this has no reconnect grace limit. A caller may
+    /// time out or cancel its wait, but must not start a replacement until a
+    /// subsequent wait completes. Clones can wait independently. Completion
+    /// means no further calls from this run, not confirmed physical safety.
+    pub async fn wait_for_teardown(&self) {
+        self.shutdown().await;
+        // No values are sent, so closure is the only possible notification.
+        let _ = self.reconnect_done.clone().changed().await;
     }
 
     /// Subscribe to the per-cycle VarSnapshot stream.
@@ -395,23 +526,54 @@ impl ProgramHandle {
         name: &str,
         value: i32,
     ) -> Result<WriteOutcome, RuntimeWriteError> {
-        self.send_write(name, value, true).await
+        self.send_write(name, value, None).await
     }
 
-    /// One-shot write that BYPASSES the project's write governance.
-    /// For the runtime's OWN internal semantics only — today that is
-    /// the monitor's pulse reset, whose write-0-back is the safety half
-    /// of the `pulse_ms` contract and must land even when a rule's
-    /// `min` would clamp 0 away. Same rationale as the force bypass
-    /// (ADR-0002): a runtime-internal action is not an external write.
-    /// Deliberately `pub(crate)` — never wired to any HTTP or
-    /// northbound surface.
-    pub(crate) async fn write_variable_ungoverned(
+    /// Register ownership only after a governed write succeeds in the VM.
+    /// `write_with_pulse` uses `queue_pulse`; tests start pulses with this.
+    #[cfg(test)]
+    pub(crate) async fn start_pulse(
         &self,
         name: &str,
         value: i32,
-    ) -> Result<WriteOutcome, RuntimeWriteError> {
-        self.send_write(name, value, false).await
+    ) -> Result<(WriteOutcome, PulseToken), RuntimeWriteError> {
+        let (landed, token) = self.queue_pulse(name, value)?;
+        Ok((landed.await?, token))
+    }
+
+    /// Queue a pulse's first write now, in the caller's command order, and
+    /// return what resolves once the scan loop has applied it. Ownership is
+    /// still registered only if that write succeeds.
+    pub(crate) fn queue_pulse(
+        &self,
+        name: &str,
+        value: i32,
+    ) -> Result<
+        (
+            impl std::future::Future<Output = Result<WriteOutcome, RuntimeWriteError>> + Send + 'static,
+            PulseToken,
+        ),
+        RuntimeWriteError,
+    > {
+        let token = PulseToken {
+            name: name.to_string(),
+            owner: Arc::new(()),
+        };
+        let landed = self.queue_write(name, value, Some(token.owner.clone()))?;
+        Ok((landed, token))
+    }
+
+    /// Bypass governance for the runtime's own reset (ADR-0002), but never
+    /// overwrite a later accepted write or force. None means superseded.
+    pub(crate) async fn reset_pulse(
+        &self,
+        token: PulseToken,
+    ) -> Result<Option<WriteOutcome>, RuntimeWriteError> {
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(RuntimeCommand::ResetPulse { token, ack: ack_tx })
+            .map_err(|_| RuntimeWriteError::Disconnected)?;
+        ack_rx.await.map_err(|_| RuntimeWriteError::Disconnected)?
     }
 
     /// Resolve on the scan thread, then await the mailbox OUTSIDE that thread.
@@ -439,18 +601,31 @@ impl ProgramHandle {
         &self,
         name: &str,
         value: i32,
-        governed: bool,
+        pulse_owner: Option<Arc<()>>,
     ) -> Result<WriteOutcome, RuntimeWriteError> {
+        self.queue_write(name, value, pulse_owner)?.await
+    }
+
+    /// Send the write command now; the returned future waits for its ack.
+    fn queue_write(
+        &self,
+        name: &str,
+        value: i32,
+        pulse_owner: Option<Arc<()>>,
+    ) -> Result<
+        impl std::future::Future<Output = Result<WriteOutcome, RuntimeWriteError>> + Send + 'static,
+        RuntimeWriteError,
+    > {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
             .send(RuntimeCommand::WriteVariable {
                 name: name.to_string(),
                 value,
-                governed,
+                pulse_owner,
                 ack: ack_tx,
             })
             .map_err(|_| RuntimeWriteError::Disconnected)?;
-        ack_rx.await.map_err(|_| RuntimeWriteError::Disconnected)?
+        Ok(async move { ack_rx.await.unwrap_or(Err(RuntimeWriteError::Disconnected)) })
     }
 
     /// Pin a variable to a fixed value. Until `unforce_variable` is
@@ -529,37 +704,31 @@ impl ProgramHandle {
 
     /// Read the current execution mode (Running / Paused / Step{N}).
     pub fn mode(&self) -> RuntimeMode {
-        self.mode.lock().map(|m| *m).unwrap_or(RuntimeMode::Running)
+        *lock_mode(&self.mode)
     }
 
     /// Halt the scan loop. The current round finishes first; subsequent
-    /// rounds are skipped until `resume` or `step` is called. IO is
-    /// frozen (no inputs read, no outputs written) — `Paused` semantics
-    /// match a "freeze the plant" debug stop, not "VM still ticking,
-    /// outputs still flapping".
+    /// rounds are skipped until `resume` or `step` is called. The program
+    /// stops advancing and no new outputs are pushed, but adapters keep
+    /// sending what they were last given — see [`RuntimeMode::Paused`]; this
+    /// is a debug stop, not a way to de-energise.
     pub fn pause(&self) {
-        if let Ok(mut m) = self.mode.lock() {
-            *m = RuntimeMode::Paused;
-        }
+        *lock_mode(&self.mode) = RuntimeMode::Paused;
     }
 
     /// Resume normal continuous scanning. No-op if already running.
     pub fn resume(&self) {
-        if let Ok(mut m) = self.mode.lock() {
-            *m = RuntimeMode::Running;
-        }
+        *lock_mode(&self.mode) = RuntimeMode::Running;
     }
 
     /// Run `cycles` scan rounds then auto-pause. Calling `step` while
     /// in Step mode resets the remaining count.
     pub fn step(&self, cycles: u32) {
-        if let Ok(mut m) = self.mode.lock() {
-            *m = if cycles == 0 {
-                RuntimeMode::Paused
-            } else {
-                RuntimeMode::Step { remaining: cycles }
-            };
-        }
+        *lock_mode(&self.mode) = if cycles == 0 {
+            RuntimeMode::Paused
+        } else {
+            RuntimeMode::Step { remaining: cycles }
+        };
     }
 
     /// Snapshot of per-device connect reports (connected/failed + EtherCAT
@@ -582,10 +751,6 @@ impl ProgramHandle {
             .unwrap_or_default()
     }
 
-    /// `true` once the scan watchdog has tripped and latched the outputs
-    /// off. Stays `true` until the program is restarted — a caller seeing
-    /// this must not read live variable values as plant state, because the
-    /// bus is holding zeros while the VM keeps computing.
     /// The fastest task interval in ms — the cadence at which `scan_count`
     /// can advance. See the field docs for why a client needs it.
     pub fn scan_period_ms(&self) -> u32 {
@@ -604,8 +769,46 @@ impl ProgramHandle {
         self.consecutive_scan_overruns.load(Ordering::Relaxed)
     }
 
+    /// `true` once the outputs are latched off, whatever latched them: the
+    /// scan watchdog, an execution-budget trap, or [`Self::latch_outputs_off`].
+    /// [`Self::latch_reason`] says which.
     pub fn watchdog_tripped(&self) -> bool {
-        self.watchdog_tripped.load(Ordering::Relaxed)
+        self.watchdog_tripped.load(Ordering::Acquire)
+    }
+
+    /// Why the outputs are latched off; `None` while they are not. The first
+    /// reason stands.
+    pub fn latch_reason(&self) -> Option<String> {
+        self.latch_reason.lock().ok().and_then(|r| r.clone())
+    }
+
+    /// Adapter safe-value results, or `None` before any attempt. Pending
+    /// calls and failures are visible independently of the software inhibit.
+    pub fn failsafe_status(&self) -> Option<FailsafeStatus> {
+        self.failsafe_status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Inhibit ordinary output writes until a program restart, and request
+    /// each adapter's configured safe values. Failures return an error while
+    /// leaving the inhibit and first reason intact. Calling again explicitly
+    /// retries only unconfirmed adapters. `Ok(true)` means newly inhibited;
+    /// `Ok(false)` means already inhibited and all attempts acknowledged.
+    /// Adapter acknowledgement does not prove wire or physical state.
+    pub async fn latch_outputs_off(
+        &self,
+        reason: impl Into<String>,
+    ) -> Result<bool, OutputLatchError> {
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(RuntimeCommand::LatchOutputsOff {
+                reason: reason.into(),
+                ack: ack_tx,
+            })
+            .map_err(|_| OutputLatchError::Disconnected)?;
+        ack_rx.await.map_err(|_| OutputLatchError::Disconnected)?
     }
 
     /// Why the scan loop died, if it died: `Some(message)` after a VM trap,
@@ -710,6 +913,8 @@ enum DeviceSource {
     Specs(Vec<DeviceSpec>),
     #[cfg(test)]
     Prebuilt(Vec<Box<dyn IoDevice>>),
+    #[cfg(test)]
+    PrebuiltWithRetries(Vec<Box<dyn IoDevice>>, Vec<DeviceSpec>),
 }
 
 fn validate_scan_clock(
@@ -737,7 +942,7 @@ fn validate_scan_clock(
             })
             .collect(),
         #[cfg(test)]
-        DeviceSource::Prebuilt(devices) => {
+        DeviceSource::Prebuilt(devices) | DeviceSource::PrebuiltWithRetries(devices, _) => {
             devices.iter().filter_map(|d| d.cycle_period()).collect()
         }
     };
@@ -760,15 +965,22 @@ fn validate_scan_clock(
     }
 }
 
-async fn latch_cycle_fault(devices: &mut [Box<dyn IoDevice>], latch: &AtomicBool, why: &str) {
-    if latch.swap(true, Ordering::Relaxed) {
+async fn latch_cycle_fault(
+    devices: &mut [Box<dyn IoDevice>],
+    latch: &AtomicBool,
+    reason: &std::sync::Mutex<Option<String>>,
+    failsafe_status: &SharedFailsafeStatus,
+    why: &str,
+) {
+    if latch.load(Ordering::Relaxed) {
         return;
     }
+    begin_failsafe_attempts(failsafe_status, devices.iter().map(|dev| dev.name()));
+    note_latch_reason(reason, format!("cycle handoff fault: {why}"));
+    latch.store(true, Ordering::Release);
     tracing::error!(%why, "cycle handoff fault; outputs latched off until program restart");
     for dev in devices {
-        if let Err(e) = dev.enter_failsafe().await {
-            tracing::error!(device = %dev.name(), %e, "cycle failsafe failed");
-        }
+        let _ = attempt_device_failsafe(dev.as_mut(), failsafe_status).await;
     }
 }
 
@@ -778,20 +990,28 @@ async fn acquire_devices(
     match source {
         DeviceSource::Specs(specs) => connect_devices(specs).await,
         #[cfg(test)]
-        DeviceSource::Prebuilt(devices) => {
-            let reports = devices
-                .iter()
-                .map(|d| DeviceReport {
-                    name: d.name().to_string(),
-                    protocol: "mock".into(),
-                    connected: true,
-                    error: None,
-                    slaves: Vec::new(),
-                })
-                .collect();
-            (devices, reports, Vec::new())
-        }
+        DeviceSource::Prebuilt(devices) => prebuilt_devices(devices, Vec::new()),
+        #[cfg(test)]
+        DeviceSource::PrebuiltWithRetries(devices, retries) => prebuilt_devices(devices, retries),
     }
+}
+
+#[cfg(test)]
+fn prebuilt_devices(
+    devices: Vec<Box<dyn IoDevice>>,
+    retries: Vec<DeviceSpec>,
+) -> (Vec<Box<dyn IoDevice>>, Vec<DeviceReport>, Vec<DeviceSpec>) {
+    let reports = devices
+        .iter()
+        .map(|d| DeviceReport {
+            name: d.name().to_string(),
+            protocol: "mock".into(),
+            connected: true,
+            error: None,
+            slaves: Vec::new(),
+        })
+        .collect();
+    (devices, reports, retries)
 }
 
 fn spawn_units_inner(
@@ -800,6 +1020,26 @@ fn spawn_units_inner(
     mappings: Vec<Mapping>,
     state_path: Option<PathBuf>,
     governance: WriteGovernance,
+) -> ProgramHandle {
+    spawn_units_with_grace(
+        units,
+        device_source,
+        mappings,
+        state_path,
+        governance,
+        RECONNECT_JOIN_GRACE,
+    )
+}
+
+/// `spawn_units_inner` with the reconnect worker's wait made explicit, so a
+/// test can exercise the abandoned-worker path without waiting out the default.
+fn spawn_units_with_grace(
+    units: Vec<ProgramUnit>,
+    device_source: DeviceSource,
+    mappings: Vec<Mapping>,
+    state_path: Option<PathBuf>,
+    governance: WriteGovernance,
+    reconnect_join_grace: Duration,
 ) -> ProgramHandle {
     let stop = Arc::new(AtomicBool::new(false));
     // Normalised exactly as `UnitClock::interval` below, and MIN across
@@ -827,7 +1067,10 @@ fn spawn_units_inner(
     let device_reports = Arc::new(std::sync::Mutex::new(Vec::<DeviceReport>::new()));
     let device_health = Arc::new(std::sync::Mutex::new(Vec::<DeviceHealth>::new()));
     let watchdog_tripped = Arc::new(AtomicBool::new(false));
+    let latch_reason = Arc::new(std::sync::Mutex::new(None::<String>));
+    let failsafe_status = Arc::new(std::sync::Mutex::new(None::<FailsafeStatus>));
     let (fault_tx, fault_rx) = tokio::sync::watch::channel(None::<String>);
+    let (reconnect_done_tx, reconnect_done_rx) = tokio::sync::watch::channel(());
 
     let stop_clone = stop.clone();
     let stop_reconnect = stop.clone();
@@ -838,6 +1081,8 @@ fn spawn_units_inner(
     let device_reports_clone = device_reports.clone();
     let device_health_clone = device_health.clone();
     let watchdog_tripped_clone = watchdog_tripped.clone();
+    let latch_reason_clone = latch_reason.clone();
+    let failsafe_status_clone = failsafe_status.clone();
     let scan_overruns_clone = scan_overruns.clone();
     let consecutive_overruns_clone = consecutive_scan_overruns.clone();
     let device_reports_reconnect = device_reports.clone();
@@ -876,8 +1121,8 @@ fn spawn_units_inner(
         };
         // Connect devices OUTSIDE the panic-guarded run_loop so that,
         // no matter how the loop exits (clean stop, VM trap, or panic),
-        // we still own the `devices` vec and can drive every output to
-        // its safe state.
+        // we still own the `devices` vec and can attempt each adapter's
+        // configured safe values.
         let expected_cycle = match validate_scan_clock(&device_source, &units) {
             Ok(period) => period,
             Err(why) => {
@@ -931,31 +1176,32 @@ fn spawn_units_inner(
             // EtherCAT bring-up can never stall scan rounds). Reconnected
             // adapters are handed to the scan loop over this channel; the
             // loop binds their parked mappings and the per-round health
-            // refresh flips them healthy. If nothing failed, the sender
-            // drops here and try_recv just reports Disconnected forever.
-            let (reconnect_tx, reconnect_rx) =
-                std::sync::mpsc::channel::<Box<dyn IoDevice>>();
-            // Set once the failsafe + per-device shutdown pass below has
-            // finished — the reconnect worker keeps its runtime (and the
-            // adapters' background tasks) alive until then.
-            let drained = Arc::new(AtomicBool::new(false));
-            if !failed_specs.is_empty() {
-                let drained_flag = drained.clone();
+            // refresh flips them healthy. Scan exit closes the handoff before
+            // draining its queued adapters along with the adopted devices.
+            let reconnect = Arc::new(ReconnectState::default());
+            let reconnect_thread = if !failed_specs.is_empty() {
+                let worker_state = reconnect.clone();
                 let spawned = std::thread::Builder::new()
                     .name("ia2-reconnect".into())
                     .spawn(move || {
+                        // Keep this guard until reconnect_worker returns and
+                        // its I/O runtime has dropped, even when it panics.
+                        let _done = reconnect_done_tx;
                         reconnect_worker(
                             failed_specs,
-                            reconnect_tx,
                             device_reports_reconnect,
                             stop_reconnect,
-                            drained_flag,
+                            worker_state,
                         )
                     });
-                if let Err(e) = spawned {
-                    tracing::error!(%e, "failed to spawn reconnect thread; unconnected devices stay down");
+                match spawned {
+                    Ok(thread) => Some(thread),
+                    Err(e) => {
+                        tracing::error!(%e, "failed to spawn reconnect thread; unconnected devices stay down");
+                        None
+                    }
                 }
-            }
+            } else { None };
 
             // Wrap the scan loop in catch_unwind so a panic in the VM
             // glue / iomap / snapshot fan-out doesn't skip failsafe.
@@ -978,79 +1224,137 @@ fn spawn_units_inner(
                 forces_clone,
                 device_health_clone,
                 watchdog_tripped_clone,
+                latch_reason_clone,
+                failsafe_status_clone.clone(),
                 scan_overruns_clone,
                 consecutive_overruns_clone,
                 fault_tx,
-                reconnect_rx,
+                &reconnect,
                 state_path,
             ))
             .catch_unwind()
             .await;
+            // Close delivery and take queued devices in one critical section.
+            // Nothing can be handed to a dead scan after this point. Adapters
+            // queued just before the exit join the same failsafe pass.
+            devices.extend(reconnect.finish());
             // A panic is a fault too: record it so the HTTP layer can
             // surface WHY the run died, not just that snapshots stopped.
             // (The failsafe + teardown below still run either way.)
             if let Err(panic) = &result {
-                let msg = panic
-                    .downcast_ref::<&str>()
-                    .map(|s| s.to_string())
-                    .or_else(|| panic.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "scan loop panicked".into());
-                record_fault(fault_tx, format!("scan loop panicked: {msg}"));
+                record_fault(
+                    fault_tx,
+                    format!("scan loop panicked: {}", panic_message(panic.as_ref())),
+                );
             }
 
-            // Always-run failsafe before the thread dies. Drive every
-            // device's outputs to zero so a hung / panicked / stopped
-            // program doesn't leave actuators energized.
+            // Always attempt each adapter's configured safe values before
+            // teardown, including after a failed or panicking earlier attempt.
             let dev_count = devices.len();
+            begin_failsafe_attempts(
+                &failsafe_status_clone,
+                devices.iter().map(|dev| dev.name()),
+            );
             let mut failsafe_failed = 0usize;
             for dev in devices.iter_mut() {
-                if let Err(e) = dev.enter_failsafe().await {
+                if attempt_device_failsafe(dev.as_mut(), &failsafe_status_clone).await.is_err() {
                     failsafe_failed += 1;
-                    tracing::warn!(device = %dev.name(), %e, "failsafe call failed");
                 }
             }
-            // Give an async-flush device (real EtherCAT) a cycle or two to
-            // push the zeros onto the bus. Conservative 50 ms covers
-            // cycle_us up to 25 ms; paid once, on shutdown.
+            // Allow an asynchronous adapter worker a brief flush opportunity
+            // before teardown. This delay does not establish transmission or
+            // physical state; paid once, on shutdown.
             tokio::time::sleep(Duration::from_millis(50)).await;
-            // Graceful per-device teardown: signal + JOIN any background
-            // I/O thread (the EtherCAT cyclic worker) so the zeroed
-            // controlword is guaranteed on the wire before we exit — not
-            // left to the drive's own watchdog after the master is gone.
-            // Runs on both the clean and panicked paths (before re-panic).
+            // Graceful per-device teardown: request shutdown and join owned
+            // workers according to each adapter's contract. An adapter that
+            // closed cleanly but could not confirm its last output returns
+            // an error, which is counted below. Runs on both the clean and
+            // panicked paths (before re-panic); errors are recorded.
             let mut shutdown_failed = 0usize;
             for dev in devices.iter_mut() {
-                if let Err(e) = dev.shutdown().await {
-                    shutdown_failed += 1;
-                    tracing::warn!(device = %dev.name(), %e, "device shutdown failed");
+                match isolate_device_call(dev.shutdown()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        shutdown_failed += 1;
+                        tracing::warn!(device = %dev.name(), %e, "device shutdown failed");
+                    }
+                    Err(panic) => {
+                        shutdown_failed += 1;
+                        tracing::error!(
+                            device = %dev.name(),
+                            %panic,
+                            "device shutdown PANICKED; continuing with the remaining devices"
+                        );
+                    }
                 }
             }
             // Failsafe + teardown done: release the reconnect worker (it
             // holds the runtime that late-connected adapters' background
             // tasks live on, and must outlive the writes above).
-            drained.store(true, Ordering::Relaxed);
-            // "Cleanly" only when nothing faulted: a VM trap or a failed
-            // start also returns normally, and its log used to read as a
-            // clean exit right after the error.
+            reconnect.drained.store(true, Ordering::Release);
+            // Bounded: a worker still inside a device connect must not hold
+            // the scan thread (and `shutdown()`) for the adapter's connect time.
+            let reconnect_end = match reconnect_thread {
+                Some(thread) => collect_reconnect_worker(thread, reconnect_join_grace).await,
+                None => ReconnectEnd::default(),
+            };
+            // "Cleanly" only when nothing faulted AND no device's failsafe or
+            // shutdown call failed: a VM trap or a failed start also returns
+            // normally, and a panicking or erroring adapter used to leave this
+            // line reading as a clean exit with the failure only in a field.
             let recorded = fault_tx.borrow().clone();
-            match (&result, recorded) {
-                (Ok(()), None) => tracing::info!(
+            let reconnect_failed = reconnect_end.failed;
+            let reconnect_unconfirmed = reconnect_end.unconfirmed;
+            let scan_end = classify_scan_end(
+                result.is_err(),
+                recorded.is_some(),
+                failsafe_failed,
+                shutdown_failed,
+                &reconnect_end,
+            );
+            #[cfg(test)]
+            record_scan_end(scan_end);
+            match scan_end {
+                ScanEnd::Clean => tracing::info!(
                     devices = dev_count,
                     failsafe_failed,
                     shutdown_failed,
+                    reconnect_failed,
                     "scan loop exited cleanly; failsafe and shutdown attempts completed"
                 ),
-                (Ok(()), Some(fault)) => tracing::error!(
+                ScanEnd::StoppedButDevicesFailed => tracing::error!(
                     devices = dev_count,
                     failsafe_failed,
                     shutdown_failed,
-                    %fault,
+                    reconnect_failed,
+                    reconnect_unconfirmed,
+                    "scan loop stopped, but failsafe or shutdown calls FAILED on some devices \
+                     (including a late-connecting one or its worker); their outputs are not \
+                     confirmed safe"
+                ),
+                ScanEnd::ReconnectUnconfirmed => tracing::warn!(
+                    devices = dev_count,
+                    failsafe_failed,
+                    shutdown_failed,
+                    "scan loop stopped and every connected device was failsafed and shut down, \
+                     but a reconnect attempt was still in flight; any adapter it produces is \
+                     cleaned up by its worker later and that outcome is NOT confirmed"
+                ),
+                ScanEnd::Fault => tracing::error!(
+                    devices = dev_count,
+                    failsafe_failed,
+                    shutdown_failed,
+                    reconnect_failed,
+                    reconnect_unconfirmed,
+                    fault = %recorded.as_deref().unwrap_or_default(),
                     "scan loop ended on a fault; failsafe and shutdown attempts completed"
                 ),
-                (Err(_), _) => tracing::error!(
+                ScanEnd::Panicked => tracing::error!(
                     devices = dev_count,
                     failsafe_failed,
                     shutdown_failed,
+                    reconnect_failed,
+                    reconnect_unconfirmed,
                     "scan loop PANICKED; failsafe and shutdown attempts completed before re-panic"
                 ),
             }
@@ -1074,9 +1378,166 @@ fn spawn_units_inner(
         device_reports,
         device_health,
         watchdog_tripped,
+        latch_reason,
+        failsafe_status,
         fault: fault_rx,
         thread: Arc::new(std::sync::Mutex::new(Some(join_handle))),
+        reconnect_done: reconnect_done_rx,
     }
+}
+
+/// How the scan thread ended, for its closing log line. A pure classification
+/// so the wording is testable without capturing another thread's log output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanEnd {
+    /// Stopped as asked (or ended on its own) with every failsafe and shutdown
+    /// call delivered.
+    Clean,
+    /// Ended without a fault, but at least one device's failsafe or shutdown
+    /// call returned an error or panicked, or a late-connecting device's
+    /// cleanup failed, or the reconnect worker itself panicked.
+    StoppedButDevicesFailed,
+    /// Every connected device was driven safe, but the reconnect worker was
+    /// still mid-connect when the scan thread stopped waiting for it: whatever
+    /// adapter it produces is failsafed later, off this thread, unconfirmed.
+    ReconnectUnconfirmed,
+    /// A VM trap or a failed start recorded a fault.
+    Fault,
+    /// The scan loop itself panicked.
+    Panicked,
+}
+
+/// Test builds only: how each scan thread's closing line was classified, by
+/// thread, so a test can check what the scan thread concluded instead of
+/// capturing log output. A real thread's id is never reused while it is alive.
+#[cfg(test)]
+static SCAN_ENDS: std::sync::Mutex<Vec<(std::thread::ThreadId, ScanEnd)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn record_scan_end(end: ScanEnd) {
+    SCAN_ENDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((std::thread::current().id(), end));
+}
+
+/// A panic outranks a fault, which outranks failed device calls (including the
+/// reconnect worker's), which outrank an unconfirmed reconnect, which outranks
+/// "clean".
+fn classify_scan_end(
+    panicked: bool,
+    faulted: bool,
+    failsafe_failed: usize,
+    shutdown_failed: usize,
+    reconnect: &ReconnectEnd,
+) -> ScanEnd {
+    if panicked {
+        ScanEnd::Panicked
+    } else if faulted {
+        ScanEnd::Fault
+    } else if failsafe_failed > 0 || shutdown_failed > 0 || reconnect.failed > 0 {
+        ScanEnd::StoppedButDevicesFailed
+    } else if reconnect.unconfirmed {
+        ScanEnd::ReconnectUnconfirmed
+    } else {
+        ScanEnd::Clean
+    }
+}
+
+/// Record why the outputs are being latched off; the first reason stands.
+fn note_latch_reason(slot: &std::sync::Mutex<Option<String>>, reason: String) {
+    if let Ok(mut r) = slot.lock() {
+        if r.is_none() {
+            *r = Some(reason);
+        }
+    }
+}
+
+/// The text of a panic payload, for logs and the recorded fault.
+pub(crate) fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".into())
+}
+
+/// Run one device's failsafe/shutdown call so that a panic in it fails THAT
+/// device only. These calls run after the scan loop has ended, outside its
+/// `catch_unwind`: unguarded, one adapter's panic (say an `.expect` on a
+/// poisoned lock) unwound the whole pass, and every device after it was
+/// never driven safe or shut down.
+async fn isolate_device_call<F>(call: F) -> Result<Result<(), iocore::IoError>, String>
+where
+    F: std::future::Future<Output = Result<(), iocore::IoError>>,
+{
+    use futures_util::FutureExt;
+    std::panic::AssertUnwindSafe(call)
+        .catch_unwind()
+        .await
+        .map_err(|panic| panic_message(panic.as_ref()))
+}
+
+/// Publish the whole target set before awaiting the first adapter. Preserve
+/// failures until an attempt succeeds, including while a retry is pending.
+fn begin_failsafe_attempts<'a>(
+    shared: &SharedFailsafeStatus,
+    names: impl IntoIterator<Item = &'a str>,
+) {
+    let mut slot = shared.lock().unwrap_or_else(|e| e.into_inner());
+    let status = slot.get_or_insert_with(FailsafeStatus::default);
+    for name in names {
+        status
+            .acknowledged
+            .retain(|acknowledged| acknowledged != name);
+        if !status.pending.iter().any(|pending| pending == name) {
+            status.pending.push(name.to_string());
+        }
+    }
+}
+
+/// Every runtime-owned safe-value pass uses the same per-device accounting
+/// and panic boundary. Callers mark the target batch pending first.
+async fn attempt_device_failsafe(
+    device: &mut dyn IoDevice,
+    shared: &SharedFailsafeStatus,
+) -> Result<(), DeviceFailsafeError> {
+    let name = device.name().to_string();
+    let result = match isolate_device_call(device.enter_failsafe()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(DeviceFailsafeError {
+            device: name.clone(),
+            error: error.to_string(),
+        }),
+        Err(panic) => Err(DeviceFailsafeError {
+            device: name.clone(),
+            error: format!("adapter panicked: {panic}"),
+        }),
+    };
+    {
+        let mut slot = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let status = slot.get_or_insert_with(FailsafeStatus::default);
+        status.pending.retain(|pending| pending != &name);
+        status.unconfirmed.retain(|error| error.device != name);
+        match &result {
+            Ok(()) => {
+                if !status.acknowledged.contains(&name) {
+                    status.acknowledged.push(name);
+                }
+            }
+            Err(error) => {
+                status
+                    .acknowledged
+                    .retain(|acknowledged| acknowledged != &name);
+                status.unconfirmed.push(error.clone());
+            }
+        }
+    }
+    if let Err(error) = &result {
+        tracing::error!(device = %error.device, error = %error.error, "adapter safe-value call unconfirmed; ordinary output inhibition is unchanged");
+    }
+    result
 }
 
 /// Connect every `DeviceSpec` into a live `IoDevice` adapter. A
@@ -1294,6 +1755,152 @@ async fn connect_one(spec: &DeviceSpec) -> (Option<Box<dyn IoDevice>>, DeviceRep
     }
 }
 
+/// A closed handoff stops retries immediately, independently of a requested
+/// Stop. `drained` is separate: the worker must still drive the I/O tasks of
+/// adapters already handed off until their failsafe/shutdown calls finish.
+struct ReconnectState {
+    devices: std::sync::Mutex<Option<Vec<Box<dyn IoDevice>>>>,
+    drained: AtomicBool,
+}
+
+impl Default for ReconnectState {
+    fn default() -> Self {
+        Self {
+            devices: std::sync::Mutex::new(Some(Vec::new())),
+            drained: AtomicBool::new(false),
+        }
+    }
+}
+
+impl ReconnectState {
+    fn finished(&self) -> bool {
+        self.devices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none()
+    }
+
+    fn deliver(&self, device: Box<dyn IoDevice>) -> Result<(), Box<dyn IoDevice>> {
+        let mut slot = self.devices.lock().unwrap_or_else(|e| e.into_inner());
+        match slot.as_mut() {
+            Some(devices) => {
+                devices.push(device);
+                Ok(())
+            }
+            None => Err(device),
+        }
+    }
+
+    fn take_devices(&self) -> Vec<Box<dyn IoDevice>> {
+        self.devices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+
+    fn finish(&self) -> Vec<Box<dyn IoDevice>> {
+        self.devices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .unwrap_or_default()
+    }
+}
+
+/// How long the scan thread waits, after its own failsafe/shutdown pass, for
+/// the reconnect worker to report. The worker may be inside an in-flight
+/// `connect_one`, which is deliberately not cancelled (an adapter can own a bus
+/// worker before it returns), so an unbounded wait would hold the scan thread
+/// and `ProgramHandle::shutdown` for as long as the adapter's connect takes.
+/// Past the grace the worker is left to finish alone: it still failsafes and
+/// shuts down any late adapter on its own runtime, but that outcome is
+/// reported as unconfirmed. Kept well under the edge runtime's 7 s drain.
+const RECONNECT_JOIN_GRACE: Duration = Duration::from_secs(2);
+
+/// What the reconnect worker reports when it exits. Adapters that connect after
+/// the scan has already ended are failsafed and shut down by the worker
+/// itself, so a failure there has to travel back to the exit summary.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ReconnectOutcome {
+    late_failsafe_failed: usize,
+    late_shutdown_failed: usize,
+}
+
+impl ReconnectOutcome {
+    fn failures(&self) -> usize {
+        self.late_failsafe_failed + self.late_shutdown_failed
+    }
+}
+
+/// What the scan thread knows about the worker's cleanup once it stopped waiting.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ReconnectEnd {
+    /// Failed late-adapter cleanup calls, plus one if the worker panicked.
+    failed: usize,
+    /// The worker was still busy after the grace: its outcome is not known.
+    unconfirmed: bool,
+}
+
+/// Wait at most `grace` for the reconnect worker, then stop waiting. Dropping
+/// the handle of a worker that is still running detaches it; it owns everything
+/// it touches (its runtime, the shared handoff, cloned `Arc`s) and exits by itself.
+async fn collect_reconnect_worker(
+    thread: std::thread::JoinHandle<ReconnectOutcome>,
+    grace: Duration,
+) -> ReconnectEnd {
+    let deadline = Instant::now() + grace;
+    while !thread.is_finished() {
+        if Instant::now() >= deadline {
+            tracing::error!(
+                grace_ms = grace.as_millis() as u64,
+                "reconnect worker is still inside a device connect; leaving it to clean up \
+                 any late adapter on its own — that outcome is NOT confirmed"
+            );
+            return ReconnectEnd {
+                failed: 0,
+                unconfirmed: true,
+            };
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    match thread.join() {
+        Ok(outcome) => ReconnectEnd {
+            failed: outcome.failures(),
+            unconfirmed: false,
+        },
+        Err(_) => {
+            tracing::error!("reconnect worker panicked during shutdown");
+            ReconnectEnd {
+                failed: 1,
+                unconfirmed: false,
+            }
+        }
+    }
+}
+
+/// An adapter that connected after the handoff had closed. Nobody will drive
+/// it any more, so drive it safe and shut it down here, on the runtime it
+/// lives on, and count what failed. Each call is isolated, so a panic in one
+/// does not skip the other.
+async fn clean_up_late_adapter(
+    name: &str,
+    mut device: Box<dyn IoDevice>,
+    outcome: &mut ReconnectOutcome,
+) {
+    let failsafe = isolate_device_call(device.enter_failsafe()).await;
+    if !matches!(failsafe, Ok(Ok(()))) {
+        outcome.late_failsafe_failed += 1;
+        tracing::error!(device = %name, ?failsafe, "late connection failsafe failed");
+    }
+    let shutdown = isolate_device_call(device.shutdown()).await;
+    if !matches!(shutdown, Ok(Ok(()))) {
+        outcome.late_shutdown_failed += 1;
+        tracing::error!(device = %name, ?shutdown, "late connection shutdown failed");
+    }
+}
+
 /// Background retry loop for devices that failed the initial connect.
 ///
 /// Runs on its own OS thread with a dedicated single-thread runtime so a
@@ -1301,16 +1908,17 @@ async fn connect_one(spec: &DeviceSpec) -> (Option<Box<dyn IoDevice>>, DeviceRep
 /// stall scan rounds. Retries every pending spec with a shared doubling
 /// backoff (1 s → 30 s cap); each success rewrites that device's
 /// /discover report in place and hands the live adapter to the scan
-/// loop, which binds the mappings it parked at startup. Exits when every
-/// spec has connected or the program stops (checked in ≤200 ms slices so
-/// shutdown isn't held up by a long backoff).
+/// loop, which binds the mappings it parked at startup. Retries stop when
+/// the scan ends (including faults) or Stop is requested, checked in ≤200 ms
+/// backoff slices. In-flight connects finish before their adapter is drained;
+/// delivered adapters keep this runtime alive until scan teardown completes.
+/// Returns the result of any late-adapter cleanup it had to do itself.
 fn reconnect_worker(
     mut pending: Vec<DeviceSpec>,
-    tx: std::sync::mpsc::Sender<Box<dyn IoDevice>>,
     reports: Arc<std::sync::Mutex<Vec<DeviceReport>>>,
     stop: Arc<AtomicBool>,
-    drained: Arc<AtomicBool>,
-) {
+    state: Arc<ReconnectState>,
+) -> ReconnectOutcome {
     const BACKOFF_START: Duration = Duration::from_secs(1);
     const BACKOFF_CAP: Duration = Duration::from_secs(30);
     let rt = match tokio::runtime::Builder::new_current_thread()
@@ -1320,7 +1928,7 @@ fn reconnect_worker(
         Ok(rt) => rt,
         Err(e) => {
             tracing::error!(%e, "failed to create reconnect runtime; unconnected devices stay down");
-            return;
+            return ReconnectOutcome::default();
         }
     };
     // Everything runs inside one block_on: adapters connected here spawn
@@ -1333,12 +1941,14 @@ fn reconnect_worker(
             devices = pending.len(),
             "entering background reconnect for devices that failed to connect"
         );
+        let mut outcome = ReconnectOutcome::default();
         let mut delivered_any = false;
         let mut backoff = BACKOFF_START;
-        while !pending.is_empty() && !stop.load(Ordering::Relaxed) {
+        let finished = || stop.load(Ordering::Relaxed) || state.finished();
+        while !pending.is_empty() && !finished() {
             let deadline = Instant::now() + backoff;
             loop {
-                if stop.load(Ordering::Relaxed) {
+                if finished() {
                     break;
                 }
                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1347,23 +1957,29 @@ fn reconnect_worker(
                 }
                 tokio::time::sleep(remaining.min(Duration::from_millis(200))).await;
             }
-            if stop.load(Ordering::Relaxed) {
+            if finished() {
                 break;
             }
             let mut still_pending = Vec::with_capacity(pending.len());
             for spec in pending {
+                if finished() {
+                    break;
+                }
                 let (device, report) = connect_one(&spec).await;
                 match device {
                     Some(d) => {
+                        // Do not cancel connect_one midway: some adapters own
+                        // a bus worker already. Finish acquisition, then drain
+                        // an unadopted adapter on its owning runtime.
+                        if let Err(d) = state.deliver(d) {
+                            clean_up_late_adapter(&spec.name, d, &mut outcome).await;
+                            break;
+                        }
                         tracing::info!(device = %spec.name, "background reconnect succeeded");
                         if let Ok(mut slot) = reports.lock() {
                             if let Some(r) = slot.iter_mut().find(|r| r.name == report.name) {
                                 *r = report;
                             }
-                        }
-                        // Scan loop gone ⇒ nobody left to adopt the device.
-                        if tx.send(d).is_err() {
-                            return;
                         }
                         delivered_any = true;
                     }
@@ -1373,20 +1989,21 @@ fn reconnect_worker(
             pending = still_pending;
             backoff = (backoff * 2).min(BACKOFF_CAP);
         }
-        if pending.is_empty() {
+        if pending.is_empty() && !finished() {
             tracing::info!("background reconnect complete; all configured devices connected");
         }
         if !delivered_any {
-            return; // nothing spawned onto this runtime; safe to wind down
+            return outcome; // nothing spawned onto this runtime; safe to wind down
         }
         // Keep driving the delivered adapters' background tasks until the
         // scan thread reports its failsafe/shutdown pass is DONE (`drained`).
         // Exiting on `stop` alone would race that pass: dropping this
         // runtime kills the poll tasks the failsafe writes go through.
-        while !drained.load(Ordering::Relaxed) {
+        while !state.drained.load(Ordering::Acquire) {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
-    });
+        outcome
+    })
 }
 
 /// Trip the watchdog after this many consecutive scan deadline overruns
@@ -1540,6 +2157,29 @@ fn resolve_var(
     var_index_by_name[i].get(rest).map(|&idx| (i, idx))
 }
 
+/// A value has already landed in the VM; report its own transport only.
+fn mapped_write_outcome(
+    value: i32,
+    idx: u16,
+    outputs: &[ResolvedMapping],
+    parked: &HashMap<u16, String>,
+    devices: &[Box<dyn IoDevice>],
+) -> WriteOutcome {
+    WriteOutcome {
+        value,
+        undelivered_device: outputs.iter().find(|rm| rm.var_index == idx).map_or_else(
+            // No live mapping: internal variable or device never connected.
+            || parked.get(&idx).cloned(),
+            |rm| {
+                devices
+                    .get(rm.device_index)
+                    .filter(|dev| !dev.is_healthy())
+                    .map(|dev| dev.name().to_string())
+            },
+        ),
+    }
+}
+
 /// Apply the project's write governance to a resolved `/write`. Returns
 /// the value to actually write — clamped to the matching rule's
 /// min/max when declared — or a governance denial.
@@ -1559,7 +2199,7 @@ fn resolve_var(
 /// decision; a governed force would no longer be a debug override, and
 /// an ungoverned exported force would be a hole — so force is simply
 /// never exported on any northbound surface). The monitor's pulse
-/// reset bypasses too, via `write_variable_ungoverned`: it is the
+/// reset bypasses too, via `reset_pulse`: it is the
 /// runtime's own safety action, not an external write.
 fn enforce_write_governance(
     governance: &WriteGovernance,
@@ -1751,6 +2391,9 @@ async fn run_loop_async(
     // tell a latched run from a healthy one — see the field docs on
     // `ProgramHandle::watchdog_tripped`.
     watchdog_tripped: Arc<AtomicBool>,
+    // Why it is latched; see `ProgramHandle::latch_reason`.
+    latch_reason: Arc<std::sync::Mutex<Option<String>>>,
+    failsafe_status: SharedFailsafeStatus,
     // Achieved-cadence counters for /status: deadlines missed since start and
     // the longest current streak. The overrun log line fires once per unit and
     // then suppresses itself, so it cannot answer "still overrunning?".
@@ -1760,7 +2403,7 @@ async fn run_loop_async(
     // record into the same channel (and so the sender drops — closing
     // the watch — only when the scan thread exits).
     fault: &tokio::sync::watch::Sender<Option<String>>,
-    reconnect_rx: std::sync::mpsc::Receiver<Box<dyn IoDevice>>,
+    reconnect: &ReconnectState,
     state_path: Option<PathBuf>,
 ) {
     if units.is_empty() {
@@ -1789,6 +2432,35 @@ async fn run_loop_async(
         }
     };
 
+    // The interruptible upstream driver executes one instance. This matches
+    // compile_project_units; reject foreign multi-instance containers instead
+    // of silently skipping their later programs or running them unbounded.
+    for unit in &units {
+        if unit.container.task_table.programs.len() != 1 {
+            record_fault(
+                fault,
+                format!(
+                    "VM requires exactly one program instance in {}",
+                    unit.instance
+                ),
+            );
+            return;
+        }
+    }
+    let execution_tasks: Vec<_> = units
+        .iter()
+        .map(|unit| {
+            let id = unit.container.task_table.programs[0].task_id;
+            unit.container
+                .task_table
+                .tasks
+                .iter()
+                .find(|task| task.task_id == id)
+                .map(|task| (task.flags & 1 != 0, task.watchdog_us))
+                .unwrap_or((false, 0))
+        })
+        .collect();
+
     // IA2 owns cadence, pause and step. Upstream now compiles cyclic task
     // tables; normalize even caller-supplied CONFIGURATIONs so every bridge
     // scan executes exactly once, without a second scheduler skipping it.
@@ -1809,7 +2481,15 @@ async fn run_loop_async(
         .collect();
     let mut runnings: Vec<VmRunning<'_>> = Vec::with_capacity(n_units);
     for (unit, buf) in units.iter().zip(bufs.iter_mut()) {
-        match Vm::new().load(&unit.container, buf).start() {
+        match Vm::new()
+            .load(&unit.container, buf)
+            .map_err(|trap| ironplc_vm::FaultContext {
+                trap,
+                task_id: ironplc_container::TaskId::DEFAULT,
+                instance_id: ironplc_container::InstanceId::DEFAULT,
+            })
+            .and_then(|ready| ready.start())
+        {
             Ok(r) => runnings.push(r),
             Err(ctx) => {
                 tracing::error!(instance = %unit.instance, ?ctx.trap, "vm failed to start");
@@ -2027,6 +2707,7 @@ async fn run_loop_async(
     let scan_trace = crate::scan_trace::Recorder::from_env(&instances);
     #[cfg(feature = "scan-trace")]
     let mut trace_sleep = None;
+    let mut pulse_owners: HashMap<(usize, u16), Arc<()>> = HashMap::new();
     let start = Instant::now();
     let mut last_snapshot = Instant::now() - Duration::from_secs(1);
     let mut last_retain_flush = Instant::now();
@@ -2053,23 +2734,20 @@ async fn run_loop_async(
     // then tasks.toml declaration order.
     let mut exec_order: Vec<usize> = (0..n_units).collect();
     exec_order.sort_by_key(|&i| (units[i].priority, i));
-    // Watchdog: any unit accumulating WATCHDOG_OVERRUN_THRESHOLD
-    // consecutive overruns fires failsafe once and latches — the loop keeps
-    // scanning so operators can see live state, but outputs stay safe until
-    // the program is restarted (industrial convention).
+    // Any unit accumulating WATCHDOG_OVERRUN_THRESHOLD consecutive
+    // overruns inhibits ordinary outputs until restart, and requests each
+    // adapter's safe values once. The loop keeps computing for observation.
     //
-    // `watchdog_tripped` IS the latch, not just a fire-once debounce: the
-    // output phase below runs only while it is clear. Setting it on trip is
-    // what makes the zeros written by `enter_failsafe` stick — otherwise the
-    // very next scan would push freshly computed (non-zero) values back over
-    // them, and the "outputs stay safe" promise above would be a comment
-    // with no code behind it.
+    // The latch guards ordinary output writes even if a safe-value request
+    // fails. Successful requests must not be overwritten on the next scan;
+    // failed requests remain visible in failsafe_status until explicitly
+    // retried or attempted again during cleanup.
     //
     // It is the shared flag rather than a local, so exactly one piece of
     // state answers "are outputs latched off" for both the loop and the
     // HTTP layer.
     let mut prev_paused = false;
-    let mut vm_fault = false;
+    let mut scan_aborted = false;
     // Pending fault injection (InjectScanStall). Owned by the loop:
     // written from the command drain, consumed one TICK at a time.
     let mut inject_stall_ms: u64 = 0;
@@ -2087,7 +2765,7 @@ async fn run_loop_async(
         // append to the device set and bind the mappings that were parked
         // at startup because this device wasn't there. Runs before the
         // health refresh so the adopted device flips healthy this round.
-        while let Ok(dev) = reconnect_rx.try_recv() {
+        for dev in reconnect.take_devices() {
             let name = dev.name().to_string();
             let device_index = devices.len();
             devices.push(dev);
@@ -2127,17 +2805,8 @@ async fn run_loop_async(
             // never be written at all.
             if watchdog_tripped.load(Ordering::Relaxed) {
                 if let Some(dev) = devices.last_mut() {
-                    match dev.enter_failsafe().await {
-                        Ok(()) => tracing::warn!(
-                            device = %name,
-                            "device joined while the watchdog was latched — put \
-                             straight into failsafe instead of going live"
-                        ),
-                        Err(e) => tracing::error!(
-                            device = %name, %e,
-                            "failsafe on a device adopted under a latched watchdog failed"
-                        ),
-                    }
+                    begin_failsafe_attempts(&failsafe_status, [name.as_str()]);
+                    let _ = attempt_device_failsafe(dev.as_mut(), &failsafe_status).await;
                 }
             }
         }
@@ -2189,58 +2858,38 @@ async fn run_loop_async(
                 RuntimeCommand::WriteVariable {
                     name,
                     value,
-                    governed,
+                    pulse_owner,
                     ack,
                 } => {
                     let result = match resolve_var(&name, &instances, &var_index_by_name) {
                         Some((u, idx)) => {
-                            // Internal runtime writes (the pulse reset)
-                            // bypass governance by design — see
-                            // `write_variable_ungoverned`.
-                            let allowed = if governed {
-                                enforce_write_governance(
-                                    &governance,
-                                    &name,
-                                    u,
-                                    idx,
-                                    value,
-                                    &instances,
-                                    &debug_maps,
-                                )
-                            } else {
-                                Ok(value)
-                            };
+                            let allowed = enforce_write_governance(
+                                &governance,
+                                &name,
+                                u,
+                                idx,
+                                value,
+                                &instances,
+                                &debug_maps,
+                            );
                             match allowed {
                                 Ok(v) => match runnings[u].write_variable(VarIndex::new(idx), v) {
-                                    // The value is in the VM either way. Report
-                                    // — do not refuse — when its own device
-                                    // cannot carry it out: scoped to THIS
-                                    // variable's device, so an unrelated island
-                                    // going down never costs the operator a
-                                    // control it could still have used.
-                                    Ok(()) => Ok(WriteOutcome {
-                                        value: v,
-                                        undelivered_device: unit_outputs[u]
-                                            .iter()
-                                            .find(|rm| rm.var_index == idx)
-                                            .map_or_else(
-                                                // Nothing bound: either this
-                                                // variable has no Output
-                                                // mapping at all (nothing to
-                                                // deliver, correctly silent),
-                                                // or its device never
-                                                // connected — which is
-                                                // undelivered without needing
-                                                // to ask anyone's health.
-                                                || parked_output_device[u].get(&idx).cloned(),
-                                                |rm| {
-                                                    devices
-                                                        .get(rm.device_index)
-                                                        .filter(|dev| !dev.is_healthy())
-                                                        .map(|dev| dev.name().to_string())
-                                                },
-                                            ),
-                                    }),
+                                    Ok(()) => {
+                                        // Only an accepted write supersedes a pulse;
+                                        // governance/VM failures leave its reset live.
+                                        if let Some(owner) = pulse_owner {
+                                            pulse_owners.insert((u, idx), owner);
+                                        } else {
+                                            pulse_owners.remove(&(u, idx));
+                                        }
+                                        Ok(mapped_write_outcome(
+                                            v,
+                                            idx,
+                                            &unit_outputs[u],
+                                            &parked_output_device[u],
+                                            devices,
+                                        ))
+                                    }
                                     Err(trap) => Err(RuntimeWriteError::Vm(format!("{trap:?}"))),
                                 },
                                 Err(e) => Err(e),
@@ -2250,17 +2899,50 @@ async fn run_loop_async(
                     };
                     let _ = ack.send(result);
                 }
+                RuntimeCommand::ResetPulse { token, ack } => {
+                    let result = match resolve_var(&token.name, &instances, &var_index_by_name) {
+                        Some((u, idx)) => {
+                            if pulse_owners
+                                .get(&(u, idx))
+                                .is_some_and(|owner| Arc::ptr_eq(owner, &token.owner))
+                            {
+                                // No await between ownership validation and the
+                                // write: a queued later write cannot be erased.
+                                let result = runnings[u]
+                                    .write_variable(VarIndex::new(idx), 0)
+                                    .map(|()| {
+                                        Some(mapped_write_outcome(
+                                            0,
+                                            idx,
+                                            &unit_outputs[u],
+                                            &parked_output_device[u],
+                                            devices,
+                                        ))
+                                    })
+                                    .map_err(|trap| RuntimeWriteError::Vm(format!("{trap:?}")));
+                                pulse_owners.remove(&(u, idx));
+                                result
+                            } else {
+                                Ok(None)
+                            }
+                        }
+                        None => Err(RuntimeWriteError::UnknownVariable(token.name)),
+                    };
+                    let _ = ack.send(result);
+                }
                 RuntimeCommand::ForceVariable { name, value, ack } => {
                     // Reject unknown names early so the caller gets
                     // immediate feedback instead of a silent no-op.
-                    let result = if resolve_var(&name, &instances, &var_index_by_name).is_some() {
-                        if let Ok(mut f) = forces.lock() {
-                            f.insert(name.clone(), value);
-                        }
-                        Ok(value)
-                    } else {
-                        Err(RuntimeWriteError::UnknownVariable(name))
-                    };
+                    let result =
+                        if let Some(slot) = resolve_var(&name, &instances, &var_index_by_name) {
+                            if let Ok(mut f) = forces.lock() {
+                                f.insert(name.clone(), value);
+                                pulse_owners.remove(&slot);
+                            }
+                            Ok(value)
+                        } else {
+                            Err(RuntimeWriteError::UnknownVariable(name))
+                        };
                     let _ = ack.send(result);
                 }
                 RuntimeCommand::UnforceVariable { name, ack } => {
@@ -2268,6 +2950,50 @@ async fn run_loop_async(
                         f.remove(&name);
                     }
                     let _ = ack.send(Ok(()));
+                }
+                RuntimeCommand::LatchOutputsOff { reason, ack } => {
+                    let newly = !watchdog_tripped.load(Ordering::Relaxed);
+                    let targets: Vec<String> = if newly {
+                        devices.iter().map(|dev| dev.name().to_string()).collect()
+                    } else {
+                        failsafe_status
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .as_ref()
+                            .map(|status| {
+                                status
+                                    .unconfirmed
+                                    .iter()
+                                    .map(|e| e.device.clone())
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    };
+                    begin_failsafe_attempts(&failsafe_status, targets.iter().map(String::as_str));
+                    if newly {
+                        note_latch_reason(&latch_reason, reason.clone());
+                        // Publish inhibition before awaiting any adapter. A
+                        // failed or panicking safe-value call never re-arms it.
+                        watchdog_tripped.store(true, Ordering::Release);
+                        tracing::error!(%reason, "outputs inhibited on request; requesting adapter safe values");
+                    }
+                    for dev in devices.iter_mut() {
+                        if targets.iter().any(|name| name == dev.name()) {
+                            let _ = attempt_device_failsafe(dev.as_mut(), &failsafe_status).await;
+                        }
+                    }
+                    let errors = failsafe_status
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                        .map(|status| status.unconfirmed.clone())
+                        .unwrap_or_default();
+                    let result = if errors.is_empty() {
+                        Ok(newly)
+                    } else {
+                        Err(OutputLatchError::FailsafeUnconfirmed { errors })
+                    };
+                    let _ = ack.send(result);
                 }
                 RuntimeCommand::InjectScanStall {
                     stall_ms,
@@ -2300,13 +3026,14 @@ async fn run_loop_async(
             }
         }
 
-        // Mode check. Paused → skip every unit's cycle (no IO, no run,
-        // no output) — the whole plant freezes together. Step{remaining}
+        // Mode check. Paused → skip every unit's cycle (no input read, no
+        // run, no output push); adapter workers keep running, see
+        // `RuntimeMode::Paused`. Step{remaining}
         // → execute this tick, decrement at the bottom; when remaining
         // hits 0 transition to Paused. Snapshots still go out while
         // paused (at the regular 10 Hz cadence) so Monitor keeps
         // showing the frozen state.
-        let current_mode = mode.lock().map(|m| *m).unwrap_or(RuntimeMode::Running);
+        let current_mode = *lock_mode(&mode);
         if sync_device.is_some()
             && !matches!(current_mode, RuntimeMode::Running)
             && !watchdog_tripped.load(Ordering::Relaxed)
@@ -2314,6 +3041,8 @@ async fn run_loop_async(
             latch_cycle_fault(
                 devices,
                 &watchdog_tripped,
+                &latch_reason,
+                &failsafe_status,
                 "pause/step interrupts synchronized scans",
             )
             .await;
@@ -2391,6 +3120,8 @@ async fn run_loop_async(
                     latch_cycle_fault(
                         devices,
                         &watchdog_tripped,
+                        &latch_reason,
+                        &failsafe_status,
                         "cycle wait failed or clock stopped",
                     )
                     .await;
@@ -2475,6 +3206,8 @@ async fn run_loop_async(
                             latch_cycle_fault(
                                 devices,
                                 &watchdog_tripped,
+                                &latch_reason,
+                                &failsafe_status,
                                 &format!("cycle input failed: {e}"),
                             )
                             .await;
@@ -2504,21 +3237,59 @@ async fn run_loop_async(
 
             // Run one scan for this unit
             let now_us = start.elapsed().as_micros() as u64;
-            if let Err(ctx) = runnings[i].run_round(now_us) {
-                tracing::error!(instance = %instances[i], ?ctx.trap, "vm trap during run_round");
-                // Record WHY before breaking — the watch write is what
-                // wakes the HTTP layer's forwarder, turning a silent halt
-                // into a visible fault on /status + SSE.
-                record_fault(
-                    fault,
-                    format!("VM trap in {}: {:?}", instances[i], ctx.trap),
-                );
-                // One faulted unit stops the whole plant — consistent
-                // with pause semantics ("the plant freezes together")
-                // and the safest default; the wrapper's failsafe pass
-                // then zeroes every output.
-                vm_fault = true;
-                break;
+            let result = if execution_tasks[i].0 {
+                run_scan(&mut runnings[i], now_us, &stop, execution_tasks[i].1)
+            } else {
+                Ok(ScanOutcome::Completed)
+            };
+            match result {
+                Ok(ScanOutcome::Completed) => {}
+                Ok(ScanOutcome::Stopped) => {
+                    // Stop outlasted its grace inside this scan (a hung
+                    // program): the partial scan is never published or
+                    // persisted. A scan that finishes returns Completed and
+                    // the loop-top Stop check ends the run normally.
+                    scan_aborted = true;
+                    break;
+                }
+                Ok(ScanOutcome::BudgetExceeded(budget)) => {
+                    begin_failsafe_attempts(&failsafe_status, devices.iter().map(|dev| dev.name()));
+                    note_latch_reason(
+                        &latch_reason,
+                        format!(
+                            "VM execution budget exceeded in {}: {}",
+                            instances[i],
+                            budget.describe()
+                        ),
+                    );
+                    watchdog_tripped.store(true, Ordering::Release);
+                    record_fault(
+                        fault,
+                        format!(
+                            "VM execution budget exceeded in {}: {}",
+                            instances[i],
+                            budget.describe()
+                        ),
+                    );
+                    scan_aborted = true;
+                    break;
+                }
+                Err(ctx) => {
+                    tracing::error!(instance = %instances[i], ?ctx.trap, "vm trap during run_round");
+                    // Record WHY before breaking — the watch write is what
+                    // wakes the HTTP layer's forwarder, turning a silent halt
+                    // into a visible fault on /status + SSE.
+                    record_fault(
+                        fault,
+                        format!("VM trap in {}: {:?}", instances[i], ctx.trap),
+                    );
+                    // One faulted unit stops the whole plant — consistent
+                    // with pause semantics ("the plant freezes together")
+                    // and the safest default; the wrapper then attempts
+                    // each adapter's configured safe values.
+                    scan_aborted = true;
+                    break;
+                }
             }
             clocks[i].scan_count += 1;
             #[cfg(feature = "scan-trace")]
@@ -2526,12 +3297,10 @@ async fn run_loop_async(
 
             // Output phase: this unit's VM variables → bus.
             //
-            // Skipped entirely once the watchdog has latched. `enter_failsafe`
-            // zeroed the output mirror; the cyclic bus thread keeps flushing
-            // that mirror every cycle, so leaving it alone is what holds the
-            // outputs safe. Writing here would overwrite the zeros on the very
-            // next scan — which is exactly the bug this guard closes. The scan
-            // itself keeps running so operators still see live state.
+            // Once inhibited, never overwrite an adapter's requested safe
+            // values with normal VM output. This guard also holds when its
+            // safe-value attempt failed; failsafe_status reports that result
+            // separately. Adapter workers retain their own transport behavior.
             if !watchdog_tripped.load(Ordering::Relaxed) {
                 for rm in &unit_outputs[i] {
                     let Ok(raw) = runnings[i].read_variable_raw(VarIndex::new(rm.var_index)) else {
@@ -2546,6 +3315,8 @@ async fn run_loop_async(
                             latch_cycle_fault(
                                 devices,
                                 &watchdog_tripped,
+                                &latch_reason,
+                                &failsafe_status,
                                 &format!("cycle output failed: {e}"),
                             )
                             .await;
@@ -2637,17 +3408,22 @@ async fn run_loop_async(
                         consecutive = clocks[i].consecutive_overruns,
                         threshold = WATCHDOG_OVERRUN_THRESHOLD,
                         interval_us = clocks[i].interval.as_micros() as u64,
-                        "watchdog tripped — engaging failsafe (outputs zeroed \
-                         and latched off; restart the program to re-arm)"
+                        "watchdog tripped — inhibiting ordinary outputs and requesting \
+                         adapter safe values; restart the program to re-arm"
                     );
+                    begin_failsafe_attempts(&failsafe_status, devices.iter().map(|dev| dev.name()));
+                    // Inhibit ordinary writes before any safe-value attempt.
+                    note_latch_reason(
+                        &latch_reason,
+                        format!(
+                            "scan watchdog: {} consecutive overruns on {}",
+                            clocks[i].consecutive_overruns, instances[i]
+                        ),
+                    );
+                    watchdog_tripped.store(true, Ordering::Release);
                     for dev in devices.iter_mut() {
-                        if let Err(e) = dev.enter_failsafe().await {
-                            tracing::warn!(device = %dev.name(), %e, "watchdog failsafe call failed");
-                        }
+                        let _ = attempt_device_failsafe(dev.as_mut(), &failsafe_status).await;
                     }
-                    // Latch: from here on the output phase is skipped, so the
-                    // zeros just written stay on the bus until a restart.
-                    watchdog_tripped.store(true, Ordering::Relaxed);
                 }
                 clocks[i].next_due = after + clocks[i].interval;
             }
@@ -2662,18 +3438,15 @@ async fn run_loop_async(
                 Ordering::Relaxed,
             );
         }
-        if vm_fault {
+        if scan_aborted {
             break;
         }
-        if sync_active
-            && !matches!(
-                mode.lock().map(|m| *m).unwrap_or(RuntimeMode::Paused),
-                RuntimeMode::Running
-            )
-        {
+        if sync_active && !matches!(*lock_mode(&mode), RuntimeMode::Running) {
             latch_cycle_fault(
                 devices,
                 &watchdog_tripped,
+                &latch_reason,
+                &failsafe_status,
                 "pause/step interrupts synchronized scans",
             )
             .await;
@@ -2689,6 +3462,8 @@ async fn run_loop_async(
                 latch_cycle_fault(
                     devices,
                     &watchdog_tripped,
+                    &latch_reason,
+                    &failsafe_status,
                     &format!("cycle commit failed: {e}"),
                 )
                 .await;
@@ -2699,18 +3474,8 @@ async fn run_loop_async(
         // one unit ran, and auto-pause at 0. Done AFTER the tick so
         // `step(1)` means "advance by exactly one scheduler tick"
         // (from pause, that's one scan of every unit).
-        if ran_any {
-            if let RuntimeMode::Step { remaining } = current_mode {
-                if let Ok(mut m) = mode.lock() {
-                    *m = if remaining <= 1 {
-                        RuntimeMode::Paused
-                    } else {
-                        RuntimeMode::Step {
-                            remaining: remaining - 1,
-                        }
-                    };
-                }
-            }
+        if ran_any && matches!(current_mode, RuntimeMode::Step { .. }) {
+            finish_step_tick(&mode);
         }
 
         // Snapshot at ~10 Hz (also when no unit was due this tick —
@@ -2782,8 +3547,10 @@ async fn run_loop_async(
 
     // Final RETAIN flush on graceful exit. Captures whatever the
     // last completed scan produced — that's the right "checkpoint"
-    // value to reload on next startup.
-    if !retain_entries.is_empty() {
+    // value to reload on next startup. Skipped after an abort (VM trap,
+    // exhausted budget, or a Stop that found a hung scan): the interrupted
+    // unit's variables are partial, so the last periodic checkpoint stands.
+    if !scan_aborted && !retain_entries.is_empty() {
         if let Some(path) = state_path.as_deref() {
             let now_us = start.elapsed().as_micros() as u64;
             persist_retain_values(
@@ -2980,6 +3747,10 @@ mod tests {
     use super::*;
     use iocore::IoError;
 
+    include!("runtime_regressions.rs");
+    include!("runtime_pulse_tests.rs");
+    include!("runtime_latch_tests.rs");
+
     /// Records the order of the safety-critical shutdown callbacks so a
     /// test can assert `enter_failsafe` runs before `shutdown` — the
     /// sequence that guarantees zeroed outputs reach the wire before a
@@ -3145,6 +3916,342 @@ mod tests {
         assert!(
             order_ok.load(Ordering::Relaxed),
             "failsafe must precede device shutdown so zeroed outputs flush before the join"
+        );
+    }
+
+    /// Repro device for the scan-thread panic path. `is_healthy` runs every
+    /// round inside the `catch_unwind`ed loop, so arming `loop_panic` is a
+    /// scan-loop panic; `failsafe_panics` models an adapter whose failsafe
+    /// itself panics (e.g. an `.expect` on a poisoned lock).
+    struct PanicDevice {
+        name: String,
+        loop_panic: Arc<AtomicBool>,
+        failsafe_panics: bool,
+        shutdown_panics: bool,
+        failsafe_called: Arc<AtomicBool>,
+        shutdown_called: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl IoDevice for PanicDevice {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        async fn read_channel(&mut self, _channel: &str) -> Result<ChannelValue, IoError> {
+            Ok(ChannelValue::I32(0))
+        }
+        async fn write_channel(
+            &mut self,
+            _channel: &str,
+            _value: ChannelValue,
+        ) -> Result<(), IoError> {
+            Ok(())
+        }
+        async fn enter_failsafe(&mut self) -> Result<(), IoError> {
+            self.failsafe_called.store(true, Ordering::Relaxed);
+            if self.failsafe_panics {
+                panic!("injected failsafe panic");
+            }
+            Ok(())
+        }
+        async fn shutdown(&mut self) -> Result<(), IoError> {
+            self.shutdown_called.store(true, Ordering::Relaxed);
+            if self.shutdown_panics {
+                panic!("injected shutdown panic");
+            }
+            Ok(())
+        }
+        fn is_healthy(&self) -> bool {
+            if self.loop_panic.load(Ordering::Relaxed) {
+                panic!("injected scan-loop panic");
+            }
+            true
+        }
+    }
+
+    fn panic_device(
+        name: &str,
+        loop_panic: &Arc<AtomicBool>,
+        failsafe_panics: bool,
+    ) -> (PanicDevice, Arc<AtomicBool>, Arc<AtomicBool>) {
+        let failsafe_called = Arc::new(AtomicBool::new(false));
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+        (
+            PanicDevice {
+                name: name.into(),
+                loop_panic: loop_panic.clone(),
+                failsafe_panics,
+                shutdown_panics: false,
+                failsafe_called: failsafe_called.clone(),
+                shutdown_called: shutdown_called.clone(),
+            },
+            failsafe_called,
+            shutdown_called,
+        )
+    }
+
+    /// Run `devices` until `armed` flips, then wait for the fault the panic
+    /// must leave behind. Returns the handle (still joinable).
+    async fn run_until_loop_panic(
+        devices: Vec<Box<dyn IoDevice>>,
+        armed: &Arc<AtomicBool>,
+    ) -> (ProgramHandle, Option<String>) {
+        let handle = spawn_units_inner(
+            vec![single_unit(trivial_container(), 5)],
+            DeviceSource::Prebuilt(devices),
+            Vec::new(),
+            None,
+            WriteGovernance::default(),
+        );
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        armed.store(true, Ordering::Relaxed);
+        let fault = tokio::time::timeout(
+            Duration::from_secs(3),
+            handle.fault_watch().wait_for(|f| f.is_some()),
+        )
+        .await
+        .ok()
+        .and_then(|r| r.ok().and_then(|f| f.clone()));
+        (handle, fault)
+    }
+
+    /// COVERAGE GAP 1: nothing in the suite ever panics the scan loop, so
+    /// "a panic still fails every device safe and is reported as a fault"
+    /// was only ever read off the code. This runs it.
+    #[tokio::test]
+    async fn a_scan_loop_panic_still_fails_every_device_safe_and_records_the_fault() {
+        let armed = Arc::new(AtomicBool::new(false));
+        let (a, a_fs, a_sd) = panic_device("a", &armed, false);
+        let (b, b_fs, b_sd) = panic_device("b", &Arc::new(AtomicBool::new(false)), false);
+        let (handle, fault) = run_until_loop_panic(vec![Box::new(a), Box::new(b)], &armed).await;
+
+        let fault = fault.expect("a scan-loop panic must be recorded as a fault");
+        assert!(
+            fault.contains("scan loop panicked") && fault.contains("injected scan-loop panic"),
+            "{fault}"
+        );
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("joined");
+        for (what, flag) in [
+            ("a failsafe", &a_fs),
+            ("a shutdown", &a_sd),
+            ("b failsafe", &b_fs),
+            ("b shutdown", &b_sd),
+        ] {
+            assert!(
+                flag.load(Ordering::Relaxed),
+                "{what} must run after a panic"
+            );
+        }
+    }
+
+    #[test]
+    fn the_closing_log_line_is_clean_only_when_nothing_failed() {
+        use ScanEnd::*;
+        let quiet = ReconnectEnd::default();
+        let late_failure = ReconnectEnd {
+            failed: 1,
+            unconfirmed: false,
+        };
+        let in_flight = ReconnectEnd {
+            failed: 0,
+            unconfirmed: true,
+        };
+        for (panicked, faulted, fs, sd, reconnect, want) in [
+            (false, false, 0, 0, &quiet, Clean),
+            (false, false, 1, 0, &quiet, StoppedButDevicesFailed),
+            (false, false, 0, 2, &quiet, StoppedButDevicesFailed),
+            // A late-connecting device's failed cleanup, or a panicked
+            // worker, is a device failure too — not a clean exit.
+            (false, false, 0, 0, &late_failure, StoppedButDevicesFailed),
+            // Still mid-connect: neither clean nor a known failure.
+            (false, false, 0, 0, &in_flight, ReconnectUnconfirmed),
+            (false, false, 1, 0, &in_flight, StoppedButDevicesFailed),
+            (false, true, 0, 0, &quiet, Fault),
+            (false, true, 3, 3, &late_failure, Fault),
+            (false, true, 0, 0, &in_flight, Fault),
+            (true, false, 0, 0, &quiet, Panicked),
+            (true, true, 5, 5, &late_failure, Panicked),
+        ] {
+            assert_eq!(
+                classify_scan_end(panicked, faulted, fs, sd, reconnect),
+                want,
+                "panicked={panicked} faulted={faulted} failsafe_failed={fs} \
+                 shutdown_failed={sd} reconnect={reconnect:?}"
+            );
+        }
+    }
+
+    /// Join `thread` if it ends within `limit`; otherwise hand the un-joined
+    /// handle back. It polls `is_finished` and joins only once that is true,
+    /// so the join returns at once and a thread that never exits cannot hang
+    /// the runtime. (`spawn_blocking(thread.join())` under a timeout does not
+    /// have that property: the timeout abandons the future but not the blocking
+    /// task, and dropping the runtime then waits for it forever.)
+    async fn join_within<T>(
+        thread: std::thread::JoinHandle<T>,
+        limit: Duration,
+    ) -> Result<std::thread::Result<T>, std::thread::JoinHandle<T>> {
+        let deadline = Instant::now() + limit;
+        while !thread.is_finished() {
+            if Instant::now() >= deadline {
+                return Err(thread);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Ok(thread.join())
+    }
+
+    /// Join the scan thread itself. `ProgramHandle::shutdown` swallows the
+    /// join error (it only logs it), so a test that waits on `shutdown` alone
+    /// cannot tell a thread that finished its pass from one that unwound out
+    /// of it — nor that it finished at all, if the result is dropped. A thread
+    /// that does not exit within 5 s fails the test instead of hanging it.
+    async fn join_scan_thread(handle: &ProgramHandle) -> std::thread::Result<()> {
+        let thread = handle
+            .thread
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the scan thread handle is still held");
+        match join_within(thread, Duration::from_secs(5)).await {
+            Ok(joined) => joined,
+            Err(_still_running) => panic!("the scan thread must exit within 5s"),
+        }
+    }
+
+    #[tokio::test]
+    async fn join_within_returns_the_result_of_a_thread_that_ends() {
+        let quick = std::thread::spawn(|| std::thread::sleep(Duration::from_millis(30)));
+        let joined = join_within(quick, Duration::from_secs(5))
+            .await
+            .expect("a thread that ends in time is joined");
+        assert!(joined.is_ok());
+
+        let panicking = std::thread::Builder::new()
+            .spawn(|| panic!("injected thread panic"))
+            .unwrap();
+        let joined = join_within(panicking, Duration::from_secs(5))
+            .await
+            .expect("a thread that panics is still joined");
+        assert_eq!(
+            panic_message(joined.expect_err("it panicked").as_ref()),
+            "injected thread panic"
+        );
+    }
+
+    /// The point of the helper: a thread that never exits gives up at the
+    /// limit and returns the handle, rather than waiting on it.
+    #[tokio::test]
+    async fn join_within_gives_up_on_a_thread_that_never_exits() {
+        let (release, parked) = std::sync::mpsc::channel::<()>();
+        let stuck = std::thread::spawn(move || {
+            let _ = parked.recv();
+        });
+        let started = Instant::now();
+        let stuck = join_within(stuck, Duration::from_millis(150))
+            .await
+            .expect_err("a parked thread is not joined");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "gave up promptly, took {:?}",
+            started.elapsed()
+        );
+
+        release.send(()).unwrap();
+        stuck.join().expect("the parked thread ends once released");
+    }
+
+    /// The post-panic failsafe pass runs OUTSIDE the loop's `catch_unwind`,
+    /// so each device's call is isolated: one adapter whose failsafe panics
+    /// must not stop the devices after it from getting `enter_failsafe` and
+    /// `shutdown`. The thread still ends by re-raising the ORIGINAL scan-loop
+    /// panic — by design, so it dies with a backtrace — and not the failsafe's.
+    #[tokio::test]
+    async fn one_devices_panicking_failsafe_must_not_skip_the_others() {
+        let armed = Arc::new(AtomicBool::new(false));
+        let (a, _a_fs, _a_sd) = panic_device("a", &armed, true); // panics in failsafe
+        let (b, b_fs, b_sd) = panic_device("b", &Arc::new(AtomicBool::new(false)), false);
+        let (handle, _fault) = run_until_loop_panic(vec![Box::new(a), Box::new(b)], &armed).await;
+        let joined = join_scan_thread(&handle).await;
+        let (fs, sd) = (b_fs.load(Ordering::Relaxed), b_sd.load(Ordering::Relaxed));
+        assert!(
+            fs && sd,
+            "a's failsafe panic skipped device b: failsafe_ran={fs} shutdown_ran={sd}"
+        );
+        let payload = joined.expect_err("the original scan-loop panic is re-raised");
+        assert_eq!(
+            panic_message(payload.as_ref()),
+            "injected scan-loop panic",
+            "the thread must die of the scan loop's panic, not a failsafe's"
+        );
+    }
+
+    /// Same isolation for the teardown pass: a device whose `shutdown`
+    /// panics must not stop the next device being shut down. As above, the
+    /// thread ends with the original scan-loop panic (re-raised on purpose),
+    /// not a clean exit.
+    #[tokio::test]
+    async fn one_devices_panicking_shutdown_must_not_skip_the_others() {
+        let armed = Arc::new(AtomicBool::new(false));
+        let (mut a, a_fs, _a_sd) = panic_device("a", &armed, false);
+        a.shutdown_panics = true;
+        let (b, b_fs, b_sd) = panic_device("b", &Arc::new(AtomicBool::new(false)), false);
+        let (handle, _fault) = run_until_loop_panic(vec![Box::new(a), Box::new(b)], &armed).await;
+        let joined = join_scan_thread(&handle).await;
+        assert!(a_fs.load(Ordering::Relaxed), "a was driven safe first");
+        assert!(
+            b_fs.load(Ordering::Relaxed) && b_sd.load(Ordering::Relaxed),
+            "a's shutdown panic skipped device b: failsafe_ran={} shutdown_ran={}",
+            b_fs.load(Ordering::Relaxed),
+            b_sd.load(Ordering::Relaxed)
+        );
+        let payload = joined.expect_err("the original scan-loop panic is re-raised");
+        assert_eq!(
+            panic_message(payload.as_ref()),
+            "injected scan-loop panic",
+            "the thread must die of the scan loop's panic, not a shutdown's"
+        );
+    }
+
+    /// The path the first two do not cover: nothing is wrong with the scan
+    /// loop, the operator just asks it to stop, and an adapter's failsafe AND
+    /// shutdown both panic. Unisolated, that unwound the scan thread out of an
+    /// otherwise clean stop; isolated, the later device is still handled and
+    /// the thread exits CLEANLY, with no fault recorded.
+    #[tokio::test]
+    async fn a_requested_stop_survives_devices_that_panic_while_stopping() {
+        let (mut a, a_fs, a_sd) = panic_device("a", &Arc::new(AtomicBool::new(false)), true);
+        a.shutdown_panics = true;
+        let (b, b_fs, b_sd) = panic_device("b", &Arc::new(AtomicBool::new(false)), false);
+        let handle = spawn_units_inner(
+            vec![single_unit(trivial_container(), 5)],
+            DeviceSource::Prebuilt(vec![Box::new(a), Box::new(b)]),
+            Vec::new(),
+            None,
+            WriteGovernance::default(),
+        );
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(handle.fault(), None, "precondition: the loop is healthy");
+
+        handle.stop();
+        join_scan_thread(&handle)
+            .await
+            .expect("a clean stop must end in a clean thread exit");
+
+        for (what, flag) in [
+            ("a failsafe attempted", &a_fs),
+            ("a shutdown attempted", &a_sd),
+            ("b failsafe", &b_fs),
+            ("b shutdown", &b_sd),
+        ] {
+            assert!(flag.load(Ordering::Relaxed), "{what}");
+        }
+        assert_eq!(
+            handle.fault(),
+            None,
+            "a stop the operator asked for is not a fault"
         );
     }
 
@@ -3486,6 +4593,91 @@ mod tests {
             "successful input read restores freshness"
         );
         handle.shutdown().await;
+    }
+
+    /// Poison the handle's mode lock the way a panicking holder would.
+    fn poison_mode(handle: &ProgramHandle) {
+        let mode = handle.mode.clone();
+        let poisoner = std::thread::spawn(move || {
+            let _held = mode.lock().unwrap();
+            panic!("test: panic while holding the mode lock");
+        });
+        assert!(poisoner.join().is_err());
+        assert!(handle.mode.is_poisoned(), "fixture must poison the lock");
+    }
+
+    /// Scans completed in `window`, read off the snapshot counter.
+    async fn scans_in(handle: &ProgramHandle, window: Duration) -> u64 {
+        let mut rx = handle.subscribe();
+        let first = last_snapshot_within(&mut rx, Duration::from_millis(150)).await;
+        let last = last_snapshot_within(&mut rx, window).await;
+        last.scan_count - first.scan_count
+    }
+
+    /// The failure direction of the mode lock. A poisoned lock used to read
+    /// as `Running` and silently swallow `pause`, so a program an operator had
+    /// stopped kept scanning (and writing) while the API still answered
+    /// success.
+    #[tokio::test]
+    async fn a_poisoned_mode_lock_still_pauses_and_reports_the_truth() {
+        let handle = spawn_units_inner(
+            vec![single_unit(trivial_container(), 5)],
+            DeviceSource::Prebuilt(vec![]),
+            Vec::new(),
+            None,
+            WriteGovernance::default(),
+        );
+        // Negative control: the fixture scans at all.
+        assert!(scans_in(&handle, Duration::from_millis(200)).await > 5);
+
+        poison_mode(&handle);
+        assert_eq!(handle.mode(), RuntimeMode::Running, "last value survives");
+
+        handle.pause();
+        assert_eq!(handle.mode(), RuntimeMode::Paused);
+        tokio::time::sleep(Duration::from_millis(100)).await; // a round may be mid-flight
+        assert_eq!(
+            scans_in(&handle, Duration::from_millis(250)).await,
+            0,
+            "a pause that was acknowledged must stop the scan loop"
+        );
+
+        handle.step(3);
+        assert_eq!(handle.mode(), RuntimeMode::Step { remaining: 3 });
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            handle.mode(),
+            RuntimeMode::Paused,
+            "the scan loop still finishes a step on a poisoned lock"
+        );
+
+        handle.resume();
+        assert_eq!(handle.mode(), RuntimeMode::Running);
+        assert!(scans_in(&handle, Duration::from_millis(200)).await > 5);
+        handle.shutdown().await;
+    }
+
+    /// A `pause` that arrives while a stepped tick is running must outlive that
+    /// tick's bookkeeping. The old code decremented from the mode it had read
+    /// at the top of the tick and so rewrote `Paused` as `Step`.
+    #[test]
+    fn finishing_a_step_tick_decides_from_the_mode_as_it_is_now() {
+        let at = |m: RuntimeMode| std::sync::Mutex::new(m);
+
+        let m = at(RuntimeMode::Step { remaining: 3 });
+        finish_step_tick(&m);
+        assert_eq!(*m.lock().unwrap(), RuntimeMode::Step { remaining: 2 });
+        finish_step_tick(&m);
+        finish_step_tick(&m);
+        assert_eq!(*m.lock().unwrap(), RuntimeMode::Paused, "last step pauses");
+
+        let m = at(RuntimeMode::Paused);
+        finish_step_tick(&m); // pause() landed during the tick
+        assert_eq!(*m.lock().unwrap(), RuntimeMode::Paused);
+
+        let m = at(RuntimeMode::Running);
+        finish_step_tick(&m); // resume() landed during the tick
+        assert_eq!(*m.lock().unwrap(), RuntimeMode::Running);
     }
 
     /// Overruns short of the watchdog threshold are invisible today: the log
@@ -3997,8 +5189,9 @@ mod tests {
         }
     }
 
-    /// P1 power-on gate: once the scan watchdog trips, no non-zero output
-    /// may reach the bus until an explicit restart.
+    /// Regression gate: once the scan watchdog trips, the normal output
+    /// phase must not write again until an explicit restart. This uses
+    /// a local adapter and makes no statement about a physical bus.
     ///
     /// Before the latch existed this failed by design: `enter_failsafe`
     /// zeroed the output mirror exactly once, the trip flag only stopped
@@ -4112,6 +5305,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(300)).await;
         let tripped = handle.watchdog_tripped();
+        let reason = handle.latch_reason();
 
         tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
             .await
@@ -4122,6 +5316,105 @@ mod tests {
             "the latch must be visible through the handle, or a UI cannot \
              tell a latched run from a healthy one"
         );
+        let reason = reason.expect("a latched run says why");
+        assert!(
+            reason.starts_with("scan watchdog:") && reason.contains("overruns on main"),
+            "{reason}"
+        );
+    }
+
+    /// The caller has decided the run must not drive the plant any more (the
+    /// runtime's alarm-supervision policy). It must land exactly like a
+    /// watchdog trip — devices in failsafe, no further output writes — while
+    /// the loop keeps scanning so the live state stays visible, the first
+    /// reason stands, and nothing here ever un-latches it.
+    #[tokio::test]
+    async fn latch_outputs_off_on_request_failsafes_devices_and_stops_the_output_phase() {
+        let container = crate::compile(
+            "PROGRAM main\n\
+                VAR n : INT := 0; END_VAR\n\
+                n := n + 1;\n\
+            END_PROGRAM",
+        )
+        .expect("counter program compiles");
+        let failsafe_engaged = Arc::new(AtomicBool::new(false));
+        let writes_after_failsafe = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dev = StallingDevice {
+            name: "mock".into(),
+            stall: Duration::ZERO,
+            failsafe_engaged: failsafe_engaged.clone(),
+            writes_after_failsafe: writes_after_failsafe.clone(),
+        };
+        let devices: Vec<Box<dyn IoDevice>> = vec![Box::new(dev)];
+        let mappings = vec![project::Mapping {
+            application: "main".into(),
+            variable: "n".into(),
+            direction: project::Direction::Output,
+            device: "mock".into(),
+            channel: "aout".into(),
+            unit: None,
+            min: None,
+            max: None,
+            description: None,
+        }];
+        let handle = spawn_units_inner(
+            vec![single_unit(container, 5)],
+            DeviceSource::Prebuilt(devices),
+            mappings,
+            None,
+            WriteGovernance::default(),
+        );
+        let mut snapshots = handle.subscribe();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!handle.watchdog_tripped(), "a healthy run is not latched");
+        assert_eq!(handle.latch_reason(), None);
+
+        let first = handle
+            .latch_outputs_off("alarm supervision lost for 30 s")
+            .await
+            .expect("the loop answers");
+        assert!(first, "this call did the latching");
+        assert!(
+            failsafe_engaged.load(Ordering::Relaxed),
+            "devices were failsafed"
+        );
+        assert!(handle.watchdog_tripped(), "the one latch flag answers");
+        assert_eq!(
+            handle.latch_reason().as_deref(),
+            Some("alarm supervision lost for 30 s")
+        );
+
+        let second = handle
+            .latch_outputs_off("something else")
+            .await
+            .expect("the loop answers");
+        assert!(!second, "already latched");
+        assert_eq!(
+            handle.latch_reason().as_deref(),
+            Some("alarm supervision lost for 30 s"),
+            "the first reason stands"
+        );
+
+        // The loop keeps scanning, and nothing more reaches the bus.
+        let before = snapshots.recv().await.map(|s| s.scan_count).unwrap_or(0);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let mut after = before;
+        while let Ok(s) = snapshots.try_recv() {
+            after = after.max(s.scan_count);
+        }
+        assert!(
+            after > before,
+            "scans continue after the latch: {before} -> {after}"
+        );
+        assert_eq!(
+            writes_after_failsafe.load(Ordering::Relaxed),
+            0,
+            "no output write may follow the failsafe"
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown joins");
     }
 
     /// The injection primitive must trip the watchdog through the real

@@ -490,6 +490,18 @@ pub async fn open_project(
     Ok(Json(info))
 }
 
+/// Stop the running program if it belongs to `project`, and retire it so a
+/// later start waits for its teardown. Another project's run is left alone.
+fn stop_program_of(state: &AppState, project: &str) {
+    let mut slot = state.program.lock();
+    if slot.as_ref().is_some_and(|rp| rp.project_name == project) {
+        if let Some(rp) = slot.take() {
+            rp.handle.stop();
+            state.retire(rp.handle);
+        }
+    }
+}
+
 pub async fn close_project(
     State(state): State<AppState>,
     project: ProjectName,
@@ -499,16 +511,7 @@ pub async fn close_project(
     // project is open. After resolving, stop the runtime if it
     // belongs to that project.
     let target = resolve_project_name(&state, &project)?;
-    {
-        let mut prog = state.program.lock();
-        if let Some(rp) = prog.as_ref() {
-            if rp.project_name == target {
-                if let Some(rp) = prog.take() {
-                    rp.handle.stop();
-                }
-            }
-        }
-    }
+    stop_program_of(&state, &target);
     // Tear down any ssh tunnels attached to this project's edges.
     state.attachments.detach_all_for_project(&target);
     let removed = state.projects.lock().remove(&target);
@@ -1578,10 +1581,31 @@ pub async fn deploy_edge_route(
         let edge = store.read_edge(&name).map_err(crate::error::project_err)?;
         Ok((edge, store.root().to_path_buf()))
     })?;
+    // Freeze before preflight; upload can only consume a checked snapshot.
+    let precheck = tokio::task::spawn_blocking(move || {
+        crate::deploy_snapshot::DeploySnapshot::prepare(&project_dir)
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("deploy pre-check task failed: {e}")))?;
+    let snapshot = match precheck {
+        Ok(snapshot) => snapshot,
+        Err(reason) => {
+            return Ok(Json(DeployReport {
+                ok: false,
+                version: String::new(),
+                log: format!(
+                    "Refused before upload — nothing on the edge changed. \
+                 Project snapshot preparation or runtime pre-check failed:\n{reason}\n"
+                ),
+                warning: None,
+                health: None,
+            }))
+        }
+    };
     let runtime_binary = find_runtime_binary();
     match deploy_to_edge(
         &edge,
-        &project_dir,
+        &snapshot,
         runtime_binary.as_deref(),
         state.web_dist.as_deref(),
     )
@@ -1597,6 +1621,7 @@ pub async fn deploy_edge_route(
             version: String::new(),
             log: format!("remote deploy script exited with status {code}\n{log}"),
             warning: None,
+            health: None,
         })),
         Err(e) => Err(ApiError::Internal(e.to_string())),
     }
@@ -1814,6 +1839,13 @@ pub async fn put_alarms(
                 project::DEVICE_ALARM_PREFIX
             )));
         }
+        if def.id.starts_with(project::SUPERVISION_ALARM_PREFIX) {
+            return Err(ApiError::BadRequest(format!(
+                "alarm id '{}' uses the reserved supervision prefix '{}'",
+                def.id,
+                project::SUPERVISION_ALARM_PREFIX
+            )));
+        }
         if !seen.insert(def.id.as_str()) {
             return Err(ApiError::BadRequest(format!(
                 "duplicate alarm id '{}'",
@@ -1834,6 +1866,14 @@ pub async fn put_alarms(
     let response = with_project(&state, &project, |store| {
         let file = conditional::file(store, "alarms", "")?;
         conditional::check(&file, &headers)?;
+        // The body replaces the alarm DEFINITIONS. A body that does not
+        // mention `supervision` (an agent editing only `alarms`) must not
+        // silently remove a protective `safe_state` the project declared;
+        // writing `{"supervision": {"on_loss": "report"}}` is how to drop it.
+        let mut config = config.clone();
+        if config.supervision.is_none() {
+            config.supervision = store.read_alarms().ok().and_then(|c| c.supervision);
+        }
         store.write_alarms(&config)?;
         conditional::written(&file, RunResponse { ok: true })
     })?;
@@ -2001,15 +2041,191 @@ pub async fn check(
     // debounce and re-parses all sibling POUs.
     let store = owned_store(&state, &project).ok();
     let path = q.path.clone();
-    let diags = tokio::task::spawn_blocking(move || match &store {
+    let diags = run_check(move || match &store {
         Some(store) => {
             ironplc_bridge::check_pou_in_project(store, &body, language, path.as_deref())
         }
         None => ironplc_bridge::check_pou_source(&body, language),
     })
-    .await
-    .unwrap_or_default();
+    .await;
     Json(diags)
+}
+
+/// `code` of the diagnostic `POST /api/check` returns when the compiler
+/// panicked during the check: on the buffer or, with a project open, on
+/// one of the sibling files parsed as its context (an internal compiler
+/// bug, not necessarily a mistake in the program being edited).
+pub const CHECK_PANIC_CODE: &str = "compiler-panic";
+
+/// `code` of the diagnostic `POST /api/check` returns when the check task
+/// was cancelled before it finished (the runtime is shutting down).
+pub const CHECK_ABORTED_CODE: &str = "check-aborted";
+
+/// Run one editor check on the blocking pool.
+///
+/// A check that did not finish is never reported as a clean file: the
+/// editor and agents read `[]` as "verified, nothing wrong", so a compiler
+/// panic (the vendored compiler still has input-dependent panics) must not
+/// collapse into it. The panic becomes one error diagnostic instead, so
+/// the squiggle says the source was NOT checked, and the panic message
+/// goes to the server log.
+async fn run_check<F>(check: F) -> Vec<CheckDiagnostic>
+where
+    F: FnOnce() -> Vec<CheckDiagnostic> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(check).await {
+        Ok(diags) => diags,
+        Err(e) => vec![join_error_diagnostic(e)],
+    }
+}
+
+/// The diagnostic that stands in for the result of a check that did not
+/// finish.
+fn join_error_diagnostic(e: tokio::task::JoinError) -> CheckDiagnostic {
+    if e.is_panic() {
+        let detail = panic_message(e.into_panic());
+        tracing::error!(%detail, "POST /api/check: the compiler panicked during a check");
+        // The project-aware check parses every sibling POU as context, so
+        // the panic is not necessarily about the buffer that was posted.
+        unchecked_diagnostic(
+            CHECK_PANIC_CODE,
+            format!(
+                "Internal compiler error: the compiler panicked during this check \
+                 ({detail}). This is a bug in the compiler, not necessarily a mistake \
+                 in this source: with a project open, the panic may come from another \
+                 file in the project. The source was NOT checked."
+            ),
+        )
+    } else {
+        tracing::warn!(error = %e, "POST /api/check: the check task did not finish");
+        unchecked_diagnostic(
+            CHECK_ABORTED_CODE,
+            format!("The check did not finish ({e}); the source was NOT checked."),
+        )
+    }
+}
+
+/// The message of a caught panic (`panic!("literal")` carries a `&str`,
+/// a formatted `panic!` or an `expect`/`unwrap` failure carries a `String`).
+pub(crate) fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(message) => *message,
+        Err(payload) => match payload.downcast::<&'static str>() {
+            Ok(message) => (*message).to_string(),
+            Err(_) => "no panic message".to_string(),
+        },
+    }
+}
+
+/// An error diagnostic that is about the check itself, not a position in
+/// the source, so it sits at line 1, column 1.
+fn unchecked_diagnostic(code: &str, message: String) -> CheckDiagnostic {
+    CheckDiagnostic {
+        severity: "error".into(),
+        code: code.into(),
+        message,
+        start_line: 1,
+        start_column: 1,
+        end_line: 1,
+        end_column: 1,
+        context: vec![],
+        related: vec![],
+        explanation: None,
+        ld_location: None,
+        fbd_location: None,
+        sfc_location: None,
+    }
+}
+
+#[cfg(test)]
+mod run_check_tests {
+    use super::{run_check, CHECK_ABORTED_CODE, CHECK_PANIC_CODE};
+
+    #[tokio::test]
+    async fn run_check_when_check_returns_then_its_diagnostics_pass_through() {
+        let diags =
+            run_check(|| vec![super::unchecked_diagnostic("P0002", "Syntax error".into())]).await;
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "P0002");
+        assert!(
+            run_check(Vec::new).await.is_empty(),
+            "a clean check stays empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_check_when_check_panics_with_str_then_error_diagnostic_not_empty() {
+        let diags = run_check(|| panic!("no group at index")).await;
+        assert_eq!(diags.len(), 1, "a panic must not look like a clean file");
+        assert_eq!(diags[0].severity, "error");
+        assert_eq!(diags[0].code, CHECK_PANIC_CODE);
+        assert!(
+            diags[0].message.contains("no group at index"),
+            "{}",
+            diags[0].message
+        );
+        assert!(
+            diags[0].message.contains("NOT checked"),
+            "{}",
+            diags[0].message
+        );
+    }
+
+    #[tokio::test]
+    async fn run_check_when_check_panics_with_string_then_message_is_reported() {
+        let n = 2;
+        let diags = run_check(move || panic!("no group at index '{n}'")).await;
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, CHECK_PANIC_CODE);
+        assert!(
+            diags[0].message.contains("no group at index '2'"),
+            "{}",
+            diags[0].message
+        );
+    }
+
+    #[tokio::test]
+    async fn run_check_when_check_panics_with_other_payload_then_still_an_error() {
+        let diags = run_check(|| std::panic::panic_any(42_u32)).await;
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, CHECK_PANIC_CODE);
+        assert!(
+            diags[0].message.contains("no panic message"),
+            "{}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn join_error_diagnostic_when_task_was_cancelled_then_aborted_error_not_clean() {
+        // One blocking thread: the second task cannot start while the first
+        // holds it, so aborting it cancels it before it ever runs.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let diag = rt.block_on(async {
+            let (release, hold) = std::sync::mpsc::channel::<()>();
+            let first = tokio::task::spawn_blocking(move || {
+                let _ = hold.recv();
+            });
+            let second = tokio::task::spawn_blocking(|| vec![0_u8]);
+            second.abort();
+            // The cancellation is only noticed when a blocking thread reaches
+            // the queued task, so free the thread before awaiting it.
+            release.send(()).unwrap();
+            first.await.unwrap();
+            let err = second
+                .await
+                .expect_err("a cancelled task must not yield a value");
+            assert!(err.is_cancelled());
+            super::join_error_diagnostic(err)
+        });
+        assert_eq!(diag.severity, "error");
+        assert_eq!(diag.code, CHECK_ABORTED_CODE);
+        assert!(diag.message.contains("NOT checked"), "{}", diag.message);
+    }
 }
 
 /// Compile the whole project (every POU + tasks.toml-synthesized
@@ -2391,11 +2607,27 @@ pub async fn run(
         .await
         .map_err(|e| ApiError::Internal(format!("compile task failed: {e}")))??;
 
-    {
-        let mut guard = state.program.lock();
-        if let Some(old) = guard.take() {
-            old.handle.stop();
-        }
+    // One start at a time, held until the new run owns the slot: two
+    // overlapping requests would otherwise both pass the wait below and both
+    // spawn.
+    let _start = state.run_gate.lock().await;
+
+    // Stopping returns at once, but the old run's scan thread then still
+    // drives outputs safe and shuts its devices down. Starting the new run
+    // meanwhile would have it connect to (or write to) devices the old run
+    // is still tearing down, and the old run's shutdown could land after the
+    // new run's first outputs. The same holds for a run that faulted: it left
+    // the slot when the fault was reported, long before its teardown ended.
+    if let Some(old) = state.program.lock().take() {
+        old.handle.stop();
+        state.retire(old.handle);
+    }
+    if let Err(busy) = state.wait_until_drained(state.run_handover_timeout).await {
+        return Err(ApiError::Conflict(format!(
+            "the previous run is still shutting down its devices ({busy} not finished after {} s); \
+             nothing was started — retry once it has finished",
+            state.run_handover_timeout.as_secs_f32()
+        )));
     }
 
     // Rebuild the alarm engine from this project's alarms.toml — the
@@ -2437,6 +2669,43 @@ pub async fn run(
     launch_run(&state, project_name, handle, info);
 
     Ok(Json(RunResponse { ok: true }))
+}
+
+/// Surface a run's fault, if it has one: record `last_error`, release the
+/// dead run's program slot, and emit `Error` + `Stopped`, so
+/// `/api/runtime/status` and SSE watchers see the fault instead of a
+/// forever-stale "running". The run is retired rather than forgotten: its
+/// scan thread is still failsafing and shutting devices down, and the next
+/// `POST /api/run` waits for that.
+///
+/// A fault is reported only for the run that owns the slot, or when the slot
+/// is empty (the run was stopped and then died anyway). If a newer run owns
+/// the slot, the fault is that older run's business: setting `last_error`
+/// would make the new run read as failed.
+fn settle_fault(state: &AppState, run: &ironplc_bridge::ProgramHandle) {
+    let Some(msg) = run.fault() else { return };
+    {
+        let mut slot = state.program.lock();
+        match slot.as_ref() {
+            Some(current) if !current.handle.same_run(run) => {
+                drop(slot);
+                tracing::warn!(error = %msg, "a run faulted after a newer run replaced it; not reporting it");
+                state.retire(run.clone());
+                return;
+            }
+            Some(_) => {
+                slot.take();
+                *state.running_info.lock() = None;
+            }
+            None => {}
+        }
+        *state.last_error.lock() = Some(msg.clone());
+        // Register teardown before releasing the slot lock: a concurrent
+        // start must never see both an empty slot and an empty drain list.
+        state.retire(run.clone());
+    }
+    let _ = state.event_tx.send(AppEvent::Error(msg));
+    let _ = state.event_tx.send(AppEvent::Stopped);
 }
 
 /// Make a freshly spawned run the server's running program: clear the
@@ -2497,26 +2766,8 @@ fn launch_run(
         }
         // A clean stop leaves `fault()` empty (the stop handler already
         // cleared state and emitted Stopped). A VM trap / scan-thread
-        // panic set it — and this task is the only one that notices, so
-        // surface it: record last_error, release the dead program slot
-        // (only if it is still ours — a newer run may have replaced it),
-        // and emit Error + Stopped so /api/runtime/status and SSE watchers
-        // see the fault instead of a forever-stale "running".
-        if let Some(msg) = fault_handle.fault() {
-            *fault_state.last_error.lock() = Some(msg.clone());
-            {
-                let mut guard = fault_state.program.lock();
-                if guard
-                    .as_ref()
-                    .is_some_and(|rp| rp.handle.same_run(&fault_handle))
-                {
-                    guard.take();
-                    *fault_state.running_info.lock() = None;
-                }
-            }
-            let _ = fault_state.event_tx.send(AppEvent::Error(msg));
-            let _ = fault_state.event_tx.send(AppEvent::Stopped);
-        }
+        // panic set it — and this task is the only one that notices.
+        settle_fault(&fault_state, &fault_handle);
     };
 
     state.program.lock().replace(RunningProgram {
@@ -2549,6 +2800,7 @@ pub async fn stop(
     );
     if let Some(rp) = state.program.lock().take() {
         rp.handle.stop();
+        state.retire(rp.handle);
     }
     *state.running_info.lock() = None;
     let _ = state.event_tx.send(AppEvent::Stopped);
@@ -3606,6 +3858,129 @@ mod launch_run_tests {
         );
     }
 
+    /// A handle to a run that traps on its first scan, spawned without being
+    /// launched (so it never occupies the program slot).
+    fn spawn_trapping() -> ironplc_bridge::ProgramHandle {
+        let container = ironplc_bridge::compile(
+            "PROGRAM main\n\
+                VAR x : DINT; z : DINT; END_VAR\n\
+                x := 1 / z;\n\
+            END_PROGRAM",
+        )
+        .expect("program compiles");
+        let unit = ironplc_bridge::ProgramUnit {
+            instance: "old_inst".into(),
+            task_name: "t".into(),
+            interval_ms: 10,
+            priority: 1,
+            container,
+            retain_vars: Vec::new(),
+        };
+        ironplc_bridge::spawn_units(
+            vec![unit],
+            Vec::new(),
+            Vec::new(),
+            None,
+            project::WriteGovernance::default(),
+        )
+    }
+
+    /// A fault belongs to the run that had it. If a newer run owns the slot
+    /// by the time an older run's fault is reported, the newer run must not
+    /// inherit the error or a `Stopped` event, and keeps its slot.
+    #[tokio::test]
+    async fn a_fault_from_a_replaced_run_is_not_reported_against_the_newer_run() {
+        let state = state();
+        let old = spawn_trapping();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            old.fault_watch().wait_for(|f| f.is_some()),
+        )
+        .await
+        .expect("the trap is recorded")
+        .expect("watch open");
+        let newer = launch(&state, false);
+        let mut events = state.event_tx.subscribe();
+
+        super::settle_fault(&state, &old);
+
+        assert!(
+            state.last_error.lock().is_none(),
+            "the newer run was marked failed"
+        );
+        assert!(state
+            .program
+            .lock()
+            .as_ref()
+            .is_some_and(|rp| rp.handle.same_run(&newer)));
+        assert!(
+            events.try_recv().is_err(),
+            "no Error or Stopped for the newer run"
+        );
+        tokio::time::timeout(Duration::from_secs(5), newer.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
+    /// The other half: with nothing newer in the slot, the fault is reported,
+    /// the slot is released, and the run is retired rather than forgotten.
+    #[tokio::test]
+    async fn a_fault_with_no_newer_run_is_reported_and_the_run_is_retired() {
+        let state = state();
+        let mut events = state.event_tx.subscribe();
+        let dead = spawn_trapping();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            dead.fault_watch().wait_for(|f| f.is_some()),
+        )
+        .await
+        .expect("the trap is recorded")
+        .expect("watch open");
+
+        super::settle_fault(&state, &dead);
+
+        let err = state.last_error.lock().clone().expect("last_error is set");
+        assert!(err.contains("old_inst"), "{err}");
+        assert!(matches!(events.try_recv(), Ok(AppEvent::Error(_))));
+        assert!(matches!(events.try_recv(), Ok(AppEvent::Stopped)));
+        // Retired exactly once even if reported again (a stop racing the
+        // fault forwarder does this).
+        super::settle_fault(&state, &dead);
+        assert!(state.draining.lock().len() <= 1);
+        state
+            .wait_until_drained(Duration::from_secs(5))
+            .await
+            .expect("the dead run finishes tearing down");
+    }
+
+    /// Closing a project stops its run but not another project's, and the
+    /// stopped run stays tracked until its scan thread has finished.
+    #[tokio::test]
+    async fn closing_a_project_retires_only_its_own_run() {
+        let state = state();
+        let run = launch(&state, false); // registered under project "p"
+
+        super::stop_program_of(&state, "other");
+        assert!(
+            state.program.lock().is_some(),
+            "another project's close stopped this run"
+        );
+        assert!(state.draining.lock().is_empty());
+
+        super::stop_program_of(&state, "p");
+        assert!(state.program.lock().is_none());
+        assert_eq!(state.draining.lock().len(), 1, "the stopped run is tracked");
+        state
+            .wait_until_drained(Duration::from_secs(5))
+            .await
+            .expect("teardown ends");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), run.shutdown())
+                .await
+                .is_ok()
+        );
+    }
+
     /// The other side: a run that starts stays registered, error-free.
     #[tokio::test]
     async fn a_run_that_starts_stays_registered() {
@@ -3621,5 +3996,402 @@ mod launch_run_tests {
         tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
             .await
             .expect("shutdown");
+    }
+}
+
+#[cfg(test)]
+mod reconnect_handover_tests;
+
+#[cfg(test)]
+mod run_handover_tests {
+    //! `POST /api/run` must not start a run while the previous one is still
+    //! failsafing and tearing down its devices. The slow teardown is made
+    //! deterministic with a device that accepts the TCP connection and never
+    //! answers: the scan thread of a run using it is stuck in its initial
+    //! connect for the adapter's `timeout_ms`, so it cannot finish sooner.
+
+    use std::time::{Duration, Instant};
+
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Request, StatusCode},
+        routing::post,
+        Router,
+    };
+    use tower::ServiceExt;
+
+    use crate::state::AppState;
+
+    const HOLD: Duration = Duration::from_millis(1200);
+
+    /// Accepts connections and never answers them.
+    async fn silent_slave() -> (std::net::SocketAddr, tokio::task::AbortHandle) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        (addr, task.abort_handle())
+    }
+
+    pub(super) fn modbus_device(name: &str, addr: std::net::SocketAddr) -> project::Device {
+        project::Device {
+            name: name.into(),
+            config: project::ProtocolConfig::Modbus(project::ModbusConfig {
+                transport: project::ModbusTransport::Tcp(project::ModbusTcpParams {
+                    host: addr.ip().to_string(),
+                    port: addr.port(),
+                }),
+                slave_id: 1,
+                poll_interval_ms: 20,
+                timeout_ms: Some(HOLD.as_millis() as u32),
+                reconnect_backoff_ms: None,
+                // The adapter's connect-time seed read has to ask something
+                // of the silent slave, or it connects at once.
+                channels: vec![project::ModbusChannel {
+                    name: "c0".into(),
+                    kind: project::ModbusChannelKind::Coil,
+                    address: 0,
+                    data_type: Default::default(),
+                    word_order: Default::default(),
+                    access: Default::default(),
+                }],
+            }),
+        }
+    }
+
+    const IDLE: &str = "PROGRAM main\n VAR x : INT; END_VAR\n x := x + 1;\nEND_PROGRAM";
+    const TRAP: &str = "PROGRAM main\n VAR x : DINT; z : DINT; END_VAR\n x := 1 / z;\nEND_PROGRAM";
+
+    pub(super) fn app_with(
+        dir: &std::path::Path,
+        source: &str,
+        device: project::Device,
+        handover_timeout: Duration,
+    ) -> (Router, AppState) {
+        let store = project::ProjectStore::create(dir.join("p"), "p").unwrap();
+        store.write_pou_source("main", source).unwrap();
+        store.write_device(&device).unwrap();
+        let mut state = AppState::new(iomap_modbus::DemoSlave::new(), String::new(), None, None);
+        state.run_handover_timeout = handover_timeout;
+        state.projects.lock().insert_and_activate(store);
+        let app = Router::new()
+            .route("/api/run", post(super::run))
+            .route("/api/stop", post(super::stop))
+            .with_state(state.clone());
+        (app, state)
+    }
+
+    pub(super) async fn post_run(app: &Router) -> (StatusCode, String) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/run")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"program":"main"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    pub(super) async fn post_stop(app: &Router) {
+        let response = app
+            .clone()
+            .oneshot(Request::post("/api/stop").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    pub(super) fn current(state: &AppState) -> ironplc_bridge::ProgramHandle {
+        state
+            .program
+            .lock()
+            .as_ref()
+            .expect("a run owns the slot")
+            .handle
+            .clone()
+    }
+
+    async fn finished(handle: &ironplc_bridge::ProgramHandle) -> bool {
+        tokio::time::timeout(Duration::from_millis(100), handle.shutdown())
+            .await
+            .is_ok()
+    }
+
+    /// Replacing a run used to stop the old one without waiting: the new run
+    /// connected while the old scan thread was still failsafing and shutting
+    /// its devices down, and the old run's last device calls could land
+    /// after the new run's first outputs.
+    #[tokio::test]
+    async fn a_new_run_waits_for_the_replaced_run_to_finish_tearing_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, silent) = silent_slave().await;
+        let (app, state) = app_with(
+            dir.path(),
+            IDLE,
+            modbus_device("field", addr),
+            crate::state::RUN_HANDOVER_TIMEOUT,
+        );
+
+        assert_eq!(post_run(&app).await.0, StatusCode::OK);
+        let first = current(&state);
+        let asked = Instant::now();
+        assert_eq!(post_run(&app).await.0, StatusCode::OK);
+
+        assert!(
+            asked.elapsed() >= Duration::from_millis(700),
+            "the second run started after only {:?}",
+            asked.elapsed()
+        );
+        assert!(
+            finished(&first).await,
+            "the new run started while the old scan thread still ran"
+        );
+        assert!(!state
+            .program
+            .lock()
+            .as_ref()
+            .is_some_and(|rp| rp.handle.same_run(&first)));
+        post_stop(&app).await;
+        state
+            .wait_until_drained(Duration::from_secs(10))
+            .await
+            .expect("teardown ends");
+        silent.abort();
+    }
+
+    /// `POST /api/stop` returns at once, but the run is still tearing down;
+    /// the next start has to wait for that.
+    #[tokio::test]
+    async fn a_run_started_after_stop_waits_for_the_stopped_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, silent) = silent_slave().await;
+        let (app, state) = app_with(
+            dir.path(),
+            IDLE,
+            modbus_device("field", addr),
+            crate::state::RUN_HANDOVER_TIMEOUT,
+        );
+
+        assert_eq!(post_run(&app).await.0, StatusCode::OK);
+        let first = current(&state);
+        post_stop(&app).await;
+        assert!(state.program.lock().is_none());
+        assert_eq!(
+            state.draining.lock().len(),
+            1,
+            "a stopped run is tracked until its thread has finished"
+        );
+        let asked = Instant::now();
+        assert_eq!(post_run(&app).await.0, StatusCode::OK);
+
+        assert!(
+            asked.elapsed() >= Duration::from_millis(700),
+            "started after only {:?}",
+            asked.elapsed()
+        );
+        assert!(finished(&first).await);
+        post_stop(&app).await;
+        state
+            .wait_until_drained(Duration::from_secs(10))
+            .await
+            .expect("teardown ends");
+        silent.abort();
+    }
+
+    /// A start that cannot get the devices to itself is refused, saying why,
+    /// and starts nothing; once the old run has finished, a start works.
+    #[tokio::test]
+    async fn a_start_is_refused_while_the_previous_run_is_still_tearing_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, silent) = silent_slave().await;
+        let (app, state) = app_with(
+            dir.path(),
+            IDLE,
+            modbus_device("field", addr),
+            Duration::from_millis(150),
+        );
+
+        assert_eq!(post_run(&app).await.0, StatusCode::OK);
+        let (status, body) = post_run(&app).await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("still shutting down"), "{body}");
+        assert!(
+            state.program.lock().is_none(),
+            "a refused start must not leave a run behind"
+        );
+        assert_eq!(state.draining.lock().len(), 1);
+
+        state
+            .wait_until_drained(Duration::from_secs(10))
+            .await
+            .expect("teardown ends");
+        assert_eq!(post_run(&app).await.0, StatusCode::OK);
+        assert!(state.program.lock().is_some());
+        post_stop(&app).await;
+        state
+            .wait_until_drained(Duration::from_secs(10))
+            .await
+            .expect("teardown ends");
+        silent.abort();
+    }
+
+    /// Several `POST /api/run` at once must leave exactly one run behind. Each
+    /// later start retires the one before it; if two starts overlapped, one
+    /// run would be displaced from the slot without being stopped and would
+    /// keep publishing snapshots for good.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn simultaneous_starts_leave_exactly_one_run() {
+        const STARTS: usize = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let store = project::ProjectStore::create(dir.path().join("p"), "p").unwrap();
+        store.write_pou_source("main", IDLE).unwrap();
+        let state = AppState::new(iomap_modbus::DemoSlave::new(), String::new(), None, None);
+        state.projects.lock().insert_and_activate(store);
+        let app = Router::new()
+            .route("/api/run", post(super::run))
+            .route("/api/stop", post(super::stop))
+            .with_state(state.clone());
+
+        let mut starts = tokio::task::JoinSet::new();
+        for _ in 0..STARTS {
+            let app = app.clone();
+            starts.spawn(async move { post_run(&app).await.0 });
+        }
+        while let Some(status) = starts.join_next().await {
+            assert_eq!(status.unwrap(), StatusCode::OK);
+        }
+        assert!(state.program.lock().is_some());
+
+        post_stop(&app).await;
+        state
+            .wait_until_drained(Duration::from_secs(10))
+            .await
+            .expect("teardown ends");
+        // Everything is stopped and drained: no snapshot may still arrive.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let before = state.last_snapshot.lock().as_ref().map(|s| s.timestamp_us);
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        let after = state.last_snapshot.lock().as_ref().map(|s| s.timestamp_us);
+        assert_eq!(
+            before, after,
+            "a run is still publishing after everything was stopped"
+        );
+    }
+
+    /// A run that faults leaves the program slot when the fault is reported,
+    /// long before its teardown ends. It must stay tracked until then, or the
+    /// next start would not know there is anything to wait for.
+    #[tokio::test]
+    async fn a_faulted_run_stays_tracked_until_its_thread_has_finished() {
+        let dir = tempfile::tempdir().unwrap();
+        // A device that refuses at once: the bridge keeps a reconnect worker
+        // for it, whose wind-down gives the teardown a measurable length.
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap()
+        };
+        let (app, state) = app_with(
+            dir.path(),
+            TRAP,
+            modbus_device("gone", closed),
+            crate::state::RUN_HANDOVER_TIMEOUT,
+        );
+
+        assert_eq!(post_run(&app).await.0, StatusCode::OK);
+        let first = current(&state);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state.last_error.lock().is_none() {
+            assert!(Instant::now() < deadline, "the trap was never reported");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            state.program.lock().is_none(),
+            "the faulted run left the slot"
+        );
+        assert_eq!(
+            state.draining.lock().len(),
+            1,
+            "but it is still tearing down, and must be tracked"
+        );
+        state
+            .wait_until_drained(Duration::from_secs(10))
+            .await
+            .expect("teardown ends");
+        assert!(finished(&first).await);
+    }
+}
+
+#[cfg(test)]
+mod deploy_precheck_tests {
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Request, StatusCode},
+        routing::post,
+        Router,
+    };
+    use tower::ServiceExt;
+
+    use crate::state::AppState;
+
+    /// A project the edge runtime would refuse at startup is refused before
+    /// upload. It used to be tarred, shipped and swapped in; the runtime
+    /// then exited on start and the edge ran nothing.
+    #[tokio::test]
+    async fn deploy_refuses_a_project_the_edge_runtime_would_not_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = project::ProjectStore::create(dir.path().join("p"), "p").unwrap();
+        store
+            .write_pou_source(
+                "main",
+                "PROGRAM main\n VAR x : INT; END_VAR\n x := ghost;\nEND_PROGRAM",
+            )
+            .unwrap();
+        // An edge no one can reach: had the route got as far as ssh, the
+        // report would carry an ssh or remote-script failure instead.
+        store
+            .create_edge("field", "nobody@ia2-precheck.invalid")
+            .unwrap();
+        let state = AppState::new(iomap_modbus::DemoSlave::new(), String::new(), None, None);
+        state.projects.lock().insert_and_activate(store);
+        let app = Router::new()
+            .route("/api/edges/{name}/deploy", post(super::deploy_edge_route))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::post("/api/edges/field/deploy")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a deploy outcome, not an error"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["ok"], false, "{body}");
+        assert_eq!(body["version"], "", "{body}");
+        assert!(body["health"].is_null(), "{body}");
+        let log = body["log"].as_str().unwrap();
+        assert!(
+            log.starts_with("Refused before upload — nothing on the edge changed.")
+                && log.contains("compiling project:")
+                && log.contains("ghost"),
+            "{log}"
+        );
     }
 }

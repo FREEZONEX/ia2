@@ -52,6 +52,99 @@ fn default_step_cycles() -> u32 {
     1
 }
 
+/// How the edge runtime's snapshot tap is doing: the task that takes each
+/// snapshot off the scan loop and feeds the historian, the alarm engine, the
+/// latest-snapshot slot behind `/status` and the `/events` stream.
+///
+/// The scan loop is a separate thread. When the tap stops, or fails on every
+/// snapshot, the program keeps running and `/health` keeps answering `ok`,
+/// while history stops recording, process alarms stop being evaluated and
+/// `scan_count` stops moving: a monitoring probe that only checks `status`
+/// would call that runtime healthy. Hence its own field, like
+/// `watchdog_tripped` and `fault`.
+///
+/// `Deserialize` as well as `Serialize`: the IDE server parses this back out
+/// of a remote edge runtime's `/health` when probing it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SnapshotTapHealth {
+    /// `false` once the tap has ended and will not come back until the runtime
+    /// restarts: nothing is feeding history, alarms or `/status` any more.
+    pub running: bool,
+    /// Incidents since the runtime started: a stage that panicked on a
+    /// snapshot, or snapshots skipped because the tap fell behind the scan
+    /// loop. A count that climbs between two polls means it is failing now.
+    #[ts(type = "number")]
+    pub faults: u64,
+    /// The latest incident in words, `null` when there has been none.
+    pub last_fault: Option<String>,
+    /// Milliseconds the tap has been inside ONE snapshot, once that has gone
+    /// on for longer than a healthy stage ever takes (2 s; the scan loop
+    /// emits a snapshot every 100 ms); `null` while it keeps up. A stage that
+    /// blocks, say a stalled disk under the historian, neither panics nor
+    /// lags yet (`running` stays true, `faults` stays 0) but history, alarms,
+    /// `scan_count` and `/events` stop moving with it. Measured from inside
+    /// the tap, so it does not mistake a program that has stopped, and so
+    /// emits no snapshots, for a stuck tap. Absent from a build that predates
+    /// the field.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub stalled_for_ms: Option<u64>,
+    /// How long ago the latest incident in `last_fault` happened, in
+    /// milliseconds; `null` when there has been none. `faults` only grows, so
+    /// on its own it cannot say whether the task is failing NOW; this can, to
+    /// any reader that polls once, without remembering the previous read.
+    /// Absent from a build that predates the field.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub last_fault_age_ms: Option<u64>,
+}
+
+/// The alarm-supervision policy a running edge runtime is ACTUALLY enforcing,
+/// as served on its `/health` and `/status`, and where it stands right now.
+///
+/// The policy is what the process read at startup, not what `alarms.toml` says
+/// now (edits apply on the next restart). It exists so a reader can tell
+/// whether a declared `[supervision]` is in force: a deploy that carries an
+/// older runtime binary forward ignores the table without a word, and the
+/// project then runs without the protection it declared. `lost_for_ms` and
+/// `latch_in_ms` are the one part that changes: how long alarm evaluation has
+/// been lost, and how long until the policy acts on it.
+///
+/// Deliberately lenient where `project::SupervisionConfig` is strict: that one
+/// refuses unknown keys and unknown modes so a typo in a protective setting
+/// fails the deploy, but a reader of `/health` must not fail to parse the WHOLE
+/// body (and report the edge unreachable) because a newer runtime reports a
+/// mode it has never heard of. So `on_loss` is the mode's name as text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SupervisionInForce {
+    /// `"report"` or `"safe_state"`.
+    pub on_loss: String,
+    /// Seconds alarm evaluation may stay lost before `on_loss` is carried out.
+    #[ts(type = "number")]
+    pub grace_secs: u64,
+    /// Milliseconds alarm evaluation has been lost in the current episode;
+    /// `null` while it is not. Measured when the answer is built, from when the
+    /// supervisor first saw it lost, so it is current between the supervisor's
+    /// looks. `null` as well when the supervisor has not looked recently (its
+    /// own task stuck): unknown is not "not lost". Absent from a build that
+    /// predates the field.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub lost_for_ms: Option<u64>,
+    /// Milliseconds until `safe_state` latches the outputs off, `0` once it is
+    /// due; `null` when nothing is pending: alarm evaluation is not lost, the
+    /// mode is `report`, or the outputs are already latched (`latch_reason`
+    /// then says why). The supervisor looks once a second and the request waits
+    /// on the scan loop, so "due" means the outputs are being latched, not that
+    /// they already are: `watchdog_tripped` says when they are. Absent from a
+    /// build that predates the field.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub latch_in_ms: Option<u64>,
+}
+
 /// Wall-clock microseconds since the UNIX epoch — the human-facing
 /// time base for alarm journals and ack stamps.
 pub fn wall_now_us() -> u64 {
@@ -59,6 +152,29 @@ pub fn wall_now_us() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros() as u64)
         .unwrap_or(0)
+}
+
+/// The text of a caught panic payload (`panic!("literal")` carries a `&str`;
+/// a formatted `panic!` or an `expect`/`unwrap` failure carries a `String`).
+pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    crate::runtime::panic_message(payload)
+}
+
+/// The body both HTTP servers (IDE server, edge runtime) answer with when a
+/// request handler panicked: the panic text, and what the caller can rely on.
+///
+/// Without an answer the connection just closes, which a client cannot tell
+/// from a network fault. The handler may have got part of the way before it
+/// panicked, so the text does not claim that nothing happened. Logs the panic
+/// at ERROR; one implementation, so the two surfaces cannot drift (the
+/// status stays each server's own `500`).
+pub fn handler_panic_body(payload: &(dyn std::any::Any + Send)) -> String {
+    let detail = panic_message(payload);
+    tracing::error!(%detail, "a request handler panicked; answering 500");
+    format!(
+        "internal error: the request handler panicked ({detail}). This is a server bug. \
+         The request did not finish; if it was a write, re-read the resource before retrying."
+    )
 }
 
 /// Snapshot of the currently-forced variables.
@@ -97,7 +213,9 @@ pub fn step(handle: &ProgramHandle, cycles: u32) -> ModeResponse {
 /// One-shot variable write with the OPTIONAL momentary-pulse contract:
 /// after `pulse_ms` the RUNTIME writes 0 back, so a closed operator tab
 /// or suspended tablet can't leave a momentary command latched.
-/// Overlapping pulses on one variable are latest-write-wins.
+/// A later accepted write (pulse or plain) or force supersedes the old reset,
+/// including bare/qualified aliases of the same variable. Rejected writes do
+/// not supersede it. Ownership is checked atomically in the scan command queue.
 ///
 /// This is the single implementation of that safety guarantee — the
 /// IDE server and the edge runtime both call it.
@@ -107,19 +225,39 @@ pub fn step(handle: &ProgramHandle, cycles: u32) -> ModeResponse {
 /// bypasses governance (same rationale as the force bypass, ADR-0002).
 /// Otherwise a rule with `min > 0` would clamp the reset up to `min`
 /// and silently latch the momentary command forever.
+///
+/// The pulse write is queued when this is called, in the caller's command
+/// order. Waiting for it to land and the reset run in a task of their own,
+/// not in the caller's future: an HTTP server drops a handler's future when
+/// the client disconnects, and a write already queued to the scan loop lands
+/// anyway. Tied to the caller, its reset was never scheduled and the value
+/// latched. The value is held for `pulse_ms` from the moment the write
+/// landed: time spent queued behind a slow scan does not shorten it.
 pub async fn write_with_pulse(
     handle: &ProgramHandle,
     name: &str,
     value: i32,
     pulse_ms: Option<u32>,
 ) -> Result<WriteOutcome, RuntimeWriteError> {
-    let v = handle.write_variable(name, value).await?;
     if let Some(ms) = pulse_ms {
+        let (landed, token) = handle.queue_pulse(name, value)?;
         let h = handle.clone();
         let n = name.to_string();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(ms as u64)).await;
-            match h.write_variable_ungoverned(&n, 0).await {
+            let outcome = match landed.await {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    let _ = started_tx.send(Err(e));
+                    return;
+                }
+            };
+            let deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_millis(ms as u64);
+            // The caller may be gone; the reset runs regardless.
+            let _ = started_tx.send(Ok(outcome));
+            tokio::time::sleep_until(deadline).await;
+            match h.reset_pulse(token).await {
                 // The program may have stopped in the window — that also
                 // clears the variable, so a failed reset is benign then;
                 // log it so a live-program failure is still visible.
@@ -134,7 +272,8 @@ pub async fn write_with_pulse(
                 // current VM value every scan, so the 0 lands when the link
                 // returns. What is lost without this line is any record that
                 // the plant held the command in between.
-                Ok(o) => {
+                Ok(None) => {} // A later accepted command owns the slot.
+                Ok(Some(o)) => {
                     if let Some(device) = o.undelivered_device {
                         tracing::warn!(
                             variable = %n,
@@ -147,8 +286,14 @@ pub async fn write_with_pulse(
                 }
             }
         });
+        // The sender is dropped unanswered only if the task was cancelled
+        // (the Tokio runtime shutting down) or panicked.
+        started_rx
+            .await
+            .unwrap_or(Err(RuntimeWriteError::Disconnected))
+    } else {
+        handle.write_variable(name, value).await
     }
-    Ok(v)
 }
 
 /// Decode a variable's raw 64-bit slot into a typed JSON value, given
@@ -223,6 +368,26 @@ mod tests {
             typed_value("STRING", 0, "'hello'"),
             serde_json::json!("'hello'")
         );
+    }
+
+    #[test]
+    fn handler_panic_body_carries_the_panic_text_and_the_retry_advice() {
+        let literal = std::panic::catch_unwind(|| panic!("no group at index")).unwrap_err();
+        let body = handler_panic_body(literal.as_ref());
+        assert!(body.contains("no group at index"), "{body}");
+        assert!(body.contains("handler panicked"), "{body}");
+        assert!(body.contains("re-read the resource"), "{body}");
+
+        let formatted = std::panic::catch_unwind(|| {
+            let n = 2;
+            panic!("no group at index '{n}'")
+        })
+        .unwrap_err();
+        assert!(handler_panic_body(formatted.as_ref()).contains("index '2'"));
+
+        // A payload that is not text still gets a body, not a second panic.
+        let other = std::panic::catch_unwind(|| std::panic::panic_any(42_u32)).unwrap_err();
+        assert!(handler_panic_body(other.as_ref()).contains("non-string panic payload"));
     }
 
     #[test]

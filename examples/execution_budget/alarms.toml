@@ -1,0 +1,6 @@
+[[alarms]]
+id = "loop_test_armed"
+variable = "arm_hang"
+condition = "is_true"
+severity = "warn"
+message = "Offline infinite-loop test armed"

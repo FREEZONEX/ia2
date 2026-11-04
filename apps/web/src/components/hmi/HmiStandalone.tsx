@@ -252,6 +252,7 @@ export function HmiStandalone() {
           )}
           {showBadge && (
             <span
+              title={health.text}
               className={cn(
                 "rounded px-1.5 py-0.5 font-mono text-xs",
                 HEADER_TONES[health.tone],

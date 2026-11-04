@@ -22,6 +22,17 @@ name); malformed explicit encoding returns 400, never the active-project
 fallback. The CLI encodes `--project` names automatically, preserving
 Unicode and literal percent signs.
 
+Browser access: `cs` and the IDE server's SSH/curl proxy send neither HTTP
+`Origin` nor Fetch Metadata and remain supported. The servers validate Origin
+when present; otherwise cross-site/same-site browser API requests are refused
+using `Sec-Fetch-Site`, even on GET. Only named HTML entry pages accept
+top-level navigation from another site. Loopback Host checks include mapped
+IPv6 listeners, and equivalent IPv6 Origin spellings compare equally.
+`--allow-origin` / `IA2_ALLOWED_ORIGINS` names a separate front-end; invalid
+runtime values fail before project compilation or device/scan startup. Older
+browsers sending neither header remain a blind-GET limitation, not authenticated
+clients. Full contract: `docs/api.md`, **Auth**.
+
 Exit codes (uniform, enforced): `0` success · `1` problems in YOUR
 content (check diagnostics, failed probe, remote deploy failure, sim
 expectation failed) · `2` bad request — usage errors AND HTTP 4xx, with
@@ -109,7 +120,7 @@ cs check hmi/overview                # server-side screen check (structure + var
 cs check P0002                       # a problem code prints its full explanation
 cs check bad.st --explain            # human mode + explanations (JSON always carries them)
 cs transpile motor.ld.json [--with-map]   # the ST a graphical POU compiles to
-cs symbols motor.fbd.json [--name pid]    # declared variables / FB instances
+cs symbols motor.fbd.json [--name pid]    # declared variables / FB instances (nothing if the file can't be parsed — `cs check` says why)
 cs project check [dir]               # strongest offline gate: full project compile
 cs project info  [dir]               # offline orientation (POUs/devices/edges)
 ```
@@ -124,10 +135,13 @@ echoes, and rejects Output bindings to gear feedback (see 06).
 
 ```
 cs run [--program NAME [--file path.st]]  # tasks.toml schedule, or one PROGRAM
-cs stop
+                                           # waits for device teardown, including late reconnects;
+                                           # exit 2 + "still shutting down" after 10 s, retry
+cs stop                                    # returns when the stop is requested, not when devices are safe
 cs runtime status [--edge NAME]      # mode + forces (no variable values)
 cs runtime snapshot [--vars a,b] [--edge NAME]   # LIVE VALUES — the read you want
-cs runtime pause | resume | step [N] [--edge NAME]
+cs runtime pause | resume | step [N] [--edge NAME]   # pause halts the PROGRAM only: adapters keep sending the
+                                     # last outputs — not a safe state; stopping the program runs the failsafe pass
 cs runtime force <var> <value> [--edge NAME]     # pinned every scan; type-aware encoding
 cs runtime unforce <var> [--edge NAME]
 cs runtime write <var> <value> [--edge NAME]     # one-shot (program may overwrite)
@@ -137,6 +151,22 @@ cs runtime ack <alarm-id>            # acknowledge an alarm (see 09-sim-alarms.m
 Value encoding for force/write: human notation — `TRUE`/`FALSE`/`1`/`0`
 for BOOL, `50.0` for REAL (the CLI bit-packs by the variable's live
 type). Negative numbers after `--`: `cs runtime force setpoint -- -5`.
+
+HTTP variable writes also accept `pulse_ms` (via `cs api` or HMI): the
+runtime resets the value to zero after the delay, counted from when the write
+was applied (queueing behind a slow scan does not shorten it), even while
+paused. A later
+accepted pulse, plain write (including MQTT), or force supersedes that reset
+for the same resolved variable, including bare/qualified aliases. A rejected
+write leaves the reset active. Reset bypasses governance bounds; if delivery
+is impossible, it still clears the VM and logs the undelivered device. A
+caller that disconnects after the runtime read the request still gets the
+write and its reset.
+The current VM value is sent on normal link recovery; no new start edge is
+introduced by this pulse contract.
+
+A timed-out or cancelled `cs run` does not abandon the previous run's
+cleanup. Retry waits for the same teardown before starting anything.
 
 Snapshot `value` is display text from ironplc's `VariableRenderer`:
 STRING is a single-quoted Latin-1 IEC literal; WSTRING is double-quoted
@@ -185,6 +215,9 @@ cs sim run scenarios/fill.toml [--program NAME] [--trace out.jsonl] [--keep-runn
 Exit 0 = every expectation held; 1 = a step failed (the report names
 the step, the deadline, and the last observed value). Scenario
 vocabulary + alarm/history workflow: `references/09-sim-alarms.md`.
+Use `expect_fault = { contains = "VM execution budget exceeded", within_ms = 5000 }`
+to assert a terminal fault. It requires `running=false` and a matching
+`last_error`; a stopped program without that error does not pass.
 
 ### Deploy / edge
 
@@ -203,13 +236,58 @@ gate on health must read `fieldbus_healthy` / `unhealthy_devices` from
 
 `watchdog_tripped` is the third field such a gate must read, and the
 nastiest: a latched runtime is reachable AND fieldbus-healthy AND its scan
-count keeps climbing, while it drives nothing. `probe` prints
-`WATCHDOG LATCHED` for it; only a restart clears it.
+count keeps climbing, while normal output publication is inhibited. `probe` prints
+`WATCHDOG LATCHED` for it, or `OUTPUT PHASE INHIBITED — <reason>` when the runtime says
+something else latched them (the project's `[supervision] safe_state` policy, an
+execution-budget trap): `latch_reason` in `cs probe --json`. Only a restart clears it.
+
+`fault` is the fourth: the edge's program stopped (a VM trap, say), and the
+runtime answers while running nothing. `probe` prints `PROGRAM FAULTED —
+<reason>`; the edge's `/status` carries the same `fault`. An edge build
+predating the field reports `fault: null` here even when faulted, so check
+`cs get edges/<n>/status` on an old edge.
+
+`snapshot_tap` is the fifth: the task that feeds history and process alarms
+from the scan loop can end (or fail on every snapshot) while the program runs
+fine, so the edge is reachable, fieldbus-healthy and scanning while it records
+no history and evaluates no alarms — `alarms_standing: 0` then means "nothing
+is evaluating", not "no alarms". `probe` prints `SNAPSHOT TAP STOPPED` when
+`snapshot_tap.running` is `false` (only a restart clears it),
+`SNAPSHOT TAP STALLED` when `stalled_for_ms` is set (a stage blocked inside one
+snapshot, usually a write that does not return: `running` stays true and
+`faults` stays 0) and `snapshot tap FAULTED N×` when `faults` is above zero, each followed by a `policy:` line (the `supervision` the runtime is enforcing; "not reported" means an older runtime that IGNORES a declared `[supervision]`); a count that climbs
+between two probes is failing now. It is `null` for an edge build that
+predates the field.
+
+Deploy first freezes regular project files into a private temporary snapshot.
+Preflight and upload use the same copy; later saves cannot alter the upload.
+Symlinks and special files are refused before upload; replace them with regular
+files. The snapshot is removed after completion or cancellation. The shared
+runtime loader validates governance, tasks, devices/iomap, the multi-PROGRAM
+shared-globals rule and compilation. Refusal is `ok:false`, empty `version`,
+`health:null` and the reason in `log`; nothing on the edge changes. This uses
+the server compiler; a carried-forward edge binary may differ. Runtime faults
+remain the responsibility of the post-restart check.
 
 Deploy REFUSES to lie: a failed restart, broken tar stream, or missing
-version stamp fails the deploy (`ok:false` + log). install_dir/systemd
-drift surfaces as a structured `warning` field. Attach/detach live
-streaming: `cs api POST /api/edges/<n>/attach` / `detach`.
+version stamp fails (`ok:false` + log). After restart the server requires
+continuous mode and advancing positive scans in consecutive `/status` reads.
+A changed `runtime_id` or reset counter/uptime restarts that observation; older
+runtimes without an identity use the weaker counter/uptime evidence. Equal
+counts are waited for (long-cycle tasks). The entire check, including SSH
+reads and sleeps, is bounded to 30 s. `health.state` is `faulted` for a fault
+or watchdog, `not_running` for paused/step, `unprotected` when the project declares a `[supervision]` the edge's runtime does not enforce (an older runtime ignores it), `unmonitored` when the runtime's
+snapshot task (history, process alarms, the scan counter) has stopped, is stuck
+on one snapshot or its `snapshot_tap.faults` is rising — the program may scan but no alarm can be
+raised, and the deploy says so instead of "program not running" — or `unknown`
+when progress cannot be confirmed by the deadline; all are `ok:false` (exit 1). **Unknown does not
+prove stopped or safe.** A task longer than the window can remain unknown.
+The new version stays current; inspect runtime and plant state before manual
+rollback/restart. There is no automatic restart of the old program. The log's
+`PREV=` names the previous version. `not_checked` (no restart / install_dir
+drift) keeps `ok:true` for installation only; the IDE marks operation
+unconfirmed. Drift also has a structured `warning`.
+Attach/detach streaming: `cs api POST /api/edges/<n>/attach` / `detach`.
 
 ### HMI authoring actions
 
@@ -263,3 +341,13 @@ application. Pause/step or a missed cycle latches `watchdog_tripped`; resume and
 bus recovery cannot re-arm it. The option defaults off and requires one SYNC0
 clock source, no gear, and matching PLC task periods. See
 [the contract](../../../../docs/scan-cycle-handoff.md).
+
+### Output latch confirmation
+
+When reading runtime status or `cs probe`, distinguish `watchdog_tripped`
+(normal output publication inhibited) from `failsafe_status` (per-adapter
+safe-value attempts). Its `pending` names and `unconfirmed` device/error rows
+require attention even when transport health is good. `acknowledged` has the
+adapter's scope, not physical readback; `null` is no report. Check device health
+for configured adapters that never connected. Restart remains the existing
+re-arm boundary. Do not describe a latch flag as proof that every output is zero.

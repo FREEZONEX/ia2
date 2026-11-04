@@ -1,0 +1,73 @@
+description = "FB_VALVE: active dual limits beat reset; cleared faults accept a held open request"
+
+# Establish both limits, reset and cmd_open TRUE through the write surface.
+[[steps]]
+set = { var = "open_limit", value = true }
+[[steps]]
+set = { var = "close_limit", value = true }
+[[steps]]
+set = { var = "reset_request", value = true }
+[[steps]]
+set = { var = "open_request", value = true }
+[[steps]]
+expect = { var = "valve_fault", op = "is_true", within_ms = 600 }
+[[steps]]
+expect = { var = "valve_status", op = "eq", value = 3 }
+[[steps]]
+expect_never = { var = "valve_open", op = "is_true", during_ms = 300 }
+
+# Clearing the cause alone must leave the fault latched.
+[[steps]]
+set = { var = "reset_request", value = false }
+[[steps]]
+set = { var = "open_limit", value = false }
+[[steps]]
+expect_never = { var = "valve_fault", op = "is_false", during_ms = 300 }
+
+# Once the cause clears, reset may resume a continuously held cmd_open.
+[[steps]]
+set = { var = "reset_request", value = true }
+[[steps]]
+expect = { var = "valve_fault", op = "is_false" }
+[[steps]]
+expect = { var = "valve_open", op = "is_true" }
+[[steps]]
+set = { var = "close_limit", value = false }
+[[steps]]
+set = { var = "open_limit", value = true }
+[[steps]]
+expect = { var = "valve_status", op = "eq", value = 2 }
+
+# A new dual-limit fault must also close an already-open valve with reset held.
+[[steps]]
+set = { var = "close_limit", value = true }
+[[steps]]
+expect = { var = "valve_fault", op = "is_true" }
+[[steps]]
+expect = { var = "valve_status", op = "eq", value = 3 }
+[[steps]]
+expect_never = { var = "valve_open", op = "is_true", during_ms = 300 }
+
+# With reset still held, clearing the cause permits normal recovery.
+[[steps]]
+set = { var = "close_limit", value = false }
+[[steps]]
+expect = { var = "valve_fault", op = "is_false" }
+[[steps]]
+expect = { var = "valve_open", op = "is_true" }
+
+# Preserve external-fault and close-command priority too.
+[[steps]]
+set = { var = "external_fault", value = true }
+[[steps]]
+expect = { var = "valve_fault", op = "is_true" }
+[[steps]]
+expect_never = { var = "valve_open", op = "is_true", during_ms = 300 }
+[[steps]]
+set = { var = "close_request", value = true }
+[[steps]]
+set = { var = "external_fault", value = false }
+[[steps]]
+expect = { var = "valve_fault", op = "is_false" }
+[[steps]]
+expect_never = { var = "valve_open", op = "is_true", during_ms = 300 }

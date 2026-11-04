@@ -7,6 +7,53 @@ serves a smaller subset on its own port — see `docs/edge-deploy.md`.
 
 **Auth:** none (localhost-only). Remote access via SSH port-forward.
 
+**Browser access guard.** A loopback port is reachable by pages open in the
+user's browser, so both HTTP services enforce these rules:
+
+- A request with `Origin` must match the request's `Host` name and effective
+  port, or an explicitly allowed origin. This covers reads, CORS preflights
+  and WebSocket handshakes. Refusals return `403` with a reason and no CORS
+  headers. The hosted UI and `vite dev` (which forwards `Host` and `Origin`
+  unchanged) work without configuration. The Host comparison deliberately
+  does not compare schemes, because a proxy may terminate TLS; this is a
+  host/port check, not the browser's strict scheme/host/port origin comparison.
+- Without `Origin`, a present `Sec-Fetch-Site` must be `same-origin` or `none`.
+  `cross-site` and `same-site` requests are refused even for GET/HEAD: edge
+  reads can launch SSH commands. Only GET/HEAD top-level HTML navigations
+  (`Sec-Fetch-Mode: navigate`, `Sec-Fetch-Dest: document`) may open the IDE's
+  `/`, `/index.html` or `/hmi.html`. API navigations, frames and cross-origin
+  subresources are refused. Responses vary by the three Fetch Metadata headers.
+- The IDE frontend treats `/index.html` as an alias for `/` on both the
+  static server and Vite. It replaces the browser history entry, preserving
+  query parameters (including `project`) and the URL fragment. This is a
+  client-side redirect after the HTML request passes the guard; it does not
+  widen the list of allowed HTML entries or API access.
+- Tools with neither `Origin` nor Fetch Metadata (`cs`, curl, the SSH/curl
+  proxy) still work. Legacy browsers that send neither header cannot be
+  distinguished from these tools: their blind GET requests remain a residual
+  exposure. This guard is not authentication.
+- While bound to loopback, including IPv4-mapped IPv6 loopback, `Host` must
+  also name loopback: `localhost`, `*.localhost`, `127.0.0.0/8`, `[::1]` or a
+  mapped loopback literal. This stops DNS rebinding. IPv6 literals in Host,
+  Origin and the allowed-origin configuration are normalized before comparison.
+
+Name a separately hosted front-end with `--allow-origin http://host:port`
+(repeatable) or `IA2_ALLOWED_ORIGINS` (comma-separated; flags take precedence).
+These explicit origins include their scheme, host and port; wildcards and
+`null` are refused. On the runtime, invalid configuration fails **before
+project loading, compilation or device/scan startup**. A named front-end must
+use CORS requests so its Origin identifies it; an originless cross-site GET
+does not inherit this permission.
+
+Binding beyond loopback (`--bind 0.0.0.0:…`) disables the Host restriction and
+logs a warning: the API still has no authentication. Browser local-network
+permissions are an additional client-side check, independent of this guard.
+Chrome's Local Network Access permission mechanism supersedes the former PNA
+preflight proposal; absence of `Access-Control-Allow-Private-Network` alone
+does not mean a named public origin cannot connect. See the
+[Chrome 142 release notes](https://developer.chrome.com/release-notes/142#local_network_access_restrictions)
+and [LNA proposal](https://wicg.github.io/local-network-access/).
+
 **Conventions:**
 - Resources are plural nouns under `/api/<resource>`.
 - Names with `/` (folder-nested POUs, devices, edges) are URL-encoded — the
@@ -21,7 +68,11 @@ serves a smaller subset on its own port — see `docs/edge-deploy.md`.
   and malformed encoded values return HTTP 400 instead of falling back
   to the active project.
 - Errors are HTTP status + a human-readable body. 4xx for client errors,
-  5xx for server bugs.
+  5xx for server bugs. A panic inside a request handler is one of those
+  bugs: it is answered `500` with the panic text in the body and logged at
+  ERROR, not with a closed connection. The handler may have got part of the
+  way first, so after such a `500` on a write, re-read the resource before
+  retrying.
 - Generated TypeScript types live under `apps/web/src/types/generated/` and
   are the source of truth for request/response shapes.
 
@@ -102,6 +153,16 @@ the failsafe sweep skips, so a configured safe state can never be applied. The
 duplicate-name half is also refused by the adapters themselves at connect,
 because the edge runtime runs no project validation at all.
 
+A third finding applies to EtherCAT devices on a real NIC only (the simulator
+ignores PDI offsets, so a `_sim` or empty `nic` is not checked): a channel whose
+`pdi_bit_offset` is 8 or more. The field is the bit position *inside* the byte
+at `pdi_byte_offset` (valid `0..=7`); the PDI range check passes a larger value
+because that bit exists in a long enough image, and a real-bus accessor then
+addresses the wrong byte. The adapter refuses it at connect too, but a device
+that fails its connect only retries in the background while the program runs,
+so without this the author learns of it from a device that never comes up.
+Deploy preflight does not run this lint.
+
 ## POUs
 
 A POU is one IEC declaration (PROGRAM / FUNCTION_BLOCK / FUNCTION). A
@@ -110,15 +171,28 @@ disk, and the tree (in `/api/project`) shows each declaration as its
 own node. The URL identifier in these routes is the **file path** —
 slash-separated under `pous/`, no `.st` extension.
 
+Declarations and variables are read with the compiler's parser and are
+best-effort listings: a file that does not parse lists none, and it is
+still shown in the tree and still readable, so it can be opened and fixed.
+The same holds when the compiler itself panics on a source (an internal
+compiler bug): the panic is logged at ERROR and that file lists nothing,
+while `GET /api/project`, `GET /api/pous/{path}` (its `source` is always
+returned), `GET /api/pous/{path}/variables`, `GET /api/project/pous`,
+`GET /api/project/variables` and `POST /api/symbols` keep answering. An
+empty listing therefore never means "this source is valid": that is what
+`POST /api/check` answers (a `compiler-panic` diagnostic in this case), and
+`POST /api/project/validate` and `POST /api/run` answer `500` with the
+panic text.
+
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/api/pous` | Create a POU file. Body: `CreatePouRequest { path, type, language }`. `type` is `program` / `function_block` / `function`; `language` is `st` / `ld` / `fbd` / `sfc` (picks the on-disk extension). |
 | `POST` | `/api/pous/folders` | Create a folder under `pous/`. Body: `CreateFolderRequest { path }`. |
 | `DELETE` | `/api/pous/folders/{path}` | Delete an empty folder. |
-| `GET` | `/api/pous/{path}` | Read a POU file. Returns `Pou { path, source, declarations: PouDecl[] }`. |
+| `GET` | `/api/pous/{path}` | Read a POU file. Returns `Pou { path, source, declarations: PouDecl[] }`. `declarations` is empty when the source cannot be parsed; `source` is returned regardless. |
 | `PUT` | `/api/pous/{path}` | Write POU source. Body is raw `text/plain`. |
 | `DELETE` | `/api/pous/{path}` | Delete a POU file (and every declaration inside it). |
-| `GET` | `/api/pous/{path}/variables` | Variables declared in the file. Returns `VariableInfo[]`. |
+| `GET` | `/api/pous/{path}/variables` | Variables declared in the file. Returns `VariableInfo[]` (`[]` when the source cannot be parsed). |
 
 ## Libraries & device catalog
 
@@ -176,14 +250,14 @@ or cached governance. Absent optional iomap/alarms files still mean none.
 | `GET` | `/api/edges/{name}` | Read an edge. Returns `Edge`. |
 | `PUT` | `/api/edges/{name}` | Update an edge. Body: `Edge`. |
 | `DELETE` | `/api/edges/{name}` | Delete. Also tears down any open attach tunnel. |
-| `GET` | `/api/edges/{name}/probe` | SSH+curl the edge's runtime `/health`. Returns `EdgeProbe { reachable, scan_count, uptime_secs, runtime_version, fieldbus_healthy, unhealthy_devices, watchdog_tripped, error }`. `reachable` only means the runtime answered — check `fieldbus_healthy` for whether its buses are up, and `unhealthy_devices` for which ones are not. `fieldbus_healthy` is `null` when unreachable or when the edge runs a build predating per-device health. `watchdog_tripped: true` means the edge latched its outputs off after losing the scan deadline — it stays reachable and fieldbus-healthy while driving nothing, so a health gate must read this too. |
+| `GET` | `/api/edges/{name}/probe` | SSH+curl the edge's runtime `/health`. Returns `EdgeProbe { reachable, scan_count, uptime_secs, runtime_version, fieldbus_healthy, unhealthy_devices, watchdog_tripped, latch_reason, failsafe_status, fault, snapshot_tap, supervision, error }`. `reachable` only means the runtime answered — check `fieldbus_healthy` for whether its buses are up, and `unhealthy_devices` for which ones are not. `fieldbus_healthy` is `null` when unreachable or when the edge runs a build predating per-device health. `watchdog_tripped: true` means the edge latched its outputs off — after losing the scan deadline, or because the project's alarm-supervision policy asked for it; `latch_reason` says which (`null` when not latched or when the edge predates the field) — it can stay reachable and fieldbus-healthy while normal output publication is inhibited, so a health gate must read this too. `fault` carries why the edge's program stopped (a VM trap, say): such an edge is reachable while running nothing, so a gate must read it as well. It is `null` while the program runs, when unreachable, or when the edge's `/health` predates the field (its `/status` still reports `fault`). `supervision` is the edge's own `/health` object (the policy it is enforcing; `null` when unreachable or when the runtime predates it). `snapshot_tap` (`{ running, faults, last_fault, stalled_for_ms, last_fault_age_ms }`, the edge's own `/health` object) says whether the edge's history, process alarms and `scan_count` are still being fed from its scan loop: an edge whose feeding task has ended is reachable, fieldbus-healthy and running its program while it records no history and evaluates no alarms, so a gate must read this too. `running: false` is the persistent state; a `faults` count that climbs between two probes means it is failing now. It is `null` when unreachable or when the edge's `/health` predates the field. |
 | `GET` | `/api/edges/{name}/logs?tail=N` | Tail the edge runtime's journald logs over ssh (`tail` clamped to 2000, default 200). Returns JSON. |
 | `GET` | `/api/edges/{name}/discover` | Per-device connect status + discovered EtherCAT topology from the edge, so PDO maps can be authored against the real bus. Returns JSON. |
 | `GET` | `/api/edges/{name}/system` | Edge interfaces / serial ports / arch — for authoring device configs against real edge facts. Returns JSON. |
 | `GET` | `/api/edges/{name}/status` | Proxy the edge runtime's `/status` (project + scan count + debug mode/forces + last snapshot). Returns JSON. |
 | `GET` | `/api/edges/{name}/audit` | Proxy the edge runtime's `/audit` write ring (who claimed to write what: self-declared origin, op, requested/applied values, outcome — see the edge table below). Backs `cs get edges/<n>/audit`. Returns JSON. |
 | `POST` | `/api/edges/{name}/runtime/{op}` | Proxy an online-debug op to the *deployed* edge runtime over ssh. `op` ∈ {`pause`,`resume`,`step`,`write`,`force`,`unforce`}; body forwarded as the remote payload (e.g. `{cycles}` for step, `{name,value}` for write/force). The edge's own answer passes through with its original status and body verbatim — a governance denial on the edge is a 403 here too, a stopped runtime a 409; only ssh/transport faults are this server's own 500s. |
-| `POST` | `/api/edges/{name}/deploy` | Tar project + runtime binary + web assets (when this server has a `--static-dir`; they land at `current/web` for the edge's HMI panel), ssh to edge, atomic symlink swap, restart unit. Returns `DeployReport`. |
+| `POST` | `/api/edges/{name}/deploy` | Freeze regular project files into a private temporary snapshot, run `load_edge_project` on that copy (governance, tasks, devices/iomap, shared-globals rule, compile), and upload the same copy. Symlinks and special files are refused before upload. Any preparation/preflight refusal returns `ok:false`, `version:""`, `health:null` and a reason, without touching the edge. The preflight uses the server compiler; a carried-forward edge binary may differ. Tar the checked project + optional runtime/web assets, upload over SSH, atomically swap current and restart the unit. Observe `/status` within a hard 30 s deadline including reads and polling: `running` requires continuous mode and advancing positive scan counts across consecutive reads, without a counter/uptime reset or changed `runtime_id`; unchanged counters are waited for (long-cycle tasks). New runtimes expose a stable per-process `runtime_id`; older ones fall back to counter/uptime evidence, which cannot exclude every fast restart. Returns `DeployReport { ok, version, log, warning, health }`; `health` is `{ state: running \| faulted \| not_running \| unmonitored \| unprotected \| unknown \| not_checked, detail, unhealthy_devices }`, or null before a restart. `unprotected` means the alarm-supervision policy the project declares (`alarms.toml` `[supervision]`) is not the one the edge's runtime reports it is enforcing — most often a runtime built before the setting, which ignores it (a deploy that ships no binary keeps the edge's own); the deploy fails (`ok:false`) because the declared protection does not exist, even though the program runs. A missing runtime policy is accepted for `report` (the project default); if the runtime reports a policy, its mode must match, and `safe_state` also requires the declared grace period. `unmonitored` means the runtime's snapshot task (the one feeding history, process alarms and the `scan_count` this check reads) has stopped, or its `snapshot_tap.faults` rose between two reads: nothing is recorded, no alarm can be raised, and the program's progress cannot be confirmed, so the deploy fails (`ok:false`) and the version stays current, with no rollback. A fault count that is steady does not fail the deploy but is named in `detail`. Fault/watchdog = `faulted`; paused/step = `not_running`; deadline, no confirmed progress, unavailable/missing status = `unknown` (not proof of a stopped or safe plant). These three fail with `ok:false`. No automatic rollback or restart of the previous program; inspect runtime and plant state before manual recovery. `not_checked` (no restart / install_dir drift) retains `ok:true` for file installation, but UI shows operation unconfirmed. Down devices on a running program remain a warning. |
 | `POST` | `/api/edges/{name}/attach` | Open `ssh -N -L` tunnel to the edge runtime port. Returns `AttachInfo { local_port }`. |
 | `POST` | `/api/edges/{name}/detach` | Close the tunnel. |
 | `GET` | `/api/edges/{name}/attachment` | Current attachment state. Returns `AttachmentStatus { attached, local_port }`. |
@@ -211,21 +285,50 @@ or cached governance. Absent optional iomap/alarms files still mean none.
 
 ## Compile, run, observe
 
+Each unit-scan is limited to 10,000,000 opcodes (the *instruction limit*)
+and to one second of wall time (the *time limit*, shorter when the container
+sets an explicit watchdog). The opcode ceiling is the one a runaway scan
+normally meets first, and it does not depend on the host: a scan that needs
+more opcodes faults the same way on a development machine and on an edge board. How long
+10,000,000 opcodes take does depend on it: about 35 ms on an Apple-silicon Mac
+in a release build, about half a second in a debug build, more on
+slower hardware. The time limit is the host-dependent backstop. Both are
+constants, so a legitimately heavy scan has to be spread over several scans
+or tasks. The clock is checked every 256 opcodes and on completion, not by
+preempting an individual opcode.
+Exhaustion terminates the run, attempts device failsafe/shutdown, and reports
+`VM execution budget exceeded in <instance>: instruction limit (10000000
+opcodes per scan)` (or `time limit (<n> ms per scan)`) in `last_error` plus
+SSE `error`/`stopped`.
+Partial scan outputs/snapshots and final RETAIN writes are suppressed.
+`POST /api/stop` takes effect at the next scan boundary: the scan in flight
+completes and the final RETAIN checkpoint is written. Only a scan still
+running 250 ms after the stop request is discarded as hung (no fault, no
+final RETAIN write).
+This is distinct from the five-overrun latch, which keeps computing.
+The IDE releases a faulted run's handle, so read `last_error` rather than
+expecting its `watchdog_tripped` flag to remain available after termination.
+`POST /api/stop` is still a request, not proof that physical outputs are safe.
+A run that faulted, or was stopped, has left the program slot while its scan thread
+is still driving outputs safe and shutting devices down; `POST /api/run` waits for
+that (up to 10 s, then `409`) instead of starting over it.
+
+
 Every `CheckDiagnostic` includes `context` and `related` arrays, even
 when empty, so clients can consume diagnostics without missing-field checks.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/api/check` | Compile-check ONE source string (no project required). Body: `text/plain`. Returns `CheckDiagnostic[]`. | Fast feedback for editor squiggles
-| `POST` | `/api/symbols?language=st\|ld\|fbd\|sfc` | Extract declared variables from one source string (any language; default `st`). Body: `text/plain`. Returns `VariableInfo[]`. | Backs the editor's binding picker
-| `POST` | `/api/run` | Compile the whole project + spawn the bridge. Body: `{}` or `RunRequest`. | Reads `tasks.toml` to decide what runs
-| `POST` | `/api/stop` | Stop the running program (cooperative; scan loop drains). |
-| `GET` | `/api/runtime/status` | Synchronous overview of the runtime. Returns `RuntimeStatus { running, project, program_instances, devices, device_health, watchdog_tripped, scan_period_ms, scan_count, last_snapshot_us, last_error, running_info, mode, forces }`; `last_error` carries why a run died — a VM trap, a VM that failed to start, or a panic — (also emitted as SSE `error` + `stopped`), `null` after a clean run. `devices` lists the project's configured device names, while `device_health` reports whether each one's transport is actually live — a `false` entry means that device's inputs are frozen at last-known values and its outputs are dropped, even though `running` stays `true` and the scan count keeps climbing. `watchdog_tripped` is `true` once the scan watchdog latched: the program lost real-time guarantees, every output was zeroed and the output phase stays off until a restart — check it before reading any variable value as plant state, because the VM keeps computing and `scan_count` keeps climbing after a trip. `scan_period_ms` is the fastest task's interval — the cadence at which `scan_count` can advance — so a client judging "is this live data current?" can size its window from the project's own rate instead of a fixed guess: `interval_ms` has no upper bound, and on a 5 s-cycle project a 4 s-old value is the newest one that exists. It says nothing about how long a scan actually takes; the overrun watchdog owns that. `scan_overruns` counts missed scan deadlines since the program started (summed over units) and `consecutive_scan_overruns` is the longest streak any unit is currently on — the achieved cadence, which `scan_period_ms` cannot describe. The overrun log line fires once per unit and then suppresses itself, so before these there was no way to tell a runtime quietly missing every fourth deadline from one meeting them all; `watchdog_tripped` only covers the terminal case. A total that climbs between two polls means it is missing them now. `scan_period_ms`, `scan_overruns` and `consecutive_scan_overruns` are `null` when nothing is running. | One-shot, agent-friendly
+| `POST` | `/api/check` | Compile-check ONE source string (no project required). Body: `text/plain`. Returns `CheckDiagnostic[]`; `[]` means the source WAS checked and is clean. If the compiler itself panics during the check (an internal compiler bug, not necessarily a mistake in this source: with a project open the sibling files are parsed as context, so the panic may come from another file in the project, and then every buffer of that project gets this answer) the answer is still `200`, but with one `error` diagnostic at line 1 column 1 whose `code` is `compiler-panic` and whose message carries the panic text and says the source was NOT checked (`check-aborted` if the check task was cancelled); never `[]`. The panic is also in the server log. | Fast feedback for editor squiggles
+| `POST` | `/api/symbols?language=st\|ld\|fbd\|sfc` | Extract declared variables from one source string (any language; default `st`). Body: `text/plain`. Returns `VariableInfo[]`; `[]` when the source cannot be parsed, including when the compiler panics on it (see POUs above). | Backs the editor's binding picker
+| `POST` | `/api/run` | Compile the whole project + spawn the bridge. Body: `{}` or `RunRequest`. A run still in the slot is stopped, and **the start waits for every earlier run to finish its failsafe pass and device teardown, including late reconnect workers** (also after `POST /api/stop`, a project close, or a fault, which release the slot at once), so the new run never connects to or writes to a device the old one is still shutting down. If that takes longer than 10 s the answer is `409` ("the previous run is still shutting down its devices …; nothing was started") and nothing is started; retry. A timed-out or cancelled request does not release this gate. Starts are serialized. | Reads `tasks.toml` to decide what runs
+| `POST` | `/api/stop` | Stop the running program (cooperative; scan loop drains). Answers as soon as the stop is requested, not when the devices are safe: the `stopped` event and `running=false` mean the run has left the slot. The next `POST /api/run` waits for the teardown. |
+| `GET` | `/api/runtime/status` | Synchronous overview of the runtime. Returns `RuntimeStatus { running, project, program_instances, devices, device_health, watchdog_tripped, latch_reason, failsafe_status, scan_period_ms, scan_count, last_snapshot_us, last_error, running_info, mode, forces }`; `last_error` carries why a run died — a VM trap, a VM that failed to start, an execution-budget exhaustion, or a panic — (also emitted as SSE `error` + `stopped`), `null` after a clean run. `devices` lists the project's configured device names, while `device_health` reports whether each one's transport is actually live — a `false` entry means that device's inputs are frozen at last-known values and its outputs are dropped, even though `running` stays `true` and the scan count keeps climbing. `watchdog_tripped` is `true` once the scan watchdog latched: normal output publication stays inhibited until a restart; it does not confirm device safe-value writes — check it before reading any variable value as plant state, because the VM keeps computing and `scan_count` keeps climbing after a trip. `scan_period_ms` is the fastest task's interval — the cadence at which `scan_count` can advance — so a client judging "is this live data current?" can size its window from the project's own rate instead of a fixed guess: `interval_ms` has no upper bound, and on a 5 s-cycle project a 4 s-old value is the newest one that exists. It says nothing about how long a scan actually takes; the overrun watchdog owns that. `scan_overruns` counts missed scan deadlines since the program started (summed over units) and `consecutive_scan_overruns` is the longest streak any unit is currently on — the achieved cadence, which `scan_period_ms` cannot describe. The overrun log line fires once per unit and then suppresses itself, so before these there was no way to tell a runtime quietly missing every fourth deadline from one meeting them all; `watchdog_tripped` only covers the terminal case. A total that climbs between two polls means it is missing them now. `scan_period_ms`, `scan_overruns` and `consecutive_scan_overruns` are `null` when nothing is running. | One-shot, agent-friendly
 | `GET` | `/api/runtime/snapshot` | Latest `VarSnapshot` or `null`. | No SSE needed for one-off queries
 | `POST` | `/api/runtime/variables/{name}` | Write a variable while running. Body: `WriteVariableRequest { value: <i32-coerceable> }`. Returns the new value. Subject to the project's `[governance]` (project.toml): in `allowlist` mode a write to an unlisted variable is 403, and a rule's `min`/`max` clamp the written value (the response echoes the clamped value). A write no honest clamp exists for is denied 403 instead: `NaN` to a min/max-ruled REAL, or a rule range containing no representable value of the variable's type. The response also carries `undelivered_device`: when the variable has an Output mapping onto a device whose transport is down, the write is still applied (a Stop that flushes when the link returns beats one never commanded) and this names that device, so a caller must not report a bare success. `null` on a healthy link or an internal variable — and it is transport health only, never proof that the value took effect. | Critical for debugging closed loops
 | `GET` | `/api/events` | SSE stream of `AppEvent` (`snapshot` / `started` / `stopped` / `error`). | For long-running IDE clients
-| `GET` | `/api/project/variables` | Flat list of every variable across every POU in the project. Returns `ProjectVariables { variables: [...] }`. | Cross-POU index for agents
-| `GET` | `/api/project/pous` | Every IEC POU declared anywhere in the project (parser-driven). Returns `ProjectPous { pous: [{ application, name, kind }] }` — `kind` ∈ `program` / `function_block` / `function`. | Source of truth for "what's schedulable" — multi-POU files (one .st declaring PROGRAM + FB + FUNCTION) are correctly enumerated, unlike `application.kind` which is a heuristic |
+| `GET` | `/api/project/variables` | Flat list of every variable across every POU in the project. Returns `ProjectVariables { variables: [...] }`. A file that cannot be parsed contributes none. | Cross-POU index for agents
+| `GET` | `/api/project/pous` | Every IEC POU declared anywhere in the project (parser-driven). Returns `ProjectPous { pous: [{ file_path, name, type, language }] }` — `type` ∈ `program` / `function_block` / `function`. A file that cannot be parsed contributes none. | Source of truth for "what's schedulable" — multi-POU files (one .st declaring PROGRAM + FB + FUNCTION) are correctly enumerated, unlike `application.kind` which is a heuristic |
 
 ## Runtime debug control
 
@@ -233,9 +336,23 @@ Online debugging of the locally-running program (the IDE-side bridge). For
 the *deployed* edge runtime, proxy the same ops through
 `POST /api/edges/{name}/runtime/{op}`. All return `409` when nothing is running.
 
+Variable writes accept optional `pulse_ms: <u32>`: the runtime writes zero
+after that delay, counted from when the write was applied (time it spent
+queued behind a slow scan does not shorten the pulse), including while
+paused. A later accepted pulse, ordinary
+write (including MQTT), or force to the same resolved variable supersedes
+the earlier reset; bare and qualified names share ownership. Rejected writes
+leave the existing reset active. The current reset bypasses write governance
+so a positive minimum cannot prevent zero. If its device is disconnected,
+zero still lands in the VM and the runtime logs the failed delivery; normal
+output synchronization sends the current value when the link returns.
+Once the request has been read, neither the write nor its reset depends on
+the client: one that disconnects before the answer still gets both.
+This contract is shared by the IDE server and the edge runtime's `/write`.
+
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/api/runtime/pause` | Freeze the scan loop (last outputs hold). Returns `ModeResponse { mode }`. |
+| `POST` | `/api/runtime/pause` | Halt the scan loop: the program stops advancing and no new outputs are pushed, but adapter workers (the EtherCAT cyclic thread, Modbus polling) keep running and keep sending the last values — a debug stop, not a safe state; stopping the program runs the failsafe pass. Returns `ModeResponse { mode }`. |
 | `POST` | `/api/runtime/resume` | Resume free-running. Returns `ModeResponse`. |
 | `POST` | `/api/runtime/step` | Advance N cycles while paused. Body: `StepRequest { cycles }` (default 1). Returns `ModeResponse`. |
 | `GET` | `/api/runtime/forces` | List currently-forced variables. Returns `ForceEntry[]` (`[]` when not running). |
@@ -264,6 +381,8 @@ state/journal/ack machinery on server and edge; they do not change PLC logic
 or output safety policy. Process alarms watching stale inputs neither raise
 nor clear, and their pending debounce resets until valid input returns.
 
+On the edge runtime, when its alarm evaluation is lost (the snapshot task that feeds the alarm engine, the history and the live feed has stopped, is stuck or is failing), a built-in `Critical` alarm `__supervision/snapshot_tap` is raised at once and listed beside the process alarms; `alarms_standing` counts it, the journal records it, and it stays standing after it returns until acknowledged (URL-encode the whole id for the ack route, as for `__device/`). It is raised by the runtime's supervisor, not by a snapshot, so it works when snapshots have stopped. The `__supervision/` prefix is reserved, and `PUT /api/alarms` refuses an id that uses it.
+
 History points add optional `stale: true` when any sample in the bucket was
 stale. Consumers must show a gap/unknown interval, not a fresh flat line;
 the edge's persisted history retains this flag across restarts.
@@ -276,12 +395,12 @@ below, same get→edit→set shape as iomap); alarm STATE lives here.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/api/runtime/history` | Downsampled history. Query: `vars=a,b` (empty = all), `from_us`, `to_us` (0 = open), `step_ms` (default 1000). Returns `HistoryResponse { series: [{ name, points: [{ t_us, min, max, v }] }], oldest_us, sample_interval_us }`. |
+| `GET` | `/api/runtime/history` | Downsampled history. Query: `vars=a,b` (empty = all), `from_us`, `to_us` (0 = open), `step_ms` (default 1000; `0` is read as 1, and a step too large to express in microseconds is one bucket covering the whole window). Returns `HistoryResponse { series: [{ name, points: [{ t_us, min, max, v }] }], oldest_us, sample_interval_us }`. |
 | `GET` | `/api/runtime/alarms` | Live alarm states, standing-first then severity. Returns `AlarmState[]` (`active`, `acked`, `raised_at_us`, `value_at_raise`, `count`). |
 | `POST` | `/api/runtime/alarms/{id}/ack` | Acknowledge one alarm. Returns the updated `AlarmState`; 404 unknown id. |
 | `GET` | `/api/runtime/alarms-journal` | Most-recent-first event journal (`raised` / `acked` / `returned`). Query: `limit` (default 100, ring-capped at 1000). Returns `AlarmJournalEntry[]`. |
-| `GET` | `/api/alarms` | Read the project's alarm definitions (`alarms.toml`). Returns `AlarmConfig { alarms: AlarmDef[] }`. |
-| `PUT` | `/api/alarms` | Replace the alarm definitions. Rejects duplicate ids and numeric conditions without a `limit`. Applies on the NEXT run. |
+| `GET` | `/api/alarms` | Read the project's alarm definitions (`alarms.toml`). Returns `AlarmConfig { alarms: AlarmDef[], supervision? }`; `supervision` is the project's declared answer to "what does the edge runtime do if it can no longer evaluate alarms" (`{ on_loss: report \| safe_state, grace_secs }`) and is absent when the file does not say, which means `report` (see `docs/edge-deploy.md`, *Alarm supervision*). |
+| `PUT` | `/api/alarms` | Replace the alarm definitions. Rejects duplicate ids and numeric conditions without a `limit`, a `supervision` table with an unknown key or an unknown `on_loss`, and a `grace_secs` outside 1..=3600. A body that omits `supervision` keeps the one the project already declares, so an edit of the definitions cannot silently remove a protective `safe_state`; send `{"supervision": {"on_loss": "report"}}` to change it. Applies on the NEXT run. |
 
 ## Agent activity (takeover overlay)
 
@@ -380,30 +499,50 @@ full online-debug set — bound to `127.0.0.1` only. The IDE proxies most of
 these through `/api/edges/{name}/…` (and `/api/edges/{name}/runtime/{op}` for
 the debug ops).
 
+As on the IDE server, a panic inside one of these handlers is answered `500`
+with the panic text as a plain-text body (and logged at ERROR), not with a
+closed connection; the handler may have got part of the way first, so after
+such a `500` on a write, re-read the resource before retrying. The standalone
+panel's static files (`/hmi`, `--static-dir`) are not behind that guard.
+
+The runtime applies the same browser guard as the IDE server (see **Auth**
+above), to the panel and its static files as well. Its allowed top-level HTML
+navigation paths are `/`, `/hmi`, `/hmi.html` and descendants of `/hmi/`;
+the root redirects to `/hmi`. API paths never get that navigation exception.
+There is one
+cross-origin exception, because the web IDE streams a runtime through the SSH
+forward's loopback port: `GET`/`HEAD /events` from a page whose own origin is a
+loopback name gets `Access-Control-Allow-Origin` for that origin. This exposes
+process snapshots to any page on a loopback origin; it grants no write access.
+A panel published through a reverse proxy, whose public name the runtime never
+sees (the proxy forwards its own `Host`), is named with
+`--allow-origin https://hmi.example` (repeatable) or `IA2_ALLOWED_ORIGINS`, as on
+the IDE server. The legacy-browser limitation above also applies here.
+
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/health` | Liveness: status, uptime, scan count, plus `fieldbus_healthy` (true only when every configured device's transport is live), a per-device `devices` health breakdown, and `watchdog_tripped` (the scan watchdog latched the outputs off — a probe that only checks `status: "ok"` would otherwise call a latched runtime healthy, since it keeps serving HTTP and keeps scanning). |
-| `GET` | `/status` | Project + PROGRAM instances + device list + scan count + last snapshot + debug mode + forces, plus `device_health` (per-device transport health; a `false` entry means that device's inputs are frozen at last-known values), `watchdog_tripped` (the scan watchdog latched: outputs were zeroed and stay off until this process restarts — check it before reading `last_snapshot` as plant state, because the VM keeps computing after a trip) and `fault` (why the scan loop died — a VM trap, a VM that failed to start, or a panic — `null` while running or after a requested stop). `scan_period_ms` is the fastest task's interval — the cadence at which `scan_count` can advance — so a client judging "is this live data current?" can size its window from the project's own rate instead of a fixed guess: `interval_ms` has no upper bound, and on a 5 s-cycle project a 4 s-old value is the newest one that exists. It says nothing about how long a scan actually takes. `scan_overruns` counts missed scan deadlines since the program started (summed over units) and `consecutive_scan_overruns` is the longest streak any unit is currently on — the achieved cadence, which `scan_period_ms` cannot describe. The overrun log line fires once per unit and then suppresses itself, so before these there was no way to tell a runtime quietly missing every fourth deadline from one meeting them all; `watchdog_tripped` only covers the terminal case. A total that climbs between two polls means it is missing them now. `build_commit` and `build_rustc` are stamped into the binary at compile time — the source commit (suffixed `-dirty`) and the compiler — so a deployed runtime can say what built it; either is `unknown` when the build could not see a git tree and none was supplied. |
+| `GET` | `/health` | Liveness: status, uptime, scan count, plus `fieldbus_healthy` (true only when every configured device's transport is live), a per-device `devices` health breakdown, and `watchdog_tripped` (the scan watchdog latched the outputs off — a probe that only checks `status: "ok"` would otherwise call a latched runtime healthy, since it keeps serving HTTP and keeps scanning). `fault` is the same message as `/status`'s: why the program stopped, `null` while it runs. `status` stays `"ok"` for a faulted runtime — it only says the process answers. `watchdog_tripped` is `true` once the outputs are latched off, whoever latched them (the scan watchdog, an execution-budget trap, or the project's alarm-supervision policy); `latch_reason` says which, `null` while they are not latched. `supervision` (`{ on_loss, grace_secs, lost_for_ms, latch_in_ms }`) is the alarm-supervision policy this process is ENFORCING: what it read from `alarms.toml` at startup, not what the file says now (edits apply on the next restart). `on_loss` is the mode's name as text (`report` or `safe_state`), so a reader does not fail on a mode it does not know. A runtime built before the field omits it, and for a project that declares `safe_state` that means the declared protection is NOT in force: such a runtime ignores the table. While alarm evaluation is lost, `lost_for_ms` is how long (since the runtime's supervisor first saw it lost) and, under `safe_state`, `latch_in_ms` is how long is left before a latch is requested (`0` once due). While the loss continues, `lost_for_ms` remains available under `report` and after a latch; only `latch_in_ms` is `null` under `report`, once a latch is requested, or when outputs are already latched (`latch_reason` explains a completed latch). Both are `null` when nothing is lost or the supervisor has not looked for several seconds, so an old countdown is not read as a live one. An older runtime omits both. `snapshot_tap` (`{ running, faults, last_fault }`) says whether history, process alarms and `scan_count` are still being fed from the scan loop: that is a separate task, so when it ends, or fails on every snapshot, the program keeps running and `status` stays `"ok"` while history stops recording and process alarms stop being evaluated. `running: false` means the task ended and stays so until the runtime restarts; `faults` counts incidents since start (a stage panicked on a snapshot, or snapshots were skipped because the tap fell behind the scan loop) and a count that climbs between two polls means it is failing now; `last_fault` is the latest in words, `null` when there has been none, and `last_fault_age_ms` is how long ago it happened (`faults` only grows, so on its own it cannot say whether the task is failing now). `stalled_for_ms` is how long the task has been stuck inside ONE snapshot once that exceeds 2 s (the scan loop emits one every 100 ms), `null` while it keeps up: a stage that blocks, a stalled disk under the historian say, neither panics nor lags, so `running` stays `true` and `faults` stays `0`, yet history, alarms, `scan_count` and `/events` stop moving; measured inside the task, so a program that has stopped (and emits no snapshots) is not mistaken for a stuck task. An edge build predating the field omits it. |
+| `GET` | `/status` | Project + PROGRAM instances + device list + scan count + last snapshot + debug mode + forces, plus `device_health` (per-device transport health; a `false` entry means that device's inputs are frozen at last-known values), `watchdog_tripped` (normal output publication is inhibited until this process restarts; inspect `failsafe_status` for device acknowledgements — check it before reading `last_snapshot` as plant state, because the VM keeps computing after a trip) and `fault` (why the scan loop died — a VM trap, a VM that failed to start, an execution-budget exhaustion, or a panic — `null` while running or after a requested stop). `scan_period_ms` is the fastest task's interval — the cadence at which `scan_count` can advance — so a client judging "is this live data current?" can size its window from the project's own rate instead of a fixed guess: `interval_ms` has no upper bound, and on a 5 s-cycle project a 4 s-old value is the newest one that exists. It says nothing about how long a scan actually takes. `scan_overruns` counts missed scan deadlines since the program started (summed over units) and `consecutive_scan_overruns` is the longest streak any unit is currently on — the achieved cadence, which `scan_period_ms` cannot describe. The overrun log line fires once per unit and then suppresses itself, so before these there was no way to tell a runtime quietly missing every fourth deadline from one meeting them all; `watchdog_tripped` only covers the terminal case. A total that climbs between two polls means it is missing them now. `build_commit` and `build_rustc` are stamped into the binary at compile time — the source commit (suffixed `-dirty`) and the compiler — so a deployed runtime can say what built it; either is `unknown` when the build could not see a git tree and none was supplied. `latch_reason`, `failsafe_status` and `supervision` are the same as `/health`'s. `snapshot_tap` is the same object `/health` carries: read it before trusting `alarms_standing: 0`, because once the tap has ended nothing is evaluating alarms and `last_snapshot` stops moving. |
 | `GET` | `/events` | SSE stream of `VarSnapshot` (bare — no `AppEvent` wrapper). |
 | `GET` | `/logs?tail=N` | The most recent `tail` (default 200) captured log lines. What `cs get edges/<n>/logs` pulls over the tunnel. |
 | `GET` | `/logs/stream` | SSE stream of log lines as they're emitted (no backlog; pair with `/logs` for history). |
 | `GET` | `/discover` | Per-device connect reports + discovered EtherCAT topology. Powers `cs get edges/<n>/scan`. |
 | `GET` | `/system` | Edge NICs / serial ports / arch, for authoring device configs against real edge facts. Powers `cs get edges/<n>/system`. |
-| `POST` | `/pause` | Freeze the scan loop (last outputs hold). Returns `{ mode }`. |
+| `POST` | `/pause` | Halt the scan loop: the program stops advancing and no new outputs are pushed, but adapter workers (the EtherCAT cyclic thread, Modbus polling) keep running and keep sending the last values — a debug stop, not a safe state; stopping the program runs the failsafe pass. Returns `{ mode }`. |
 | `POST` | `/resume` | Resume free-running. Returns `{ mode }`. |
 | `POST` | `/step` | Advance N cycles while paused. Body: `{ cycles }`. Returns `{ mode }`. |
 | `POST` | `/write` | One-shot write of a variable. Body: `{ name, value }`. Returns the applied value. Subject to the deployed project's `[governance]` (project.toml): `write_mode = "allowlist"` rejects writes to variables with no matching `[[governance.rules]]` entry (403), and a rule's `min`/`max` clamp the value (the response echoes the clamped value — a clamp is also logged and lands in `/audit` as `result: "clamped"` with both `requested` and `applied`, never silent). A write no honest clamp exists for is denied 403 instead: `NaN` to a min/max-ruled REAL, or a rule range containing no representable value of the variable's type. The response also carries `undelivered_device`: when the variable has an Output mapping onto a device whose transport is down, the write is still applied (a Stop that flushes when the link returns beats one never commanded) and this names that device, so a caller must not report a bare success. `null` on a healthy link or an internal variable — and it is transport health only, never proof that the value took effect. |
 | `POST` | `/force` | Pin a variable every cycle until released. Body: `{ name, value }`. Same precedence as the server route: applied before the program runs, so a program-written variable is overwritten by the program and the force never reaches the field. Force is the debug override: it **bypasses governance** by explicit decision (ADR-0002) and is never exported on any northbound surface. |
 | `POST` | `/unforce` | Release a forced variable. Body: `{ name }`. |
 | `POST` | `/inject-scan-stall` | Fault injection (test primitive): same contract as the server's `/api/runtime/inject-scan-stall` — stall `scans` scans by `stall_ms` each and trip the watchdog for real. Body: `{ stall_ms, scans? }`. |
-| `GET` | `/audit` | The write-audit ring (bounded at 256, oldest first): every `/write`·`/force`·`/unforce` and MQTT northbound write with `ts_unix_secs`, `origin` (`X-IA2-Origin` header, `mqtt`, or `anonymous`), `op`, `name`, bit-packed `requested` and `applied` values (an `unforce` entry carries neither — there is no value to release to), and `result` — `ok`, `clamped` (governance altered the value; `requested`/`applied` show both sides), or the error text (denied writes are recorded too, with the denial reason; `applied` is then absent). In-memory only — cleared when the runtime process restarts (a redeploy restarts it), and under steady write traffic the 256-entry window covers only the recent past; `/history` is the surface that survives restarts. Also readable through the IDE as `GET /api/edges/{name}/audit` / `cs get edges/<n>/audit`. |
-| `GET` | `/history` | Downsampled history, same query/response shape as `/api/runtime/history`. Backed by JSONL segments under the edge's state dir — survives restarts AND deploys (state/ sits beside `current`). |
+| `GET` | `/audit` | The write-audit ring (bounded at 256, oldest first): every `/write`·`/force`·`/unforce` and MQTT northbound write with `ts_unix_secs`, `origin` (the self-declared `X-IA2-Origin` label, `mqtt`, or `anonymous` — a label anyone who reaches the socket can claim), `http_origin` (the real HTTP `Origin` header of a browser-made request, e.g. the operator panel's own address; absent for curl, `cs`, the IDE server's proxy and MQTT), `op`, `name`, bit-packed `requested` and `applied` values (an `unforce` entry carries neither — there is no value to release to), and `result` — `ok`, `clamped` (governance altered the value; `requested`/`applied` show both sides), or the error text (denied writes are recorded too, with the denial reason; `applied` is then absent). A request the runtime has read is executed and recorded even when its client disconnects before the answer, so a write whose call timed out can still have an entry. In-memory only — cleared when the runtime process restarts (a redeploy restarts it), and under steady write traffic the 256-entry window covers only the recent past; `/history` is the surface that survives restarts. Also readable through the IDE as `GET /api/edges/{name}/audit` / `cs get edges/<n>/audit`. |
+| `GET` | `/history` | Downsampled history, same query/response shape as `/api/runtime/history`. Backed by JSONL segments under the edge's state dir — survives restarts AND deploys (state/ sits beside `current`). The disk is written on its own thread behind a bounded queue (about eight minutes at 1 Hz): a stalled disk cannot freeze the alarm engine, `/status` or `/events`, and cannot block this endpoint; if it stays stalled past the queue, new samples are still held in memory and served here but are not persisted, which is logged (at the 1st, 2nd, 4th ... dropped sample) as `history persistence is not keeping up`. |
 | `GET` | `/alarms` | Live `AlarmState[]` for the deployed `alarms.toml`, standing-first. `/status` carries the `alarms_standing` count on the panel's existing poll. |
 | `POST` | `/alarms/{id}/ack` | Acknowledge one alarm (operator action from the panel). 404 unknown id. |
 | `GET` | `/alarms-journal` | Most-recent-first alarm event journal (`raised` / `acked` / `returned`). Query: `limit`. |
 | `POST` | `/stop` | Request graceful shutdown. |
 | `GET` | `/api/hmi` | HMI screens deployed with the project: `[{ path, title, level }]` (same row shape as the IDE route). Read-only — screens are edited in the IDE and arrive via deploy. |
-| `GET` | `/api/hmi/{path}` | One screen's full `HmiDoc` JSON. 404 if the deployed project has no such screen. |
+| `GET` | `/api/hmi/{path}` | One screen's full `HmiDoc` JSON. 400 if the screen name is not a valid slug (empty, an empty or `.`-prefixed segment, `\` or `:`; the body states the rule), 404 if the deployed project has no such screen, 500 if the deployed file exists but is not a valid `HmiDoc`. |
 
 With `--static-dir` pointing at the built web assets the runtime also serves the
 standalone operator panel: `GET /hmi` lists the deployed screens, `GET /hmi/{rest}`
@@ -460,3 +599,40 @@ of monotonic host-time events. A cycle fault sets `watchdog_tripped` and makes
 that device unhealthy; resuming or bus recovery does not clear it. The CLI
 resource is unchanged: `cs get runtime/status`. Details and timing limits:
 [cycle handoff contract](scan-cycle-handoff.md).
+
+### Output inhibition and device acknowledgement
+
+`watchdog_tripped` describes the run's monotonic normal-output inhibit, whether
+requested explicitly, by the scan watchdog, or by an execution-budget fault.
+`latch_reason` preserves the first cause. Neither field establishes that device
+safe-value writes completed. The VM can continue evaluating after a latch.
+
+`failsafe_status` is additive on IDE `GET /api/runtime/status`, edge `GET /health`
+and `GET /status`, and `GET /api/edges/{name}/probe`:
+
+```json
+{
+  "pending": ["coupler"],
+  "acknowledged": ["sensor"],
+  "unconfirmed": [{"device": "drive", "error": "protocol: safe write rejected"}]
+}
+```
+
+It is `null` before any attempt, when the IDE has no running handle, or when a
+probed older edge omits it. `pending` is published before awaiting an attempt;
+a previous failure remains in `unconfirmed` while that device is being retried,
+and clears only on acknowledgement. Rejection or panic remains visible in
+`unconfirmed`. Results cover adapters owned by the run; configured devices that
+never connected must also be checked in `device_health`. They are not confirmed
+by an empty report. `acknowledged` is the adapter's documented acknowledgement,
+not wire delivery or physical readback: EtherCAT acknowledges a cleared mirror
+for a later cyclic exchange; OPC UA and CANopen attempt only explicitly
+configured safe values, which need not be zero. Background reconnection and
+initialization commands are outside the normal output-phase inhibit.
+
+The bridge's `latch_outputs_off` returns an error for unconfirmed devices while
+keeping the normal-output inhibit set. A subsequent explicit call retries only
+unconfirmed devices; it does not clear the latch or replace its first reason.
+A successful retry returns `false` (the run was already inhibited). The alarm
+supervisor does not introduce an automatic retry or re-arm policy. Runtime/CLI
+status views show pending and rejected attempts separately from transport health.

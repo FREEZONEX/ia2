@@ -30,7 +30,7 @@ class FakeEventSource {
 
 const idle: RuntimeStatus = {
   running: false, project: "Current", program_instances: [], devices: [], device_health: [],
-  watchdog_tripped: false, scan_period_ms: null, scan_overruns: null, consecutive_scan_overruns: null,
+  watchdog_tripped: false, latch_reason: null, failsafe_status: null, scan_period_ms: null, scan_overruns: null, consecutive_scan_overruns: null,
   scan_count: 0n, last_snapshot_us: 0n, last_error: null, running_info: null, mode: null, forces: [],
 }
 

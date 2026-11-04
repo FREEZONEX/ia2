@@ -1,9 +1,10 @@
 # watchdog_latch — bench fixture for the scan-watchdog latch
 
-Proves on real hardware what
-`runtime::tests::watchdog_trip_latches_outputs_off_until_restart` proves in
-a unit test: once the scan watchdog trips, **no non-zero output may reach
-the bus until the program is restarted**.
+Exercises the scan-watchdog latch. The offline regression
+`runtime::tests::watchdog_trip_latches_outputs_off_until_restart` checks that
+the normal output phase cannot overwrite configured safe values after a
+trip. The bench procedure observes a drive's statusword separately; an
+adapter acknowledgement alone does not establish wire or physical state.
 
 ## Two ways to make it trip
 
@@ -18,6 +19,13 @@ finish inside its interval. Two ways to create it, one per environment:
   ```bash
   cs sim run scenarios/latch.toml
   ```
+
+  `scenarios/acknowledgement.toml` adds a healthy-before-trip control and a
+  continued-latch check. The CLI end-to-end regression runs it with `_sim`
+  and checks `/api/runtime/status`: `watchdog_tripped` is true, `servo` is in
+  `failsafe_status.acknowledged`, and pending/unconfirmed lists are empty.
+  This confirms an in-memory adapter response only. Rejection and panic
+  cases are covered by the bridge's local-adapter regressions.
 
 - **bench** — force the CPU burn live: `cs runtime force burn_n 200000
   --edge <edge>`. Every scan then overruns for real with no HTTP in the

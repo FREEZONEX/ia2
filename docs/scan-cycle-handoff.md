@@ -49,6 +49,8 @@ dispatches the cycle timer directly. The same worker polls the socket pump
 with a local executor while the socket uses the existing reactor for I/O
 readiness. A native timer failure trips the gate,
 and the worker continues safe-zero exchange using the asynchronous timer.
+The worker owns and drains its socket task before a transport replacement or
+completed shutdown, including when initialization returns early or unwinds.
 An operator can explicitly set `IA2_EC_SYNC_RT_PRIORITY` to 1–20 to run
 this one thread under Linux `SCHED_RR` after socket registration, including
 startup exchanges. Omit it
@@ -72,7 +74,10 @@ HTTP variable writes still enter the VM and are processed by subsequent scans.
 
 Pause or step also trips the synchronized run. The common runtime sets the existing
 `watchdog_tripped` latch and keeps serving diagnostics; it does not exit/restart on
-this fault. Transport recovery or re-walk cannot clear the gate. Explicit program
+this fault. The first cause appears in `latch_reason`; adapter safe-value attempts
+use the shared `failsafe_status` reporting and panic isolation. An adapter's
+acknowledgement does not establish physical output state. Transport recovery or
+re-walk cannot clear the gate. Explicit program
 restart creates a new gate; it is not an automatic retry of a failed trajectory.
 Stopping still invokes the existing failsafe/shutdown sequence. An already handed
 off/in-flight bus frame cannot be retracted by a later software stop.

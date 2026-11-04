@@ -591,8 +591,10 @@ export async function writeVariable(
 
 // ---------- Runtime debug controls ----------
 
-/** Halt the scan loop. IO is frozen; the program does not advance.
- *  Variable writes and forces still apply while paused. */
+/** Halt the scan loop. The program does not advance and no new outputs are
+ *  pushed, but devices keep the last values they were sent: this is a debug
+ *  stop, not a safe state. Variable writes still update the VM while paused;
+ *  force commands register overrides that apply on the next scan. */
 export async function pauseRuntime(): Promise<void> {
   await jsonOrThrow(
     await apiFetch(`/api/runtime/pause`, { method: "POST" }),

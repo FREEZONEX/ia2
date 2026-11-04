@@ -1,4 +1,5 @@
 import { ChevronDown, ChevronUp, Lock, Pause, Pin, Play, Search, StepForward, Unlock } from "@/components/ui/icons"
+import { outputLatchMessage } from "@/lib/output-latch"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 
 import { Button } from "@/components/ui/button"
@@ -82,9 +83,9 @@ export function MonitorPane({ collapsed, onToggleCollapse }: { collapsed: boolea
       setMode(nextMode === "running" || nextMode === "paused" || nextMode === "step" ? nextMode : null)
       setForces(new Set(data.forces.map(force => force.name)))
       const failedDevices = data.device_health.filter(device => !device.healthy).map(device => device.name)
-      setRuntimeFault(data.watchdog_tripped
-        ? "Watchdog tripped — outputs are locked"
-        : data.last_error || (failedDevices.length ? `Device connection lost: ${failedDevices.join(", ")}` : null))
+      const latch = outputLatchMessage(data)
+      setRuntimeFault([data.last_error, latch].filter(Boolean).join(". ")
+        || (failedDevices.length ? `Device connection lost: ${failedDevices.join(", ")}` : null))
       setStatusError(null)
     } catch (error) {
       if (revision === revisionRef.current) setStatusError(`Runtime status unavailable: ${String(error)}`)
@@ -255,7 +256,10 @@ export function MonitorPane({ collapsed, onToggleCollapse }: { collapsed: boolea
       ? unforceVariable(variable.name)
       : forceVariable(variable.name, currentForceValue(variable), variable.type_name),
   )
-  const error = commandError || statusError || runtimeFault || (collapsed ? alarmStatusError : null)
+  // A retained command error must not hide a later failsafe report. Keep the
+  // existing priority order while showing each independently known problem.
+  const error = [commandError, statusError, runtimeFault, collapsed ? alarmStatusError : null]
+    .filter(Boolean).join(". ") || null
 
   return (
     <section aria-label="Monitor" className="flex h-full min-h-0 min-w-0 flex-col bg-background">

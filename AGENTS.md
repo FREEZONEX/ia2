@@ -32,7 +32,8 @@ directories.
   `runtime` = headless edge binary, `cli` = the `cs` binary,
   `ironplc-bridge` = compiler/VM wrapper + shared `monitor` layer
   (debug ops, historian, alarm engine), `project` = on-disk schema,
-  `iomap-*` = field-protocol adapters, `esi`/`iocore` = support).
+  `iomap-*` = field-protocol adapters, `http-guard` = the Origin/Host
+  rules both HTTP servers sit behind, `esi`/`iocore` = support).
   `vendor/ironplc` is a git submodule — never edit it directly; the
   patch registry is `docs/adr/0001-ironplc-ia2-boundary.md`.
 - Web IDE in `apps/web` (React 19 + Vite + Tailwind 4; single SPA plus

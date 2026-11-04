@@ -31,6 +31,7 @@ import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
 import { useHmiMutation } from "@/state/hmi-live"
 import { useRuntime } from "@/state/runtime"
+import { outputLatchMessage } from "@/lib/output-latch"
 import type { HmiDoc } from "@/types/generated/HmiDoc"
 import type { HmiIssue } from "@/types/generated/HmiIssue"
 
@@ -62,6 +63,7 @@ export function HmiPane() {
       nav: (target) => void selectHmi(target),
       runtimeState: async () => {
         const s = await fetchRuntimeStatus()
+        const latch = outputLatchMessage(s)
         // mode rides along so a paused scan loop doesn't show as a
         // green "Running" in the canvas alarmbar. unhealthyDevices does
         // the same job for a dead fieldbus: the scan loop keeps running
@@ -69,8 +71,8 @@ export function HmiPane() {
         // alarmbar shows a calm green plant while the bus is down —
         // the standalone edge panel has always shown it.
         return {
-          running: s.running,
-          alarm: s.watchdog_tripped ? "Watchdog tripped — outputs are locked" : s.last_error ?? null,
+          running: s.running && !latch,
+          alarm: [s.last_error, latch].filter(Boolean).join(". ") || null,
           mode: s.mode?.kind,
           scanPeriodMs: s.scan_period_ms,
           unhealthyDevices: s.device_health

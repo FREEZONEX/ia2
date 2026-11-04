@@ -11,6 +11,66 @@ ticks := ticks + 1;
 END_PROGRAM
 ";
 
+fn numeric_result(source: &str) -> u64 {
+    let c = compile(source).unwrap();
+    let index = c
+        .debug_section
+        .as_ref()
+        .unwrap()
+        .var_names
+        .iter()
+        .find(|v| v.name == "result")
+        .unwrap()
+        .var_index;
+    let mut buffers = ironplc_vm::VmBuffers::from_container(&c);
+    let mut vm = ironplc_vm::Vm::new()
+        .load(&c, &mut buffers)
+        .unwrap()
+        .start()
+        .unwrap();
+    vm.run_round(0).unwrap();
+    vm.read_variable_raw(index).unwrap()
+}
+
+#[test]
+fn inverted_integer_limit_returns_max_without_panicking() {
+    for ty in ["DINT", "LINT", "UDINT", "ULINT"] {
+        assert_eq!(
+            numeric_result(&format!(
+                "PROGRAM main VAR mn : {ty} := 10; mx : {ty} := 5; result : {ty}; END_VAR
+             result := LIMIT(mn, 7, mx); END_PROGRAM"
+            )),
+            5,
+            "{ty}"
+        );
+    }
+}
+
+#[test]
+fn unsigned_abs_and_large_lint_exponents_keep_their_full_width() {
+    assert_eq!(
+        numeric_result(
+            "PROGRAM main VAR x : UDINT := 3000000000; result : UDINT; END_VAR
+         result := ABS(x); END_PROGRAM"
+        ) as u32,
+        3_000_000_000
+    );
+    assert_eq!(
+        numeric_result(
+            "PROGRAM main VAR x : ULINT := 10000000000000000000; result : ULINT; END_VAR
+         result := ABS(x); END_PROGRAM"
+        ),
+        10_000_000_000_000_000_000
+    );
+    assert_eq!(
+        numeric_result(
+            "PROGRAM main VAR x : LINT := 2; n : LINT := 4294967296; result : LINT; END_VAR
+         result := x ** n; END_PROGRAM"
+        ),
+        0
+    );
+}
+
 fn tasks() -> Tasks {
     Tasks {
         tasks: vec![Task {
@@ -76,6 +136,7 @@ END_PROGRAM",
     let mut buffers = ironplc_vm::VmBuffers::from_container(&container);
     let mut vm = ironplc_vm::Vm::new()
         .load(&container, &mut buffers)
+        .unwrap()
         .start()
         .unwrap();
     vm.run_round(0).unwrap();
@@ -102,6 +163,7 @@ END_PROGRAM";
     let mut buffers = ironplc_vm::VmBuffers::from_container(&container);
     let mut vm = ironplc_vm::Vm::new()
         .load(&container, &mut buffers)
+        .unwrap()
         .start()
         .unwrap();
     vm.run_round(0).unwrap();

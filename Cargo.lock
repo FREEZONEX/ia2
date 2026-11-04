@@ -475,13 +475,13 @@ checksum = "8b75356056920673b02621b35afd0f7dda9306d03c79a30f5c56c44cf256e3de"
 
 [[package]]
 name = "async-trait"
-version = "0.1.89"
+version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9035ad2d096bed7955a320ee7e2230574d28fd3c3a0f186cbea1ff3c7eed5dbb"
+checksum = "82f6aeea286b8eb4dd3431a1be1b59d290ace00f5bfd8e2a159bc2a05e2c1667"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -1004,7 +1004,7 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "container_derive"
-version = "0.244.0"
+version = "0.248.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1322,7 +1322,7 @@ dependencies = [
 
 [[package]]
 name = "dsl_macro_derive"
-version = "0.244.0"
+version = "0.248.0"
 dependencies = [
  "convert_case 0.12.0",
  "proc-macro2",
@@ -2079,13 +2079,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "ia2-http-guard"
+version = "0.0.1"
+dependencies = [
+ "axum 0.8.9",
+ "tokio",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "ia2-runtime"
 version = "0.0.1"
 dependencies = [
  "anyhow",
  "axum 0.8.9",
  "futures-util",
+ "ia2-http-guard",
  "ironplc-bridge",
+ "parking_lot",
  "project",
  "rumqttc",
  "rumqttd",
@@ -2095,6 +2107,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
+ "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",
@@ -2361,7 +2374,7 @@ dependencies = [
 
 [[package]]
 name = "ironplc-analyzer"
-version = "0.244.0"
+version = "0.248.0"
 dependencies = [
  "ctor",
  "env_logger",
@@ -2399,6 +2412,7 @@ dependencies = [
  "ironplc-parser",
  "ironplc-vm",
  "libc",
+ "parking_lot",
  "project",
  "serde",
  "serde_json",
@@ -2411,7 +2425,7 @@ dependencies = [
 
 [[package]]
 name = "ironplc-cli"
-version = "0.244.0"
+version = "0.248.0"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -2443,7 +2457,7 @@ dependencies = [
 
 [[package]]
 name = "ironplc-cli-support"
-version = "0.244.0"
+version = "0.248.0"
 dependencies = [
  "env_logger",
  "log",
@@ -2453,7 +2467,7 @@ dependencies = [
 
 [[package]]
 name = "ironplc-codegen"
-version = "0.244.0"
+version = "0.248.0"
 dependencies = [
  "blake3",
  "ironplc-analyzer",
@@ -2468,11 +2482,12 @@ dependencies = [
  "proptest",
  "rstest",
  "spec_test_macro",
+ "time",
 ]
 
 [[package]]
 name = "ironplc-container"
-version = "0.244.0"
+version = "0.248.0"
 dependencies = [
  "blake3",
  "container_derive",
@@ -2483,7 +2498,7 @@ dependencies = [
 
 [[package]]
 name = "ironplc-dsl"
-version = "0.244.0"
+version = "0.248.0"
 dependencies = [
  "dsl_macro_derive",
  "ironplc-problems",
@@ -2497,7 +2512,7 @@ dependencies = [
 
 [[package]]
 name = "ironplc-parser"
-version = "0.244.0"
+version = "0.248.0"
 dependencies = [
  "ironplc-container",
  "ironplc-dsl",
@@ -2514,9 +2529,10 @@ dependencies = [
 
 [[package]]
 name = "ironplc-plc2plc"
-version = "0.244.0"
+version = "0.248.0"
 dependencies = [
  "dsl_macro_derive",
+ "ironplc-analyzer",
  "ironplc-dsl",
  "ironplc-parser",
  "ironplc-spec-requirements-gen",
@@ -2528,14 +2544,14 @@ dependencies = [
 
 [[package]]
 name = "ironplc-problems"
-version = "0.244.0"
+version = "0.248.0"
 dependencies = [
  "csv",
 ]
 
 [[package]]
 name = "ironplc-project"
-version = "0.244.0"
+version = "0.248.0"
 dependencies = [
  "ctor",
  "env_logger",
@@ -2554,7 +2570,7 @@ dependencies = [
 
 [[package]]
 name = "ironplc-sources"
-version = "0.244.0"
+version = "0.248.0"
 dependencies = [
  "ctor",
  "encoding_rs",
@@ -2574,15 +2590,15 @@ dependencies = [
 
 [[package]]
 name = "ironplc-spec-requirements-gen"
-version = "0.244.0"
+version = "0.248.0"
 
 [[package]]
 name = "ironplc-test"
-version = "0.244.0"
+version = "0.248.0"
 
 [[package]]
 name = "ironplc-vm"
-version = "0.244.0"
+version = "0.248.0"
 dependencies = [
  "csv",
  "ironplc-container",
@@ -4342,6 +4358,7 @@ dependencies = [
  "axum 0.8.9",
  "clap",
  "futures-util",
+ "ia2-http-guard",
  "iomap-ethercat",
  "iomap-modbus",
  "iomap-opcua",
@@ -4527,7 +4544,7 @@ dependencies = [
 
 [[package]]
 name = "spec_test_macro"
-version = "0.244.0"
+version = "0.248.0"
 dependencies = [
  "proc-macro2",
  "quote",
