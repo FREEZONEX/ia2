@@ -991,6 +991,18 @@ fn first_line(s: &str) -> &str {
         .trim_end()
 }
 
+/// Preserve HTTP errors on the read-only mailbox proxy, including busy and
+/// timeout. Path is generated from validated, percent-encoded query fields.
+pub async fn proxy_edge_runtime_get(
+    edge: &Edge,
+    path: &str,
+) -> Result<serde_json::Value, EdgeRuntimeError> {
+    let quoted_path = path.replace('\'', r"'\''");
+    let resp = edge_runtime_curl(edge, |port| format!("curl --silent --max-time 7 -w '\\n%{{http_code}}' 'http://127.0.0.1:{port}/{quoted_path}'"))
+        .await.map_err(EdgeRuntimeError::Transport)?;
+    parse_edge_runtime_response(&resp)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

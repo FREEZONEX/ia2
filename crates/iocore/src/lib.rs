@@ -7,6 +7,7 @@
 //! without forming a cycle.
 
 mod health;
+pub mod sdo;
 
 use async_trait::async_trait;
 use serde::Serialize;
@@ -132,6 +133,10 @@ pub enum IoError {
 #[async_trait]
 pub trait IoDevice: Send {
     fn name(&self) -> &str;
+    /// A read-only handle to the existing master; never creates another owner.
+    fn sdo_upload_handle(&self) -> Option<std::sync::Arc<dyn sdo::SdoUpload>> {
+        None
+    }
     async fn read_channel(&mut self, channel: &str) -> Result<ChannelValue, IoError>;
     async fn write_channel(&mut self, channel: &str, value: ChannelValue) -> Result<(), IoError>;
 

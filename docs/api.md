@@ -414,3 +414,39 @@ operator client needs nothing but a browser and this port.
 
 Access from the dev machine: open an `ssh -N -L <local>:127.0.0.1:<runtime_port> <edge>`
 tunnel (see `/api/edges/{name}/attach`) and hit `http://127.0.0.1:<local>/...`.
+
+
+### Read-only live CoE upload
+
+| Method | Path | Result |
+|---|---|---|
+| GET | `/api/runtime/sdo` | Scalar SDO upload from the local running program's existing EtherCAT master |
+| GET | `/api/edges/{name}/sdo` | The same operation through the edge SSH proxy; preserves edge status/body |
+| GET | `/sdo` | Edge runtime endpoint (localhost only) |
+
+All three require query fields `device` (configured device name), `slave` (zero-based
+bus position, u16), `index` (decimal or explicit `0x` hexadecimal), and `subindex`
+(u8). Unknown fields are rejected. No POST/PUT/download, complete-access, or
+state-transition operation is provided. `_sim` returns unsupported; it never
+pretends to return drive parameters.
+
+A 200 response contains `device` and `upload`: address, exact little-endian
+`bytes` (1/2/4/8 bytes), `unsigned`, `signed`, discovered vendor/product/revision/
+serial identity, and `sampled_at_unix_ms`. Both numeric interpretations are
+provided; the object dictionary defines the applicable one and scale. For 64-bit
+values, use bytes in clients whose JSON numbers lose integer precision.
+
+Only one upload may be outstanding per master, including after client cancellation.
+The mailbox future is polled beside PDO exchange; neither PLC scans nor PDO cycles
+await the transaction. Requests are not replayed after a bus re-walk. 400 = invalid
+query, 404 = device/slave missing, 409 = unsupported/busy (also no local program),
+502 = CoE/protocol failure including the drive abort detail, 503 = unhealthy,
+reinitializing or ended session, 504 = timeout (one second handle resolution,
+four seconds upload). A client timeout is not proof of a stopped transaction;
+the lane remains reserved until the worker finishes/cancels it. Read requests
+never enable a drive, reset faults, or modify outputs. Mailbox traffic still
+consumes bus/CPU time; diagnose with drives disabled and monitor communication.
+
+Examples:
+`cs get runtime/sdo/bus/1/0x2008/1`
+`cs --project demo get edges/edge-a/sdo/bus/1/0x2008/1`

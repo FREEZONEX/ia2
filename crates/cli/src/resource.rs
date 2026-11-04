@@ -176,6 +176,34 @@ pub(crate) fn resolve_get(path: &str) -> Result<Plan> {
         );
     };
     let joined = rest.join("/");
+    let sdo_at = match kind {
+        "runtime" if rest.first().map(String::as_str) == Some("sdo") => Some(0),
+        "edges" => rest
+            .iter()
+            .rposition(|s| s == "sdo")
+            .filter(|i| *i > 0 && rest.len() == *i + 5),
+        _ => None,
+    };
+    if let Some(i) = sdo_at {
+        if rest.len() != i + 5 {
+            bail!("expected {kind}/.../sdo/<device>/<slave>/<index>/<subindex>");
+        }
+        let base = if kind == "runtime" {
+            "/api/runtime/sdo".to_string()
+        } else {
+            format!("/api/edges/{}/sdo", url_encode(&rest[..i].join("/")))
+        };
+        return Ok(Plan::Get {
+            path: format!(
+                "{base}?device={}&slave={}&index={}&subindex={}",
+                url_encode(&rest[i + 1]),
+                url_encode(&rest[i + 2]),
+                url_encode(&rest[i + 3]),
+                url_encode(&rest[i + 4])
+            ),
+            render: Render::Json,
+        });
+    }
     let plan = match kind {
         "iomap" | "tasks" | "northbound" | "alarms" | "hmi-symbols" => {
             if !rest.is_empty() {

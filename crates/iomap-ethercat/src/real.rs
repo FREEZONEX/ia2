@@ -230,6 +230,7 @@ struct PdiMirror {
 const WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub struct RealEthercat {
+    sdo: Arc<crate::sdo::Client>,
     name: String,
     channels: HashMap<String, EthercatChannel>,
     /// Slow-plane routing for in-cycle gear parameter channels; consulted
@@ -256,6 +257,8 @@ pub struct RealEthercat {
 /// The `Arc` handles `connect` shares with the cyclic worker thread,
 /// bundled so `smol_main` keeps a readable signature.
 struct WorkerShared {
+    sdo_rx: smol::channel::Receiver<crate::sdo::Request>,
+    verify_init_sdo: bool,
     pdi: Arc<Mutex<PdiMirror>>,
     shutdown: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
@@ -379,6 +382,21 @@ impl RealEthercat {
         let input_changes = Arc::new(AtomicU64::new(0));
         let reinitializing = Arc::new(AtomicBool::new(false));
         let reinits = Arc::new(AtomicU64::new(0));
+        let (sdo, sdo_rx) = crate::sdo::channel(
+            healthy.clone(),
+            shutdown.clone(),
+            reinitializing.clone(),
+            reinits.clone(),
+        );
+        let verify_init_sdo = match std::env::var("IA2_EC_INIT_SDO_VERIFY_ONLY").as_deref() {
+            Ok("1") => true,
+            Err(std::env::VarError::NotPresent) | Ok("0") => false,
+            _ => {
+                return Err(IoError::Connect(
+                    "IA2_EC_INIT_SDO_VERIFY_ONLY must be 0 or 1".into(),
+                ))
+            }
+        };
         let (init_tx, init_rx) = mpsc::sync_channel::<InitResult>(1);
 
         let nic = config.nic.clone();
@@ -387,6 +405,8 @@ impl RealEthercat {
         let dc_static_sync_iterations = config.dc_static_sync_iterations;
         let slaves = config.slaves.clone();
         let shared = WorkerShared {
+            sdo_rx,
+            verify_init_sdo,
             pdi: pdi.clone(),
             shutdown: shutdown.clone(),
             stopped: stopped.clone(),
@@ -477,6 +497,7 @@ impl RealEthercat {
                     reinits,
                 );
                 Ok(Self {
+                    sdo,
                     name,
                     channels,
                     gear_routing,
@@ -510,6 +531,9 @@ impl Drop for RealEthercat {
 
 #[async_trait]
 impl IoDevice for RealEthercat {
+    fn sdo_upload_handle(&self) -> Option<Arc<dyn iocore::sdo::SdoUpload>> {
+        Some(self.sdo.clone())
+    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -952,6 +976,8 @@ fn smol_main(
     init_tx: mpsc::SyncSender<InitResult>,
 ) {
     let WorkerShared {
+        sdo_rx,
+        verify_init_sdo,
         pdi,
         shutdown,
         stopped,
@@ -1155,6 +1181,33 @@ fn smol_main(
                 let Some(cfg) = slaves.iter().find(|s| s.index == pos as u16) else {
                     continue;
                 };
+                if verify_init_sdo {
+                    for cmd in crate::sdo::final_assignments(&cfg.init_sdo) {
+                        let result = sd
+                            .sdo_read::<crate::sdo::Scalar>(cmd.index, cmd.sub_index)
+                            .await;
+                        match result {
+                            Ok(raw) if crate::sdo::matches_init(&raw, cmd) => tracing::info!(
+                                slave = pos,
+                                index = cmd.index,
+                                subindex = cmd.sub_index,
+                                "init sdo verified; no download"
+                            ),
+                            result => {
+                                let detail = match result {
+                                    Ok(raw) => format!(
+                                        "got {:?}, expected {} ({} bits)",
+                                        raw.0, cmd.value, cmd.bits
+                                    ),
+                                    Err(e) => format!("{e:?}"),
+                                };
+                                if walk_fail(first_init, &init_tx, &mut reinit_attempt, format!("init SDO verification failed on slave {pos} {:#06x}:{}: {detail}", cmd.index, cmd.sub_index)) { return; }
+                                continue 'supervise;
+                            }
+                        }
+                    }
+                    continue;
+                }
                 for cmd in &cfg.init_sdo {
                     let res = match cmd.bits {
                         8 => {
@@ -1388,6 +1441,7 @@ fn smol_main(
                     let mut bus_ok = true;
                     let mut prev_shape: Option<(Vec<ethercrab::SubDeviceState>, u16)> = None;
                     let mut shape_edges: u64 = 0;
+                    crate::sdo::run(&sdo_rx, &reinits, async {
                     while !shutdown.load(Ordering::Relaxed) {
                         cycles.fetch_add(1, Ordering::Relaxed);
                         let cycle_start = std::time::Instant::now();
@@ -1490,6 +1544,7 @@ fn smol_main(
                         };
                         smol::Timer::at(cycle_start + next_wait).await;
                     }
+                    }, |address| crate::sdo::read(group.subdevice(&maindevice, usize::from(address.slave)), address)).await;
                     if demoted && !shutdown.load(Ordering::Relaxed) {
                         tracing::error!(
                             "subdevice(s) out of OP mid-run — re-walking the bus \
@@ -1548,50 +1603,65 @@ fn smol_main(
                     let mut bus_ok = true;
                     let mut prev_shape: Option<(Vec<ethercrab::SubDeviceState>, u16)> = None;
                     let mut shape_edges: u64 = 0;
-                    while !shutdown.load(Ordering::Relaxed) {
-                        cycles.fetch_add(1, Ordering::Relaxed);
-                        copy_outputs_to_bus!(group, maindevice, pdi);
-                        gear_tick!(group, maindevice, engines, bus_ok);
-                        match group.tx_rx(&maindevice).await {
-                            Ok(resp) => {
-                                note_bus_shape(
-                                    &mut prev_shape,
-                                    &mut shape_edges,
-                                    &resp.subdevice_states,
-                                    resp.working_counter,
-                                );
-                                if resp
-                                    .subdevice_states
-                                    .iter()
-                                    .any(|s| *s != ethercrab::SubDeviceState::Op)
-                                {
-                                    // Break is deferred until after the input
-                                    // copy below — the last snapshot is still
-                                    // worth capturing.
-                                    healthy.store(false, Ordering::Relaxed);
-                                    demoted = true;
-                                } else if health.record_success() == HealthTransition::Recovered {
-                                    tracing::info!(
-                                        "ethercat recovered; cyclic exchange running again"
-                                    );
+                    crate::sdo::run(
+                        &sdo_rx,
+                        &reinits,
+                        async {
+                            while !shutdown.load(Ordering::Relaxed) {
+                                cycles.fetch_add(1, Ordering::Relaxed);
+                                copy_outputs_to_bus!(group, maindevice, pdi);
+                                gear_tick!(group, maindevice, engines, bus_ok);
+                                match group.tx_rx(&maindevice).await {
+                                    Ok(resp) => {
+                                        note_bus_shape(
+                                            &mut prev_shape,
+                                            &mut shape_edges,
+                                            &resp.subdevice_states,
+                                            resp.working_counter,
+                                        );
+                                        if resp
+                                            .subdevice_states
+                                            .iter()
+                                            .any(|s| *s != ethercrab::SubDeviceState::Op)
+                                        {
+                                            // Break is deferred until after the input
+                                            // copy below — the last snapshot is still
+                                            // worth capturing.
+                                            healthy.store(false, Ordering::Relaxed);
+                                            demoted = true;
+                                        } else if health.record_success()
+                                            == HealthTransition::Recovered
+                                        {
+                                            tracing::info!(
+                                                "ethercat recovered; cyclic exchange running again"
+                                            );
+                                        }
+                                        bus_ok = true;
+                                    }
+                                    Err(e) => {
+                                        note_txrx_failure(&mut health, &e);
+                                        if pump_dead.load(Ordering::Relaxed) {
+                                            healthy.store(false, Ordering::Relaxed);
+                                            demoted = true;
+                                        }
+                                        bus_ok = false;
+                                    }
                                 }
-                                bus_ok = true;
-                            }
-                            Err(e) => {
-                                note_txrx_failure(&mut health, &e);
-                                if pump_dead.load(Ordering::Relaxed) {
-                                    healthy.store(false, Ordering::Relaxed);
-                                    demoted = true;
+                                copy_inputs_from_bus!(group, maindevice, pdi, input_changes);
+                                if demoted {
+                                    break;
                                 }
-                                bus_ok = false;
+                                tick.next().await;
                             }
-                        }
-                        copy_inputs_from_bus!(group, maindevice, pdi, input_changes);
-                        if demoted {
-                            break;
-                        }
-                        tick.next().await;
-                    }
+                        },
+                        |address| {
+                            crate::sdo::read(
+                                group.subdevice(&maindevice, usize::from(address.slave)),
+                                address,
+                            )
+                        },
+                    )
+                    .await;
                     if demoted && !shutdown.load(Ordering::Relaxed) {
                         tracing::error!(
                             "subdevice(s) out of OP mid-run — re-walking the bus \
@@ -1702,6 +1772,13 @@ mod tests {
         let mut outputs = HashMap::new();
         outputs.insert(0u16, vec![0xffu8; 4]);
         RealEthercat {
+            sdo: crate::sdo::channel(
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicU64::new(0)),
+            )
+            .0,
             name: "axis".into(),
             channels: HashMap::new(),
             gear_routing: crate::gear::GearRouting {

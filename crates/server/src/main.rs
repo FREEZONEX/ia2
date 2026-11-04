@@ -314,6 +314,11 @@ async fn main() -> anyhow::Result<()> {
             get(runtime_routes::runtime_snapshot),
         )
         .route("/api/runtime/status", get(runtime_routes::runtime_status))
+        .route("/api/runtime/sdo", get(runtime_routes::runtime_sdo_upload))
+        .route(
+            "/api/edges/{name}/sdo",
+            get(runtime_routes::edge_sdo_upload),
+        )
         // Debug control trio
         .route(
             "/api/runtime/inject-scan-stall",

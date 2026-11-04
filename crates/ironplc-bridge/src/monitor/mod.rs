@@ -14,6 +14,7 @@
 
 pub mod alarms;
 pub mod history;
+pub mod sdo;
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;

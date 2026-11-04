@@ -183,6 +183,12 @@ pub enum RuntimeWriteError {
 // `RuntimeCommand::WriteVariable` self-documenting at the call site.
 #[allow(clippy::enum_variant_names)]
 enum RuntimeCommand {
+    SdoHandle {
+        name: String,
+        ack: tokio::sync::oneshot::Sender<
+            Result<Arc<dyn iocore::sdo::SdoUpload>, iocore::sdo::SdoError>,
+        >,
+    },
     /// One-shot variable write — applied once, may be overwritten by
     /// the program in subsequent scans. Use `ForceVariable` to keep a
     /// value pinned. `governed: false` marks the runtime's OWN internal
@@ -403,6 +409,27 @@ impl ProgramHandle {
         value: i32,
     ) -> Result<WriteOutcome, RuntimeWriteError> {
         self.send_write(name, value, false).await
+    }
+
+    /// Resolve on the scan thread, then await the mailbox OUTSIDE that thread.
+    pub async fn sdo_upload(
+        &self,
+        device: &str,
+        address: iocore::sdo::SdoAddress,
+    ) -> Result<iocore::sdo::SdoValue, iocore::sdo::SdoError> {
+        use iocore::sdo::SdoError;
+        let (ack, rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(RuntimeCommand::SdoHandle {
+                name: device.into(),
+                ack,
+            })
+            .map_err(|_| SdoError::Unavailable("program stopped".into()))?;
+        let handle = tokio::time::timeout(Duration::from_secs(1), rx)
+            .await
+            .map_err(|_| SdoError::Timeout)?
+            .map_err(|_| SdoError::Unavailable("program stopped".into()))??;
+        handle.upload(address).await
     }
 
     async fn send_write(
@@ -2043,6 +2070,25 @@ async fn run_loop_async(
         // poke values without scanning.
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
+                RuntimeCommand::SdoHandle { name, ack } => {
+                    if !ack.is_closed() {
+                        let result = devices
+                            .iter()
+                            .find(|d| d.name() == name)
+                            .ok_or(iocore::sdo::SdoError::NotFound(name))
+                            .and_then(|d| {
+                                if !d.is_healthy() {
+                                    Err(iocore::sdo::SdoError::Unavailable(
+                                        "device unhealthy".into(),
+                                    ))
+                                } else {
+                                    d.sdo_upload_handle()
+                                        .ok_or(iocore::sdo::SdoError::Unsupported)
+                                }
+                            });
+                        let _ = ack.send(result);
+                    }
+                }
                 RuntimeCommand::WriteVariable {
                     name,
                     value,
@@ -3054,6 +3100,83 @@ mod tests {
             .await
             .expect("shutdown");
         server.abort();
+    }
+
+    struct UploadDevice(Arc<tokio::sync::Notify>);
+    #[async_trait::async_trait]
+    impl iocore::sdo::SdoUpload for UploadDevice {
+        async fn upload(
+            &self,
+            address: iocore::sdo::SdoAddress,
+        ) -> Result<iocore::sdo::SdoValue, iocore::sdo::SdoError> {
+            self.0.notify_one();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            Ok(iocore::sdo::SdoValue {
+                address,
+                bytes: vec![42],
+                unsigned: 42,
+                signed: 42,
+                vendor_id: 1,
+                product_id: 2,
+                revision: 3,
+                serial: 4,
+                sampled_at_unix_ms: 1,
+            })
+        }
+    }
+    #[async_trait::async_trait]
+    impl IoDevice for UploadDevice {
+        fn name(&self) -> &str {
+            "bus"
+        }
+        fn sdo_upload_handle(&self) -> Option<Arc<dyn iocore::sdo::SdoUpload>> {
+            Some(Arc::new(Self(self.0.clone())))
+        }
+        async fn read_channel(&mut self, _: &str) -> Result<ChannelValue, IoError> {
+            Ok(ChannelValue::U16(0))
+        }
+        async fn write_channel(&mut self, _: &str, _: ChannelValue) -> Result<(), IoError> {
+            panic!("diagnostic must not write a channel")
+        }
+    }
+    #[tokio::test]
+    async fn sdo_upload_does_not_pause_scan_or_write_outputs() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let handle = spawn_units_inner(
+            vec![single_unit(trivial_container(), 5)],
+            DeviceSource::Prebuilt(vec![Box::new(UploadDevice(started.clone()))]),
+            Vec::new(),
+            None,
+            WriteGovernance::default(),
+        );
+        let mut snapshots = handle.subscribe();
+        let caller = handle.clone();
+        let address = iocore::sdo::SdoAddress {
+            slave: 1,
+            index: 0x2008,
+            subindex: 1,
+        };
+        let upload = tokio::spawn(async move { caller.sdo_upload("bus", address).await });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        let before = snapshots.recv().await.unwrap();
+        let after = tokio::time::timeout(Duration::from_millis(300), snapshots.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !upload.is_finished(),
+            "snapshot must advance while upload is pending"
+        );
+        let result = upload.await.unwrap().unwrap();
+        assert_eq!(result.bytes, vec![42]);
+        assert!(after.scan_count > before.scan_count);
+        assert!(matches!(
+            handle.sdo_upload("missing", address).await,
+            Err(iocore::sdo::SdoError::NotFound(_))
+        ));
+        handle.shutdown().await;
     }
 
     /// The handle must mirror a device's live transport health: `true`

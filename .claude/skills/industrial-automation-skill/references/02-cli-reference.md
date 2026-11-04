@@ -238,3 +238,18 @@ cs project open <path> | close
 cs agent run --label "..." -- bash -c '...'    # REQUIRED wrapper for multi-step work
 cs agent enter --label "..." / cs agent leave  # script-managed session variant
 ```
+
+
+### Live SDO upload (read only)
+
+`cs get runtime/sdo/<device>/<slave>/<index>/<subindex>` and
+`cs --project <project> get edges/<edge>/sdo/<device>/<slave>/<index>/<subindex>`
+read a scalar through the running master. Slave is zero based; hexadecimal indexes
+require `0x`. Example: `cs get runtime/sdo/bus/1/0x2008/1`.
+`cs api GET '/api/runtime/sdo?device=bus&slave=1&index=0x2008&subindex=1'`
+is equivalent. There is no SDO set/rm resource. Preserve the returned raw bytes,
+identity and timestamp as evidence; apply the drive dictionary's signedness and
+scale. Do not label old startup configuration as current readback. Busy/unsupported
+returns 409, unavailable 503, timeout 504, and drive abort/protocol failure 502;
+errors propagate through the edge proxy. `_sim` explicitly rejects live uploads.
+See `docs/api.md` for bounds and `docs/edge-deploy.md` for startup verification.

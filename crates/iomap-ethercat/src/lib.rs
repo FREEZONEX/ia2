@@ -20,6 +20,7 @@ pub mod cam;
 mod esi_map;
 pub mod gear;
 mod real;
+mod sdo;
 mod sim;
 mod validate;
 
@@ -97,6 +98,12 @@ fn is_sim_nic(nic: &str) -> bool {
 
 #[async_trait]
 impl IoDevice for EthercatDevice {
+    fn sdo_upload_handle(&self) -> Option<std::sync::Arc<dyn iocore::sdo::SdoUpload>> {
+        match &self.0 {
+            Inner::Real(r) => r.sdo_upload_handle(),
+            Inner::Sim(_) => None,
+        }
+    }
     fn name(&self) -> &str {
         match &self.0 {
             Inner::Sim(s) => s.name(),

@@ -576,6 +576,40 @@ pub async fn edge_audit_route(
         .map_err(ApiError::Internal)
 }
 
+/// Read-only diagnostic upload; no write attribution or scan mutation.
+pub async fn runtime_sdo_upload(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<ironplc_bridge::monitor::sdo::UploadQuery>,
+) -> Result<impl axum::response::IntoResponse, ApiError> {
+    let handle = live_program(&state)?;
+    let (status, body) = ironplc_bridge::monitor::sdo::upload(&handle, query).await;
+    Ok((
+        axum::http::StatusCode::from_u16(status).expect("SDO status code"),
+        Json(body),
+    ))
+}
+
+pub async fn edge_sdo_upload(
+    State(state): State<AppState>,
+    project: ProjectName,
+    AxumPath(name): AxumPath<String>,
+    axum::extract::Query(query): axum::extract::Query<ironplc_bridge::monitor::sdo::UploadQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    let address = query
+        .address()
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let edge = crate::routes::with_project(&state, &project, |store| {
+        store.read_edge(&name).map_err(Into::into)
+    })?;
+    let device =
+        percent_encoding::utf8_percent_encode(&query.device, percent_encoding::NON_ALPHANUMERIC);
+    let path = format!(
+        "sdo?device={device}&slave={}&index={}&subindex={}",
+        address.slave, address.index, address.subindex
+    );
+    edge_proxy_response(crate::edges::proxy_edge_runtime_get(&edge, &path).await)
+}
+
 #[cfg(test)]
 mod edge_proxy_tests {
     use super::*;

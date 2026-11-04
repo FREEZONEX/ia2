@@ -1,0 +1,10 @@
+description = "read-only diagnostic preparation keeps the idle process outputs off"
+
+[[steps]]
+expect = { var = "inlet_cmd", op = "is_false", within_ms = 1000 }
+
+[[steps]]
+expect_never = { var = "overflow", op = "is_true", during_ms = 200 }
+
+[[steps]]
+expect = { var = "level", op = "eq", value = 0.0, within_ms = 1000 }

@@ -209,3 +209,13 @@ installer; the check never contacts a server, network, or hardware.
 
 IA2 is licensed under [Apache-2.0](LICENSE). Vendored IronPLC carries its own
 [MIT license](vendor/ironplc/LICENSE); other dependencies retain their respective licenses.
+
+
+### Live SDO upload (read only)
+
+`cs get runtime/sdo/<device>/<slave>/<index>/<subindex>` and
+`cs --project <project> get edges/<edge>/sdo/<device>/<slave>/<index>/<subindex>`
+read a scalar through the running master. Slave is zero based; hexadecimal indexes
+require `0x`. Example: `cs get runtime/sdo/bus/1/0x2008/1`.
+`cs api GET '/api/runtime/sdo?device=bus&slave=1&index=0x2008&subindex=1'`
+is equivalent. There is no SDO set/rm resource.

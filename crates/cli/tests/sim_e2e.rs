@@ -475,3 +475,39 @@ fn unavailable_device_has_stale_inputs_and_an_acknowledgeable_default_alarm() {
         .assert()
         .success();
 }
+
+#[test]
+fn sdo_resource_is_read_only_and_keeps_the_idle_scenario_running() {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("sdo_idle");
+    copy_dir(&repo_root().join("examples/sim_smoke"), &proj);
+    let server = spawn_server(tmp.path());
+    server.open_project(&proj);
+    cs(&server.base)
+        .args(["api", "POST", "/api/run"])
+        .assert()
+        .success();
+    cs(&server.base)
+        .args(["get", "runtime/sdo/missing/1/0x2008/1"])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("SDO target not found"));
+    cs(&server.base)
+        .args(["get", "runtime/sdo/missing/1/0x10000/1"])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("index must be"));
+    cs(&server.base)
+        .args([
+            "api",
+            "POST",
+            "/api/runtime/sdo?device=missing&slave=1&index=0x2008&subindex=1",
+        ])
+        .assert()
+        .code(2);
+    cs(&server.base)
+        .args(["sim", "run", "--no-run"])
+        .arg(proj.join("scenarios/sdo_idle.toml"))
+        .assert()
+        .success();
+}

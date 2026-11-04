@@ -521,6 +521,7 @@ async fn main() -> Result<()> {
         .route("/logs", get(logs))
         .route("/logs/stream", get(logs_stream))
         .route("/discover", get(discover))
+        .route("/sdo", get(sdo_upload))
         .route("/system", get(system))
         .route("/pause", post(rt_pause))
         .route("/resume", post(rt_resume))
@@ -1591,4 +1592,15 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         assert_eq!(sibling_web_dir(&project), None);
     }
+}
+
+async fn sdo_upload(
+    State(state): State<AppState>,
+    Query(query): Query<ironplc_bridge::monitor::sdo::UploadQuery>,
+) -> impl IntoResponse {
+    let (status, body) = ironplc_bridge::monitor::sdo::upload(&state.handle, query).await;
+    (
+        StatusCode::from_u16(status).expect("SDO status code"),
+        Json(body),
+    )
 }

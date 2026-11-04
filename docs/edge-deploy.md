@@ -324,3 +324,21 @@ Only enable on hardware after a device-free Linux check and a measured overhead
 pilot. A native Mac build does not validate Linux tracefs or serve as an edge
 binary. Disable tracing and restore the original service environment/build at
 the end of the diagnostic experiment through the normal handoff procedure.
+
+
+### Inspecting an existing bus without replaying startup SDO downloads
+
+Set `IA2_EC_INIT_SDO_VERIFY_ONLY=1` in the runtime service environment when
+maintenance must preserve current drive parameters. Only `0`/unset (normal
+startup downloads) and `1` are accepted. In verification mode, the existing
+master uploads every configured `init_sdo` object's final value and checks its
+exact configured width. Repeated assignments use their last value (e.g. PDO
+assignment count zero followed by the final count). A mismatch or read failure
+fails device initialization; it never corrects the value. The mode applies to
+initial connect and automatic re-walks. It does not eliminate the standard
+EtherCAT AL/DC/SM/FMMU initialization required to restart the existing master.
+Do not restart while motion is active; preserve the project and safe outputs,
+verify topology and live state, then use the read-only `/sdo` endpoint. Never
+start a second master to obtain a parameter dump. Rollback must retain the
+verification-mode runtime if replaying the previous binary's startup downloads
+would violate the current maintenance scope.
