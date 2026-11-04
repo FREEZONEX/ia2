@@ -260,6 +260,23 @@ impl DcStartup {
     }
 }
 
+/// The first cyclic exchange has no outstanding PLC ticket, so the gate
+/// cannot infer a missed cycle from a ticket deadline yet.
+struct DcHandoff {
+    deadline: Instant,
+    last_slot: u64,
+}
+
+impl DcHandoff {
+    fn check(&self, clock: &crate::cycle::Gate<impl Clone>, cycle_start: Instant, slot: u64) {
+        if cycle_start >= self.deadline + clock.period
+            || self.last_slot.checked_add(1) != Some(slot)
+        {
+            clock.trip("startup handoff missed a DC slot; restart required");
+        }
+    }
+}
+
 pub struct RealEthercat {
     cycle: Option<Arc<crate::cycle::Gate<PdiMirror>>>,
     staged: Option<(crate::cycle::Ticket, PdiMirror)>,
@@ -1543,7 +1560,7 @@ fn smol_main(
                     // Pump zero outputs until OP. In synchronized mode,
                     // follow the DC phase during startup and preserve the
                     // next deadline across the transition to the scan loop.
-                    let mut first_deadline = None;
+                    let mut first_handoff = None;
                     {
                         let deadline = std::time::Instant::now() + Duration::from_secs(10);
                         let mut reached_op = false;
@@ -1563,7 +1580,10 @@ fn smol_main(
                                             && Instant::now() < next;
                                         if startup.observe(slot, healthy) {
                                             reached_op = true;
-                                            first_deadline = Some(next);
+                                            first_handoff = Some(DcHandoff {
+                                                deadline: next,
+                                                last_slot: slot,
+                                            });
                                             break;
                                         }
                                         next
@@ -1642,13 +1662,13 @@ fn smol_main(
                     let mut shape_edges: u64 = 0;
                     let mut previous_wait: Option<(Instant, Instant, Instant)> = None;
                     crate::sdo::run(&sdo_rx, &reinits, async {
-                    if let Some(deadline) = first_deadline {
-                        if let Err(error) = timer.wait(deadline).await {
+                    if let Some(handoff) = &first_handoff {
+                        if let Err(error) = timer.wait(handoff.deadline).await {
                             if let Some(clock) = &cycle {
                                 clock.trip("EtherCAT monotonic wait failed; restart required");
                             }
                             tracing::error!(%error, "EtherCAT cycle timer failed");
-                            smol::Timer::at(deadline).await;
+                            smol::Timer::at(handoff.deadline).await;
                         }
                     }
                     while !shutdown.load(Ordering::Relaxed) {
@@ -1686,6 +1706,10 @@ fn smol_main(
                         let next_wait = match response {
                             Ok(resp) => {
                                 if let Some(clock) = &cycle {
+                                    if let Some(handoff) = first_handoff.take() {
+                                        handoff.check(clock, cycle_start,
+                                            resp.extra.dc_system_time / sync0.as_nanos() as u64);
+                                    }
                                     if resp.working_counter != expected_wkc || !resp.all_op() {
                                         clock.trip("unexpected WKC or bus left OP; restart required");
                                         for bytes in pdi.lock().expect("pdi mirror poisoned").outputs.values_mut() { bytes.fill(0); }
@@ -1977,6 +2001,92 @@ mod tests {
             assert!(!ready.observe(slot, healthy));
         }
         assert!(ready.observe(19, true));
+    }
+
+    #[test]
+    fn startup_handoff_latches_gaps_before_any_ticket_and_keeps_outputs_zero() {
+        use std::{future::Future, task::Context, task::Waker};
+
+        let period = Duration::from_millis(2);
+        for armed in [false, true] {
+            for (late, slot) in [
+                (period, 14),         // Host deadline missed, even with an adjacent DC slot.
+                (period * 2, 16),     // Review reproducer: delayed past the first slot.
+                (Duration::ZERO, 13), // Duplicate DC slot.
+                (Duration::ZERO, 15), // Skip despite an on-time host clock.
+                (Duration::ZERO, 12), // Reference clock moved backwards.
+            ] {
+                let clock = crate::cycle::Gate::new(period);
+                let mut scan = Box::pin(clock.begin());
+                let mut context = Context::from_waker(Waker::noop());
+                if armed {
+                    assert!(scan.as_mut().poll(&mut context).is_pending());
+                }
+                let handoff = DcHandoff {
+                    deadline: Instant::now(),
+                    last_slot: 13,
+                };
+                let started = handoff.deadline + late;
+                clock.consume(started, |image| assert!(image.is_none()));
+                handoff.check(&clock, started, slot);
+                clock.publish([0u8], started + period, started);
+                assert!(matches!(
+                    scan.as_mut().poll(&mut context),
+                    std::task::Poll::Ready(Err(_))
+                ));
+                assert_eq!(
+                    clock.status().fault.as_deref(),
+                    Some("startup handoff missed a DC slot; restart required")
+                );
+                // Neither another healthy exchange nor an on-time handoff
+                // may re-arm this run or put a frame on the output mirror.
+                handoff.check(&clock, handoff.deadline, 14);
+                for n in 1..=3 {
+                    let now = started + period * n;
+                    clock.consume(now, |image| assert!(image.is_none()));
+                    clock.publish([1u8], now + period, now);
+                }
+                let status = clock.status();
+                assert_eq!(
+                    (status.issued, status.committed, status.consumed),
+                    (0, 0, 0)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn startup_handoff_accepts_adjacent_slot_with_subperiod_host_lateness() {
+        use std::{future::Future, task::Context, task::Poll, task::Waker};
+
+        let period = Duration::from_millis(2);
+        for late in [Duration::ZERO, period - Duration::from_nanos(1)] {
+            let clock = crate::cycle::Gate::new(period);
+            let mut scan = Box::pin(clock.begin());
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(scan.as_mut().poll(&mut context).is_pending());
+            let handoff = DcHandoff {
+                deadline: Instant::now(),
+                last_slot: 13,
+            };
+            let started = handoff.deadline + late;
+            clock.consume(started, |image| assert!(image.is_none()));
+            handoff.check(&clock, started, 14);
+            let deadline = started + period;
+            clock.publish([0u8], deadline, started);
+            let Poll::Ready(Ok((ticket, image))) = scan.as_mut().poll(&mut context) else {
+                panic!("adjacent startup handoff must issue the first ticket");
+            };
+            assert_eq!(image, [0u8]);
+            clock.commit(ticket, [1u8], started).unwrap();
+            clock.consume(deadline, |image| assert_eq!(image, Some(&[1u8])));
+            let status = clock.status();
+            assert!(status.fault.is_none());
+            assert_eq!(
+                (status.issued, status.committed, status.consumed),
+                (1, 1, 1)
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

@@ -58,7 +58,12 @@ the requested scheduling policy. A rejected request fails initialization.
 During synchronized startup the worker follows the reference clock while
 sending zero outputs. It waits for four adjacent DC slots with all devices
 in OP and the expected working counter, then retains the next deadline
-when handing the bus clock to the PLC.
+and last DC slot when handing the bus clock to the PLC. Before publishing
+the first input ticket, it checks that the first cyclic exchange used the
+immediately following DC slot and started less than one period after the
+retained deadline. A whole-period delay or a non-adjacent slot latches
+zero outputs even if the PLC has not started waiting for its first ticket;
+later healthy exchanges cannot clear this fault.
 
 The input image is fixed for the entire scan. Output channel writes affect a
 private staging image until the whole scan commits. Channel errors fail the
