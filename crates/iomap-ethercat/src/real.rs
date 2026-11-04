@@ -13,8 +13,9 @@
 //!   1. `Box::leak`s a `PduStorage` (gives `&'static`; required by
 //!      `try_split`). One leaked storage per `connect` — fine, devices
 //!      don't churn at runtime.
-//!   2. Builds the `MainDevice`, spawns `tx_rx_task` as a detached smol
-//!      task, walks the bus with `init_single_group`, transitions to OP.
+//!   2. Builds the `MainDevice`, spawns `tx_rx_task`, walks the bus with
+//!      `init_single_group`, transitions to OP. The Linux synchronized
+//!      worker drives its pump locally; other paths use the smol executor.
 //!   3. Reports back through a `tokio::sync::oneshot` so the connect()
 //!      future awaits an "actually live" signal (or an init error).
 //!   4. Enters the cyclic loop, exiting when the shutdown flag flips.
@@ -260,6 +261,7 @@ pub struct RealEthercat {
 /// bundled so `smol_main` keeps a readable signature.
 struct WorkerShared {
     cycle: Option<Arc<crate::cycle::Gate<PdiMirror>>>,
+    rt_priority: Option<i32>,
     sdo_rx: smol::channel::Receiver<crate::sdo::Request>,
     verify_init_sdo: bool,
     pdi: Arc<Mutex<PdiMirror>>,
@@ -324,6 +326,13 @@ impl RealEthercat {
                 config.cycle_us,
             ))))
         });
+        let rt_priority = if cycle.is_some() {
+            crate::cycle_timer::configured_rt_priority().map_err(|error| {
+                IoError::Connect(format!("EtherCAT DC worker priority: {error}"))
+            })?
+        } else {
+            None
+        };
         // ESI-modular real-bus cyclic bring-up (master-programmed
         // SyncManager/FMMU + logical-RW exchange, bypassing the auto
         // PDO-assignment path) is validated against the physical coupler
@@ -415,6 +424,7 @@ impl RealEthercat {
         let slaves = config.slaves.clone();
         let shared = WorkerShared {
             cycle: cycle.clone(),
+            rt_priority,
             sdo_rx,
             verify_init_sdo,
             pdi: pdi.clone(),
@@ -843,6 +853,8 @@ fn build_transport(
     nic: &str,
     dc_static_sync_iterations: u32,
     pump_dead: Arc<AtomicBool>,
+    worker_stopped: Arc<AtomicBool>,
+    local_executor: Option<&smol::LocalExecutor<'_>>,
 ) -> Result<Arc<MainDevice<'static>>, String> {
     let storage: &'static Storage = Box::leak(Box::new(Storage::new()));
     let (tx, rx, pdu_loop) = storage
@@ -868,26 +880,32 @@ fn build_transport(
     ));
     let tx_rx = ethercrab::std::tx_rx_task(nic, tx, rx)
         .map_err(|e| format!("tx_rx_task on {nic}: {e} (need CAP_NET_RAW + real NIC)"))?;
-    smol::spawn(async move {
+    let pump = async move {
         // The guard fires on unwind too, closing the silent panic exit;
         // the flag is what turns a dead pump from a permanent wedge into
         // a transport rebuild.
-        struct PumpGuard(Arc<AtomicBool>);
+        struct PumpGuard(Arc<AtomicBool>, Arc<AtomicBool>);
         impl Drop for PumpGuard {
             fn drop(&mut self) {
                 self.0.store(true, Ordering::Relaxed);
-                tracing::error!(
-                    "ethercat tx_rx socket pump EXITED (return or panic) — \
-                     the supervise loop will rebuild the transport"
-                );
+                if !self.1.load(Ordering::Relaxed) {
+                    tracing::error!(
+                        "ethercat tx_rx socket pump EXITED (return or panic) — \
+                         the supervise loop will rebuild the transport"
+                    );
+                }
             }
         }
-        let _g = PumpGuard(pump_dead);
+        let _g = PumpGuard(pump_dead, worker_stopped);
         if let Err(e) = tx_rx.await {
             tracing::error!(?e, "ethercat tx_rx task exited");
         }
-    })
-    .detach();
+    };
+    if let Some(executor) = local_executor {
+        executor.spawn(pump).detach();
+    } else {
+        smol::spawn(pump).detach();
+    }
     Ok(maindevice)
 }
 
@@ -1029,6 +1047,7 @@ fn smol_main(
 ) {
     let WorkerShared {
         cycle,
+        rt_priority,
         sdo_rx,
         verify_init_sdo,
         pdi,
@@ -1051,22 +1070,32 @@ fn smol_main(
             self.0.store(true, Ordering::Relaxed);
         }
     }
-    let _done = DoneGuard(stopped);
+    let executor = smol::LocalExecutor::new();
+    let local_pump = (cfg!(target_os = "linux") && cycle.is_some()).then_some(&executor);
+    let _done = DoneGuard(stopped.clone());
 
     let nic_owned = nic.to_string();
-    smol::block_on(async move {
+    let master = async move {
         // Transport = leaked PduStorage + MainDevice + detached TX/RX
         // pump. Built once here; rebuilt from a fresh leak if the pump
         // ever dies (see build_transport).
         let pump_dead = Arc::new(AtomicBool::new(false));
-        let mut maindevice =
-            match build_transport(&nic_owned, dc_static_sync_iterations, pump_dead.clone()) {
-                Ok(m) => m,
-                Err(msg) => {
-                    let _ = init_tx.send(InitResult::Err(msg));
-                    return;
-                }
-            };
+        let build = || {
+            build_transport(
+                &nic_owned,
+                dc_static_sync_iterations,
+                pump_dead.clone(),
+                stopped.clone(),
+                local_pump,
+            )
+        };
+        let mut maindevice = match build() {
+            Ok(m) => m,
+            Err(msg) => {
+                let _ = init_tx.send(InitResult::Err(msg));
+                return;
+            }
+        };
 
         // ===== RTSO-HOLD-0731 fix: supervised re-walk loop =====
         // Everything from bus enumeration through the cyclic exchange sits
@@ -1116,7 +1145,7 @@ fn smol_main(
                     "rebuilding ethercat transport after pump death \
                      (fresh PduStorage + MainDevice + pump)"
                 );
-                match build_transport(&nic_owned, dc_static_sync_iterations, pump_dead.clone()) {
+                match build() {
                     Ok(m) => {
                         maindevice = m;
                         pump_dead.store(false, Ordering::Relaxed);
@@ -1500,19 +1529,25 @@ fn smol_main(
                         tracing::info!("all subdevices reached OP (dc=sync0)");
                     }
 
-                    let mut timer = match crate::cycle_timer::CycleTimer::new(cycle.is_some()) {
-                        Ok(timer) => timer,
-                        Err(error) => {
-                            let message = format!("configure EtherCAT cycle timer: {error}");
-                            if let Some(clock) = &cycle {
-                                clock.trip(&message);
+                    // The socket reactor is initialized during the walk. Apply
+                    // the opt-in scheduling policy after its helper starts.
+                    let mut timer =
+                        match crate::cycle_timer::CycleTimer::new(cycle.is_some(), rt_priority) {
+                            Ok(timer) => timer,
+                            Err(error) => {
+                                let message = format!("configure EtherCAT cycle timer: {error}");
+                                if let Some(clock) = &cycle {
+                                    clock.trip(&message);
+                                }
+                                let _ =
+                                    walk_fail(first_init, &init_tx, &mut reinit_attempt, message);
+                                return;
                             }
-                            let _ = walk_fail(first_init, &init_tx, &mut reinit_attempt, message);
-                            return;
-                        }
-                    };
+                        };
                     tracing::info!(
                         native_clock = timer.uses_native_clock(),
+                        local_pump = local_pump.is_some(),
+                        ?rt_priority,
                         "EtherCAT DC cycle timer"
                     );
                     if first_init {
@@ -1665,7 +1700,18 @@ fn smol_main(
                                 bus_ok = true;
                                 if let Some(clock) = &cycle {
                                     let image = pdi.lock().expect("pdi mirror poisoned").clone();
-                                    clock.publish(image, cycle_start + resp.extra.next_cycle_wait, Instant::now());
+                                    let deadline = cycle_start + resp.extra.next_cycle_wait;
+                                    let publish_time = Instant::now();
+                                    clock.publish(image, deadline, publish_time);
+                                    if publish_time >= deadline {
+                                        tracing::error!(
+                                            exchange_us = exchange_end.duration_since(exchange_start).as_micros() as u64,
+                                            pre_exchange_us = exchange_start.duration_since(cycle_start).as_micros() as u64,
+                                            rx_to_publish_us = publish_time.duration_since(exchange_end).as_micros() as u64,
+                                            budget_us = resp.extra.next_cycle_wait.as_micros() as u64,
+                                            "EtherCAT exchange exhausted the next ticket deadline"
+                                        );
+                                    }
                                 }
                                 resp.extra.next_cycle_wait
                             }
@@ -1830,7 +1876,12 @@ fn smol_main(
                 }
             }
         }
-    });
+    };
+    if local_pump.is_some() {
+        smol::block_on(executor.run(master));
+    } else {
+        smol::block_on(master);
+    }
 }
 
 #[cfg(test)]

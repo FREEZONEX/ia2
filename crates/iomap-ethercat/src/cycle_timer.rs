@@ -1,13 +1,55 @@
 //! Deadline wait for the dedicated synchronized EtherCAT worker.
 
-use std::{io, time::Instant};
+use std::{env, io, time::Instant};
+
+const RT_PRIORITY_ENV: &str = "IA2_EC_SYNC_RT_PRIORITY";
+
+pub(crate) fn configured_rt_priority() -> io::Result<Option<i32>> {
+    match env::var(RT_PRIORITY_ENV) {
+        Ok(value) => parse_rt_priority(&value).map(Some),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(io::Error::new(io::ErrorKind::InvalidInput, error)),
+    }
+}
+
+fn parse_rt_priority(value: &str) -> io::Result<i32> {
+    if !cfg!(target_os = "linux") {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("{RT_PRIORITY_ENV} requires Linux"),
+        ));
+    }
+    value
+        .parse::<i32>()
+        .ok()
+        .filter(|p| (1..=20).contains(p))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{RT_PRIORITY_ENV} must be 1..=20"),
+            )
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn set_round_robin(priority: i32) -> io::Result<()> {
+    let params = libc::sched_param {
+        sched_priority: priority,
+    };
+    // SAFETY: pid 0 selects only the current thread. params is initialized
+    // and is read by the kernel during this call.
+    if unsafe { libc::sched_setscheduler(0, libc::SCHED_RR, &params) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
 
 pub(crate) struct CycleTimer {
     native: bool,
 }
 
 impl CycleTimer {
-    pub(crate) fn new(synchronized: bool) -> io::Result<Self> {
+    pub(crate) fn new(synchronized: bool, rt_priority: Option<i32>) -> io::Result<Self> {
         let native = synchronized && cfg!(target_os = "linux");
         #[cfg(target_os = "linux")]
         if native {
@@ -16,7 +58,12 @@ impl CycleTimer {
             if unsafe { libc::prctl(libc::PR_SET_TIMERSLACK, 1 as libc::c_ulong, 0, 0, 0) } != 0 {
                 return Err(io::Error::last_os_error());
             }
+            if let Some(priority) = rt_priority {
+                set_round_robin(priority)?;
+            }
         }
+        #[cfg(not(target_os = "linux"))]
+        debug_assert!(rt_priority.is_none());
         Ok(Self { native })
     }
 
@@ -27,9 +74,8 @@ impl CycleTimer {
     pub(crate) async fn wait(&mut self, deadline: Instant) -> io::Result<()> {
         #[cfg(target_os = "linux")]
         if self.native {
-            // This worker owns the DC schedule. Socket I/O is pumped on a
-            // separate thread. Mailbox futures on this worker can run when
-            // the exchange yields, with at most a cycle's extra wait here.
+            // The PDO exchange has completed before this wait. Mailbox
+            // work and the pump can run when the next exchange yields.
             if let Err(error) = sleep_until(deadline) {
                 self.native = false;
                 return Err(error);
@@ -92,7 +138,7 @@ mod tests {
     fn cycle_wait_preserves_deadlines_and_selects_native_only_for_linux_sync() {
         for synchronized in [false, true] {
             std::thread::spawn(move || {
-                let mut timer = CycleTimer::new(synchronized).unwrap();
+                let mut timer = CycleTimer::new(synchronized, None).unwrap();
                 assert_eq!(
                     timer.uses_native_clock(),
                     synchronized && cfg!(target_os = "linux")
@@ -165,7 +211,7 @@ mod tests {
             .as_mut()
             .poll(&mut Context::from_waker(&waker))
             .is_pending());
-        let mut native = CycleTimer::new(true).unwrap();
+        let mut native = CycleTimer::new(true, None).unwrap();
         smol::block_on(native.wait(deadline)).unwrap();
         assert!(Instant::now() >= deadline);
         assert!(matches!(
@@ -174,5 +220,67 @@ mod tests {
         ));
         release.send(()).unwrap();
         notification.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn real_time_priority_is_explicit_bounded_and_linux_only() {
+        assert_eq!(
+            parse_rt_priority("10").ok(),
+            cfg!(target_os = "linux").then_some(10)
+        );
+        for invalid in ["", "0", "-1", "21", "99", "bogus"] {
+            assert!(parse_rt_priority(invalid).is_err());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn local_socket_pump_can_complete_exchange_between_native_waits() {
+        use smol::io::{AsyncReadExt, AsyncWriteExt};
+        use std::os::unix::net::UnixStream;
+
+        let executor = smol::LocalExecutor::new();
+        let (client, mut peer) = UnixStream::pair().unwrap();
+        let mut client = smol::Async::new(client).unwrap();
+        let (request, outgoing) = smol::channel::bounded::<u8>(1);
+        let (incoming, response) = smol::channel::bounded::<u8>(1);
+        let responder = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            for _ in 0..16 {
+                let mut byte = [0];
+                peer.read_exact(&mut byte).unwrap();
+                peer.write_all(&[byte[0] + 1]).unwrap();
+            }
+        });
+        let owner = std::thread::current().id();
+        let pump = executor.spawn(async move {
+            while let Ok(byte) = outgoing.recv().await {
+                assert_eq!(std::thread::current().id(), owner);
+                client.write_all(&[byte]).await.unwrap();
+                let mut reply = [0];
+                client.read_exact(&mut reply).await.unwrap();
+                incoming.send(reply[0]).await.unwrap();
+            }
+        });
+        smol::block_on(executor.run(async {
+            let mut timer = CycleTimer::new(true, None).unwrap();
+            for sequence in 0..16 {
+                timer
+                    .wait(Instant::now() + Duration::from_millis(2))
+                    .await
+                    .unwrap();
+                request.send(sequence).await.unwrap();
+                let reply = smol::future::race(async { response.recv().await.ok() }, async {
+                    smol::Timer::after(Duration::from_secs(1)).await;
+                    None
+                })
+                .await;
+                assert_eq!(reply, Some(sequence + 1));
+            }
+            drop(request);
+            pump.await;
+        }));
+        responder.join().unwrap();
     }
 }

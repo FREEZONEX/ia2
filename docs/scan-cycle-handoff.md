@@ -45,9 +45,14 @@ adapter uses the existing master's DC next-cycle wait; no second master is creat
 
 On Linux, the synchronized worker waits for that deadline using an absolute
 `CLOCK_MONOTONIC` sleep with reduced timer slack on that worker. The kernel
-dispatches the cycle timer directly and the shared reactor handles socket
-send/receive. A native timer failure trips the gate,
+dispatches the cycle timer directly. The same worker polls the socket pump
+with a local executor while the socket uses the existing reactor for I/O
+readiness. A native timer failure trips the gate,
 and the worker continues safe-zero exchange using the asynchronous timer.
+An operator can explicitly set `IA2_EC_SYNC_RT_PRIORITY` to 1–20 to run
+this one thread under Linux `SCHED_RR` after bus initialization. Omit it
+for the normal OS scheduling policy. The service needs permission to set
+the requested scheduling policy. A rejected request fails initialization.
 
 The input image is fixed for the entire scan. Output channel writes affect a
 private staging image until the whole scan commits. Channel errors fail the
@@ -87,6 +92,8 @@ and `watchdog_tripped` report that path.
 When the DC worker resumes a whole period late, the runtime journal records
 the prior timer entry margin, the time from prior exchange completion to timer
 entry, and the current pre-exchange and exchange durations.
+An expired ticket publication additionally records the time from exchange
+completion to publication.
 
 ## Offline proof and hardware boundary
 
