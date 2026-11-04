@@ -230,6 +230,10 @@ struct PdiMirror {
 /// teardown reap it.
 const WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
+// EtherCrab's group walk constructs large fixed-capacity values. Leave
+// room for those temporaries and the pinned master future on this worker.
+const LINUX_SYNC_WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
+
 pub struct RealEthercat {
     cycle: Option<Arc<crate::cycle::Gate<PdiMirror>>>,
     staged: Option<(crate::cycle::Ticket, PdiMirror)>,
@@ -439,8 +443,11 @@ impl RealEthercat {
         };
         let thread_name = format!("ec-{name}");
 
-        let thread = thread::Builder::new()
-            .name(thread_name)
+        let mut builder = thread::Builder::new().name(thread_name);
+        if cfg!(target_os = "linux") && config.scan_sync {
+            builder = builder.stack_size(LINUX_SYNC_WORKER_STACK_BYTES);
+        }
+        let thread = builder
             .spawn(move || {
                 smol_main(
                     &nic,
@@ -1075,7 +1082,7 @@ fn smol_main(
     let _done = DoneGuard(stopped.clone());
 
     let nic_owned = nic.to_string();
-    let master = async move {
+    let master = std::pin::pin!(async move {
         // Transport = leaked PduStorage + MainDevice + detached TX/RX
         // pump. Built once here; rebuilt from a fresh leak if the pump
         // ever dies (see build_transport).
@@ -1876,7 +1883,7 @@ fn smol_main(
                 }
             }
         }
-    };
+    });
     if local_pump.is_some() {
         smol::block_on(executor.run(master));
     } else {
@@ -1887,6 +1894,32 @@ fn smol_main(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn synchronized_linux_worker_startup_reaches_transport_on_missing_interface() {
+        // Exercise the production worker's stack and executor construction
+        // without transmitting on any host interface.
+        const MISSING: &str = "ia2-test-absent";
+        assert!(!std::path::Path::new("/sys/class/net")
+            .join(MISSING)
+            .exists());
+        let config = EthercatConfig {
+            scan_sync: true,
+            nic: MISSING.into(),
+            bringup: Default::default(),
+            cycle_us: 2_000,
+            dc_sync: EthercatDcSync::Sync0,
+            dc_static_sync_iterations: 0,
+            slaves: vec![],
+            channels: vec![],
+            gear: vec![],
+        };
+        let result = RealEthercat::connect("offline-stack-test".into(), &config).await;
+        assert!(
+            matches!(result, Err(IoError::Connect(message)) if message.contains("tx_rx_task on ia2-test-absent"))
+        );
+    }
 
     /// Respond through EtherCrab's actual PDU storage/parser, with no NIC
     /// or privilege. The only request must be BRD(Type), never a write to
