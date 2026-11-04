@@ -305,3 +305,22 @@ one carrying your SSH / management traffic.
   (`bringup = auto`, the default) still take hand-authored `pdi_byte_offset`s —
   read them off the connect-time PDO-mapping log, where the runtime dumps each
   `0x1C12`/`0x1C13` entry with its object index and byte offset.
+
+### Experimental scan diagnostics (offline preparation)
+
+The optional `scan-trace` feature on `ia2-runtime` enables a Linux-only diagnostic
+recorder. It remains inactive unless `IA2_SCAN_TRACE_JSONL` names a new file.
+`IA2_SCAN_TRACE_MARKER` may name a pre-created private tracefs instance's
+`trace_marker`. The scan thread submits timestamped deadline misses to a bounded
+queue; a separate writer emits JSONL and optional markers. Existing deadline,
+cadence and watchdog decisions are preserved. Queue drops, marker errors and
+writer failures invalidate diagnostic coverage; they do not block the scan.
+
+This build is experimental and adds timestamp/queue overhead. Do not treat it as
+the unchanged production binary or infer a realtime guarantee from average scan
+throughput. Pair the payload's CLOCK_MONOTONIC timestamps and scan TID with the
+same-clock scheduler/IRQ stream, not with the writer's marker emission context.
+Only enable on hardware after a device-free Linux check and a measured overhead
+pilot. A native Mac build does not validate Linux tracefs or serve as an edge
+binary. Disable tracing and restore the original service environment/build at
+the end of the diagnostic experiment through the normal handoff procedure.

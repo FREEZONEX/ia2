@@ -9,6 +9,9 @@ publish.workspace = true
 name = "ia2-runtime"
 path = "src/main.rs"
 
+[features]
+scan-trace = ["ironplc-bridge/scan-trace"]
+
 [dependencies]
 tokio.workspace = true
 tokio-stream.workspace = true

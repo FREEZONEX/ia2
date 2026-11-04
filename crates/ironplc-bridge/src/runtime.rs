@@ -1907,6 +1907,10 @@ async fn run_loop_async(
     }
 
     // ---- Scan loop ----
+    #[cfg(feature = "scan-trace")]
+    let scan_trace = crate::scan_trace::Recorder::from_env(&instances);
+    #[cfg(feature = "scan-trace")]
+    let mut trace_sleep = None;
     let start = Instant::now();
     let mut last_snapshot = Instant::now() - Duration::from_secs(1);
     let mut last_retain_flush = Instant::now();
@@ -1956,6 +1960,8 @@ async fn run_loop_async(
     let mut inject_stall_scans: u32 = 0;
 
     loop {
+        #[cfg(feature = "scan-trace")]
+        let trace_tick = scan_trace.point();
         if stop.load(Ordering::Relaxed) {
             break;
         }
@@ -2238,6 +2244,11 @@ async fn run_loop_async(
             }
             ran_any = true;
 
+            #[cfg(feature = "scan-trace")]
+            let trace_due = clocks[i].next_due;
+            #[cfg(feature = "scan-trace")]
+            let trace_input = scan_trace.point();
+
             // Input phase: bus → this unit's VM variables
             for rm in &unit_inputs[i] {
                 let Some(dev) = devices.get_mut(rm.device_index) else {
@@ -2271,6 +2282,9 @@ async fn run_loop_async(
                 }
             }
 
+            #[cfg(feature = "scan-trace")]
+            let trace_inputs_done = scan_trace.point();
+
             // Force phase: apply pinned variables that resolve to this
             // unit AFTER its input read (a forced value beats the bus)
             // and BEFORE its run_round (the program sees the forced
@@ -2282,6 +2296,9 @@ async fn run_loop_async(
                     }
                 }
             }
+
+            #[cfg(feature = "scan-trace")]
+            let trace_logic = scan_trace.point();
 
             // Run one scan for this unit
             let now_us = start.elapsed().as_micros() as u64;
@@ -2302,6 +2319,8 @@ async fn run_loop_async(
                 break;
             }
             clocks[i].scan_count += 1;
+            #[cfg(feature = "scan-trace")]
+            let trace_logic_done = scan_trace.point();
 
             // Output phase: this unit's VM variables → bus.
             //
@@ -2356,7 +2375,36 @@ async fn run_loop_async(
                 clocks[i].consecutive_overruns = clocks[i].consecutive_overruns.saturating_add(1);
                 // Counted every time, unlike the warning below, which fires
                 // once per unit and then goes quiet for the life of the run.
-                scan_overruns.fetch_add(1, Ordering::Relaxed);
+                let trace_total = scan_overruns
+                    .fetch_add(1, Ordering::Relaxed)
+                    .wrapping_add(1);
+                #[cfg(not(feature = "scan-trace"))]
+                let _ = trace_total;
+                #[cfg(feature = "scan-trace")]
+                if let (Some(tick), Some(input), Some(inputs_done), Some(logic), Some(logic_done)) = (
+                    trace_tick,
+                    trace_input,
+                    trace_inputs_done,
+                    trace_logic,
+                    trace_logic_done,
+                ) {
+                    scan_trace.miss(crate::scan_trace::Miss {
+                        unit: i,
+                        scan: clocks[i].scan_count,
+                        total: trace_total,
+                        interval,
+                        points: [
+                            trace_due,
+                            tick,
+                            input,
+                            inputs_done,
+                            logic,
+                            logic_done,
+                            after,
+                        ],
+                        sleep: trace_sleep,
+                    });
+                }
                 if !clocks[i].warned_overrun {
                     let overrun = after - clocks[i].next_due;
                     tracing::warn!(
@@ -2479,7 +2527,16 @@ async fn run_loop_async(
             .expect("at least one unit");
         let now = Instant::now();
         if earliest > now {
-            tokio::time::sleep((earliest - now).min(SNAPSHOT_PERIOD)).await;
+            let duration = (earliest - now).min(SNAPSHOT_PERIOD);
+            #[cfg(feature = "scan-trace")]
+            let trace_request = scan_trace.point();
+            tokio::time::sleep(duration).await;
+            #[cfg(feature = "scan-trace")]
+            {
+                trace_sleep = trace_request
+                    .zip(scan_trace.point())
+                    .map(|(requested, returned)| [requested, now + duration, returned]);
+            }
         }
     }
 
