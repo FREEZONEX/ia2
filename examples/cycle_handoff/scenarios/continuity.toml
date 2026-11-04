@@ -1,0 +1,7 @@
+description = "Bus-clocked scan progresses without watchdog or pair alarm"
+[[steps]]
+expect = { var = "counter", op = "ge", value = 5, within_ms = 2000 }
+[[steps]]
+expect_watchdog = { tripped = false, during_ms = 500 }
+[[steps]]
+expect_alarm = { id = "invalid_pair", active = false, within_ms = 1000 }

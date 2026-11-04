@@ -214,7 +214,7 @@ macro_rules! copy_inputs_from_bus {
 /// onto the bus pre-tx_rx. Reads of RxPDO channels echo back from this
 /// same buffer (matches sim mode and is useful for "did my write take?"
 /// debugging in the UI).
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 struct PdiMirror {
     inputs: HashMap<u16, Vec<u8>>,
     outputs: HashMap<u16, Vec<u8>>,
@@ -230,6 +230,8 @@ struct PdiMirror {
 const WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub struct RealEthercat {
+    cycle: Option<Arc<crate::cycle::Gate<PdiMirror>>>,
+    staged: Option<(crate::cycle::Ticket, PdiMirror)>,
     sdo: Arc<crate::sdo::Client>,
     name: String,
     channels: HashMap<String, EthercatChannel>,
@@ -257,6 +259,7 @@ pub struct RealEthercat {
 /// The `Arc` handles `connect` shares with the cyclic worker thread,
 /// bundled so `smol_main` keeps a readable signature.
 struct WorkerShared {
+    cycle: Option<Arc<crate::cycle::Gate<PdiMirror>>>,
     sdo_rx: smol::channel::Receiver<crate::sdo::Request>,
     verify_init_sdo: bool,
     pdi: Arc<Mutex<PdiMirror>>,
@@ -315,6 +318,12 @@ enum InitResult {
 
 impl RealEthercat {
     pub async fn connect(name: String, config: &EthercatConfig) -> Result<Self, IoError> {
+        crate::cycle::validate(config)?;
+        let cycle = config.scan_sync.then(|| {
+            Arc::new(crate::cycle::Gate::new(Duration::from_micros(u64::from(
+                config.cycle_us,
+            ))))
+        });
         // ESI-modular real-bus cyclic bring-up (master-programmed
         // SyncManager/FMMU + logical-RW exchange, bypassing the auto
         // PDO-assignment path) is validated against the physical coupler
@@ -405,6 +414,7 @@ impl RealEthercat {
         let dc_static_sync_iterations = config.dc_static_sync_iterations;
         let slaves = config.slaves.clone();
         let shared = WorkerShared {
+            cycle: cycle.clone(),
             sdo_rx,
             verify_init_sdo,
             pdi: pdi.clone(),
@@ -497,6 +507,8 @@ impl RealEthercat {
                     reinits,
                 );
                 Ok(Self {
+                    cycle,
+                    staged: None,
                     sdo,
                     name,
                     channels,
@@ -534,6 +546,28 @@ impl IoDevice for RealEthercat {
     fn sdo_upload_handle(&self) -> Option<Arc<dyn iocore::sdo::SdoUpload>> {
         Some(self.sdo.clone())
     }
+    fn cycle_period(&self) -> Option<Duration> {
+        self.cycle.as_ref().map(|c| c.period)
+    }
+    fn cycle_status(&self) -> Option<iocore::cycle::CycleStatus> {
+        self.cycle.as_ref().map(|c| c.status())
+    }
+    async fn begin_cycle(&mut self) -> Result<(), IoError> {
+        if let Some(cycle) = &self.cycle {
+            self.staged = Some(cycle.begin().await?);
+        }
+        Ok(())
+    }
+    async fn finish_cycle(&mut self) -> Result<(), IoError> {
+        if let Some(cycle) = &self.cycle {
+            let (ticket, image) = self
+                .staged
+                .take()
+                .ok_or_else(|| IoError::Protocol("no cycle in progress".into()))?;
+            cycle.commit(ticket, image, Instant::now())?;
+        }
+        Ok(())
+    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -548,7 +582,9 @@ impl IoDevice for RealEthercat {
         // value forever — only `record_failure` could clear it, and a dead
         // thread never calls it. Reported observable only; nothing gates
         // control flow on this.
-        self.healthy.load(Ordering::Relaxed) && !self.stopped.load(Ordering::Relaxed)
+        self.healthy.load(Ordering::Relaxed)
+            && !self.stopped.load(Ordering::Relaxed)
+            && !self.cycle.as_ref().is_some_and(|c| c.is_faulted())
     }
 
     async fn read_channel(&mut self, channel: &str) -> Result<ChannelValue, IoError> {
@@ -563,6 +599,7 @@ impl IoDevice for RealEthercat {
             .ok_or_else(|| IoError::UnknownChannel(channel.into()))?
             .clone();
         let pdi = self.pdi.lock().expect("pdi mirror poisoned");
+        let pdi = self.staged.as_ref().map(|(_, image)| image).unwrap_or(&pdi);
         let map = match meta.direction {
             EthercatPdoDirection::TxPdo => &pdi.inputs,
             EthercatPdoDirection::RxPdo => &pdi.outputs,
@@ -600,7 +637,18 @@ impl IoDevice for RealEthercat {
             });
         }
         let mut pdi = self.pdi.lock().expect("pdi mirror poisoned");
-        let buffer = pdi.outputs.get_mut(&meta.slave_index).ok_or_else(|| {
+        let image = if self.cycle.is_some() {
+            &mut self
+                .staged
+                .as_mut()
+                .ok_or_else(|| {
+                    IoError::Protocol("scan_sync outputs require an active cycle".into())
+                })?
+                .1
+        } else {
+            &mut *pdi
+        };
+        let buffer = image.outputs.get_mut(&meta.slave_index).ok_or_else(|| {
             IoError::Transport(format!(
                 "slave_index={} not present in discovered bus",
                 meta.slave_index
@@ -627,6 +675,10 @@ impl IoDevice for RealEthercat {
     /// is still zeroed, but nothing will transmit it, so `Ok` would be a
     /// false report of a safe state having been commanded.
     async fn enter_failsafe(&mut self) -> Result<(), IoError> {
+        if let Some(cycle) = &self.cycle {
+            cycle.trip("failsafe requested; restart required");
+        }
+        self.staged = None;
         // Gear axes first: drop every engage request so the engines fall
         // back to shadow/hold instead of re-driving targets over the
         // zeroed mirror below.
@@ -976,6 +1028,7 @@ fn smol_main(
     init_tx: mpsc::SyncSender<InitResult>,
 ) {
     let WorkerShared {
+        cycle,
         sdo_rx,
         verify_init_sdo,
         pdi,
@@ -1308,6 +1361,19 @@ fn smol_main(
                 EthercatDcSync::Off
             };
 
+            if cycle.is_some() && bus_dc != EthercatDcSync::Sync0 {
+                if let Some(clock) = &cycle {
+                    clock.trip("scan_sync has no effective SYNC0 slave");
+                }
+                walk_fail(
+                    first_init,
+                    &init_tx,
+                    &mut reinit_attempt,
+                    "scan_sync has no effective SYNC0 slave".into(),
+                );
+                return;
+            }
+
             match bus_dc {
                 EthercatDcSync::Sync0 => {
                     // Servo drives (e.g. Inovance SV660N) need DC SYNC0 to
@@ -1379,6 +1445,26 @@ fn smol_main(
                     // Capture discovery before confirming OP so the topology is
                     // visible even if OP never settles.
                     let discovered = capture_discovery!(group, maindevice, pdi);
+                    // The synchronized path initially supports one LRW PDI chunk.
+                    // This makes its expected working counter unambiguous even
+                    // when some slaves have only input or only output data.
+                    let expected_wkc: u16 = discovered
+                        .iter()
+                        .map(|d| u16::from(d.input_bytes > 0) + 2 * u16::from(d.output_bytes > 0))
+                        .sum();
+                    let pdi_bytes: usize = discovered
+                        .iter()
+                        .map(|d| usize::from(d.input_bytes) + usize::from(d.output_bytes))
+                        .sum();
+                    if cycle.is_some() && pdi_bytes > 1024 {
+                        walk_fail(
+                            first_init,
+                            &init_tx,
+                            &mut reinit_attempt,
+                            "scan_sync currently requires total PDI <= 1024 bytes".into(),
+                        );
+                        return;
+                    }
 
                     // Pump tx_rx_dc until every SubDevice reaches OP (zero
                     // outputs / controlword 0 — nothing moves). Bounded.
@@ -1445,10 +1531,25 @@ fn smol_main(
                     while !shutdown.load(Ordering::Relaxed) {
                         cycles.fetch_add(1, Ordering::Relaxed);
                         let cycle_start = std::time::Instant::now();
-                        copy_outputs_to_bus!(group, maindevice, pdi);
+                        if let Some(clock) = &cycle {
+                            clock.consume(cycle_start, |image| {
+                                {
+                                    let mut mirror = pdi.lock().expect("pdi mirror poisoned");
+                                    if let Some(image) = image { mirror.outputs.clone_from(&image.outputs); }
+                                    else { for bytes in mirror.outputs.values_mut() { bytes.fill(0); } }
+                                }
+                                copy_outputs_to_bus!(group, maindevice, pdi);
+                            });
+                        } else { copy_outputs_to_bus!(group, maindevice, pdi); }
                         gear_tick!(group, maindevice, engines, bus_ok);
                         let next_wait = match group.tx_rx_dc(&maindevice).await {
                             Ok(resp) => {
+                                if let Some(clock) = &cycle {
+                                    if resp.working_counter != expected_wkc || !resp.all_op() {
+                                        clock.trip("unexpected WKC or bus left OP; restart required");
+                                        for bytes in pdi.lock().expect("pdi mirror poisoned").outputs.values_mut() { bytes.fill(0); }
+                                    }
+                                }
                                 let edge = note_bus_shape(
                                     &mut prev_shape,
                                     &mut shape_edges,
@@ -1517,6 +1618,7 @@ fn smol_main(
                                     // applies outputs. Leave the cyclic loop
                                     // and re-walk instead of exchanging with
                                     // a bus that silently ignores us.
+                                    if let Some(clock) = &cycle { clock.trip("bus left OP; restart required"); }
                                     healthy.store(false, Ordering::Relaxed);
                                     demoted = true;
                                     break;
@@ -1527,9 +1629,17 @@ fn smol_main(
                                     );
                                 }
                                 bus_ok = true;
+                                if let Some(clock) = &cycle {
+                                    let image = pdi.lock().expect("pdi mirror poisoned").clone();
+                                    clock.publish(image, cycle_start + resp.extra.next_cycle_wait, Instant::now());
+                                }
                                 resp.extra.next_cycle_wait
                             }
                             Err(e) => {
+                                if let Some(clock) = &cycle {
+                                    clock.trip("bus exchange failed; restart required");
+                                    for bytes in pdi.lock().expect("pdi mirror poisoned").outputs.values_mut() { bytes.fill(0); }
+                                }
                                 note_txrx_failure(&mut health, &e);
                                 if pump_dead.load(Ordering::Relaxed) {
                                     // A dead pump cannot recover by retrying
@@ -1772,6 +1882,8 @@ mod tests {
         let mut outputs = HashMap::new();
         outputs.insert(0u16, vec![0xffu8; 4]);
         RealEthercat {
+            cycle: None,
+            staged: None,
             sdo: crate::sdo::channel(
                 Arc::new(AtomicBool::new(true)),
                 Arc::new(AtomicBool::new(false)),
@@ -1969,5 +2081,60 @@ mod tests {
             start.elapsed() < Duration::from_millis(300),
             "must return shortly after the timeout, not wait out the worker"
         );
+    }
+    #[tokio::test]
+    async fn synchronized_real_bit_packer_stages_outputs_and_latches_inputs_without_a_bus() {
+        let mut dev = device_with_outputs(false);
+        dev.pdi.lock().unwrap().outputs.get_mut(&0).unwrap().fill(0);
+        dev.pdi.lock().unwrap().inputs.insert(0, vec![5, 0]);
+        for (name, offset, direction) in [
+            ("a", 0, EthercatPdoDirection::RxPdo),
+            ("b", 2, EthercatPdoDirection::RxPdo),
+            ("feedback", 0, EthercatPdoDirection::TxPdo),
+        ] {
+            dev.channels.insert(
+                name.into(),
+                EthercatChannel {
+                    name: name.into(),
+                    slave_index: 0,
+                    direction,
+                    pdo_index: 0x7000,
+                    sub_index: 0,
+                    bit_length: 16,
+                    data_type: project::EthercatDataType::U16,
+                    pdi_byte_offset: offset,
+                    pdi_bit_offset: 0,
+                },
+            );
+        }
+        let clock = Arc::new(crate::cycle::Gate::new(Duration::from_millis(50)));
+        dev.cycle = Some(clock.clone());
+        let mirror = dev.pdi.clone();
+        let publish = async {
+            tokio::task::yield_now().await;
+            let image = mirror.lock().unwrap().clone();
+            let now = Instant::now();
+            clock.publish(image, now + clock.period, now);
+        };
+        let (begun, ()) = tokio::join!(dev.begin_cycle(), publish);
+        begun.unwrap();
+        mirror.lock().unwrap().inputs.insert(0, vec![9, 0]);
+        assert_eq!(dev.read_channel("feedback").await.unwrap().to_i32(), 5);
+        dev.write_channel("a", ChannelValue::U16(11)).await.unwrap();
+        assert_eq!(mirror.lock().unwrap().outputs[&0], vec![0; 4]);
+        dev.write_channel("b", ChannelValue::U16(22)).await.unwrap();
+        dev.finish_cycle().await.unwrap();
+        assert_eq!(mirror.lock().unwrap().outputs[&0], vec![0; 4]);
+        clock.consume(Instant::now() + clock.period, |image| {
+            mirror
+                .lock()
+                .unwrap()
+                .outputs
+                .clone_from(&image.unwrap().outputs);
+        });
+        assert_eq!(mirror.lock().unwrap().outputs[&0], vec![11, 0, 22, 0]);
+        dev.enter_failsafe().await.unwrap();
+        assert_eq!(mirror.lock().unwrap().outputs[&0], vec![0; 4]);
+        assert!(dev.begin_cycle().await.is_err());
     }
 }

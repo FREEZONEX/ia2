@@ -219,3 +219,7 @@ read a scalar through the running master. Slave is zero based; hexadecimal index
 require `0x`. Example: `cs get runtime/sdo/bus/1/0x2008/1`.
 `cs api GET '/api/runtime/sdo?device=bus&slave=1&index=0x2008&subindex=1'`
 is equivalent. There is no SDO set/rm resource.
+
+Opt-in EtherCAT bus-clocked scans and their offline regression fixture are
+documented in [the cycle handoff contract](docs/scan-cycle-handoff.md). Inspect
+the bounded sequence diagnostics with `cs get runtime/status`.

@@ -6,6 +6,7 @@
 //! `iomap-ethercat`) and the ironplc-bridge runtime can all depend on it
 //! without forming a cycle.
 
+pub mod cycle;
 mod health;
 pub mod sdo;
 
@@ -136,6 +137,19 @@ pub trait IoDevice: Send {
     /// A read-only handle to the existing master; never creates another owner.
     fn sdo_upload_handle(&self) -> Option<std::sync::Arc<dyn sdo::SdoUpload>> {
         None
+    }
+    /// Opt-in clock: the scan waits for this device's completed bus exchange.
+    fn cycle_period(&self) -> Option<std::time::Duration> {
+        None
+    }
+    fn cycle_status(&self) -> Option<cycle::CycleStatus> {
+        None
+    }
+    async fn begin_cycle(&mut self) -> Result<(), IoError> {
+        Ok(())
+    }
+    async fn finish_cycle(&mut self) -> Result<(), IoError> {
+        Ok(())
     }
     async fn read_channel(&mut self, channel: &str) -> Result<ChannelValue, IoError>;
     async fn write_channel(&mut self, channel: &str, value: ChannelValue) -> Result<(), IoError>;

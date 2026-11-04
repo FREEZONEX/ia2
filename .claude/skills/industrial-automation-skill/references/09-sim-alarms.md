@@ -198,3 +198,13 @@ max = 100.0
 - **`force` bypasses governance by explicit decision** (ADR-0002): it stays the pure debug override and is never exported on any northbound surface. Mechanically, force only sticks on variables the program *reads* — which includes setpoints (see 02's force-precedence note) — but in a governed project, drive governed setpoints through writes so the clamps apply. Forcing a governed variable is a deliberate ungoverned override: it is attributed on the takeover overlay like any other mutating call, recorded in the edge audit ring, and belongs to commissioning/debug, not to normal operation.
 - Sim scenarios can assert governance directly: a `set` step to an unlisted variable fails the step with the 403 reason, and a `set` past a rule's bound followed by an `expect` reads back the clamped bound (the `set` itself discards the response) — both deterministic offline proofs.
 - Variable `unit`/`min`/`max`/`description` **metadata** (iomap.toml `[[mappings]]`, see `06-devices-iomap-tasks.md`) is documentation for generated surfaces; the `[governance]` rules here are the enforcement. Keep them consistent when both exist.
+
+## Cycle handoff regression
+
+`examples/cycle_handoff/scenarios/continuity.toml` verifies normal progress on an
+independent `_sim` bus thread. `late_frame.toml` injects one late scan and requires
+the watchdog to stay latched. Run in an isolated local server and one agent
+session. Use `--keep-running` for the first scenario and `--no-run` for the second
+when inspecting status between them, then stop explicitly. These 50 ms scenarios
+do not establish 2 ms hardware scheduling performance. The deterministic 2 ms
+state-machine and actual PDO staging checks live in Rust tests.

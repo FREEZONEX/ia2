@@ -511,3 +511,56 @@ fn sdo_resource_is_read_only_and_keeps_the_idle_scenario_running() {
         .assert()
         .success();
 }
+
+#[test]
+fn cycle_handoff_scenarios_expose_exact_sequence_and_latched_fault_over_http() {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("cycle_handoff");
+    copy_dir(&repo_root().join("examples/cycle_handoff"), &proj);
+    let server = spawn_server(tmp.path());
+    server.open_project(&proj);
+    let validation = cs(&server.base)
+        .args(["api", "POST", "/api/project/validate"])
+        .output()
+        .unwrap();
+    assert!(validation.status.success());
+    let diagnostics: serde_json::Value = serde_json::from_slice(&validation.stdout).unwrap();
+    assert_eq!(diagnostics, serde_json::json!([]), "{diagnostics}");
+    cs(&server.base)
+        .args(["sim", "run", "--keep-running"])
+        .arg(proj.join("scenarios/continuity.toml"))
+        .assert()
+        .success();
+    let out = cs(&server.base)
+        .args(["get", "runtime/status"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    eprintln!("cycle_handoff healthy status: {status}");
+    let clock = &status["device_health"][0]["cycle"];
+    assert!(clock["consumed"].as_u64().unwrap() >= 5, "{status}");
+    assert!(clock["fault"].is_null(), "{status}");
+    let events = clock["events"].as_array().unwrap();
+    let consumed: Vec<_> = events
+        .iter()
+        .filter(|e| e["kind"] == "consume")
+        .map(|e| e["sequence"].as_u64().unwrap())
+        .collect();
+    assert!(consumed.len() >= 2);
+    assert!(consumed.windows(2).all(|p| p[1] == p[0] + 1));
+    cs(&server.base)
+        .args(["sim", "run", "--no-run"])
+        .arg(proj.join("scenarios/late_frame.toml"))
+        .assert()
+        .success();
+    let out = cs(&server.base)
+        .args(["get", "runtime/status"])
+        .output()
+        .unwrap();
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    eprintln!("cycle_handoff fault status: {status}");
+    assert!(status["watchdog_tripped"].as_bool().unwrap());
+    assert!(status["device_health"][0]["cycle"]["fault"].is_string());
+    cs(&server.base).args(["stop"]).assert().success();
+}

@@ -450,3 +450,13 @@ consumes bus/CPU time; diagnose with drives disabled and monitor communication.
 Examples:
 `cs get runtime/sdo/bus/1/0x2008/1`
 `cs --project demo get edges/edge-a/sdo/bus/1/0x2008/1`
+
+### Bus-clocked scan diagnostics
+
+The existing local runtime status and edge status surfaces include optional
+`device_health[].cycle` for `scan_sync` EtherCAT devices. It contains period,
+issued/committed/consumed counters, the first latched fault, and a bounded ring
+of monotonic host-time events. A cycle fault sets `watchdog_tripped` and makes
+that device unhealthy; resuming or bus recovery does not clear it. The CLI
+resource is unchanged: `cs get runtime/status`. Details and timing limits:
+[cycle handoff contract](scan-cycle-handoff.md).

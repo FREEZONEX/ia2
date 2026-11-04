@@ -253,3 +253,13 @@ scale. Do not label old startup configuration as current readback. Busy/unsuppor
 returns 409, unavailable 503, timeout 504, and drive abort/protocol failure 502;
 errors propagate through the edge proxy. `_sim` explicitly rejects live uploads.
 See `docs/api.md` for bounds and `docs/edge-deploy.md` for startup verification.
+
+## EtherCAT cycle handoff status
+
+`cs get runtime/status` exposes optional `device_health[].cycle` for a device
+with `scan_sync = true`: ticket/frame counters, first latched fault and the last
+32 sequence events. `consumed` means selected for bus exchange, not proven drive
+application. Pause/step or a missed cycle latches `watchdog_tripped`; resume and
+bus recovery cannot re-arm it. The option defaults off and requires one SYNC0
+clock source, no gear, and matching PLC task periods. See
+[the contract](../../../../docs/scan-cycle-handoff.md).

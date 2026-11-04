@@ -1,0 +1,14 @@
+[[mappings]]
+application = "main"
+variable = "counter"
+direction = "output"
+device = "bus"
+channel = "counter"
+
+[[mappings]]
+application = "main"
+variable = "paired"
+direction = "output"
+device = "bus"
+channel = "paired"
+

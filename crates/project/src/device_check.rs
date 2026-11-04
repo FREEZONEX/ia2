@@ -68,6 +68,15 @@ where
 pub fn validate_devices(devices: &[Device]) -> Vec<DeviceIssue> {
     let mut issues = Vec::new();
     for device in devices {
+        if let ProtocolConfig::Ethercat(c) = &device.config {
+            if let Some(why) = c.scan_sync_error() {
+                issues.push(DeviceIssue {
+                    device: device.name.clone(),
+                    channel: String::new(),
+                    message: why.into(),
+                });
+            }
+        }
         let names = device.config.channel_names();
         for dup in duplicate_channel_names(names.iter().map(String::as_str)) {
             let count = names.iter().filter(|n| **n == dup).count();

@@ -2283,6 +2283,7 @@ dependencies = [
  "async-trait",
  "serde",
  "thiserror 2.0.18",
+ "ts-rs",
 ]
 
 [[package]]

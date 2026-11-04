@@ -1,0 +1,6 @@
+[[alarms]]
+id = "invalid_pair"
+variable = "pair_invalid"
+condition = "is_true"
+severity = "high"
+message = "Output pair invariant violated"

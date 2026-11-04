@@ -590,6 +590,7 @@ mod tests {
     async fn sim_facade_echoes_parameters_and_rejects_feedback_writes() {
         use iocore::IoDevice;
         let config = project::EthercatConfig {
+            scan_sync: false,
             nic: crate::SIM_NIC.into(),
             cycle_us: 2_000,
             bringup: Default::default(),
