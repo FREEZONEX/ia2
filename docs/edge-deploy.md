@@ -346,7 +346,8 @@ would violate the current maintenance scope.
 ### Opt-in bus-clocked scans
 
 EtherCAT `scan_sync = true` selects the existing bus as the PLC clock and commits
-one complete output image per cycle. It requires a matching task period and one
+one complete output image per cycle. On Linux, its DC worker uses a per-thread
+monotonic deadline wait. It requires a matching task period and one
 clock owner; failures latch off until explicit program restart. It defaults to
 false and does not change existing project files. Source/offline validation is
 not hardware acceptance. Read the [contract and hardware boundary](scan-cycle-handoff.md)

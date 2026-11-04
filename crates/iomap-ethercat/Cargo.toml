@@ -18,3 +18,6 @@ async-trait.workspace = true
 iocore = { path = "../iocore" }
 project = { path = "../project" }
 esi = { path = "../esi" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

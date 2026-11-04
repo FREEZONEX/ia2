@@ -1500,6 +1500,21 @@ fn smol_main(
                         tracing::info!("all subdevices reached OP (dc=sync0)");
                     }
 
+                    let mut timer = match crate::cycle_timer::CycleTimer::new(cycle.is_some()) {
+                        Ok(timer) => timer,
+                        Err(error) => {
+                            let message = format!("configure EtherCAT cycle timer: {error}");
+                            if let Some(clock) = &cycle {
+                                clock.trip(&message);
+                            }
+                            let _ = walk_fail(first_init, &init_tx, &mut reinit_attempt, message);
+                            return;
+                        }
+                    };
+                    tracing::info!(
+                        native_clock = timer.uses_native_clock(),
+                        "EtherCAT DC cycle timer"
+                    );
                     if first_init {
                         let _ = init_tx.send(InitResult::Ok { discovered });
                         first_init = false;
@@ -1527,6 +1542,7 @@ fn smol_main(
                     let mut bus_ok = true;
                     let mut prev_shape: Option<(Vec<ethercrab::SubDeviceState>, u16)> = None;
                     let mut shape_edges: u64 = 0;
+                    let mut previous_wait: Option<(Instant, Instant, Instant)> = None;
                     crate::sdo::run(&sdo_rx, &reinits, async {
                     while !shutdown.load(Ordering::Relaxed) {
                         cycles.fetch_add(1, Ordering::Relaxed);
@@ -1542,7 +1558,25 @@ fn smol_main(
                             });
                         } else { copy_outputs_to_bus!(group, maindevice, pdi); }
                         gear_tick!(group, maindevice, engines, bus_ok);
-                        let next_wait = match group.tx_rx_dc(&maindevice).await {
+                        let exchange_start = Instant::now();
+                        let response = group.tx_rx_dc(&maindevice).await;
+                        let exchange_end = Instant::now();
+                        if let Some((deadline, wait_start, previous_exchange_end)) = previous_wait {
+                            let late = cycle_start.saturating_duration_since(deadline);
+                            if late >= sync0 {
+                                tracing::error!(
+                                    late_us = late.as_micros() as u64,
+                                    timer_entry_margin_us = deadline.saturating_duration_since(wait_start).as_micros() as u64,
+                                    timer_entry_late_us = wait_start.saturating_duration_since(deadline).as_micros() as u64,
+                                    previous_rx_to_timer_us = wait_start.duration_since(previous_exchange_end).as_micros() as u64,
+                                    pre_exchange_us = exchange_start.duration_since(cycle_start).as_micros() as u64,
+                                    exchange_us = exchange_end.duration_since(exchange_start).as_micros() as u64,
+                                    native_clock = timer.uses_native_clock(),
+                                    "EtherCAT bus cycle resumed after a missed deadline"
+                                );
+                            }
+                        }
+                        let next_wait = match response {
                             Ok(resp) => {
                                 if let Some(clock) = &cycle {
                                     if resp.working_counter != expected_wkc || !resp.all_op() {
@@ -1652,7 +1686,15 @@ fn smol_main(
                                 sync0
                             }
                         };
-                        smol::Timer::at(cycle_start + next_wait).await;
+                        let deadline = cycle_start + next_wait;
+                        previous_wait = cycle.as_ref().map(|_| (deadline, Instant::now(), exchange_end));
+                        if let Err(error) = timer.wait(deadline).await {
+                            if let Some(clock) = &cycle {
+                                clock.trip("EtherCAT monotonic wait failed; restart required");
+                            }
+                            tracing::error!(%error, "EtherCAT cycle timer failed");
+                            smol::Timer::at(deadline).await;
+                        }
                     }
                     }, |address| crate::sdo::read(group.subdevice(&maindevice, usize::from(address.slave)), address)).await;
                     if demoted && !shutdown.load(Ordering::Relaxed) {

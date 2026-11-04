@@ -43,6 +43,12 @@ non-OP state latches the gate. Output selection and failsafe are serialized unde
 one lock; a previously committed frame cannot undo a latched failsafe. The real
 adapter uses the existing master's DC next-cycle wait; no second master is created.
 
+On Linux, the synchronized worker waits for that deadline using an absolute
+`CLOCK_MONOTONIC` sleep with reduced timer slack on that worker. The kernel
+dispatches the cycle timer directly and the shared reactor handles socket
+send/receive. A native timer failure trips the gate,
+and the worker continues safe-zero exchange using the asynchronous timer.
+
 The input image is fixed for the entire scan. Output channel writes affect a
 private staging image until the whole scan commits. Channel errors fail the
 synchronized scan closed. Direct adapter writes outside an active scan are refused;
@@ -77,6 +83,10 @@ not an atomic live transaction with other status fields. No per-cycle file I/O i
 performed. A cycle fault makes the device unhealthy until restart. Independent
 scheduler `scan_overruns` is not used to decide synchronized deadlines: the gate
 and `watchdog_tripped` report that path.
+
+When the DC worker resumes a whole period late, the runtime journal records
+the prior timer entry margin, the time from prior exchange completion to timer
+entry, and the current pre-exchange and exchange durations.
 
 ## Offline proof and hardware boundary
 

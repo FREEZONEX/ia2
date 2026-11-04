@@ -2307,6 +2307,7 @@ dependencies = [
  "ethercrab",
  "ethercrab-wire",
  "iocore",
+ "libc",
  "project",
  "serde",
  "smol",

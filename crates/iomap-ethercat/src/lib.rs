@@ -18,6 +18,7 @@
 mod bits;
 pub mod cam;
 mod cycle;
+mod cycle_timer;
 mod esi_map;
 pub mod gear;
 mod real;
