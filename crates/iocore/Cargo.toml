@@ -10,3 +10,6 @@ serde.workspace = true
 ts-rs.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

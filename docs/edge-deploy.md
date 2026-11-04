@@ -574,7 +574,14 @@ would violate the current maintenance scope.
 ### Opt-in bus-clocked scans
 
 EtherCAT `scan_sync = true` selects the existing bus as the PLC clock and commits
-one complete output image per cycle. On Linux, its DC worker uses a per-thread
+one complete output image per cycle. Linux deployments can explicitly set
+`IA2_SCAN_SYNC_RT_PRIORITY=1..20` for the synchronized PLC producer and
+`IA2_EC_SYNC_RT_PRIORITY=1..20` for the bus worker, with the bus priority higher
+(for example bus 10, scan 9). Policies are applied only
+to their dedicated threads and read back; a denied request fails startup. The
+scan option is ignored for timer-driven projects. No priority is raised by
+default, and a priority setting does not replace disabled field acceptance.
+On Linux, its DC worker uses a per-thread
 monotonic deadline wait. It requires a matching task period and one
 clock owner. Steady DC slots must remain adjacent; a phase-based host selection
 limit rejects stale output frames before the next exchange, and returned DC
