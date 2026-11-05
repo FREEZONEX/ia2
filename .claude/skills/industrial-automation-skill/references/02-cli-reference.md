@@ -350,7 +350,9 @@ See `docs/api.md` for bounds and `docs/edge-deploy.md` for startup verification.
 
 `cs get runtime/status` exposes optional `device_health[].cycle` for a device
 with `scan_sync = true`: ticket/frame counters, first latched fault and the last
-32 sequence events. `consumed` means selected for bus exchange, not proven drive
+32 sequence events, including `dc_send_expired` when output selection misses its
+DC-slot limit. Steady DC discontinuities include raw previous/current DC
+nanoseconds in the first fault reason. `consumed` means selected for bus exchange, not proven drive
 application. Pause/step or a missed cycle latches `watchdog_tripped`; resume and
 bus recovery cannot re-arm it. The option defaults off and requires one SYNC0
 clock source, no gear, and matching PLC task periods. See

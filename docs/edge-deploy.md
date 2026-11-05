@@ -576,7 +576,10 @@ would violate the current maintenance scope.
 EtherCAT `scan_sync = true` selects the existing bus as the PLC clock and commits
 one complete output image per cycle. On Linux, its DC worker uses a per-thread
 monotonic deadline wait. It requires a matching task period and one
-clock owner; failures latch off until explicit program restart. It defaults to
+clock owner. Steady DC slots must remain adjacent; a phase-based host selection
+limit rejects stale output frames before the next exchange, and returned DC
+discontinuities latch zero output for subsequent exchanges. Failures latch off
+until explicit program restart. It defaults to
 false and does not change existing project files. Source/offline validation is
 not hardware acceptance. Read the [contract and hardware boundary](scan-cycle-handoff.md)
 before preparing a synchronized edge deployment; keep initialization SDO policy

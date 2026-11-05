@@ -422,20 +422,88 @@ impl DcStartup {
     }
 }
 
-/// The first cyclic exchange has no outstanding PLC ticket, so the gate
-/// cannot infer a missed cycle from a ticket deadline yet.
-struct DcHandoff {
+/// Retained across startup and EVERY steady exchange. A host-only ticket
+/// deadline cannot detect a DC slot skip shorter than one host period.
+struct DcContinuity {
     deadline: Instant,
     last_slot: u64,
+    last_dc_ns: u64,
+    send_before: Instant,
 }
 
-impl DcHandoff {
-    fn check(&self, clock: &crate::cycle::Gate<impl Clone>, cycle_start: Instant, slot: u64) {
-        if cycle_start >= self.deadline + clock.period
-            || self.last_slot.checked_add(1) != Some(slot)
-        {
-            clock.trip("startup handoff missed a DC slot; restart required");
+impl DcContinuity {
+    fn new(deadline: Instant, sampled_from: Instant, dc_ns: u64, period: Duration) -> Self {
+        let period_ns = period.as_nanos() as u64;
+        Self {
+            deadline,
+            last_slot: dc_ns / period_ns,
+            last_dc_ns: dc_ns,
+            // The next frame belongs in slot N+1, before slot N+2. The
+            // host sample precedes the reference-clock read on the wire,
+            // so this is a conservative estimate, not physical send proof.
+            send_before: sampled_from + Duration::from_nanos(2 * period_ns - dc_ns % period_ns),
         }
+    }
+
+    fn check(&self, clock: &crate::cycle::Gate<impl Clone>, cycle_start: Instant, dc_ns: u64) {
+        if clock.is_faulted() {
+            return;
+        }
+        let slot = dc_ns / clock.period.as_nanos() as u64;
+        let reason = if dc_ns == 0 {
+            Some("invalid zero DC time")
+        } else if dc_ns < self.last_dc_ns {
+            Some("DC time moved backwards")
+        } else if slot == self.last_slot {
+            Some("duplicate DC slot")
+        } else if self.last_slot.checked_add(1) != Some(slot) {
+            Some("skipped DC slot")
+        } else if cycle_start >= self.deadline + clock.period {
+            Some("missed DC host deadline")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            let detail = format!(
+                "{reason}: previous_dc_ns={}, dc_ns={dc_ns}; restart required",
+                self.last_dc_ns
+            );
+            clock.trip(&detail);
+            tracing::error!(
+                previous_dc_ns = self.last_dc_ns,
+                dc_ns,
+                previous_slot = self.last_slot,
+                slot,
+                sequence = clock.status().issued,
+                host_lateness_us = cycle_start
+                    .saturating_duration_since(self.deadline)
+                    .as_micros() as u64,
+                reason,
+                "EtherCAT DC continuity fault"
+            );
+        }
+    }
+}
+
+/// Production hook used for startup handoff AND all subsequent successful
+/// synchronized exchanges. Healthy traffic never clears a previous latch.
+fn observe_dc_exchange<T: Clone>(
+    clock: &crate::cycle::Gate<T>,
+    handoff: &mut Option<DcContinuity>,
+    cycle_start: Instant,
+    dc_ns: u64,
+    next_deadline: Instant,
+) {
+    if let Some(previous) = handoff.as_ref() {
+        previous.check(clock, cycle_start, dc_ns);
+    }
+    if !clock.is_faulted() {
+        *handoff = Some(DcContinuity::new(
+            next_deadline,
+            cycle_start,
+            dc_ns,
+            clock.period,
+        ));
     }
 }
 
@@ -1828,7 +1896,7 @@ fn smol_main(
                     // Pump zero outputs until OP. In synchronized mode,
                     // follow the DC phase during startup and preserve the
                     // next deadline across the transition to the scan loop.
-                    let mut first_handoff = None;
+                    let mut dc_continuity = None;
                     {
                         let deadline = std::time::Instant::now() + Duration::from_secs(10);
                         let mut reached_op = false;
@@ -1848,10 +1916,12 @@ fn smol_main(
                                             && Instant::now() < next;
                                         if startup.observe(slot, healthy) {
                                             reached_op = true;
-                                            first_handoff = Some(DcHandoff {
-                                                deadline: next,
-                                                last_slot: slot,
-                                            });
+                                            dc_continuity = Some(DcContinuity::new(
+                                                next,
+                                                sent_at,
+                                                resp.extra.dc_system_time,
+                                                sync0,
+                                            ));
                                             break;
                                         }
                                         next
@@ -1930,7 +2000,7 @@ fn smol_main(
                     let mut shape_edges: u64 = 0;
                     let mut previous_wait: Option<(Instant, Instant, Instant)> = None;
                     crate::sdo::run(&sdo_rx, &reinits, async {
-                    if let Some(handoff) = &first_handoff {
+                    if let Some(handoff) = &dc_continuity {
                         if let Err(error) = timer.wait(handoff.deadline).await {
                             if let Some(clock) = &cycle {
                                 clock.trip("EtherCAT monotonic wait failed; restart required");
@@ -1943,7 +2013,7 @@ fn smol_main(
                         cycles.fetch_add(1, Ordering::Relaxed);
                         let cycle_start = std::time::Instant::now();
                         if let Some(clock) = &cycle {
-                            clock.consume(|image| {
+                            clock.consume_before(dc_continuity.as_ref().map(|d| d.send_before), |image| {
                                 {
                                     let mut mirror = lock_pdi_for_cycle(&pdi, &pdi_poisoned);
                                     if let Some(image) = image { mirror.outputs.clone_from(&image.outputs); }
@@ -1974,12 +2044,12 @@ fn smol_main(
                         let next_wait = match response {
                             Ok(resp) => {
                                 if let Some(clock) = &cycle {
-                                    if let Some(handoff) = first_handoff.take() {
-                                        handoff.check(clock, cycle_start,
-                                            resp.extra.dc_system_time / sync0.as_nanos() as u64);
-                                    }
+                                    observe_dc_exchange(clock, &mut dc_continuity, cycle_start,
+                                        resp.extra.dc_system_time, cycle_start + resp.extra.next_cycle_wait);
                                     if resp.working_counter != expected_wkc || !resp.all_op() {
                                         clock.trip("unexpected WKC or bus left OP; restart required");
+                                    }
+                                    if clock.is_faulted() {
                                         for bytes in lock_pdi_for_cycle(&pdi, &pdi_poisoned).outputs.values_mut() { bytes.fill(0); }
                                     }
                                 }
@@ -2322,25 +2392,25 @@ mod tests {
                 if armed {
                     assert!(scan.as_mut().poll(&mut context).is_pending());
                 }
-                let handoff = DcHandoff {
-                    deadline: Instant::now(),
-                    last_slot: 13,
-                };
+                let now = Instant::now();
+                let handoff = DcContinuity::new(now, now - period, 27_000_000, period);
                 let started = handoff.deadline + late;
                 clock.consume_at(started, |image| assert!(image.is_none()));
-                handoff.check(&clock, started, slot);
+                handoff.check(&clock, started, slot * 2_000_000 + 1_000_000);
                 clock.publish_at([0u8], started + period, started);
                 assert!(matches!(
                     scan.as_mut().poll(&mut context),
                     std::task::Poll::Ready(Err(_))
                 ));
-                assert_eq!(
-                    clock.status().fault.as_deref(),
-                    Some("startup handoff missed a DC slot; restart required")
-                );
+                assert!(clock
+                    .status()
+                    .fault
+                    .as_deref()
+                    .unwrap()
+                    .contains("restart required"));
                 // Neither another healthy exchange nor an on-time handoff
                 // may re-arm this run or put a frame on the output mirror.
-                handoff.check(&clock, handoff.deadline, 14);
+                handoff.check(&clock, handoff.deadline, 29_000_000);
                 for n in 1..=3 {
                     let now = started + period * n;
                     clock.consume_at(now, |image| assert!(image.is_none()));
@@ -2365,13 +2435,11 @@ mod tests {
             let mut scan = Box::pin(clock.begin());
             let mut context = Context::from_waker(Waker::noop());
             assert!(scan.as_mut().poll(&mut context).is_pending());
-            let handoff = DcHandoff {
-                deadline: Instant::now(),
-                last_slot: 13,
-            };
+            let now = Instant::now();
+            let handoff = DcContinuity::new(now, now - period, 27_000_000, period);
             let started = handoff.deadline + late;
             clock.consume_at(started, |image| assert!(image.is_none()));
-            handoff.check(&clock, started, 14);
+            handoff.check(&clock, started, 29_000_000);
             let deadline = started + period;
             clock.publish_at([0u8], deadline, started);
             let Poll::Ready(Ok((ticket, image))) = scan.as_mut().poll(&mut context) else {
@@ -2385,6 +2453,141 @@ mod tests {
             assert_eq!(
                 (status.issued, status.committed, status.consumed),
                 (1, 1, 1)
+            );
+        }
+    }
+
+    #[test]
+    fn steady_dc_slot_skip_latches_even_below_the_host_period_allowance() {
+        use std::{
+            future::Future,
+            task::{Context, Poll, Waker},
+        };
+        let period = Duration::from_millis(2);
+        let origin = Instant::now();
+        let clock = crate::cycle::Gate::new(period);
+        let mut scan = Box::pin(clock.begin());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(scan.as_mut().poll(&mut cx).is_pending());
+        let mut handoff = Some(DcContinuity::new(
+            origin,
+            origin - period,
+            27_000_000,
+            period,
+        ));
+        observe_dc_exchange(&clock, &mut handoff, origin, 29_000_000, origin + period);
+        clock.publish_at([0u8], origin + period, origin);
+        let Poll::Ready(Ok((ticket, _))) = scan.as_mut().poll(&mut cx) else {
+            panic!("ticket")
+        };
+        clock
+            .commit_at(ticket, [7u8], origin + Duration::from_micros(694))
+            .unwrap();
+        // A complete frame committed 1306 us early is still accepted 1030 us
+        // late by the old host-only gate, despite the reference clock skip.
+        let started = origin + period + Duration::from_micros(1030);
+        clock.consume_at(started, |image| assert_eq!(image, Some(&[7u8])));
+        observe_dc_exchange(&clock, &mut handoff, started, 32_033_928, started + period);
+        assert!(
+            clock.is_faulted(),
+            "steady slot 14 -> 16 must latch after startup"
+        );
+        clock.publish_at([9u8], started + period, started);
+        clock.consume_at(started + period, |image| assert!(image.is_none()));
+        assert_eq!(clock.status().issued, 1);
+    }
+
+    #[test]
+    fn steady_dc_accepts_adjacent_slots_with_phase_jitter_not_host_interval_thresholds() {
+        let period = Duration::from_millis(2);
+        let origin = Instant::now();
+        let clock = crate::cycle::Gate::<[u8; 1]>::new(period);
+        let mut handoff = Some(DcContinuity::new(
+            origin,
+            origin - period,
+            27_000_000,
+            period,
+        ));
+        // Some intervals exceed 2 ms, but every reference-clock slot is adjacent.
+        for n in 0..10_000u64 {
+            let phase = [800_000, 1_271_209, 950_000, 1_100_000][n as usize % 4];
+            let dc_ns = (14 + n) * 2_000_000 + phase;
+            let now = origin + Duration::from_nanos(n * 2_000_000 + phase - 800_000);
+            let next = now + Duration::from_nanos(3_000_000 - phase);
+            observe_dc_exchange(&clock, &mut handoff, now, dc_ns, next);
+            assert!(!clock.is_faulted(), "{n}: {:?}", clock.status());
+            assert_eq!(handoff.as_ref().unwrap().last_dc_ns, dc_ns);
+        }
+    }
+
+    #[test]
+    fn steady_dc_classifies_invalid_samples_and_preserves_the_first_fault() {
+        let period = Duration::from_millis(2);
+        let origin = Instant::now();
+        for (bad_dc, reason) in [
+            (31_500_000, "duplicate"),
+            (30_900_000, "DC time moved backwards"),
+            (34_033_928, "skipped"),
+            (0, "invalid zero"),
+        ] {
+            let clock = crate::cycle::Gate::<[u8; 1]>::new(period);
+            let mut handoff = Some(DcContinuity::new(
+                origin,
+                origin - period,
+                27_000_000,
+                period,
+            ));
+            for n in 0..2 {
+                let now = origin + period * n;
+                observe_dc_exchange(
+                    &clock,
+                    &mut handoff,
+                    now,
+                    29_000_000 + u64::from(n) * 2_000_000,
+                    now + period,
+                );
+            }
+            let now = origin + period * 2;
+            observe_dc_exchange(&clock, &mut handoff, now, bad_dc, now + period);
+            let fault = clock.status().fault.unwrap();
+            assert!(fault.starts_with(reason), "{fault}");
+            assert!(fault.contains("previous_dc_ns=31000000"));
+            assert!(fault.contains(&format!("dc_ns={bad_dc}")));
+            observe_dc_exchange(
+                &clock,
+                &mut handoff,
+                now + period,
+                35_000_000,
+                now + period * 2,
+            );
+            assert_eq!(clock.status().fault.as_ref(), Some(&fault));
+            clock.consume_at(now + period, |image| assert!(image.is_none()));
+            assert!(smol::block_on(clock.begin()).is_err());
+        }
+    }
+
+    #[test]
+    fn dc_time_wrap_is_rejected_and_send_limit_is_phase_relative() {
+        let period = Duration::from_millis(2);
+        let origin = Instant::now();
+        let clock = crate::cycle::Gate::<[u8; 1]>::new(period);
+        let mut handoff = Some(DcContinuity::new(
+            origin,
+            origin - period,
+            u64::MAX - 1000,
+            period,
+        ));
+        observe_dc_exchange(&clock, &mut handoff, origin, 1000, origin + period);
+        assert!(clock
+            .status()
+            .fault
+            .unwrap()
+            .starts_with("DC time moved backwards"));
+        for phase in [0, 33_928, 1_000_000, 1_271_209, 1_999_999] {
+            let h = DcContinuity::new(origin + period, origin, 40_000_000 + phase, period);
+            assert_eq!(
+                h.send_before - origin,
+                Duration::from_nanos(4_000_000 - phase)
             );
         }
     }

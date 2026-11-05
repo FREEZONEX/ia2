@@ -169,11 +169,28 @@ impl<T: Clone> Gate<T> {
     /// Callback runs under the gate lock. Failsafe cannot race an accepted
     /// frame back onto the mirror. None means ZERO outputs, never hold-last.
     pub fn consume(&self, apply: impl FnOnce(Option<&T>)) {
-        self.consume_with_clock(Instant::now, apply);
+        self.consume_before(None, apply);
     }
-    fn consume_with_clock(&self, now: impl FnOnce() -> Instant, apply: impl FnOnce(Option<&T>)) {
+    /// The real DC worker additionally bounds selection by the predicted
+    /// end of the next reference-clock slot. Check AFTER taking the lock.
+    pub fn consume_before(&self, send_before: Option<Instant>, apply: impl FnOnce(Option<&T>)) {
+        self.consume_with_clock(Instant::now, send_before, apply);
+    }
+    fn consume_with_clock(
+        &self,
+        now: impl FnOnce() -> Instant,
+        send_before: Option<Instant>,
+        apply: impl FnOnce(Option<&T>),
+    ) {
         let mut s = self.state.lock().expect("cycle gate poisoned");
         let now = now();
+        if s.status.fault.is_none() {
+            if let Some(limit) = send_before.filter(|limit| now >= *limit) {
+                let sequence = s.status.issued;
+                self.event(&mut s, "dc_send_expired", sequence, now, Some(limit));
+                self.fail(&mut s, "DC slot send window expired; restart required", now);
+            }
+        }
         if s.status.fault.is_none() {
             if let Some((ticket, _)) = s.ticket.take() {
                 if now >= ticket.deadline + self.period || s.pending.is_none() {
@@ -226,7 +243,7 @@ impl<T: Clone> Gate<T> {
         self.commit_with_clock(ticket, image, || now)
     }
     pub(crate) fn consume_at(&self, now: Instant, apply: impl FnOnce(Option<&T>)) {
-        self.consume_with_clock(|| now, apply);
+        self.consume_with_clock(|| now, None, apply);
     }
     pub(crate) fn publish_at(&self, image: T, deadline: Instant, now: Instant) {
         self.publish_with_clock(image, deadline, || now);
@@ -375,10 +392,61 @@ mod tests {
         }
     }
 
+    #[test]
+    fn dc_selection_deadline_rejects_subperiod_lateness_and_latches_without_a_ticket() {
+        for armed in [false, true] {
+            for late in [false, true] {
+                let g = Gate::new(Duration::from_millis(2));
+                g.state.lock().unwrap().armed = armed;
+                let now = g.origin;
+                let deadline = now + g.period;
+                let limit = deadline + Duration::from_millis(1);
+                let ticket = if armed {
+                    g.publish_at([0, 0], deadline, now);
+                    let ticket = begin_at(&g);
+                    g.commit_at(ticket, [1, 2], now).unwrap();
+                    Some(ticket)
+                } else {
+                    None
+                };
+                let selected_at = limit
+                    - if late {
+                        Duration::ZERO
+                    } else {
+                        Duration::from_nanos(1)
+                    };
+                g.consume_with_clock(
+                    || selected_at,
+                    Some(limit),
+                    |frame| {
+                        assert_eq!(frame, (armed && !late).then_some(&[1, 2]));
+                    },
+                );
+                assert_eq!(g.is_faulted(), late);
+                if late {
+                    let status = g.status();
+                    assert_eq!(status.consumed, 0);
+                    let event = status
+                        .events
+                        .iter()
+                        .find(|e| e.kind == "dc_send_expired")
+                        .unwrap();
+                    assert_eq!(event.deadline_us, Some(3000));
+                    if let Some(ticket) = ticket {
+                        assert!(g.commit_at(ticket, [8, 9], now).is_err());
+                    }
+                    g.publish_at([8, 9], limit + g.period, limit);
+                    g.consume_at(limit + g.period, |image| assert!(image.is_none()));
+                }
+            }
+        }
+    }
+
     #[derive(Clone, Copy, Debug)]
     enum ContendedOperation {
         Commit,
         Consume,
+        DcConsume,
         Publish,
     }
 
@@ -394,7 +462,10 @@ mod tests {
         } else {
             g.publish_at([0, 0], deadline, issued_at);
             let ticket = begin_at(&g);
-            if matches!(operation, ContendedOperation::Consume) {
+            if matches!(
+                operation,
+                ContendedOperation::Consume | ContendedOperation::DcConsume
+            ) {
                 g.commit_at(ticket, [1, 2], issued_at).unwrap();
             }
             Some(ticket)
@@ -412,6 +483,9 @@ mod tests {
                 }
                 ContendedOperation::Consume => {
                     worker_gate.consume(|frame| assert!(frame.is_none()));
+                }
+                ContendedOperation::DcConsume => {
+                    worker_gate.consume_before(Some(deadline), |frame| assert!(frame.is_none()));
                 }
                 ContendedOperation::Publish => worker_gate.publish([0, 0], deadline),
             }
@@ -450,6 +524,11 @@ mod tests {
     #[test]
     fn mutex_wait_cannot_consume_a_frame_after_a_missed_cycle() {
         expired_while_waiting_for_lock(ContendedOperation::Consume);
+    }
+
+    #[test]
+    fn mutex_wait_cannot_select_an_output_past_the_dc_slot_limit() {
+        expired_while_waiting_for_lock(ContendedOperation::DcConsume);
     }
 
     #[test]

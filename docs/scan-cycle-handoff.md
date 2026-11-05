@@ -38,7 +38,8 @@ There is one outstanding ticket and one pending frame. There is no growing queue
 catch-up loop, interpolation, or producer timer in synchronized operation. The
 worker selects an exact complete frame before the next exchange. An unarmed gate
 sends zero outputs. After arming, a missing frame, late/duplicate/stale commit,
-whole-period bus lateness, expired/overlapping issue, bad WKC, exchange failure or
+whole-period bus lateness, a missed DC selection window, non-adjacent DC slots,
+expired/overlapping issue, bad WKC, exchange failure or
 non-OP state latches the gate. Output selection and failsafe are serialized under
 one lock; a previously committed frame cannot undo a latched failsafe. Commit,
 consume and publication sample their deadline-check time after taking that lock,
@@ -69,6 +70,26 @@ retained deadline. A whole-period delay or a non-adjacent slot latches
 zero outputs even if the PLC has not started waiting for its first ticket;
 later healthy exchanges cannot clear this fault.
 
+The worker retains that check for every steady exchange. Reference-clock time
+must increase into exactly the next `dc_ns / period_ns` slot. Zero DC time,
+repeated slots, backwards time and skipped slots latch the gate, including when
+host lateness is less than a period. The first DC fault includes both raw DC
+nanosecond samples; its journal entry also records the issued sequence and host
+lateness. DC samples are from the returned FRMW, not host capture timestamps.
+The half-period SYNC0 shift sets the intended transmit phase inside each slot;
+it does not change this reference-clock slot numbering.
+
+Before output selection, the gate checks a conservative host estimate of the end
+of the next DC slot, after acquiring its mutex. For a sample in slot N, this
+limit is `sample_host_start + 2 * period - dc_phase`. Expiry emits a
+`dc_send_expired` event with the limit in `deadline_us` and selects zero outputs,
+even before the first ticket. The host sample precedes the reference-clock read,
+so this limit can fail early; it is not a guarantee of the physical send time.
+Preemption after selection may still delay a frame. A discontinuity discovered
+from its response prevents the next ticket and selects zero for the next
+exchange; software cannot retract the frame already sent. The check does not
+apply to unsynchronized DC or free-run adapters and never queues catch-up frames.
+
 The input image is fixed for the entire scan. Output channel writes affect a
 private staging image until the whole scan commits. Channel errors fail the
 synchronized scan closed. Direct adapter writes outside an active scan are refused;
@@ -96,7 +117,7 @@ the existing edge status proxy carry `device_health[].cycle` for clock owners:
 | `committed` | Complete frames accepted before their deadlines |
 | `consumed` | Frames selected for exchange, not proof of drive application |
 | `fault` | First latched reason; null before fault |
-| `events` | Last 32 issue/begin/commit/consume/fault events |
+| `events` | Last 32 issue/begin/commit/consume/dc_send_expired/fault events |
 | `events_dropped` | Earlier events evicted from the bounded ring |
 
 Events have a sequence, `host_us`, and optional `deadline_us`, all relative to one
