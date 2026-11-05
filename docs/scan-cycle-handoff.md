@@ -92,6 +92,15 @@ change CPU affinity, priorities, drive parameters or any cycle deadline, and
 does not guarantee wakeup latency against other kernel or firmware delays.
 See the Linux [CPU idle PM QoS interface](https://docs.kernel.org/admin-guide/pm/cpuidle.html).
 
+Idle wake latency and runnable-task dispatch latency are different. An idle
+constraint does not make kernel code preemptible. On a `PREEMPT_DYNAMIC` host,
+verify the selected mode as well as the bus/scan priorities: `voluntary` can
+leave a ready realtime thread waiting behind ordinary kernel work. A qualified
+deployment may require `full` preemption before it starts the cyclic worker;
+that host policy is separate from this runtime's process-owned PM QoS lease.
+Preserve wakeup, context-switch and packet timing evidence to distinguish a
+late timer, delayed dispatch, lock wait and actual network latency.
+
 During synchronized startup the worker follows the reference clock while
 sending zero outputs. It waits for four adjacent DC slots with all devices
 in OP and the expected working counter, then retains the next deadline

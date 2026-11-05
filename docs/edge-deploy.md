@@ -603,3 +603,17 @@ constraint and may increase idle power. It does not alter persistent OS
 configuration, scheduling priorities, EtherCAT DC limits or the fault latch.
 Validate both its effect on idle states and sustained disabled bus continuity
 on the target; setting a value alone is not a real-time guarantee.
+
+Qualify kernel preemption separately. A `PREEMPT_DYNAMIC` kernel can still be
+running in `voluntary` mode: an ordinary kernel worker can defer an already
+runnable `SCHED_RR` bus thread until a voluntary scheduling point. Read the
+selected mode from `/sys/kernel/debug/sched/preempt` with sufficient permission;
+neither the kernel name nor the thread priority proves it is `full`. When a
+captured wakeup-to-dispatch delay requires full preemption, a qualified host
+launcher can select `full` through that interface **before** cyclic startup,
+verify readback and refuse admission if it later differs. This is an explicit
+host-wide policy, remains after the runtime exits, and is distinct from the
+descriptor-owned idle latency request. It does not update boot configuration,
+provide PREEMPT_RT, or eliminate explicit non-preemptible sections. Keep the
+prior/selected mode in deployment evidence and repeat disabled acceptance.
+See Linux [scheduler preemption](https://www.kernel.org/doc/html/latest/scheduler/sched-preemption.html).
