@@ -203,7 +203,7 @@ impl SimEthercat {
                 .spawn(move || {
                     while !stop.load(Ordering::Relaxed) {
                         let now = std::time::Instant::now();
-                        clock.consume(now, |image| {
+                        clock.consume(|image| {
                             let mut live = values.lock().expect("sim values poisoned");
                             for (name, ty) in &outputs {
                                 live.insert(
@@ -217,7 +217,7 @@ impl SimEthercat {
                         });
                         let deadline = now + clock.period;
                         let image = values.lock().expect("sim values poisoned").clone();
-                        clock.publish(image, deadline, std::time::Instant::now());
+                        clock.publish(image, deadline);
                         std::thread::sleep(
                             deadline.saturating_duration_since(std::time::Instant::now()),
                         );
@@ -278,7 +278,7 @@ impl IoDevice for SimEthercat {
                 .staged
                 .take()
                 .ok_or_else(|| IoError::Protocol("no cycle in progress".into()))?;
-            cycle.commit(ticket, image, std::time::Instant::now())?;
+            cycle.commit(ticket, image)?;
             // Reads outside a scan must report the consumed image.
         }
         Ok(())

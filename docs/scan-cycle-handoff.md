@@ -40,7 +40,9 @@ worker selects an exact complete frame before the next exchange. An unarmed gate
 sends zero outputs. After arming, a missing frame, late/duplicate/stale commit,
 whole-period bus lateness, expired/overlapping issue, bad WKC, exchange failure or
 non-OP state latches the gate. Output selection and failsafe are serialized under
-one lock; a previously committed frame cannot undo a latched failsafe. The real
+one lock; a previously committed frame cannot undo a latched failsafe. Commit,
+consume and publication sample their deadline-check time after taking that lock,
+so time spent waiting for it counts toward expiry. The real
 adapter uses the existing master's DC next-cycle wait; no second master is created.
 
 On Linux, the synchronized worker waits for that deadline using an absolute

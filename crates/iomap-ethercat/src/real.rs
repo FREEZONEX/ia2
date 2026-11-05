@@ -805,7 +805,7 @@ impl IoDevice for RealEthercat {
                 .staged
                 .take()
                 .ok_or_else(|| IoError::Protocol("no cycle in progress".into()))?;
-            cycle.commit(ticket, image, Instant::now())?;
+            cycle.commit(ticket, image)?;
         }
         Ok(())
     }
@@ -1943,7 +1943,7 @@ fn smol_main(
                         cycles.fetch_add(1, Ordering::Relaxed);
                         let cycle_start = std::time::Instant::now();
                         if let Some(clock) = &cycle {
-                            clock.consume(cycle_start, |image| {
+                            clock.consume(|image| {
                                 {
                                     let mut mirror = lock_pdi_for_cycle(&pdi, &pdi_poisoned);
                                     if let Some(image) = image { mirror.outputs.clone_from(&image.outputs); }
@@ -2074,8 +2074,8 @@ fn smol_main(
                                         clock.trip("PDI mirror poisoned; restart required");
                                     }
                                     let deadline = cycle_start + resp.extra.next_cycle_wait;
+                                    clock.publish(image, deadline);
                                     let publish_time = Instant::now();
-                                    clock.publish(image, deadline, publish_time);
                                     if publish_time >= deadline {
                                         tracing::error!(
                                             exchange_us = exchange_end.duration_since(exchange_start).as_micros() as u64,
@@ -2327,9 +2327,9 @@ mod tests {
                     last_slot: 13,
                 };
                 let started = handoff.deadline + late;
-                clock.consume(started, |image| assert!(image.is_none()));
+                clock.consume_at(started, |image| assert!(image.is_none()));
                 handoff.check(&clock, started, slot);
-                clock.publish([0u8], started + period, started);
+                clock.publish_at([0u8], started + period, started);
                 assert!(matches!(
                     scan.as_mut().poll(&mut context),
                     std::task::Poll::Ready(Err(_))
@@ -2343,8 +2343,8 @@ mod tests {
                 handoff.check(&clock, handoff.deadline, 14);
                 for n in 1..=3 {
                     let now = started + period * n;
-                    clock.consume(now, |image| assert!(image.is_none()));
-                    clock.publish([1u8], now + period, now);
+                    clock.consume_at(now, |image| assert!(image.is_none()));
+                    clock.publish_at([1u8], now + period, now);
                 }
                 let status = clock.status();
                 assert_eq!(
@@ -2370,16 +2370,16 @@ mod tests {
                 last_slot: 13,
             };
             let started = handoff.deadline + late;
-            clock.consume(started, |image| assert!(image.is_none()));
+            clock.consume_at(started, |image| assert!(image.is_none()));
             handoff.check(&clock, started, 14);
             let deadline = started + period;
-            clock.publish([0u8], deadline, started);
+            clock.publish_at([0u8], deadline, started);
             let Poll::Ready(Ok((ticket, image))) = scan.as_mut().poll(&mut context) else {
                 panic!("adjacent startup handoff must issue the first ticket");
             };
             assert_eq!(image, [0u8]);
-            clock.commit(ticket, [1u8], started).unwrap();
-            clock.consume(deadline, |image| assert_eq!(image, Some(&[1u8])));
+            clock.commit_at(ticket, [1u8], started).unwrap();
+            clock.consume_at(deadline, |image| assert_eq!(image, Some(&[1u8])));
             let status = clock.status();
             assert!(status.fault.is_none());
             assert_eq!(
@@ -3038,7 +3038,7 @@ mod tests {
             tokio::task::yield_now().await;
             let image = mirror.lock().unwrap().clone();
             let now = Instant::now();
-            clock.publish(image, now + clock.period, now);
+            clock.publish_at(image, now + clock.period, now);
         };
         let (begun, ()) = tokio::join!(dev.begin_cycle(), publish);
         begun.unwrap();
@@ -3049,7 +3049,7 @@ mod tests {
         dev.write_channel("b", ChannelValue::U16(22)).await.unwrap();
         dev.finish_cycle().await.unwrap();
         assert_eq!(mirror.lock().unwrap().outputs[&0], vec![0; 4]);
-        clock.consume(Instant::now() + clock.period, |image| {
+        clock.consume_at(Instant::now() + clock.period, |image| {
             mirror
                 .lock()
                 .unwrap()

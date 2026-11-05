@@ -324,6 +324,14 @@ cs agent enter --label "..." / cs agent leave  # script-managed session variant
 `cs --project <project> get edges/<edge>/sdo/<device>/<slave>/<index>/<subindex>`
 read a scalar through the running master. Slave is zero based; hexadecimal indexes
 require `0x`. Example: `cs get runtime/sdo/bus/1/0x2008/1`.
+
+Device names may include folders: `runtime/sdo/motion/bus/1/0x2008/1`.
+The last three path segments are always slave/index/subindex. For an edge path
+with more than one possible `/sdo/` separator, percent-encode the slashes inside
+its edge/device names, for example
+`edges/plant%2Fsdo%2Fedge-a/sdo/motion%2Fsdo%2Fbus/1/0x2008/1`.
+SDO name escapes are decoded once; encode a literal `%` as `%25`.
+
 `cs api GET '/api/runtime/sdo?device=bus&slave=1&index=0x2008&subindex=1'`
 is equivalent. There is no SDO set/rm resource. Preserve the returned raw bytes,
 identity and timestamp as evidence; apply the drive dictionary's signedness and

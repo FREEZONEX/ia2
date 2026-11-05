@@ -590,6 +590,13 @@ Examples:
 `cs get runtime/sdo/bus/1/0x2008/1`
 `cs --project demo get edges/edge-a/sdo/bus/1/0x2008/1`
 
+Device names may include folders: `runtime/sdo/motion/bus/1/0x2008/1`.
+The last three path segments are always slave/index/subindex. For an edge path
+with more than one possible `/sdo/` separator, percent-encode the slashes inside
+its edge/device names, for example
+`edges/plant%2Fsdo%2Fedge-a/sdo/motion%2Fsdo%2Fbus/1/0x2008/1`.
+SDO name escapes are decoded once; encode a literal `%` as `%25`.
+
 ### Bus-clocked scan diagnostics
 
 The existing local runtime status and edge status surfaces include optional

@@ -1040,12 +1040,31 @@ fn sdo_resource_is_read_only_and_keeps_the_idle_scenario_running() {
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("sdo_idle");
     copy_dir(&repo_root().join("examples/sim_smoke"), &proj);
+    std::fs::create_dir_all(proj.join("devices/motion")).unwrap();
+    for path in ["devices/motion/bus.toml", "devices/sdo.toml"] {
+        std::fs::write(
+            proj.join(path),
+            "name = \"bus\"\nprotocol = \"ethercat\"\nnic = \"_sim\"\n",
+        )
+        .unwrap();
+    }
     let server = spawn_server(tmp.path());
     server.open_project(&proj);
     cs(&server.base)
         .args(["api", "POST", "/api/run"])
         .assert()
         .success();
+    // A 409 unsupported response proves the configured simulated device was
+    // resolved by its exact name; a malformed or double-encoded name is 404.
+    for name in ["motion/bus", "motion%2Fbus", "sdo"] {
+        cs(&server.base)
+            .args(["get", &format!("runtime/sdo/{name}/1/0x2008/1")])
+            .assert()
+            .code(2)
+            .stderr(predicates::str::contains(
+                "does not support live SDO upload",
+            ));
+    }
     cs(&server.base)
         .args(["get", "runtime/sdo/missing/1/0x2008/1"])
         .assert()

@@ -127,8 +127,18 @@ impl<T: Clone> Gate<T> {
                 .map_err(|_| IoError::Transport("cycle clock closed".into()))?;
         }
     }
-    pub fn commit(&self, ticket: Ticket, image: T, now: Instant) -> Result<(), IoError> {
+    pub fn commit(&self, ticket: Ticket, image: T) -> Result<(), IoError> {
+        self.commit_with_clock(ticket, image, Instant::now)
+    }
+    fn commit_with_clock(
+        &self,
+        ticket: Ticket,
+        image: T,
+        now: impl FnOnce() -> Instant,
+    ) -> Result<(), IoError> {
         let mut s = self.state.lock().expect("cycle gate poisoned");
+        // Lock contention consumes the same deadline budget as scan work.
+        let now = now();
         if let Some(why) = &s.status.fault {
             return Err(IoError::Transport(why.clone()));
         }
@@ -158,8 +168,12 @@ impl<T: Clone> Gate<T> {
     }
     /// Callback runs under the gate lock. Failsafe cannot race an accepted
     /// frame back onto the mirror. None means ZERO outputs, never hold-last.
-    pub fn consume(&self, now: Instant, apply: impl FnOnce(Option<&T>)) {
+    pub fn consume(&self, apply: impl FnOnce(Option<&T>)) {
+        self.consume_with_clock(Instant::now, apply);
+    }
+    fn consume_with_clock(&self, now: impl FnOnce() -> Instant, apply: impl FnOnce(Option<&T>)) {
         let mut s = self.state.lock().expect("cycle gate poisoned");
+        let now = now();
         if s.status.fault.is_none() {
             if let Some((ticket, _)) = s.ticket.take() {
                 if now >= ticket.deadline + self.period || s.pending.is_none() {
@@ -180,8 +194,12 @@ impl<T: Clone> Gate<T> {
         s.pending = None;
     }
     /// Called only after a successful OP exchange and a complete input copy.
-    pub fn publish(&self, image: T, deadline: Instant, now: Instant) {
+    pub fn publish(&self, image: T, deadline: Instant) {
+        self.publish_with_clock(image, deadline, Instant::now);
+    }
+    fn publish_with_clock(&self, image: T, deadline: Instant, now: impl FnOnce() -> Instant) {
         let mut s = self.state.lock().expect("cycle gate poisoned");
+        let now = now();
         if !s.armed || s.status.fault.is_some() {
             return;
         }
@@ -197,6 +215,21 @@ impl<T: Clone> Gate<T> {
         s.ticket = Some((ticket, image));
         self.event(&mut s, "issue", ticket.sequence, now, Some(deadline));
         self.wake.send_modify(|v| *v = v.wrapping_add(1));
+    }
+}
+
+// Explicit logical time is available only to deterministic state-machine tests.
+// Production callers always sample the monotonic clock after acquiring the lock.
+#[cfg(test)]
+impl<T: Clone> Gate<T> {
+    pub(crate) fn commit_at(&self, ticket: Ticket, image: T, now: Instant) -> Result<(), IoError> {
+        self.commit_with_clock(ticket, image, || now)
+    }
+    pub(crate) fn consume_at(&self, now: Instant, apply: impl FnOnce(Option<&T>)) {
+        self.consume_with_clock(|| now, apply);
+    }
+    pub(crate) fn publish_at(&self, image: T, deadline: Instant, now: Instant) {
+        self.publish_with_clock(image, deadline, || now);
     }
 }
 
@@ -226,17 +259,17 @@ mod tests {
         let mut now = g.origin;
         let mut wire = Vec::new();
         for n in 1..=10_000 {
-            g.publish([n - 1, (n - 1) * 2], now + g.period, now);
+            g.publish_at([n - 1, (n - 1) * 2], now + g.period, now);
             let t = begin_at(&g);
             // Deterministic producer work varies, always within the bus deadline.
-            g.commit(
+            g.commit_at(
                 t,
                 [n, 2 * n],
                 now + Duration::from_micros(100 + n * 37 % 1700),
             )
             .unwrap();
             now += g.period;
-            g.consume(now, |frame| wire.push(*frame.unwrap()));
+            g.consume_at(now, |frame| wire.push(*frame.unwrap()));
         }
         assert_eq!(wire, (1..=10_000).map(|n| [n, n * 2]).collect::<Vec<_>>());
         let status = g.status();
@@ -270,22 +303,24 @@ mod tests {
         for fault in 0..5 {
             let g = armed();
             let now = g.origin;
-            g.publish([0, 0], now + g.period, now);
+            g.publish_at([0, 0], now + g.period, now);
             let t = begin_at(&g);
             match fault {
                 0 => {
-                    assert!(g.commit(t, [1, 2], now + g.period).is_err());
+                    assert!(g.commit_at(t, [1, 2], now + g.period).is_err());
                 }
                 1 => {} // no output commit
                 2 => {
-                    g.commit(t, [1, 2], now).unwrap();
-                    assert!(g.commit(t, [2, 4], now).is_err());
+                    g.commit_at(t, [1, 2], now).unwrap();
+                    assert!(g.commit_at(t, [2, 4], now).is_err());
                 }
                 3 => {
-                    assert!(g.commit(Ticket { sequence: 0, ..t }, [1, 2], now).is_err());
+                    assert!(g
+                        .commit_at(Ticket { sequence: 0, ..t }, [1, 2], now)
+                        .is_err());
                 }
                 _ => {
-                    g.commit(t, [1, 2], now).unwrap();
+                    g.commit_at(t, [1, 2], now).unwrap();
                 }
             }
             let consume_at = if fault == 4 {
@@ -293,12 +328,12 @@ mod tests {
             } else {
                 now + g.period
             };
-            g.consume(consume_at, |frame| assert!(frame.is_none()));
+            g.consume_at(consume_at, |frame| assert!(frame.is_none()));
             assert!(g.status().fault.is_some());
             // A healthy transport and fresh data NEVER re-arm a failed gate.
-            g.publish([8, 16], now + g.period * 4, now + g.period * 3);
-            assert!(g.commit(t, [1, 2], now).is_err());
-            g.consume(now + g.period * 4, |frame| assert!(frame.is_none()));
+            g.publish_at([8, 16], now + g.period * 4, now + g.period * 3);
+            assert!(g.commit_at(t, [1, 2], now).is_err());
+            g.consume_at(now + g.period * 4, |frame| assert!(frame.is_none()));
             assert_eq!(g.status().consumed, 0);
         }
     }
@@ -309,22 +344,22 @@ mod tests {
         let task = tokio::spawn(async move { reader.begin().await.unwrap() });
         tokio::task::yield_now().await;
         let now = Instant::now();
-        g.publish([3, 6], now + g.period, now);
+        g.publish_at([3, 6], now + g.period, now);
         let (ticket, image) = task.await.unwrap();
         assert_eq!(image, [3, 6]);
-        g.commit(ticket, [4, 8], Instant::now()).unwrap();
-        g.consume(now + g.period, |v| assert_eq!(v, Some(&[4, 8])));
+        g.commit_at(ticket, [4, 8], Instant::now()).unwrap();
+        g.consume_at(now + g.period, |v| assert_eq!(v, Some(&[4, 8])));
         assert_eq!(image, [3, 6]);
     }
     #[test]
     fn failsafe_cannot_be_overwritten_by_a_previously_committed_frame() {
         let g = armed();
         let now = g.origin;
-        g.publish([0, 0], now + g.period, now);
+        g.publish_at([0, 0], now + g.period, now);
         let t = begin_at(&g);
-        g.commit(t, [1, 2], now).unwrap();
+        g.commit_at(t, [1, 2], now).unwrap();
         g.trip("stop");
-        g.consume(now + g.period, |v| assert!(v.is_none()));
+        g.consume_at(now + g.period, |v| assert!(v.is_none()));
         assert_eq!(g.status().fault.as_deref(), Some("stop"));
     }
     #[test]
@@ -332,11 +367,93 @@ mod tests {
         for expired in [false, true] {
             let g = armed();
             let now = g.origin;
-            g.publish([0, 0], if expired { now } else { now + g.period }, now);
+            g.publish_at([0, 0], if expired { now } else { now + g.period }, now);
             if !expired {
-                g.publish([1, 2], now + g.period, now);
+                g.publish_at([1, 2], now + g.period, now);
             }
             assert!(g.status().fault.is_some());
         }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ContendedOperation {
+        Commit,
+        Consume,
+        Publish,
+    }
+
+    fn expired_while_waiting_for_lock(operation: ContendedOperation) {
+        use std::sync::{mpsc, Arc};
+
+        let g = Arc::new(Gate::new(Duration::from_millis(200)));
+        g.state.lock().unwrap().armed = true;
+        let issued_at = Instant::now();
+        let deadline = issued_at + g.period;
+        let ticket = if matches!(operation, ContendedOperation::Publish) {
+            None
+        } else {
+            g.publish_at([0, 0], deadline, issued_at);
+            let ticket = begin_at(&g);
+            if matches!(operation, ContendedOperation::Consume) {
+                g.commit_at(ticket, [1, 2], issued_at).unwrap();
+            }
+            Some(ticket)
+        };
+        // Model a status reader preempted while holding the gate mutex.
+        // These calls exercise the production clock, not logical test time.
+        let holder = g.state.lock().unwrap();
+        let worker_gate = g.clone();
+        let (entered, observed) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            entered.send(Instant::now()).unwrap();
+            match operation {
+                ContendedOperation::Commit => {
+                    assert!(worker_gate.commit(ticket.unwrap(), [1, 2]).is_err());
+                }
+                ContendedOperation::Consume => {
+                    worker_gate.consume(|frame| assert!(frame.is_none()));
+                }
+                ContendedOperation::Publish => worker_gate.publish([0, 0], deadline),
+            }
+        });
+        let entered_at = observed.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            entered_at < deadline,
+            "worker must enter before its deadline"
+        );
+        let expires = deadline
+            + if matches!(operation, ContendedOperation::Consume) {
+                g.period
+            } else {
+                Duration::ZERO
+            };
+        std::thread::sleep(
+            (expires + Duration::from_millis(10)).saturating_duration_since(Instant::now()),
+        );
+        drop(holder);
+        worker.join().unwrap();
+        let status = g.status();
+        assert!(status.fault.is_some(), "{operation:?}: {status:?}");
+        assert_eq!(status.consumed, 0);
+        g.consume(|frame| assert!(frame.is_none()));
+        assert!(smol::block_on(g.begin()).is_err());
+        // Later traffic cannot re-arm the failed run.
+        g.publish([8, 16], Instant::now() + g.period);
+        assert!(g.is_faulted());
+    }
+
+    #[test]
+    fn mutex_wait_cannot_accept_a_late_commit() {
+        expired_while_waiting_for_lock(ContendedOperation::Commit);
+    }
+
+    #[test]
+    fn mutex_wait_cannot_consume_a_frame_after_a_missed_cycle() {
+        expired_while_waiting_for_lock(ContendedOperation::Consume);
+    }
+
+    #[test]
+    fn mutex_wait_cannot_publish_an_expired_ticket() {
+        expired_while_waiting_for_lock(ContendedOperation::Publish);
     }
 }
