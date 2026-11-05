@@ -533,3 +533,54 @@ grace_secs = 30         # 1..=3600; ignored for "report"
   (`bringup = auto`, the default) still take hand-authored `pdi_byte_offset`s —
   read them off the connect-time PDO-mapping log, where the runtime dumps each
   `0x1C12`/`0x1C13` entry with its object index and byte offset.
+
+### Experimental scan diagnostics (offline preparation)
+
+The optional `scan-trace` feature on `ia2-runtime` enables a Linux-only diagnostic
+recorder. It remains inactive unless `IA2_SCAN_TRACE_JSONL` names a new file.
+`IA2_SCAN_TRACE_MARKER` may name a pre-created private tracefs instance's
+`trace_marker`. The scan thread submits timestamped deadline misses to a bounded
+queue; a separate writer emits JSONL and optional markers. Existing deadline,
+cadence and watchdog decisions are preserved. Queue drops, marker errors and
+writer failures invalidate diagnostic coverage; they do not block the scan.
+
+This build is experimental and adds timestamp/queue overhead. Do not treat it as
+the unchanged production binary or infer a realtime guarantee from average scan
+throughput. Pair the payload's CLOCK_MONOTONIC timestamps and scan TID with the
+same-clock scheduler/IRQ stream, not with the writer's marker emission context.
+Only enable on hardware after a device-free Linux check and a measured overhead
+pilot. A native Mac build does not validate Linux tracefs or serve as an edge
+binary. Disable tracing and restore the original service environment/build at
+the end of the diagnostic experiment through the normal handoff procedure.
+
+
+### Inspecting an existing bus without replaying startup SDO downloads
+
+Set `IA2_EC_INIT_SDO_VERIFY_ONLY=1` in the runtime service environment when
+maintenance must preserve current drive parameters. Only `0`/unset (normal
+startup downloads) and `1` are accepted. In verification mode, the existing
+master uploads every configured `init_sdo` object's final value and checks its
+exact configured width. Repeated assignments use their last value (e.g. PDO
+assignment count zero followed by the final count). A mismatch or read failure
+fails device initialization; it never corrects the value. The mode applies to
+initial connect and automatic re-walks. It does not eliminate the standard
+EtherCAT AL/DC/SM/FMMU initialization required to restart the existing master.
+Do not restart while motion is active; preserve the project and safe outputs,
+verify topology and live state, then use the read-only `/sdo` endpoint. Never
+start a second master to obtain a parameter dump. Rollback must retain the
+verification-mode runtime if replaying the previous binary's startup downloads
+would violate the current maintenance scope.
+
+### Opt-in bus-clocked scans
+
+EtherCAT `scan_sync = true` selects the existing bus as the PLC clock and commits
+one complete output image per cycle. On Linux, its DC worker uses a per-thread
+monotonic deadline wait. It requires a matching task period and one
+clock owner. Steady DC slots must remain adjacent; a phase-based host selection
+limit rejects stale output frames before the next exchange, and returned DC
+discontinuities latch zero output for subsequent exchanges. Failures latch off
+until explicit program restart. It defaults to
+false and does not change existing project files. Source/offline validation is
+not hardware acceptance. Read the [contract and hardware boundary](scan-cycle-handoff.md)
+before preparing a synchronized edge deployment; keep initialization SDO policy
+and any existing read-only maintenance launcher intact.

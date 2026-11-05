@@ -1618,6 +1618,7 @@ fn default_config_for(protocol: Protocol) -> ProtocolConfig {
             channels: vec![],
         }),
         Protocol::Ethercat => ProtocolConfig::Ethercat(crate::types::EthercatConfig {
+            scan_sync: false,
             nic: default_ethercat_nic().into(),
             bringup: crate::types::EthercatBringup::Auto,
             cycle_us: 1_000,

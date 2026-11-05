@@ -125,9 +125,12 @@ pub struct DeviceReport {
 pub struct DeviceHealth {
     pub name: String,
     /// `true` = transport believed good, variable values are live.
-    /// `false` = connect failed or the background link is down; input
+    /// `false` = connect failed, link down, or a cycle handoff fault; input
     /// variables are frozen at last-known values.
     pub healthy: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub cycle: Option<iocore::cycle::CycleStatus>,
 }
 
 #[derive(Clone, Debug)]
@@ -224,6 +227,12 @@ type SharedFailsafeStatus = Arc<std::sync::Mutex<Option<FailsafeStatus>>>;
 // `RuntimeCommand::WriteVariable` self-documenting at the call site.
 #[allow(clippy::enum_variant_names)]
 enum RuntimeCommand {
+    SdoHandle {
+        name: String,
+        ack: tokio::sync::oneshot::Sender<
+            Result<Arc<dyn iocore::sdo::SdoUpload>, iocore::sdo::SdoError>,
+        >,
+    },
     /// One-shot variable write — applied once, may be overwritten by
     /// the program in subsequent scans. Use `ForceVariable` to keep a
     /// value pinned. A successful write replaces any earlier pulse owner.
@@ -567,6 +576,27 @@ impl ProgramHandle {
         ack_rx.await.map_err(|_| RuntimeWriteError::Disconnected)?
     }
 
+    /// Resolve on the scan thread, then await the mailbox OUTSIDE that thread.
+    pub async fn sdo_upload(
+        &self,
+        device: &str,
+        address: iocore::sdo::SdoAddress,
+    ) -> Result<iocore::sdo::SdoValue, iocore::sdo::SdoError> {
+        use iocore::sdo::SdoError;
+        let (ack, rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(RuntimeCommand::SdoHandle {
+                name: device.into(),
+                ack,
+            })
+            .map_err(|_| SdoError::Unavailable("program stopped".into()))?;
+        let handle = tokio::time::timeout(Duration::from_secs(1), rx)
+            .await
+            .map_err(|_| SdoError::Timeout)?
+            .map_err(|_| SdoError::Unavailable("program stopped".into()))??;
+        handle.upload(address).await
+    }
+
     async fn send_write(
         &self,
         name: &str,
@@ -887,6 +917,73 @@ enum DeviceSource {
     PrebuiltWithRetries(Vec<Box<dyn IoDevice>>, Vec<DeviceSpec>),
 }
 
+fn validate_scan_clock(
+    source: &DeviceSource,
+    units: &[ProgramUnit],
+) -> Result<Option<Duration>, String> {
+    #[allow(irrefutable_let_patterns)]
+    if let DeviceSource::Specs(specs) = source {
+        for spec in specs {
+            if let ProtocolConfig::Ethercat(c) = &spec.config {
+                if let Some(why) = c.scan_sync_error() {
+                    return Err(why.into());
+                }
+            }
+        }
+    }
+    let periods: Vec<Duration> = match source {
+        DeviceSource::Specs(specs) => specs
+            .iter()
+            .filter_map(|d| match &d.config {
+                ProtocolConfig::Ethercat(c) if c.scan_sync => {
+                    Some(Duration::from_micros(u64::from(c.cycle_us)))
+                }
+                _ => None,
+            })
+            .collect(),
+        #[cfg(test)]
+        DeviceSource::Prebuilt(devices) | DeviceSource::PrebuiltWithRetries(devices, _) => {
+            devices.iter().filter_map(|d| d.cycle_period()).collect()
+        }
+    };
+    match periods.as_slice() {
+        [] => Ok(None),
+        [period]
+            if units.iter().all(|u| {
+                Duration::from_millis(if u.interval_ms == 0 {
+                    DEFAULT_SCAN_INTERVAL_MS
+                } else {
+                    u.interval_ms
+                }) == *period
+            }) =>
+        {
+            Ok(Some(*period))
+        }
+        _ => Err(
+            "scan_sync requires exactly one clock source and all PLC tasks at its cycle_us".into(),
+        ),
+    }
+}
+
+async fn latch_cycle_fault(
+    devices: &mut [Box<dyn IoDevice>],
+    latch: &AtomicBool,
+    reason: &std::sync::Mutex<Option<String>>,
+    failsafe_status: &SharedFailsafeStatus,
+    why: &str,
+) {
+    if latch.load(Ordering::Relaxed) {
+        return;
+    }
+    begin_failsafe_attempts(failsafe_status, devices.iter().map(|dev| dev.name()));
+    note_latch_reason(reason, format!("cycle handoff fault: {why}"));
+    latch.store(true, Ordering::Release);
+    tracing::error!(%why, "cycle handoff fault; outputs latched off until program restart");
+    for dev in devices {
+        let _ = attempt_device_failsafe(dev.as_mut(), failsafe_status).await;
+    }
+}
+
 async fn acquire_devices(
     source: DeviceSource,
 ) -> (Vec<Box<dyn IoDevice>>, Vec<DeviceReport>, Vec<DeviceSpec>) {
@@ -1026,6 +1123,13 @@ fn spawn_units_with_grace(
         // no matter how the loop exits (clean stop, VM trap, or panic),
         // we still own the `devices` vec and can attempt each adapter's
         // configured safe values.
+        let expected_cycle = match validate_scan_clock(&device_source, &units) {
+            Ok(period) => period,
+            Err(why) => {
+                record_fault(fault_tx, why);
+                return;
+            }
+        };
         let (mut devices, reports, failed_specs) = io_rt.block_on(acquire_devices(device_source));
 
         let rt = match tokio::runtime::Builder::new_current_thread()
@@ -1052,6 +1156,7 @@ fn spawn_units_with_grace(
                 *slot = reports
                     .iter()
                     .map(|r| DeviceHealth {
+                        cycle: None,
                         name: r.name.clone(),
                         healthy: r.connected
                             && devices
@@ -1107,6 +1212,7 @@ fn spawn_units_with_grace(
             use futures_util::FutureExt;
             use std::panic::AssertUnwindSafe;
             let result = AssertUnwindSafe(run_loop_async(
+                expected_cycle,
                 units,
                 &mut devices,
                 mappings,
@@ -2267,6 +2373,7 @@ impl Drop for ExitGuard {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_loop_async(
+    expected_cycle: Option<Duration>,
     mut units: Vec<ProgramUnit>,
     // Devices are borrowed so the outer wrapper retains ownership for
     // its always-run failsafe pass (see `spawn_units_inner`'s async
@@ -2308,6 +2415,22 @@ async fn run_loop_async(
         return;
     }
     let n_units = units.len();
+    let clock_devices: Vec<_> = devices
+        .iter()
+        .enumerate()
+        .filter_map(|(i, d)| d.cycle_period().map(|p| (i, p)))
+        .collect();
+    let sync_device = match clock_devices.as_slice() {
+        [] if expected_cycle.is_none() => None,
+        [(i, period)] if Some(*period) == expected_cycle => Some(*i),
+        _ => {
+            record_fault(
+                fault,
+                "configured scan clock unavailable; refusing timer fallback".into(),
+            );
+            return;
+        }
+    };
 
     // The interruptible upstream driver executes one instance. This matches
     // compile_project_units; reject foreign multi-instance containers instead
@@ -2580,6 +2703,10 @@ async fn run_loop_async(
     }
 
     // ---- Scan loop ----
+    #[cfg(feature = "scan-trace")]
+    let scan_trace = crate::scan_trace::Recorder::from_env(&instances);
+    #[cfg(feature = "scan-trace")]
+    let mut trace_sleep = None;
     let mut pulse_owners: HashMap<(usize, u16), Arc<()>> = HashMap::new();
     let start = Instant::now();
     let mut last_snapshot = Instant::now() - Duration::from_secs(1);
@@ -2625,8 +2752,11 @@ async fn run_loop_async(
     // written from the command drain, consumed one TICK at a time.
     let mut inject_stall_ms: u64 = 0;
     let mut inject_stall_scans: u32 = 0;
+    let mut last_cycle_diagnostics = Instant::now() - SNAPSHOT_PERIOD;
 
     loop {
+        #[cfg(feature = "scan-trace")]
+        let trace_tick = scan_trace.point();
         if stop.load(Ordering::Relaxed) {
             break;
         }
@@ -2689,8 +2819,15 @@ async fn run_loop_async(
             for entry in health.iter_mut() {
                 if let Some(d) = devices.iter().find(|d| d.name() == entry.name) {
                     entry.healthy = d.is_healthy();
+                    if last_cycle_diagnostics.elapsed() >= SNAPSHOT_PERIOD {
+                        entry.cycle = d.cycle_status();
+                    }
                 }
             }
+        }
+
+        if last_cycle_diagnostics.elapsed() >= SNAPSHOT_PERIOD {
+            last_cycle_diagnostics = Instant::now();
         }
 
         // Drain any pending out-of-band commands (variable writes,
@@ -2699,6 +2836,25 @@ async fn run_loop_async(
         // poke values without scanning.
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
+                RuntimeCommand::SdoHandle { name, ack } => {
+                    if !ack.is_closed() {
+                        let result = devices
+                            .iter()
+                            .find(|d| d.name() == name)
+                            .ok_or(iocore::sdo::SdoError::NotFound(name))
+                            .and_then(|d| {
+                                if !d.is_healthy() {
+                                    Err(iocore::sdo::SdoError::Unavailable(
+                                        "device unhealthy".into(),
+                                    ))
+                                } else {
+                                    d.sdo_upload_handle()
+                                        .ok_or(iocore::sdo::SdoError::Unsupported)
+                                }
+                            });
+                        let _ = ack.send(result);
+                    }
+                }
                 RuntimeCommand::WriteVariable {
                     name,
                     value,
@@ -2878,6 +3034,19 @@ async fn run_loop_async(
         // paused (at the regular 10 Hz cadence) so Monitor keeps
         // showing the frozen state.
         let current_mode = *lock_mode(&mode);
+        if sync_device.is_some()
+            && !matches!(current_mode, RuntimeMode::Running)
+            && !watchdog_tripped.load(Ordering::Relaxed)
+        {
+            latch_cycle_fault(
+                devices,
+                &watchdog_tripped,
+                &latch_reason,
+                &failsafe_status,
+                "pause/step interrupts synchronized scans",
+            )
+            .await;
+        }
         if matches!(current_mode, RuntimeMode::Paused) {
             prev_paused = true;
             if last_snapshot.elapsed() >= SNAPSHOT_PERIOD {
@@ -2924,7 +3093,48 @@ async fn run_loop_async(
             Err(_) => Vec::new(),
         };
 
+        let sync_active = sync_device.is_some() && !watchdog_tripped.load(Ordering::Relaxed);
+        if sync_active {
+            let dev = &mut devices[sync_device.expect("active clock")];
+            let wait_deadline = Instant::now()
+                + expected_cycle
+                    .unwrap_or_default()
+                    .saturating_mul(2)
+                    .max(Duration::from_millis(100));
+            let wait = loop {
+                let slice = wait_deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(100));
+                let result = tokio::time::timeout(slice, dev.begin_cycle()).await;
+                if result.is_ok() || stop.load(Ordering::Relaxed) || Instant::now() >= wait_deadline
+                {
+                    break result;
+                }
+            };
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            match wait {
+                Ok(Ok(())) => {}
+                _ => {
+                    latch_cycle_fault(
+                        devices,
+                        &watchdog_tripped,
+                        &latch_reason,
+                        &failsafe_status,
+                        "cycle wait failed or clock stopped",
+                    )
+                    .await;
+                    continue;
+                }
+            }
+        }
         let tick_now = Instant::now();
+        if sync_active {
+            for clock in &mut clocks {
+                clock.next_due = tick_now;
+            }
+        }
         let mut ran_any = false;
 
         // Fault injection: one stall per TICK, ahead of the unit loop.
@@ -2958,6 +3168,11 @@ async fn run_loop_async(
             }
             ran_any = true;
 
+            #[cfg(feature = "scan-trace")]
+            let trace_due = clocks[i].next_due;
+            #[cfg(feature = "scan-trace")]
+            let trace_input = scan_trace.point();
+
             // Input phase: bus → this unit's VM variables
             for rm in &unit_inputs[i] {
                 let Some(dev) = devices.get_mut(rm.device_index) else {
@@ -2987,9 +3202,23 @@ async fn run_loop_async(
                             q.stale = true;
                         }
                         tracing::debug!(channel = %rm.channel, %e, "input read failed");
+                        if sync_active {
+                            latch_cycle_fault(
+                                devices,
+                                &watchdog_tripped,
+                                &latch_reason,
+                                &failsafe_status,
+                                &format!("cycle input failed: {e}"),
+                            )
+                            .await;
+                            break;
+                        }
                     }
                 }
             }
+
+            #[cfg(feature = "scan-trace")]
+            let trace_inputs_done = scan_trace.point();
 
             // Force phase: apply pinned variables that resolve to this
             // unit AFTER its input read (a forced value beats the bus)
@@ -3002,6 +3231,9 @@ async fn run_loop_async(
                     }
                 }
             }
+
+            #[cfg(feature = "scan-trace")]
+            let trace_logic = scan_trace.point();
 
             // Run one scan for this unit
             let now_us = start.elapsed().as_micros() as u64;
@@ -3060,6 +3292,8 @@ async fn run_loop_async(
                 }
             }
             clocks[i].scan_count += 1;
+            #[cfg(feature = "scan-trace")]
+            let trace_logic_done = scan_trace.point();
 
             // Output phase: this unit's VM variables → bus.
             //
@@ -3077,6 +3311,17 @@ async fn run_loop_async(
                         continue;
                     };
                     if let Err(e) = dev.write_channel(&rm.channel, value).await {
+                        if sync_active {
+                            latch_cycle_fault(
+                                devices,
+                                &watchdog_tripped,
+                                &latch_reason,
+                                &failsafe_status,
+                                &format!("cycle output failed: {e}"),
+                            )
+                            .await;
+                            break;
+                        }
                         // RTSO-HOLD-0731: debug-level swallowing meant we could
                         // not know whether control_word writes were erroring
                         // invisibly during the 2026-08-24 stall. First failure
@@ -3106,13 +3351,42 @@ async fn run_loop_async(
             let interval = clocks[i].interval;
             clocks[i].next_due += interval;
             let after = Instant::now();
-            if clocks[i].next_due > after {
+            if sync_active || clocks[i].next_due > after {
                 clocks[i].consecutive_overruns = 0;
             } else {
                 clocks[i].consecutive_overruns = clocks[i].consecutive_overruns.saturating_add(1);
                 // Counted every time, unlike the warning below, which fires
                 // once per unit and then goes quiet for the life of the run.
-                scan_overruns.fetch_add(1, Ordering::Relaxed);
+                let trace_total = scan_overruns
+                    .fetch_add(1, Ordering::Relaxed)
+                    .wrapping_add(1);
+                #[cfg(not(feature = "scan-trace"))]
+                let _ = trace_total;
+                #[cfg(feature = "scan-trace")]
+                if let (Some(tick), Some(input), Some(inputs_done), Some(logic), Some(logic_done)) = (
+                    trace_tick,
+                    trace_input,
+                    trace_inputs_done,
+                    trace_logic,
+                    trace_logic_done,
+                ) {
+                    scan_trace.miss(crate::scan_trace::Miss {
+                        unit: i,
+                        scan: clocks[i].scan_count,
+                        total: trace_total,
+                        interval,
+                        points: [
+                            trace_due,
+                            tick,
+                            input,
+                            inputs_done,
+                            logic,
+                            logic_done,
+                            after,
+                        ],
+                        sleep: trace_sleep,
+                    });
+                }
                 if !clocks[i].warned_overrun {
                     let overrun = after - clocks[i].next_due;
                     tracing::warn!(
@@ -3166,6 +3440,34 @@ async fn run_loop_async(
         }
         if scan_aborted {
             break;
+        }
+        if sync_active && !matches!(*lock_mode(&mode), RuntimeMode::Running) {
+            latch_cycle_fault(
+                devices,
+                &watchdog_tripped,
+                &latch_reason,
+                &failsafe_status,
+                "pause/step interrupts synchronized scans",
+            )
+            .await;
+        }
+        if sync_active && !watchdog_tripped.load(Ordering::Relaxed) {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            if let Err(e) = devices[sync_device.expect("active clock")]
+                .finish_cycle()
+                .await
+            {
+                latch_cycle_fault(
+                    devices,
+                    &watchdog_tripped,
+                    &latch_reason,
+                    &failsafe_status,
+                    &format!("cycle commit failed: {e}"),
+                )
+                .await;
+            }
         }
 
         // If we're stepping, decrement once per tick in which at least
@@ -3229,8 +3531,17 @@ async fn run_loop_async(
             .min()
             .expect("at least one unit");
         let now = Instant::now();
-        if earliest > now {
-            tokio::time::sleep((earliest - now).min(SNAPSHOT_PERIOD)).await;
+        if !sync_active && earliest > now {
+            let duration = (earliest - now).min(SNAPSHOT_PERIOD);
+            #[cfg(feature = "scan-trace")]
+            let trace_request = scan_trace.point();
+            tokio::time::sleep(duration).await;
+            #[cfg(feature = "scan-trace")]
+            {
+                trace_sleep = trace_request
+                    .zip(scan_trace.point())
+                    .map(|(requested, returned)| [requested, now + duration, returned]);
+            }
         }
     }
 
@@ -4090,6 +4401,83 @@ mod tests {
             .await
             .expect("shutdown");
         server.abort();
+    }
+
+    struct UploadDevice(Arc<tokio::sync::Notify>);
+    #[async_trait::async_trait]
+    impl iocore::sdo::SdoUpload for UploadDevice {
+        async fn upload(
+            &self,
+            address: iocore::sdo::SdoAddress,
+        ) -> Result<iocore::sdo::SdoValue, iocore::sdo::SdoError> {
+            self.0.notify_one();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            Ok(iocore::sdo::SdoValue {
+                address,
+                bytes: vec![42],
+                unsigned: 42,
+                signed: 42,
+                vendor_id: 1,
+                product_id: 2,
+                revision: 3,
+                serial: 4,
+                sampled_at_unix_ms: 1,
+            })
+        }
+    }
+    #[async_trait::async_trait]
+    impl IoDevice for UploadDevice {
+        fn name(&self) -> &str {
+            "bus"
+        }
+        fn sdo_upload_handle(&self) -> Option<Arc<dyn iocore::sdo::SdoUpload>> {
+            Some(Arc::new(Self(self.0.clone())))
+        }
+        async fn read_channel(&mut self, _: &str) -> Result<ChannelValue, IoError> {
+            Ok(ChannelValue::U16(0))
+        }
+        async fn write_channel(&mut self, _: &str, _: ChannelValue) -> Result<(), IoError> {
+            panic!("diagnostic must not write a channel")
+        }
+    }
+    #[tokio::test]
+    async fn sdo_upload_does_not_pause_scan_or_write_outputs() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let handle = spawn_units_inner(
+            vec![single_unit(trivial_container(), 5)],
+            DeviceSource::Prebuilt(vec![Box::new(UploadDevice(started.clone()))]),
+            Vec::new(),
+            None,
+            WriteGovernance::default(),
+        );
+        let mut snapshots = handle.subscribe();
+        let caller = handle.clone();
+        let address = iocore::sdo::SdoAddress {
+            slave: 1,
+            index: 0x2008,
+            subindex: 1,
+        };
+        let upload = tokio::spawn(async move { caller.sdo_upload("bus", address).await });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        let before = snapshots.recv().await.unwrap();
+        let after = tokio::time::timeout(Duration::from_millis(300), snapshots.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !upload.is_finished(),
+            "snapshot must advance while upload is pending"
+        );
+        let result = upload.await.unwrap().unwrap();
+        assert_eq!(result.bytes, vec![42]);
+        assert!(after.scan_count > before.scan_count);
+        assert!(matches!(
+            handle.sdo_upload("missing", address).await,
+            Err(iocore::sdo::SdoError::NotFound(_))
+        ));
+        handle.shutdown().await;
     }
 
     /// The handle must mirror a device's live transport health: `true`
@@ -6415,5 +6803,133 @@ mod tests {
             .await
             .expect("shutdown");
         assert_eq!(recorded_fault(&handle).await, None);
+    }
+    fn synchronized_spec() -> DeviceSpec {
+        let config = serde_json::from_value(serde_json::json!({
+            "protocol":"ethercat", "nic":"_sim", "scan_sync":true,
+            "cycle_us":50000, "dc_sync":"sync0"
+        }))
+        .unwrap();
+        DeviceSpec {
+            name: "clock".into(),
+            config,
+        }
+    }
+
+    #[test]
+    fn synchronized_clock_rejects_ambiguous_or_mismatched_tasks_before_connect() {
+        let c = crate::compile("PROGRAM main VAR n:INT; END_VAR n:=n+1; END_PROGRAM").unwrap();
+        let units = vec![single_unit(c, 50)];
+        assert_eq!(
+            validate_scan_clock(&DeviceSource::Specs(vec![synchronized_spec()]), &units).unwrap(),
+            Some(Duration::from_millis(50))
+        );
+        assert!(validate_scan_clock(
+            &DeviceSource::Specs(vec![synchronized_spec(), synchronized_spec()]),
+            &units
+        )
+        .is_err());
+        let mut wrong = synchronized_spec();
+        if let ProtocolConfig::Ethercat(c) = &mut wrong.config {
+            c.cycle_us = 2000;
+        }
+        assert!(validate_scan_clock(&DeviceSource::Specs(vec![wrong]), &units).is_err());
+    }
+
+    #[tokio::test]
+    async fn synchronized_scan_uses_bus_ticks_and_one_late_scan_latches_without_auto_restart() {
+        let c = crate::compile("PROGRAM main VAR n:DINT; END_VAR n:=n+1; END_PROGRAM").unwrap();
+        let h = spawn_units(
+            vec![single_unit(c, 50)],
+            vec![synchronized_spec()],
+            Vec::new(),
+            None,
+            WriteGovernance::default(),
+        );
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        let health = h.device_health();
+        let cycle = health[0].cycle.as_ref().unwrap();
+        assert!(cycle.consumed >= 3 && cycle.consumed <= 12, "{cycle:?}");
+        assert!(cycle.fault.is_none(), "{cycle:?}");
+        assert!(!h.watchdog_tripped());
+        h.inject_scan_stall(150, 1).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(h.watchdog_tripped());
+        let consumed = h.device_health()[0].cycle.as_ref().unwrap().consumed;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            h.device_health()[0].cycle.as_ref().unwrap().consumed,
+            consumed
+        );
+        assert!(h.device_health()[0].cycle.as_ref().unwrap().fault.is_some());
+        h.shutdown().await;
+    }
+    #[tokio::test]
+    async fn absent_configured_clock_does_not_fall_back_to_timed_scans() {
+        let c = crate::compile("PROGRAM main VAR n:INT; END_VAR n:=n+1; END_PROGRAM").unwrap();
+        let mut spec = synchronized_spec();
+        if let ProtocolConfig::Ethercat(cfg) = &mut spec.config {
+            // A nonempty topology makes slave 42 invalid (an empty table
+            // intentionally accepts arbitrary indices for legacy simulation).
+            cfg.slaves.push(project::EthercatSlave {
+                index: 0,
+                name: "virtual".into(),
+                vendor_id: 0,
+                product_id: 0,
+                dc_sync: None,
+                init_sdo: Vec::new(),
+            });
+            // A local config error, never a physical NIC or network probe.
+            cfg.channels.push(project::EthercatChannel {
+                name: "bad".into(),
+                slave_index: 42,
+                direction: project::EthercatPdoDirection::RxPdo,
+                pdo_index: 0x7000,
+                sub_index: 0,
+                bit_length: 16,
+                data_type: project::EthercatDataType::U16,
+                pdi_byte_offset: 0,
+                pdi_bit_offset: 0,
+            });
+        }
+        let h = spawn_units(
+            vec![single_unit(c, 50)],
+            vec![spec],
+            Vec::new(),
+            None,
+            WriteGovernance::default(),
+        );
+        let mut fault = h.fault_watch();
+        tokio::time::timeout(Duration::from_secs(5), fault.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(h.fault().unwrap().contains("refusing timer fallback"));
+        h.shutdown().await;
+    }
+    #[tokio::test]
+    async fn synchronized_pause_and_resume_cannot_rearm_outputs() {
+        let c = crate::compile("PROGRAM main VAR n:INT; END_VAR n:=n+1; END_PROGRAM").unwrap();
+        let h = spawn_units(
+            vec![single_unit(c, 50)],
+            vec![synchronized_spec()],
+            Vec::new(),
+            None,
+            WriteGovernance::default(),
+        );
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert!(!h.watchdog_tripped());
+        h.pause();
+        tokio::time::sleep(Duration::from_millis(180)).await;
+        assert!(h.watchdog_tripped());
+        let consumed = h.device_health()[0].cycle.as_ref().unwrap().consumed;
+        h.resume();
+        tokio::time::sleep(Duration::from_millis(180)).await;
+        assert!(h.watchdog_tripped());
+        assert_eq!(
+            h.device_health()[0].cycle.as_ref().unwrap().consumed,
+            consumed
+        );
+        h.shutdown().await;
     }
 }

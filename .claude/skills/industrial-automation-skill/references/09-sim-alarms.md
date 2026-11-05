@@ -242,6 +242,16 @@ max = 100.0
 - Sim scenarios can assert governance directly: a `set` step to an unlisted variable fails the step with the 403 reason, and a `set` past a rule's bound followed by an `expect` reads back the clamped bound (the `set` itself discards the response) — both deterministic offline proofs.
 - Variable `unit`/`min`/`max`/`description` **metadata** (iomap.toml `[[mappings]]`, see `06-devices-iomap-tasks.md`) is documentation for generated surfaces; the `[governance]` rules here are the enforcement. Keep them consistent when both exist.
 
+## Cycle handoff regression
+
+`examples/cycle_handoff/scenarios/continuity.toml` verifies normal progress on an
+independent `_sim` bus thread. `late_frame.toml` injects one late scan and requires
+the watchdog to stay latched. Run in an isolated local server and one agent
+session. Use `--keep-running` for the first scenario and `--no-run` for the second
+when inspecting status between them, then stop explicitly. These 50 ms scenarios
+do not establish 2 ms hardware scheduling performance. The deterministic 2 ms
+state-machine and actual PDO staging checks live in Rust tests.
+
 
 Runtime output-latch status carries `failsafe_status` separately from
 `watchdog_tripped`: pending attempts, adapter acknowledgements, and unconfirmed

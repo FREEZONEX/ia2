@@ -26,7 +26,10 @@ use project::{EthercatChannel, EthercatConfig, EthercatDataType, EthercatPdoDire
 
 use crate::validate;
 
+type SimImage = HashMap<String, ChannelValue>;
 pub struct SimEthercat {
+    cycle: Option<Arc<crate::cycle::Gate<SimImage>>>,
+    staged: Option<(crate::cycle::Ticket, SimImage)>,
     name: String,
     values: Arc<Mutex<HashMap<String, ChannelValue>>>,
     channels: HashMap<String, EthercatChannel>,
@@ -40,6 +43,12 @@ pub struct SimEthercat {
 
 impl SimEthercat {
     pub async fn connect(name: String, config: &EthercatConfig) -> Result<Self, IoError> {
+        crate::cycle::validate(config)?;
+        let cycle = config.scan_sync.then(|| {
+            Arc::new(crate::cycle::Gate::<SimImage>::new(
+                std::time::Duration::from_micros(u64::from(config.cycle_us)),
+            ))
+        });
         // Each channel must point at a known slave index, and no two
         // channels may share a name — same references check as the real path.
         validate::validate_channel_refs(&config.channels, &config.slaves)
@@ -181,7 +190,45 @@ impl SimEthercat {
             gear_axes = config.gear.len(),
             "ethercat device ready (sim mode)"
         );
+        if let Some(clock) = cycle.clone() {
+            let values = values.clone();
+            let stop = gear_stop.clone();
+            let outputs: Vec<_> = channels
+                .values()
+                .filter(|c| c.direction == EthercatPdoDirection::RxPdo)
+                .map(|c| (c.name.clone(), c.data_type))
+                .collect();
+            std::thread::Builder::new()
+                .name("ec-sim-cycle".into())
+                .spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let now = std::time::Instant::now();
+                        clock.consume(|image| {
+                            let mut live = values.lock().expect("sim values poisoned");
+                            for (name, ty) in &outputs {
+                                live.insert(
+                                    name.clone(),
+                                    image
+                                        .and_then(|v| v.get(name))
+                                        .copied()
+                                        .unwrap_or_else(|| zero_for(*ty)),
+                                );
+                            }
+                        });
+                        let deadline = now + clock.period;
+                        let image = values.lock().expect("sim values poisoned").clone();
+                        clock.publish(image, deadline);
+                        std::thread::sleep(
+                            deadline.saturating_duration_since(std::time::Instant::now()),
+                        );
+                    }
+                    clock.trip("sim clock stopped");
+                })
+                .map_err(|e| IoError::Connect(e.to_string()))?;
+        }
         Ok(Self {
+            cycle,
+            staged: None,
             name,
             values,
             channels,
@@ -205,6 +252,37 @@ impl SimEthercat {
 
 #[async_trait]
 impl IoDevice for SimEthercat {
+    async fn shutdown(&mut self) -> Result<(), IoError> {
+        self.enter_failsafe().await?;
+        self.gear_stop.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+    fn is_healthy(&self) -> bool {
+        !self.cycle.as_ref().is_some_and(|c| c.is_faulted())
+    }
+    fn cycle_period(&self) -> Option<std::time::Duration> {
+        self.cycle.as_ref().map(|c| c.period)
+    }
+    fn cycle_status(&self) -> Option<iocore::cycle::CycleStatus> {
+        self.cycle.as_ref().map(|c| c.status())
+    }
+    async fn begin_cycle(&mut self) -> Result<(), IoError> {
+        if let Some(cycle) = &self.cycle {
+            self.staged = Some(cycle.begin().await?);
+        }
+        Ok(())
+    }
+    async fn finish_cycle(&mut self) -> Result<(), IoError> {
+        if let Some(cycle) = &self.cycle {
+            let (ticket, image) = self
+                .staged
+                .take()
+                .ok_or_else(|| IoError::Protocol("no cycle in progress".into()))?;
+            cycle.commit(ticket, image)?;
+            // Reads outside a scan must report the consumed image.
+        }
+        Ok(())
+    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -214,6 +292,9 @@ impl IoDevice for SimEthercat {
             return Ok(v);
         }
         let _meta = self.channel(channel)?;
+        if let Some((_, image)) = &self.staged {
+            return Ok(*image.get(channel).unwrap_or(&ChannelValue::I32(0)));
+        }
         Ok(self
             .values
             .lock()
@@ -235,10 +316,20 @@ impl IoDevice for SimEthercat {
             });
         }
         let coerced = coerce_to_type(value, meta.data_type);
-        self.values
-            .lock()
-            .expect("sim values poisoned")
-            .insert(channel.into(), coerced);
+        if self.cycle.is_some() {
+            self.staged
+                .as_mut()
+                .ok_or_else(|| {
+                    IoError::Protocol("scan_sync outputs require an active cycle".into())
+                })?
+                .1
+                .insert(channel.into(), coerced);
+        } else {
+            self.values
+                .lock()
+                .expect("sim values poisoned")
+                .insert(channel.into(), coerced);
+        }
         Ok(())
     }
 
@@ -247,6 +338,10 @@ impl IoDevice for SimEthercat {
     /// semantics so sim and real behave identically from the scan
     /// loop's perspective.
     async fn enter_failsafe(&mut self) -> Result<(), IoError> {
+        if let Some(cycle) = &self.cycle {
+            cycle.trip("failsafe requested; restart required");
+        }
+        self.staged = None;
         let to_zero: Vec<(String, EthercatDataType)> = self
             .channels
             .values()
@@ -265,6 +360,9 @@ impl IoDevice for SimEthercat {
 
 impl Drop for SimEthercat {
     fn drop(&mut self) {
+        if let Some(clock) = &self.cycle {
+            clock.trip("sim device dropped");
+        }
         self.gear_stop.store(true, Ordering::Relaxed);
     }
 }

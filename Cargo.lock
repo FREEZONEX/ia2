@@ -2296,6 +2296,7 @@ dependencies = [
  "async-trait",
  "serde",
  "thiserror 2.0.18",
+ "ts-rs",
 ]
 
 [[package]]
@@ -2317,7 +2318,9 @@ dependencies = [
  "async-trait",
  "esi",
  "ethercrab",
+ "ethercrab-wire",
  "iocore",
+ "libc",
  "project",
  "serde",
  "smol",
@@ -2408,6 +2411,7 @@ dependencies = [
  "ironplc-dsl",
  "ironplc-parser",
  "ironplc-vm",
+ "libc",
  "parking_lot",
  "project",
  "serde",

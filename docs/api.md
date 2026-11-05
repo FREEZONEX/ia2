@@ -555,6 +555,64 @@ Access from the dev machine: open an `ssh -N -L <local>:127.0.0.1:<runtime_port>
 tunnel (see `/api/edges/{name}/attach`) and hit `http://127.0.0.1:<local>/...`.
 
 
+### Read-only live CoE upload
+
+| Method | Path | Result |
+|---|---|---|
+| GET | `/api/runtime/sdo` | Scalar SDO upload from the local running program's existing EtherCAT master |
+| GET | `/api/edges/{name}/sdo` | The same operation through the edge SSH proxy; preserves edge status/body |
+| GET | `/sdo` | Edge runtime endpoint (localhost only) |
+
+All three require query fields `device` (configured device name), `slave` (zero-based
+bus position, u16), `index` (decimal or explicit `0x` hexadecimal), and `subindex`
+(u8). Unknown fields are rejected. No POST/PUT/download, complete-access, or
+state-transition operation is provided. `_sim` returns unsupported; it never
+pretends to return drive parameters.
+
+A 200 response contains `device` and `upload`: address, exact little-endian
+`bytes` (1/2/4/8 bytes), `unsigned`, `signed`, discovered vendor/product/revision/
+serial identity, and `sampled_at_unix_ms`. Both numeric interpretations are
+provided; the object dictionary defines the applicable one and scale. For 64-bit
+values, use bytes in clients whose JSON numbers lose integer precision.
+
+Only one upload may be outstanding per master, including after client cancellation.
+The mailbox future is polled beside PDO exchange; neither PLC scans nor PDO cycles
+await the transaction. Requests are not replayed after a bus re-walk. 400 = invalid
+query, 404 = device/slave missing, 409 = unsupported/busy (also no local program),
+502 = CoE/protocol failure including the drive abort detail, 503 = unhealthy,
+reinitializing or ended session, 504 = timeout (one second handle resolution,
+four seconds upload). A client timeout is not proof of a stopped transaction;
+the lane remains reserved until the worker finishes/cancels it. Read requests
+never enable a drive, reset faults, or modify outputs. Mailbox traffic still
+consumes bus/CPU time; diagnose with drives disabled and monitor communication.
+
+Examples:
+`cs get runtime/sdo/bus/1/0x2008/1`
+`cs --project demo get edges/edge-a/sdo/bus/1/0x2008/1`
+
+Device names may include folders: `runtime/sdo/motion/bus/1/0x2008/1`.
+The last three path segments are always slave/index/subindex. For an edge path
+with more than one possible `/sdo/` separator, percent-encode the slashes inside
+its edge/device names, for example
+`edges/plant%2Fsdo%2Fedge-a/sdo/motion%2Fsdo%2Fbus/1/0x2008/1`.
+SDO name escapes are decoded once; encode a literal `%` as `%25`.
+
+For edge requests, SDO matching also requires decimal slave/subindex fields and
+a decimal or `0x` hexadecimal index. Numeric ranges are checked by the server.
+Other suffixes retain normal edge configuration/subread meaning, even under a
+folder named `sdo`. If an edge name itself matches the entire SDO grammar, read
+its configuration with `cs api GET /api/edges/<percent-encoded-full-name>`.
+
+### Bus-clocked scan diagnostics
+
+The existing local runtime status and edge status surfaces include optional
+`device_health[].cycle` for `scan_sync` EtherCAT devices. It contains period,
+issued/committed/consumed counters, the first latched fault, and a bounded ring
+of monotonic host-time events. A cycle fault sets `watchdog_tripped` and makes
+that device unhealthy; resuming or bus recovery does not clear it. The CLI
+resource is unchanged: `cs get runtime/status`. Details and timing limits:
+[cycle handoff contract](scan-cycle-handoff.md).
+
 ### Output inhibition and device acknowledgement
 
 `watchdog_tripped` describes the run's monotonic normal-output inhibit, whether

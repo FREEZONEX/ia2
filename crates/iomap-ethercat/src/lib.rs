@@ -17,9 +17,12 @@
 
 mod bits;
 pub mod cam;
+mod cycle;
+mod cycle_timer;
 mod esi_map;
 pub mod gear;
 mod real;
+mod sdo;
 mod sim;
 mod validate;
 
@@ -98,6 +101,36 @@ fn is_sim_nic(nic: &str) -> bool {
 
 #[async_trait]
 impl IoDevice for EthercatDevice {
+    fn sdo_upload_handle(&self) -> Option<std::sync::Arc<dyn iocore::sdo::SdoUpload>> {
+        match &self.0 {
+            Inner::Real(r) => r.sdo_upload_handle(),
+            Inner::Sim(_) => None,
+        }
+    }
+    fn cycle_period(&self) -> Option<std::time::Duration> {
+        match &self.0 {
+            Inner::Real(r) => r.cycle_period(),
+            Inner::Sim(s) => s.cycle_period(),
+        }
+    }
+    fn cycle_status(&self) -> Option<iocore::cycle::CycleStatus> {
+        match &self.0 {
+            Inner::Real(r) => r.cycle_status(),
+            Inner::Sim(s) => s.cycle_status(),
+        }
+    }
+    async fn begin_cycle(&mut self) -> Result<(), IoError> {
+        match &mut self.0 {
+            Inner::Real(r) => r.begin_cycle().await,
+            Inner::Sim(s) => s.begin_cycle().await,
+        }
+    }
+    async fn finish_cycle(&mut self) -> Result<(), IoError> {
+        match &mut self.0 {
+            Inner::Real(r) => r.finish_cycle().await,
+            Inner::Sim(s) => s.finish_cycle().await,
+        }
+    }
     fn name(&self) -> &str {
         match &self.0 {
             Inner::Sim(s) => s.name(),
@@ -107,8 +140,8 @@ impl IoDevice for EthercatDevice {
 
     /// Forwarded like `shutdown` (see below): the bridge boxes the
     /// façade, so without this the trait's default `true` would mask
-    /// `RealEthercat`'s tx_rx health flag. Sim has no link to lose and
-    /// reports the default `true`.
+    /// `RealEthercat`'s tx_rx health flag. Both variants also report a
+    /// latched cycle handoff as unhealthy.
     fn is_healthy(&self) -> bool {
         match &self.0 {
             Inner::Sim(s) => s.is_healthy(),
@@ -166,6 +199,7 @@ mod tests {
 
     fn sim_config_with_two_outputs_and_one_input() -> EthercatConfig {
         EthercatConfig {
+            scan_sync: false,
             nic: SIM_NIC.into(),
             bringup: project::EthercatBringup::Auto,
             cycle_us: 1_000,
@@ -322,5 +356,40 @@ mod tests {
             0,
             "outputs stay zeroed across shutdown"
         );
+    }
+    #[tokio::test]
+    async fn synchronized_sim_publishes_whole_frames_and_latches_on_pause() {
+        let mut cfg = sim_config_with_two_outputs_and_one_input();
+        cfg.scan_sync = true;
+        cfg.cycle_us = 50_000;
+        cfg.dc_sync = project::EthercatDcSync::Sync0;
+        let mut dev = EthercatDevice::connect("clock".into(), &cfg).await.unwrap();
+        assert!(dev
+            .write_channel("out_motor", ChannelValue::Bool(true))
+            .await
+            .is_err());
+        for n in 1..=5 {
+            tokio::time::timeout(std::time::Duration::from_secs(1), dev.begin_cycle())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                dev.read_channel("out_speed").await.unwrap().to_i32(),
+                (n - 1) * 10
+            );
+            dev.write_channel("out_motor", ChannelValue::Bool(true))
+                .await
+                .unwrap();
+            dev.write_channel("out_speed", ChannelValue::I32(n * 10))
+                .await
+                .unwrap();
+            dev.finish_cycle().await.unwrap();
+        }
+        dev.enter_failsafe().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        assert_eq!(dev.read_channel("out_speed").await.unwrap().to_i32(), 0);
+        assert_eq!(dev.read_channel("out_motor").await.unwrap().to_i32(), 0);
+        assert!(dev.begin_cycle().await.is_err());
+        assert!(dev.cycle_status().unwrap().fault.is_some());
     }
 }

@@ -1034,3 +1034,180 @@ fn a_named_ipv6_origin_works_with_browser_canonical_headers_and_preflights() {
         204
     );
 }
+
+#[test]
+fn sdo_directories_preserve_edge_configuration_and_subread_routes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("edge_paths");
+    let store = project::ProjectStore::create(proj.clone(), "edge_paths").unwrap();
+    let names = [
+        "plant/sdo/area/line/cell/rack/edge",
+        "plant/sdo/area/line/sdo/rack/edge",
+    ];
+    for name in names {
+        store.create_edge(name, "127.0.0.1").unwrap();
+    }
+    // A name matching the entire reserved SDO grammar is still readable
+    // through the raw API, with the complete name encoded as one component.
+    let reserved_name = "plant/sdo/bus/1/0x2008/1";
+    store.create_edge(reserved_name, "127.0.0.1").unwrap();
+    let server = spawn_server(tmp.path());
+    server.open_project(&proj);
+    for name in names {
+        let output = cs(&server.base)
+            .args(["get", &format!("edges/{name}")])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let edge: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(edge["name"], name);
+        // Missing targets stop before any network access. The exact name in
+        // the 404 proves the CLI reached the intended edge subroute, not SDO.
+        let missing = format!("missing/{name}");
+        for subread in ["status", "logs", "audit", "scan", "probe", "system"] {
+            cs(&server.base)
+                .args(["get", &format!("edges/{missing}/{subread}")])
+                .assert()
+                .code(2)
+                .stderr(predicates::str::contains(format!(
+                    "edge '{missing}' not found"
+                )));
+        }
+    }
+    let encoded =
+        percent_encoding::utf8_percent_encode(reserved_name, percent_encoding::NON_ALPHANUMERIC);
+    cs(&server.base)
+        .args(["api", "GET", &format!("/api/edges/{encoded}")])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(reserved_name));
+    // Out-of-range numeric addresses must still reach SDO validation.
+    cs(&server.base)
+        .args(["get", "edges/missing/sdo/motion/bus/1/0x10000/1"])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("index must be a u16"));
+}
+
+#[test]
+fn sdo_resource_is_read_only_and_keeps_the_idle_scenario_running() {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("sdo_idle");
+    copy_dir(&repo_root().join("examples/sim_smoke"), &proj);
+    std::fs::create_dir_all(proj.join("devices/motion")).unwrap();
+    for path in ["devices/motion/bus.toml", "devices/sdo.toml"] {
+        std::fs::write(
+            proj.join(path),
+            "name = \"bus\"\nprotocol = \"ethercat\"\nnic = \"_sim\"\n",
+        )
+        .unwrap();
+    }
+    let server = spawn_server(tmp.path());
+    server.open_project(&proj);
+    cs(&server.base)
+        .args(["api", "POST", "/api/run"])
+        .assert()
+        .success();
+    // A 409 unsupported response proves the configured simulated device was
+    // resolved by its exact name; a malformed or double-encoded name is 404.
+    for name in ["motion/bus", "motion%2Fbus", "sdo"] {
+        cs(&server.base)
+            .args(["get", &format!("runtime/sdo/{name}/1/0x2008/1")])
+            .assert()
+            .code(2)
+            .stderr(predicates::str::contains(
+                "does not support live SDO upload",
+            ));
+    }
+    cs(&server.base)
+        .args(["get", "runtime/sdo/missing/1/0x2008/1"])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("SDO target not found"));
+    cs(&server.base)
+        .args(["get", "runtime/sdo/missing/1/0x10000/1"])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("index must be"));
+    cs(&server.base)
+        .args([
+            "api",
+            "POST",
+            "/api/runtime/sdo?device=missing&slave=1&index=0x2008&subindex=1",
+        ])
+        .assert()
+        .code(2);
+    cs(&server.base)
+        .args(["sim", "run", "--no-run"])
+        .arg(proj.join("scenarios/sdo_idle.toml"))
+        .assert()
+        .success();
+}
+
+#[test]
+fn cycle_handoff_scenarios_expose_exact_sequence_and_latched_fault_over_http() {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("cycle_handoff");
+    copy_dir(&repo_root().join("examples/cycle_handoff"), &proj);
+    let server = spawn_server(tmp.path());
+    server.open_project(&proj);
+    let validation = cs(&server.base)
+        .args(["api", "POST", "/api/project/validate"])
+        .output()
+        .unwrap();
+    assert!(validation.status.success());
+    let diagnostics: serde_json::Value = serde_json::from_slice(&validation.stdout).unwrap();
+    assert_eq!(diagnostics, serde_json::json!([]), "{diagnostics}");
+    cs(&server.base)
+        .args(["sim", "run", "--keep-running"])
+        .arg(proj.join("scenarios/continuity.toml"))
+        .assert()
+        .success();
+    let out = cs(&server.base)
+        .args(["get", "runtime/status"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    eprintln!("cycle_handoff healthy status: {status}");
+    let clock = &status["device_health"][0]["cycle"];
+    assert!(clock["consumed"].as_u64().unwrap() >= 5, "{status}");
+    assert!(clock["fault"].is_null(), "{status}");
+    let events = clock["events"].as_array().unwrap();
+    let consumed: Vec<_> = events
+        .iter()
+        .filter(|e| e["kind"] == "consume")
+        .map(|e| e["sequence"].as_u64().unwrap())
+        .collect();
+    assert!(consumed.len() >= 2);
+    assert!(consumed.windows(2).all(|p| p[1] == p[0] + 1));
+    cs(&server.base)
+        .args(["sim", "run", "--no-run"])
+        .arg(proj.join("scenarios/late_frame.toml"))
+        .assert()
+        .success();
+    let out = cs(&server.base)
+        .args(["get", "runtime/status"])
+        .output()
+        .unwrap();
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    eprintln!("cycle_handoff fault status: {status}");
+    assert!(status["watchdog_tripped"].as_bool().unwrap());
+    assert!(status["device_health"][0]["cycle"]["fault"].is_string());
+    assert!(status["latch_reason"]
+        .as_str()
+        .unwrap()
+        .contains("cycle handoff"));
+    assert_eq!(status["failsafe_status"]["pending"], serde_json::json!([]));
+    assert_eq!(
+        status["failsafe_status"]["unconfirmed"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        status["failsafe_status"]["acknowledged"],
+        serde_json::json!(["bus"])
+    );
+    cs(&server.base).args(["stop"]).assert().success();
+}

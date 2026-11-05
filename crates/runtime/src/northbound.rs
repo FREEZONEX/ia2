@@ -444,6 +444,7 @@ mod tests {
             scan_count: 7,
             vars: vec![input],
             device_health: Some(vec![ironplc_bridge::DeviceHealth {
+                cycle: None,
                 name: "meter".into(),
                 healthy: false,
             }]),

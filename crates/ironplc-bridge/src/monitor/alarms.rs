@@ -601,6 +601,7 @@ mod tests {
     fn bus_snap(t_us: u64, healthy: bool) -> VarSnapshot {
         let mut snap = snap(t_us, 0.0);
         snap.device_health = Some(vec![crate::DeviceHealth {
+            cycle: None,
             name: "bus0".into(),
             healthy,
         }]);

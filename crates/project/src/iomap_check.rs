@@ -641,6 +641,7 @@ mod tests {
         Device {
             name: name.into(),
             config: ProtocolConfig::Ethercat(EthercatConfig {
+                scan_sync: false,
                 nic: "_sim".into(),
                 bringup: Default::default(),
                 cycle_us: 1_000,

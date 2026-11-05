@@ -166,6 +166,27 @@ pub(crate) fn resolve_ls(path: Option<&str>) -> Result<Option<Plan>> {
     }
 }
 
+/// Recognize numeric address spelling without validating its range. The server
+/// owns range errors; the CLI only distinguishes SDO from ordinary edge names.
+fn sdo_address_suffix(parts: &[String]) -> bool {
+    fn decimal(part: &str) -> bool {
+        let digits = part
+            .strip_prefix('+')
+            .or_else(|| part.strip_prefix('-'))
+            .unwrap_or(part);
+        !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+    }
+    let [slave, index, subindex] = parts else {
+        return false;
+    };
+    decimal(slave)
+        && decimal(subindex)
+        && index.strip_prefix("0x").map_or_else(
+            || decimal(index),
+            |hex| !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()),
+        )
+}
+
 /// Resolve `cs get <path>`.
 pub(crate) fn resolve_get(path: &str) -> Result<Plan> {
     let (kind, rest) = split(path);
@@ -176,6 +197,54 @@ pub(crate) fn resolve_get(path: &str) -> Result<Plan> {
         );
     };
     let joined = rest.join("/");
+    // The final three segments are the address; device and edge names may
+    // both contain folders. Keep encoded name segments intact until the
+    // literal resource delimiter has been resolved.
+    let address_at = rest.len().saturating_sub(3);
+    let sdo_at = match kind {
+        "runtime" if rest.first().map(String::as_str) == Some("sdo") => Some(0),
+        // A folder called `sdo` alone must not capture ordinary configuration
+        // reads or reserved subreads such as /status, /logs and /audit.
+        "edges" if sdo_address_suffix(&rest[address_at..]) => {
+            let mut markers = rest.iter().enumerate().filter_map(|(i, part)| {
+                (i > 0 && i + 1 < address_at && part == "sdo").then_some(i)
+            });
+            let marker = markers.next();
+            if markers.next().is_some() {
+                bail!("ambiguous SDO path: percent-encode slashes in the edge/device names (e.g. plant%2Fsdo%2Fbus)");
+            }
+            marker
+        }
+        _ => None,
+    };
+    if let Some(i) = sdo_at {
+        if address_at <= i + 1 || rest[i + 1..address_at].iter().any(String::is_empty) {
+            bail!("expected {kind}/.../sdo/<device>/<slave>/<index>/<subindex>");
+        }
+        let decode_name = |name: String| -> Result<String> {
+            Ok(percent_encoding::percent_decode_str(&name)
+                .decode_utf8()
+                .map_err(|_| anyhow::anyhow!("SDO names must decode to valid UTF-8"))?
+                .into_owned())
+        };
+        let device = decode_name(rest[i + 1..address_at].join("/"))?;
+        let base = if kind == "runtime" {
+            "/api/runtime/sdo".to_string()
+        } else {
+            let edge = decode_name(rest[..i].join("/"))?;
+            format!("/api/edges/{}/sdo", url_encode(&edge))
+        };
+        return Ok(Plan::Get {
+            path: format!(
+                "{base}?device={}&slave={}&index={}&subindex={}",
+                url_encode(&device),
+                url_encode(&rest[address_at]),
+                url_encode(&rest[address_at + 1]),
+                url_encode(&rest[address_at + 2])
+            ),
+            render: Render::Json,
+        });
+    }
     let plan = match kind {
         "iomap" | "tasks" | "northbound" | "alarms" | "hmi-symbols" => {
             if !rest.is_empty() {
@@ -404,6 +473,121 @@ mod tests {
             "/api/devices/plant%20a%2Fplc1/describe"
         );
         assert_eq!(get_url("hmi/overview"), "/api/hmi/overview");
+    }
+
+    #[test]
+    fn sdo_paths_preserve_nested_edge_and_device_names() {
+        for (path, expected) in [
+            ("runtime/sdo/motion/bus/1/0x2008/1", "/api/runtime/sdo?device=motion%2Fbus&slave=1&index=0x2008&subindex=1"),
+            ("runtime/sdo/sdo/1/0x2008/1", "/api/runtime/sdo?device=sdo&slave=1&index=0x2008&subindex=1"),
+            ("edges/plant/edge-a/sdo/motion/bus/1/0x2008/1", "/api/edges/plant%2Fedge-a/sdo?device=motion%2Fbus&slave=1&index=0x2008&subindex=1"),
+            ("edges/edge-a/sdo/sdo/1/0x2008/1", "/api/edges/edge-a/sdo?device=sdo&slave=1&index=0x2008&subindex=1"),
+            ("edges/sdo/sdo/sdo/1/0x2008/1", "/api/edges/sdo/sdo?device=sdo&slave=1&index=0x2008&subindex=1"),
+            ("runtime/sdo/车间/总线/0/8192/0", "/api/runtime/sdo?device=%E8%BD%A6%E9%97%B4%2F%E6%80%BB%E7%BA%BF&slave=0&index=8192&subindex=0"),
+        ] {
+            assert_eq!(get_url(path), expected, "{path}");
+        }
+    }
+
+    #[test]
+    fn sdo_directories_do_not_capture_edge_configuration_reads() {
+        for name in [
+            "plant/sdo/area/line/cell/rack/edge",
+            "plant/sdo/area/line/sdo/rack/edge",
+            "plant/sdo/bus/1/axis/0",
+            "plant/sdo/bus/1/0x2008/name",
+            "plant/sdo/bus/name/0x2008/1",
+            "plant/sdo/bus/1/0xnothex/1",
+            "plant/%73do/area/line/cell/rack/edge",
+        ] {
+            assert_eq!(
+                get_url(&format!("edges/{name}")),
+                format!("/api/edges/{}", url_encode(name)),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn sdo_directories_do_not_capture_edge_subreads() {
+        for name in [
+            "plant/sdo/area/line/cell/rack/edge",
+            "plant/sdo/area/line/sdo/rack/edge",
+            "plant/sdo/bus/1/0x2008/1",
+        ] {
+            for &subread in EDGE_SUBREADS {
+                let route = if subread == "scan" {
+                    "discover"
+                } else {
+                    subread
+                };
+                assert_eq!(
+                    get_url(&format!("edges/{name}/{subread}")),
+                    format!("/api/edges/{}/{route}", url_encode(name)),
+                    "{name}/{subread}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn edge_sdo_numeric_ranges_are_validated_by_the_server() {
+        for address in [
+            "65536/0x2008/1",
+            "1/0x10000/1",
+            "1/0x2008/256",
+            "-1/0x2008/1",
+            "1/-1/1",
+            "+1/+8192/+1",
+            "999999999999/0xFFFFFFFFFFFF/999999999999",
+        ] {
+            let parts: Vec<_> = address.split('/').collect();
+            assert_eq!(
+                get_url(&format!("edges/edge-a/sdo/motion/bus/{address}")),
+                format!(
+                    "/api/edges/edge-a/sdo?device=motion%2Fbus&slave={}&index={}&subindex={}",
+                    url_encode(parts[0]),
+                    url_encode(parts[1]),
+                    url_encode(parts[2])
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_sdo_paths_require_encoded_names() {
+        for path in [
+            "edges/plant/sdo/edge-a/sdo/motion/bus/1/0x2008/1",
+            "edges/edge-a/sdo/motion/sdo/bus/1/0x2008/1",
+        ] {
+            let error = resolve_get(path).err().expect("ambiguous resource path");
+            assert!(error.to_string().contains("ambiguous SDO path"));
+        }
+        assert_eq!(
+            get_url("edges/plant%2Fsdo%2Fedge-a/sdo/motion%2Fsdo%2Fbus/1/0x2008/1"),
+            "/api/edges/plant%2Fsdo%2Fedge-a/sdo?device=motion%2Fsdo%2Fbus&slave=1&index=0x2008&subindex=1"
+        );
+    }
+
+    #[test]
+    fn sdo_name_escapes_decode_once_and_reject_invalid_utf8() {
+        assert_eq!(
+            get_url("runtime/sdo/motion%2Fbus/1/0x2008/1"),
+            get_url("runtime/sdo/motion/bus/1/0x2008/1")
+        );
+        assert_eq!(
+            get_url("runtime/sdo/literal%252Fbus/1/0x2008/1"),
+            "/api/runtime/sdo?device=literal%252Fbus&slave=1&index=0x2008&subindex=1"
+        );
+        for path in [
+            "runtime/sdo",
+            "runtime/sdo/bus/1/0x2008",
+            "runtime/sdo//1/0x2008/1",
+            "runtime/sdo/%FF/1/0x2008/1",
+            "edges/%FF/sdo/bus/1/0x2008/1",
+        ] {
+            assert!(resolve_get(path).is_err(), "{path}");
+        }
     }
 
     #[test]

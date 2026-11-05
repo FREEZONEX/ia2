@@ -10,6 +10,8 @@ pub mod monitor;
 mod problem_docs;
 mod retain;
 mod runtime;
+#[cfg(feature = "scan-trace")]
+mod scan_trace;
 mod sfc_transpile;
 #[cfg(test)]
 mod test_vm;

@@ -1,0 +1,9 @@
+description = "A single missed bus deadline latches outputs; no automatic continuation"
+[[steps]]
+expect_watchdog = { tripped = false, during_ms = 250 }
+[[steps]]
+inject = { scan_stall_ms = 150, scans = 1 }
+[[steps]]
+expect_watchdog = { tripped = true, within_ms = 2000 }
+[[steps]]
+expect_watchdog = { tripped = true, during_ms = 500 }

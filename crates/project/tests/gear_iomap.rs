@@ -33,6 +33,7 @@ fn device(gears: Vec<EthercatGear>) -> Device {
     Device {
         name: "ec".into(),
         config: ProtocolConfig::Ethercat(EthercatConfig {
+            scan_sync: false,
             nic: "_sim".into(),
             cycle_us: 2_000,
             bringup: Default::default(),

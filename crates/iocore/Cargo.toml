@@ -7,5 +7,6 @@ publish.workspace = true
 
 [dependencies]
 serde.workspace = true
+ts-rs.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true

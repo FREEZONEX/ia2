@@ -95,6 +95,15 @@ pub fn pdi_bit_offset_problem(bit_offset: u8) -> Option<String> {
 pub fn validate_devices(devices: &[Device]) -> Vec<DeviceIssue> {
     let mut issues = Vec::new();
     for device in devices {
+        if let ProtocolConfig::Ethercat(c) = &device.config {
+            if let Some(why) = c.scan_sync_error() {
+                issues.push(DeviceIssue {
+                    device: device.name.clone(),
+                    channel: String::new(),
+                    message: why.into(),
+                });
+            }
+        }
         let names = device.config.channel_names();
         for dup in duplicate_channel_names(names.iter().map(String::as_str)) {
             let count = names.iter().filter(|n| **n == dup).count();
@@ -203,6 +212,7 @@ mod tests {
         Device {
             name: name.into(),
             config: ProtocolConfig::Ethercat(EthercatConfig {
+                scan_sync: false,
                 nic: nic.into(),
                 bringup: EthercatBringup::Auto,
                 cycle_us: 1_000,

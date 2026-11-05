@@ -13,8 +13,9 @@
 //!   1. `Box::leak`s a `PduStorage` (gives `&'static`; required by
 //!      `try_split`). One leaked storage per `connect` — fine, devices
 //!      don't churn at runtime.
-//!   2. Builds the `MainDevice`, owns a smol `tx_rx_task`, walks the bus
-//!      with `init_single_group`, transitions to OP.
+//!   2. Builds the `MainDevice`, spawns `tx_rx_task`, walks the bus with
+//!      `init_single_group`, transitions to OP. The Linux synchronized
+//!      worker drives its pump locally; other paths use the smol executor.
 //!   3. Reports back through a `tokio::sync::oneshot` so the connect()
 //!      future awaits an "actually live" signal (or an init error).
 //!   4. Enters the cyclic loop, exiting when the shutdown flag flips,
@@ -324,7 +325,7 @@ macro_rules! copy_inputs_from_bus {
 /// onto the bus pre-tx_rx. Reads of RxPDO channels echo back from this
 /// same buffer (matches sim mode and is useful for "did my write take?"
 /// debugging in the UI).
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 struct PdiMirror {
     inputs: HashMap<u16, Vec<u8>>,
     outputs: HashMap<u16, Vec<u8>>,
@@ -391,7 +392,125 @@ fn lock_pdi_for_cycle<'a>(
 /// teardown reap it.
 const WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
+// EtherCrab's group walk constructs large fixed-capacity values. Leave
+// room for those temporaries and the pinned master future on this worker.
+const LINUX_SYNC_WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+/// Consecutive healthy DC slots with zero outputs before handing the
+/// synchronized bus clock to the PLC.
+const DC_STARTUP_SLOTS: u8 = 4;
+
+#[derive(Default)]
+struct DcStartup {
+    last_slot: Option<u64>,
+    consecutive: u8,
+}
+
+impl DcStartup {
+    fn observe(&mut self, slot: u64, healthy: bool) -> bool {
+        if !healthy {
+            *self = Self::default();
+            return false;
+        }
+        self.consecutive = if self.last_slot.and_then(|prev| prev.checked_add(1)) == Some(slot) {
+            self.consecutive.saturating_add(1)
+        } else {
+            1
+        };
+        self.last_slot = Some(slot);
+        self.consecutive >= DC_STARTUP_SLOTS
+    }
+}
+
+/// Retained across startup and EVERY steady exchange. A host-only ticket
+/// deadline cannot detect a DC slot skip shorter than one host period.
+struct DcContinuity {
+    deadline: Instant,
+    last_slot: u64,
+    last_dc_ns: u64,
+    send_before: Instant,
+}
+
+impl DcContinuity {
+    fn new(deadline: Instant, sampled_from: Instant, dc_ns: u64, period: Duration) -> Self {
+        let period_ns = period.as_nanos() as u64;
+        Self {
+            deadline,
+            last_slot: dc_ns / period_ns,
+            last_dc_ns: dc_ns,
+            // The next frame belongs in slot N+1, before slot N+2. The
+            // host sample precedes the reference-clock read on the wire,
+            // so this is a conservative estimate, not physical send proof.
+            send_before: sampled_from + Duration::from_nanos(2 * period_ns - dc_ns % period_ns),
+        }
+    }
+
+    fn check(&self, clock: &crate::cycle::Gate<impl Clone>, cycle_start: Instant, dc_ns: u64) {
+        if clock.is_faulted() {
+            return;
+        }
+        let slot = dc_ns / clock.period.as_nanos() as u64;
+        let reason = if dc_ns == 0 {
+            Some("invalid zero DC time")
+        } else if dc_ns < self.last_dc_ns {
+            Some("DC time moved backwards")
+        } else if slot == self.last_slot {
+            Some("duplicate DC slot")
+        } else if self.last_slot.checked_add(1) != Some(slot) {
+            Some("skipped DC slot")
+        } else if cycle_start >= self.deadline + clock.period {
+            Some("missed DC host deadline")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            let detail = format!(
+                "{reason}: previous_dc_ns={}, dc_ns={dc_ns}; restart required",
+                self.last_dc_ns
+            );
+            clock.trip(&detail);
+            tracing::error!(
+                previous_dc_ns = self.last_dc_ns,
+                dc_ns,
+                previous_slot = self.last_slot,
+                slot,
+                sequence = clock.status().issued,
+                host_lateness_us = cycle_start
+                    .saturating_duration_since(self.deadline)
+                    .as_micros() as u64,
+                reason,
+                "EtherCAT DC continuity fault"
+            );
+        }
+    }
+}
+
+/// Production hook used for startup handoff AND all subsequent successful
+/// synchronized exchanges. Healthy traffic never clears a previous latch.
+fn observe_dc_exchange<T: Clone>(
+    clock: &crate::cycle::Gate<T>,
+    handoff: &mut Option<DcContinuity>,
+    cycle_start: Instant,
+    dc_ns: u64,
+    next_deadline: Instant,
+) {
+    if let Some(previous) = handoff.as_ref() {
+        previous.check(clock, cycle_start, dc_ns);
+    }
+    if !clock.is_faulted() {
+        *handoff = Some(DcContinuity::new(
+            next_deadline,
+            cycle_start,
+            dc_ns,
+            clock.period,
+        ));
+    }
+}
+
 pub struct RealEthercat {
+    cycle: Option<Arc<crate::cycle::Gate<PdiMirror>>>,
+    staged: Option<(crate::cycle::Ticket, PdiMirror)>,
+    sdo: Arc<crate::sdo::Client>,
     name: String,
     channels: HashMap<String, EthercatChannel>,
     /// Slow-plane routing for in-cycle gear parameter channels; consulted
@@ -422,6 +541,10 @@ pub struct RealEthercat {
 /// The `Arc` handles `connect` shares with the cyclic worker thread,
 /// bundled so `smol_main` keeps a readable signature.
 struct WorkerShared {
+    cycle: Option<Arc<crate::cycle::Gate<PdiMirror>>>,
+    rt_priority: Option<i32>,
+    sdo_rx: smol::channel::Receiver<crate::sdo::Request>,
+    verify_init_sdo: bool,
     pdi: Arc<Mutex<PdiMirror>>,
     shutdown: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
@@ -484,6 +607,19 @@ enum InitResult {
 
 impl RealEthercat {
     pub async fn connect(name: String, config: &EthercatConfig) -> Result<Self, IoError> {
+        crate::cycle::validate(config)?;
+        let cycle = config.scan_sync.then(|| {
+            Arc::new(crate::cycle::Gate::new(Duration::from_micros(u64::from(
+                config.cycle_us,
+            ))))
+        });
+        let rt_priority = if cycle.is_some() {
+            crate::cycle_timer::configured_rt_priority().map_err(|error| {
+                IoError::Connect(format!("EtherCAT DC worker priority: {error}"))
+            })?
+        } else {
+            None
+        };
         // ESI-modular real-bus cyclic bring-up (master-programmed
         // SyncManager/FMMU + logical-RW exchange, bypassing the auto
         // PDO-assignment path) is validated against the physical coupler
@@ -555,6 +691,21 @@ impl RealEthercat {
         let input_changes = Arc::new(AtomicU64::new(0));
         let reinitializing = Arc::new(AtomicBool::new(false));
         let reinits = Arc::new(AtomicU64::new(0));
+        let (sdo, sdo_rx) = crate::sdo::channel(
+            healthy.clone(),
+            shutdown.clone(),
+            reinitializing.clone(),
+            reinits.clone(),
+        );
+        let verify_init_sdo = match std::env::var("IA2_EC_INIT_SDO_VERIFY_ONLY").as_deref() {
+            Ok("1") => true,
+            Err(std::env::VarError::NotPresent) | Ok("0") => false,
+            _ => {
+                return Err(IoError::Connect(
+                    "IA2_EC_INIT_SDO_VERIFY_ONLY must be 0 or 1".into(),
+                ))
+            }
+        };
         let (init_tx, init_rx) = mpsc::sync_channel::<InitResult>(1);
 
         let nic = config.nic.clone();
@@ -563,6 +714,10 @@ impl RealEthercat {
         let dc_static_sync_iterations = config.dc_static_sync_iterations;
         let slaves = config.slaves.clone();
         let shared = WorkerShared {
+            cycle: cycle.clone(),
+            rt_priority,
+            sdo_rx,
+            verify_init_sdo,
             pdi: pdi.clone(),
             shutdown: shutdown.clone(),
             stopped: stopped.clone(),
@@ -577,8 +732,11 @@ impl RealEthercat {
         };
         let thread_name = format!("ec-{name}");
 
-        let thread = thread::Builder::new()
-            .name(thread_name)
+        let mut builder = thread::Builder::new().name(thread_name);
+        if cfg!(target_os = "linux") && config.scan_sync {
+            builder = builder.stack_size(LINUX_SYNC_WORKER_STACK_BYTES);
+        }
+        let thread = builder
             .spawn(move || {
                 smol_main(
                     &nic,
@@ -655,6 +813,9 @@ impl RealEthercat {
                     reinits,
                 );
                 Ok(Self {
+                    cycle,
+                    staged: None,
+                    sdo,
                     name,
                     channels,
                     gear_routing,
@@ -691,6 +852,31 @@ impl Drop for RealEthercat {
 
 #[async_trait]
 impl IoDevice for RealEthercat {
+    fn sdo_upload_handle(&self) -> Option<Arc<dyn iocore::sdo::SdoUpload>> {
+        Some(self.sdo.clone())
+    }
+    fn cycle_period(&self) -> Option<Duration> {
+        self.cycle.as_ref().map(|c| c.period)
+    }
+    fn cycle_status(&self) -> Option<iocore::cycle::CycleStatus> {
+        self.cycle.as_ref().map(|c| c.status())
+    }
+    async fn begin_cycle(&mut self) -> Result<(), IoError> {
+        if let Some(cycle) = &self.cycle {
+            self.staged = Some(cycle.begin().await?);
+        }
+        Ok(())
+    }
+    async fn finish_cycle(&mut self) -> Result<(), IoError> {
+        if let Some(cycle) = &self.cycle {
+            let (ticket, image) = self
+                .staged
+                .take()
+                .ok_or_else(|| IoError::Protocol("no cycle in progress".into()))?;
+            cycle.commit(ticket, image)?;
+        }
+        Ok(())
+    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -707,6 +893,7 @@ impl IoDevice for RealEthercat {
         // control flow on this.
         self.healthy.load(Ordering::Relaxed)
             && !self.stopped.load(Ordering::Relaxed)
+            && !self.cycle.as_ref().is_some_and(|c| c.is_faulted())
             // A poisoned mirror means the scan thread died mid-write; the
             // worker is holding the outputs at zero (`lock_pdi_for_cycle`),
             // so the device is not under control of the program.
@@ -725,6 +912,7 @@ impl IoDevice for RealEthercat {
             .ok_or_else(|| IoError::UnknownChannel(channel.into()))?
             .clone();
         let pdi = self.pdi.lock().expect("pdi mirror poisoned");
+        let pdi = self.staged.as_ref().map(|(_, image)| image).unwrap_or(&pdi);
         let map = match meta.direction {
             EthercatPdoDirection::TxPdo => &pdi.inputs,
             EthercatPdoDirection::RxPdo => &pdi.outputs,
@@ -762,7 +950,18 @@ impl IoDevice for RealEthercat {
             });
         }
         let mut pdi = self.pdi.lock().expect("pdi mirror poisoned");
-        let buffer = pdi.outputs.get_mut(&meta.slave_index).ok_or_else(|| {
+        let image = if self.cycle.is_some() {
+            &mut self
+                .staged
+                .as_mut()
+                .ok_or_else(|| {
+                    IoError::Protocol("scan_sync outputs require an active cycle".into())
+                })?
+                .1
+        } else {
+            &mut *pdi
+        };
+        let buffer = image.outputs.get_mut(&meta.slave_index).ok_or_else(|| {
             IoError::Transport(format!(
                 "slave_index={} not present in discovered bus",
                 meta.slave_index
@@ -788,6 +987,10 @@ impl IoDevice for RealEthercat {
     /// unavailable during an unhealthy bus/re-walk. The mirror is still
     /// zeroed even when transmission cannot be confirmed.
     async fn enter_failsafe(&mut self) -> Result<(), IoError> {
+        if let Some(cycle) = &self.cycle {
+            cycle.trip("failsafe requested; restart required");
+        }
+        self.staged = None;
         // Gear axes first: drop every engage request so the engines fall
         // back to shadow/hold instead of re-driving targets over the
         // zeroed mirror below.
@@ -970,10 +1173,20 @@ struct SocketPump {
     task: Option<smol::Task<()>>,
     closing: Arc<AtomicBool>,
     dead: Arc<AtomicBool>,
+    local_executor: Option<Arc<smol::Executor<'static>>>,
 }
 
 impl SocketPump {
+    #[cfg(test)]
     fn spawn<F, E>(future: F) -> Self
+    where
+        F: std::future::Future<Output = Result<(), E>> + Send + 'static,
+        E: std::fmt::Debug + Send + 'static,
+    {
+        Self::spawn_on(future, None)
+    }
+
+    fn spawn_on<F, E>(future: F, local_executor: Option<Arc<smol::Executor<'static>>>) -> Self
     where
         F: std::future::Future<Output = Result<(), E>> + Send + 'static,
         E: std::fmt::Debug + Send + 'static,
@@ -999,16 +1212,21 @@ impl SocketPump {
             closing: closing.clone(),
             dead: dead.clone(),
         };
-        let task = smol::spawn(async move {
+        let run = async move {
             let _guard = guard;
             if let Err(e) = future.await {
                 tracing::error!(?e, "ethercat tx_rx task exited");
             }
-        });
+        };
+        let task = match &local_executor {
+            Some(executor) => executor.spawn(run),
+            None => smol::spawn(run),
+        };
         Self {
             task: Some(task),
             closing,
             dead,
+            local_executor,
         }
     }
 
@@ -1038,8 +1256,13 @@ impl SocketPump {
 impl Drop for SocketPump {
     fn drop(&mut self) {
         // Init errors and unwinding also need the socket ownership barrier.
-        // The task runs on smol's global executor, independently of this worker.
-        smol::block_on(self.stop());
+        // A local task's cancellation must also be polled on this worker,
+        // including when its master future returns early or unwinds.
+        if let Some(executor) = self.local_executor.clone() {
+            smol::block_on(executor.run(self.stop()));
+        } else {
+            smol::block_on(self.stop());
+        }
     }
 }
 
@@ -1048,6 +1271,7 @@ impl Drop for SocketPump {
 fn build_transport(
     nic: &str,
     dc_static_sync_iterations: u32,
+    local_executor: Option<Arc<smol::Executor<'static>>>,
 ) -> Result<(Arc<MainDevice<'static>>, SocketPump), String> {
     let storage: &'static Storage = Box::leak(Box::new(Storage::new()));
     let (tx, rx, pdu_loop) = storage
@@ -1073,7 +1297,7 @@ fn build_transport(
     ));
     let tx_rx = ethercrab::std::tx_rx_task(nic, tx, rx)
         .map_err(|e| format!("tx_rx_task on {nic}: {e} (need CAP_NET_RAW + real NIC)"))?;
-    let pump = SocketPump::spawn(async move { tx_rx.await.map(|_| ()) });
+    let pump = SocketPump::spawn_on(async move { tx_rx.await.map(|_| ()) }, local_executor);
     Ok((maindevice, pump))
 }
 
@@ -1214,6 +1438,10 @@ fn smol_main(
     init_tx: mpsc::SyncSender<InitResult>,
 ) {
     let WorkerShared {
+        cycle,
+        rt_priority,
+        sdo_rx,
+        verify_init_sdo,
         pdi,
         shutdown,
         stopped,
@@ -1236,19 +1464,35 @@ fn smol_main(
             self.0.store(true, Ordering::Relaxed);
         }
     }
-    let _done = DoneGuard(stopped);
+    let executor = Arc::new(smol::Executor::new());
+    let run_local = cfg!(target_os = "linux") && cycle.is_some();
+    let local_pump = run_local.then(|| executor.clone());
+    let _done = DoneGuard(stopped.clone());
 
     let nic_owned = nic.to_string();
-    smol::block_on(async move {
-        // The owned pump closes on every return or unwind, before DoneGuard.
+    let master = std::pin::pin!(async move {
+        // Own and drain each pump before replacing its transport or reporting
+        // the worker stopped. Synchronized pumps run on this worker's executor.
         let (mut maindevice, mut pump) =
-            match build_transport(&nic_owned, dc_static_sync_iterations) {
+            match build_transport(&nic_owned, dc_static_sync_iterations, local_pump.clone()) {
                 Ok(m) => m,
                 Err(msg) => {
                     let _ = init_tx.send(InitResult::Err(msg));
                     return;
                 }
             };
+        // Socket registration has initialized the shared reactor and its
+        // helper thread. Only this worker receives the opt-in scheduling
+        // policy, including during the startup exchanges.
+        let mut timer = match crate::cycle_timer::CycleTimer::new(cycle.is_some(), rt_priority) {
+            Ok(timer) => timer,
+            Err(error) => {
+                let _ = init_tx.send(InitResult::Err(format!(
+                    "configure EtherCAT cycle timer: {error}"
+                )));
+                return;
+            }
+        };
 
         // ===== RTSO-HOLD-0731 fix: supervised re-walk loop =====
         // Everything from bus enumeration through the cyclic exchange sits
@@ -1299,7 +1543,7 @@ fn smol_main(
                      (fresh PduStorage + MainDevice + pump)"
                 );
                 pump.stop().await;
-                match build_transport(&nic_owned, dc_static_sync_iterations) {
+                match build_transport(&nic_owned, dc_static_sync_iterations, local_pump.clone()) {
                     Ok((m, replacement)) => {
                         maindevice = m;
                         pump = replacement;
@@ -1417,6 +1661,33 @@ fn smol_main(
                 let Some(cfg) = slaves.iter().find(|s| s.index == pos as u16) else {
                     continue;
                 };
+                if verify_init_sdo {
+                    for cmd in crate::sdo::final_assignments(&cfg.init_sdo) {
+                        let result = sd
+                            .sdo_read::<crate::sdo::Scalar>(cmd.index, cmd.sub_index)
+                            .await;
+                        match result {
+                            Ok(raw) if crate::sdo::matches_init(&raw, cmd) => tracing::info!(
+                                slave = pos,
+                                index = cmd.index,
+                                subindex = cmd.sub_index,
+                                "init sdo verified; no download"
+                            ),
+                            result => {
+                                let detail = match result {
+                                    Ok(raw) => format!(
+                                        "got {:?}, expected {} ({} bits)",
+                                        raw.0, cmd.value, cmd.bits
+                                    ),
+                                    Err(e) => format!("{e:?}"),
+                                };
+                                if walk_fail(first_init, &init_tx, &mut reinit_attempt, format!("init SDO verification failed on slave {pos} {:#06x}:{}: {detail}", cmd.index, cmd.sub_index)) { return; }
+                                continue 'supervise;
+                            }
+                        }
+                    }
+                    continue;
+                }
                 for cmd in &cfg.init_sdo {
                     let res = match cmd.bits {
                         8 => {
@@ -1517,6 +1788,19 @@ fn smol_main(
                 EthercatDcSync::Off
             };
 
+            if cycle.is_some() && bus_dc != EthercatDcSync::Sync0 {
+                if let Some(clock) = &cycle {
+                    clock.trip("scan_sync has no effective SYNC0 slave");
+                }
+                walk_fail(
+                    first_init,
+                    &init_tx,
+                    &mut reinit_attempt,
+                    "scan_sync has no effective SYNC0 slave".into(),
+                );
+                return;
+            }
+
             match bus_dc {
                 EthercatDcSync::Sync0 => {
                     // Servo drives (e.g. Inovance SV660N) need DC SYNC0 to
@@ -1588,41 +1872,105 @@ fn smol_main(
                     // Capture discovery before confirming OP so the topology is
                     // visible even if OP never settles.
                     let discovered = capture_discovery!(group, maindevice, pdi, pdi_poisoned);
-
-                    // Pump tx_rx_dc until every SubDevice reaches OP (zero
-                    // outputs / controlword 0 — nothing moves). Bounded.
-                    {
-                        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-                        let mut reached_op = false;
-                        while !shutdown.load(Ordering::Relaxed)
-                            && std::time::Instant::now() < deadline
-                        {
-                            match group.tx_rx_dc(&maindevice).await {
-                                Ok(resp) => {
-                                    if resp.all_op() {
-                                        reached_op = true;
-                                        break;
-                                    }
-                                }
-                                Err(e) => tracing::warn!(?e, "tx_rx_dc while waiting for OP"),
-                            }
-                            smol::Timer::after(sync0).await;
-                        }
-                        if !reached_op {
-                            if walk_fail(
+                    // The synchronized path initially supports one LRW PDI chunk.
+                    // This makes its expected working counter unambiguous even
+                    // when some slaves have only input or only output data.
+                    let expected_wkc: u16 = discovered
+                        .iter()
+                        .map(|d| u16::from(d.input_bytes > 0) + 2 * u16::from(d.output_bytes > 0))
+                        .sum();
+                    let pdi_bytes: usize = discovered
+                        .iter()
+                        .map(|d| usize::from(d.input_bytes) + usize::from(d.output_bytes))
+                        .sum();
+                    if cycle.is_some() && pdi_bytes > 1024 {
+                        walk_fail(
                             first_init,
                             &init_tx,
                             &mut reinit_attempt,
-                            "SubDevices did not reach OP within 10s (SyncManager watchdog / DC?)"
-                                .into(),
-                        ) {
-                            return;
-                        }
-                            continue 'supervise;
-                        }
-                        tracing::info!("all subdevices reached OP (dc=sync0)");
+                            "scan_sync currently requires total PDI <= 1024 bytes".into(),
+                        );
+                        return;
                     }
 
+                    // Pump zero outputs until OP. In synchronized mode,
+                    // follow the DC phase during startup and preserve the
+                    // next deadline across the transition to the scan loop.
+                    let mut dc_continuity = None;
+                    {
+                        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                        let mut reached_op = false;
+                        let mut startup = DcStartup::default();
+                        while !shutdown.load(Ordering::Relaxed)
+                            && std::time::Instant::now() < deadline
+                        {
+                            let sent_at = Instant::now();
+                            let next = match group.tx_rx_dc(&maindevice).await {
+                                Ok(resp) => {
+                                    if cycle.is_some() {
+                                        let slot =
+                                            resp.extra.dc_system_time / sync0.as_nanos() as u64;
+                                        let next = sent_at + resp.extra.next_cycle_wait;
+                                        let healthy = resp.all_op()
+                                            && resp.working_counter == expected_wkc
+                                            && Instant::now() < next;
+                                        if startup.observe(slot, healthy) {
+                                            reached_op = true;
+                                            dc_continuity = Some(DcContinuity::new(
+                                                next,
+                                                sent_at,
+                                                resp.extra.dc_system_time,
+                                                sync0,
+                                            ));
+                                            break;
+                                        }
+                                        next
+                                    } else if resp.all_op() {
+                                        reached_op = true;
+                                        break;
+                                    } else {
+                                        Instant::now() + sync0
+                                    }
+                                }
+                                Err(e) => {
+                                    startup = DcStartup::default();
+                                    tracing::warn!(?e, "tx_rx_dc while waiting for OP");
+                                    Instant::now() + sync0
+                                }
+                            };
+                            if let Err(error) = timer.wait(next).await {
+                                let message = format!("EtherCAT startup timer: {error}");
+                                if let Some(clock) = &cycle {
+                                    clock.trip(&message);
+                                }
+                                let _ =
+                                    walk_fail(first_init, &init_tx, &mut reinit_attempt, message);
+                                return;
+                            }
+                        }
+                        if !reached_op {
+                            if walk_fail(
+                                first_init,
+                                &init_tx,
+                                &mut reinit_attempt,
+                                "SubDevices did not establish OP/DC readiness within 10s".into(),
+                            ) {
+                                return;
+                            }
+                            continue 'supervise;
+                        }
+                        tracing::info!(
+                            consecutive_dc_slots = startup.consecutive,
+                            "all subdevices reached OP (dc=sync0)"
+                        );
+                    }
+
+                    tracing::info!(
+                        native_clock = timer.uses_native_clock(),
+                        local_pump = local_pump.is_some(),
+                        ?rt_priority,
+                        "EtherCAT DC cycle timer"
+                    );
                     if first_init {
                         let _ = init_tx.send(InitResult::Ok { discovered });
                         first_init = false;
@@ -1650,13 +1998,61 @@ fn smol_main(
                     let mut bus_ok = true;
                     let mut prev_shape: Option<(Vec<ethercrab::SubDeviceState>, u16)> = None;
                     let mut shape_edges: u64 = 0;
+                    let mut previous_wait: Option<(Instant, Instant, Instant)> = None;
+                    crate::sdo::run(&sdo_rx, &reinits, async {
+                    if let Some(handoff) = &dc_continuity {
+                        if let Err(error) = timer.wait(handoff.deadline).await {
+                            if let Some(clock) = &cycle {
+                                clock.trip("EtherCAT monotonic wait failed; restart required");
+                            }
+                            tracing::error!(%error, "EtherCAT cycle timer failed");
+                            smol::Timer::at(handoff.deadline).await;
+                        }
+                    }
                     while !shutdown.load(Ordering::Relaxed) {
                         cycles.fetch_add(1, Ordering::Relaxed);
                         let cycle_start = std::time::Instant::now();
-                        copy_outputs_to_bus!(group, maindevice, pdi, pdi_poisoned);
+                        if let Some(clock) = &cycle {
+                            clock.consume_before(dc_continuity.as_ref().map(|d| d.send_before), |image| {
+                                {
+                                    let mut mirror = lock_pdi_for_cycle(&pdi, &pdi_poisoned);
+                                    if let Some(image) = image { mirror.outputs.clone_from(&image.outputs); }
+                                    else { for bytes in mirror.outputs.values_mut() { bytes.fill(0); } }
+                                }
+                                copy_outputs_to_bus!(group, maindevice, pdi, pdi_poisoned);
+                            });
+                        } else { copy_outputs_to_bus!(group, maindevice, pdi, pdi_poisoned); }
                         gear_tick!(group, maindevice, engines, bus_ok, pdi_poisoned);
-                        let next_wait = match group.tx_rx_dc(&maindevice).await {
+                        let exchange_start = Instant::now();
+                        let response = group.tx_rx_dc(&maindevice).await;
+                        let exchange_end = Instant::now();
+                        if let Some((deadline, wait_start, previous_exchange_end)) = previous_wait {
+                            let late = cycle_start.saturating_duration_since(deadline);
+                            if late >= sync0 {
+                                tracing::error!(
+                                    late_us = late.as_micros() as u64,
+                                    timer_entry_margin_us = deadline.saturating_duration_since(wait_start).as_micros() as u64,
+                                    timer_entry_late_us = wait_start.saturating_duration_since(deadline).as_micros() as u64,
+                                    previous_rx_to_timer_us = wait_start.duration_since(previous_exchange_end).as_micros() as u64,
+                                    pre_exchange_us = exchange_start.duration_since(cycle_start).as_micros() as u64,
+                                    exchange_us = exchange_end.duration_since(exchange_start).as_micros() as u64,
+                                    native_clock = timer.uses_native_clock(),
+                                    "EtherCAT bus cycle resumed after a missed deadline"
+                                );
+                            }
+                        }
+                        let next_wait = match response {
                             Ok(resp) => {
+                                if let Some(clock) = &cycle {
+                                    observe_dc_exchange(clock, &mut dc_continuity, cycle_start,
+                                        resp.extra.dc_system_time, cycle_start + resp.extra.next_cycle_wait);
+                                    if resp.working_counter != expected_wkc || !resp.all_op() {
+                                        clock.trip("unexpected WKC or bus left OP; restart required");
+                                    }
+                                    if clock.is_faulted() {
+                                        for bytes in lock_pdi_for_cycle(&pdi, &pdi_poisoned).outputs.values_mut() { bytes.fill(0); }
+                                    }
+                                }
                                 let edge = note_bus_shape(
                                     &mut prev_shape,
                                     &mut shape_edges,
@@ -1731,6 +2127,7 @@ fn smol_main(
                                     // applies outputs. Leave the cyclic loop
                                     // and re-walk instead of exchanging with
                                     // a bus that silently ignores us.
+                                    if let Some(clock) = &cycle { clock.trip("bus left OP; restart required"); }
                                     healthy.store(false, Ordering::Relaxed);
                                     demoted = true;
                                     break;
@@ -1741,9 +2138,31 @@ fn smol_main(
                                     );
                                 }
                                 bus_ok = true;
+                                if let Some(clock) = &cycle {
+                                    let image = lock_pdi_for_cycle(&pdi, &pdi_poisoned).clone();
+                                    if pdi_poisoned.load(Ordering::Relaxed) {
+                                        clock.trip("PDI mirror poisoned; restart required");
+                                    }
+                                    let deadline = cycle_start + resp.extra.next_cycle_wait;
+                                    clock.publish(image, deadline);
+                                    let publish_time = Instant::now();
+                                    if publish_time >= deadline {
+                                        tracing::error!(
+                                            exchange_us = exchange_end.duration_since(exchange_start).as_micros() as u64,
+                                            pre_exchange_us = exchange_start.duration_since(cycle_start).as_micros() as u64,
+                                            rx_to_publish_us = publish_time.duration_since(exchange_end).as_micros() as u64,
+                                            budget_us = resp.extra.next_cycle_wait.as_micros() as u64,
+                                            "EtherCAT exchange exhausted the next ticket deadline"
+                                        );
+                                    }
+                                }
                                 resp.extra.next_cycle_wait
                             }
                             Err(e) => {
+                                if let Some(clock) = &cycle {
+                                    clock.trip("bus exchange failed; restart required");
+                                    for bytes in lock_pdi_for_cycle(&pdi, &pdi_poisoned).outputs.values_mut() { bytes.fill(0); }
+                                }
                                 note_txrx_failure(&mut health, &e);
                                 if pump.is_dead() {
                                     // A dead pump cannot recover by retrying
@@ -1756,8 +2175,17 @@ fn smol_main(
                                 sync0
                             }
                         };
-                        smol::Timer::at(cycle_start + next_wait).await;
+                        let deadline = cycle_start + next_wait;
+                        previous_wait = cycle.as_ref().map(|_| (deadline, Instant::now(), exchange_end));
+                        if let Err(error) = timer.wait(deadline).await {
+                            if let Some(clock) = &cycle {
+                                clock.trip("EtherCAT monotonic wait failed; restart required");
+                            }
+                            tracing::error!(%error, "EtherCAT cycle timer failed");
+                            smol::Timer::at(deadline).await;
+                        }
                     }
+                    }, |address| crate::sdo::read(group.subdevice(&maindevice, usize::from(address.slave)), address)).await;
                     if demoted && !shutdown.load(Ordering::Relaxed) {
                         tracing::error!(
                             "subdevice(s) out of OP mid-run — re-walking the bus \
@@ -1823,50 +2251,71 @@ fn smol_main(
                     let mut bus_ok = true;
                     let mut prev_shape: Option<(Vec<ethercrab::SubDeviceState>, u16)> = None;
                     let mut shape_edges: u64 = 0;
-                    while !shutdown.load(Ordering::Relaxed) {
-                        cycles.fetch_add(1, Ordering::Relaxed);
-                        copy_outputs_to_bus!(group, maindevice, pdi, pdi_poisoned);
-                        gear_tick!(group, maindevice, engines, bus_ok, pdi_poisoned);
-                        match group.tx_rx(&maindevice).await {
-                            Ok(resp) => {
-                                note_bus_shape(
-                                    &mut prev_shape,
-                                    &mut shape_edges,
-                                    &resp.subdevice_states,
-                                    resp.working_counter,
+                    crate::sdo::run(
+                        &sdo_rx,
+                        &reinits,
+                        async {
+                            while !shutdown.load(Ordering::Relaxed) {
+                                cycles.fetch_add(1, Ordering::Relaxed);
+                                copy_outputs_to_bus!(group, maindevice, pdi, pdi_poisoned);
+                                gear_tick!(group, maindevice, engines, bus_ok, pdi_poisoned);
+                                match group.tx_rx(&maindevice).await {
+                                    Ok(resp) => {
+                                        note_bus_shape(
+                                            &mut prev_shape,
+                                            &mut shape_edges,
+                                            &resp.subdevice_states,
+                                            resp.working_counter,
+                                        );
+                                        if resp
+                                            .subdevice_states
+                                            .iter()
+                                            .any(|s| *s != ethercrab::SubDeviceState::Op)
+                                        {
+                                            // Break is deferred until after the input
+                                            // copy below — the last snapshot is still
+                                            // worth capturing.
+                                            healthy.store(false, Ordering::Relaxed);
+                                            demoted = true;
+                                        } else if health.record_success()
+                                            == HealthTransition::Recovered
+                                        {
+                                            tracing::info!(
+                                                "ethercat recovered; cyclic exchange running again"
+                                            );
+                                        }
+                                        bus_ok = true;
+                                    }
+                                    Err(e) => {
+                                        note_txrx_failure(&mut health, &e);
+                                        if pump.is_dead() {
+                                            healthy.store(false, Ordering::Relaxed);
+                                            demoted = true;
+                                        }
+                                        bus_ok = false;
+                                    }
+                                }
+                                copy_inputs_from_bus!(
+                                    group,
+                                    maindevice,
+                                    pdi,
+                                    pdi_poisoned,
+                                    input_changes
                                 );
-                                if resp
-                                    .subdevice_states
-                                    .iter()
-                                    .any(|s| *s != ethercrab::SubDeviceState::Op)
-                                {
-                                    // Break is deferred until after the input
-                                    // copy below — the last snapshot is still
-                                    // worth capturing.
-                                    healthy.store(false, Ordering::Relaxed);
-                                    demoted = true;
-                                } else if health.record_success() == HealthTransition::Recovered {
-                                    tracing::info!(
-                                        "ethercat recovered; cyclic exchange running again"
-                                    );
+                                if demoted {
+                                    break;
                                 }
-                                bus_ok = true;
+                                tick.next().await;
                             }
-                            Err(e) => {
-                                note_txrx_failure(&mut health, &e);
-                                if pump.is_dead() {
-                                    healthy.store(false, Ordering::Relaxed);
-                                    demoted = true;
-                                }
-                                bus_ok = false;
-                            }
-                        }
-                        copy_inputs_from_bus!(group, maindevice, pdi, pdi_poisoned, input_changes);
-                        if demoted {
-                            break;
-                        }
-                        tick.next().await;
-                    }
+                        },
+                        |address| {
+                            crate::sdo::read(
+                                group.subdevice(&maindevice, usize::from(address.slave)),
+                                address,
+                            )
+                        },
+                    )
+                    .await;
                     if demoted && !shutdown.load(Ordering::Relaxed) {
                         tracing::error!(
                             "subdevice(s) out of OP mid-run — re-walking the bus \
@@ -1894,11 +2343,280 @@ fn smol_main(
         // Complete its cancellation before the worker's stopped flag is set.
         pump.stop().await;
     });
+    if run_local {
+        smol::block_on(executor.run(master));
+    } else {
+        smol::block_on(master);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_needs_four_consecutive_healthy_dc_slots() {
+        let mut ready = DcStartup::default();
+        for (slot, healthy) in [
+            (10, true),
+            (11, true),
+            (11, true),
+            (12, true),
+            (13, false),
+            (14, true),
+            (16, true),
+            (17, true),
+            (18, true),
+        ] {
+            assert!(!ready.observe(slot, healthy));
+        }
+        assert!(ready.observe(19, true));
+    }
+
+    #[test]
+    fn startup_handoff_latches_gaps_before_any_ticket_and_keeps_outputs_zero() {
+        use std::{future::Future, task::Context, task::Waker};
+
+        let period = Duration::from_millis(2);
+        for armed in [false, true] {
+            for (late, slot) in [
+                (period, 14),         // Host deadline missed, even with an adjacent DC slot.
+                (period * 2, 16),     // Review reproducer: delayed past the first slot.
+                (Duration::ZERO, 13), // Duplicate DC slot.
+                (Duration::ZERO, 15), // Skip despite an on-time host clock.
+                (Duration::ZERO, 12), // Reference clock moved backwards.
+            ] {
+                let clock = crate::cycle::Gate::new(period);
+                let mut scan = Box::pin(clock.begin());
+                let mut context = Context::from_waker(Waker::noop());
+                if armed {
+                    assert!(scan.as_mut().poll(&mut context).is_pending());
+                }
+                let now = Instant::now();
+                let handoff = DcContinuity::new(now, now - period, 27_000_000, period);
+                let started = handoff.deadline + late;
+                clock.consume_at(started, |image| assert!(image.is_none()));
+                handoff.check(&clock, started, slot * 2_000_000 + 1_000_000);
+                clock.publish_at([0u8], started + period, started);
+                assert!(matches!(
+                    scan.as_mut().poll(&mut context),
+                    std::task::Poll::Ready(Err(_))
+                ));
+                assert!(clock
+                    .status()
+                    .fault
+                    .as_deref()
+                    .unwrap()
+                    .contains("restart required"));
+                // Neither another healthy exchange nor an on-time handoff
+                // may re-arm this run or put a frame on the output mirror.
+                handoff.check(&clock, handoff.deadline, 29_000_000);
+                for n in 1..=3 {
+                    let now = started + period * n;
+                    clock.consume_at(now, |image| assert!(image.is_none()));
+                    clock.publish_at([1u8], now + period, now);
+                }
+                let status = clock.status();
+                assert_eq!(
+                    (status.issued, status.committed, status.consumed),
+                    (0, 0, 0)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn startup_handoff_accepts_adjacent_slot_with_subperiod_host_lateness() {
+        use std::{future::Future, task::Context, task::Poll, task::Waker};
+
+        let period = Duration::from_millis(2);
+        for late in [Duration::ZERO, period - Duration::from_nanos(1)] {
+            let clock = crate::cycle::Gate::new(period);
+            let mut scan = Box::pin(clock.begin());
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(scan.as_mut().poll(&mut context).is_pending());
+            let now = Instant::now();
+            let handoff = DcContinuity::new(now, now - period, 27_000_000, period);
+            let started = handoff.deadline + late;
+            clock.consume_at(started, |image| assert!(image.is_none()));
+            handoff.check(&clock, started, 29_000_000);
+            let deadline = started + period;
+            clock.publish_at([0u8], deadline, started);
+            let Poll::Ready(Ok((ticket, image))) = scan.as_mut().poll(&mut context) else {
+                panic!("adjacent startup handoff must issue the first ticket");
+            };
+            assert_eq!(image, [0u8]);
+            clock.commit_at(ticket, [1u8], started).unwrap();
+            clock.consume_at(deadline, |image| assert_eq!(image, Some(&[1u8])));
+            let status = clock.status();
+            assert!(status.fault.is_none());
+            assert_eq!(
+                (status.issued, status.committed, status.consumed),
+                (1, 1, 1)
+            );
+        }
+    }
+
+    #[test]
+    fn steady_dc_slot_skip_latches_even_below_the_host_period_allowance() {
+        use std::{
+            future::Future,
+            task::{Context, Poll, Waker},
+        };
+        let period = Duration::from_millis(2);
+        let origin = Instant::now();
+        let clock = crate::cycle::Gate::new(period);
+        let mut scan = Box::pin(clock.begin());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(scan.as_mut().poll(&mut cx).is_pending());
+        let mut handoff = Some(DcContinuity::new(
+            origin,
+            origin - period,
+            27_000_000,
+            period,
+        ));
+        observe_dc_exchange(&clock, &mut handoff, origin, 29_000_000, origin + period);
+        clock.publish_at([0u8], origin + period, origin);
+        let Poll::Ready(Ok((ticket, _))) = scan.as_mut().poll(&mut cx) else {
+            panic!("ticket")
+        };
+        clock
+            .commit_at(ticket, [7u8], origin + Duration::from_micros(694))
+            .unwrap();
+        // A complete frame committed 1306 us early is still accepted 1030 us
+        // late by the old host-only gate, despite the reference clock skip.
+        let started = origin + period + Duration::from_micros(1030);
+        clock.consume_at(started, |image| assert_eq!(image, Some(&[7u8])));
+        observe_dc_exchange(&clock, &mut handoff, started, 32_033_928, started + period);
+        assert!(
+            clock.is_faulted(),
+            "steady slot 14 -> 16 must latch after startup"
+        );
+        clock.publish_at([9u8], started + period, started);
+        clock.consume_at(started + period, |image| assert!(image.is_none()));
+        assert_eq!(clock.status().issued, 1);
+    }
+
+    #[test]
+    fn steady_dc_accepts_adjacent_slots_with_phase_jitter_not_host_interval_thresholds() {
+        let period = Duration::from_millis(2);
+        let origin = Instant::now();
+        let clock = crate::cycle::Gate::<[u8; 1]>::new(period);
+        let mut handoff = Some(DcContinuity::new(
+            origin,
+            origin - period,
+            27_000_000,
+            period,
+        ));
+        // Some intervals exceed 2 ms, but every reference-clock slot is adjacent.
+        for n in 0..10_000u64 {
+            let phase = [800_000, 1_271_209, 950_000, 1_100_000][n as usize % 4];
+            let dc_ns = (14 + n) * 2_000_000 + phase;
+            let now = origin + Duration::from_nanos(n * 2_000_000 + phase - 800_000);
+            let next = now + Duration::from_nanos(3_000_000 - phase);
+            observe_dc_exchange(&clock, &mut handoff, now, dc_ns, next);
+            assert!(!clock.is_faulted(), "{n}: {:?}", clock.status());
+            assert_eq!(handoff.as_ref().unwrap().last_dc_ns, dc_ns);
+        }
+    }
+
+    #[test]
+    fn steady_dc_classifies_invalid_samples_and_preserves_the_first_fault() {
+        let period = Duration::from_millis(2);
+        let origin = Instant::now();
+        for (bad_dc, reason) in [
+            (31_500_000, "duplicate"),
+            (30_900_000, "DC time moved backwards"),
+            (34_033_928, "skipped"),
+            (0, "invalid zero"),
+        ] {
+            let clock = crate::cycle::Gate::<[u8; 1]>::new(period);
+            let mut handoff = Some(DcContinuity::new(
+                origin,
+                origin - period,
+                27_000_000,
+                period,
+            ));
+            for n in 0..2 {
+                let now = origin + period * n;
+                observe_dc_exchange(
+                    &clock,
+                    &mut handoff,
+                    now,
+                    29_000_000 + u64::from(n) * 2_000_000,
+                    now + period,
+                );
+            }
+            let now = origin + period * 2;
+            observe_dc_exchange(&clock, &mut handoff, now, bad_dc, now + period);
+            let fault = clock.status().fault.unwrap();
+            assert!(fault.starts_with(reason), "{fault}");
+            assert!(fault.contains("previous_dc_ns=31000000"));
+            assert!(fault.contains(&format!("dc_ns={bad_dc}")));
+            observe_dc_exchange(
+                &clock,
+                &mut handoff,
+                now + period,
+                35_000_000,
+                now + period * 2,
+            );
+            assert_eq!(clock.status().fault.as_ref(), Some(&fault));
+            clock.consume_at(now + period, |image| assert!(image.is_none()));
+            assert!(smol::block_on(clock.begin()).is_err());
+        }
+    }
+
+    #[test]
+    fn dc_time_wrap_is_rejected_and_send_limit_is_phase_relative() {
+        let period = Duration::from_millis(2);
+        let origin = Instant::now();
+        let clock = crate::cycle::Gate::<[u8; 1]>::new(period);
+        let mut handoff = Some(DcContinuity::new(
+            origin,
+            origin - period,
+            u64::MAX - 1000,
+            period,
+        ));
+        observe_dc_exchange(&clock, &mut handoff, origin, 1000, origin + period);
+        assert!(clock
+            .status()
+            .fault
+            .unwrap()
+            .starts_with("DC time moved backwards"));
+        for phase in [0, 33_928, 1_000_000, 1_271_209, 1_999_999] {
+            let h = DcContinuity::new(origin + period, origin, 40_000_000 + phase, period);
+            assert_eq!(
+                h.send_before - origin,
+                Duration::from_nanos(4_000_000 - phase)
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn synchronized_linux_worker_startup_reaches_transport_on_missing_interface() {
+        // Exercise the production worker's stack and executor construction
+        // without transmitting on any host interface.
+        const MISSING: &str = "ia2-test-absent";
+        assert!(!std::path::Path::new("/sys/class/net")
+            .join(MISSING)
+            .exists());
+        let config = EthercatConfig {
+            scan_sync: true,
+            nic: MISSING.into(),
+            bringup: Default::default(),
+            cycle_us: 2_000,
+            dc_sync: EthercatDcSync::Sync0,
+            dc_static_sync_iterations: 0,
+            slaves: vec![],
+            channels: vec![],
+            gear: vec![],
+        };
+        let result = RealEthercat::connect("offline-stack-test".into(), &config).await;
+        assert!(
+            matches!(result, Err(IoError::Connect(message)) if message.contains("tx_rx_task on ia2-test-absent"))
+        );
+    }
 
     struct PumpResource(mpsc::Sender<()>);
 
@@ -1919,6 +2637,73 @@ mod tests {
         });
         ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         (pump, dropped_rx)
+    }
+
+    #[test]
+    fn locally_polled_pump_releases_socket_on_stop_return_and_unwind() {
+        for exit in 0..3 {
+            let (released, dropped) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                let owner = thread::current().id();
+                let executor = Arc::new(smol::Executor::new());
+                let (ready, running) = smol::channel::bounded(1);
+                let resource = PumpResource(released);
+                let mut pump = SocketPump::spawn_on(
+                    async move {
+                        let _resource = resource;
+                        assert_eq!(thread::current().id(), owner);
+                        ready.send(()).await.unwrap();
+                        std::future::pending::<Result<(), ()>>().await
+                    },
+                    Some(executor.clone()),
+                );
+                smol::block_on(executor.run(async move {
+                    running.recv().await.unwrap();
+                    match exit {
+                        0 => {
+                            pump.stop().await;
+                            assert!(!pump.is_dead());
+                        }
+                        1 => drop(pump),
+                        _ => panic!("worker unwound with a locally polled socket"),
+                    }
+                }));
+            });
+            // Bound failure if cancellation stops driving the local executor.
+            dropped.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(worker.join().is_err(), exit == 2);
+        }
+    }
+
+    #[test]
+    fn locally_polled_pump_failure_requests_rebuild_and_drains() {
+        for outcome in 0..3 {
+            let executor = Arc::new(smol::Executor::new());
+            let (released, dropped) = mpsc::channel();
+            let resource = PumpResource(released);
+            let pump = SocketPump::spawn_on(
+                async move {
+                    let _resource = resource;
+                    match outcome {
+                        0 => Ok(()),
+                        1 => Err("receive error"),
+                        _ => panic!("local socket task panic"),
+                    }
+                },
+                Some(executor.clone()),
+            );
+            smol::block_on(executor.run(async {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !pump.is_dead() {
+                    assert!(Instant::now() < deadline);
+                    smol::future::yield_now().await;
+                }
+            }));
+            drop(pump);
+            dropped
+                .try_recv()
+                .expect("failed local pump released its socket");
+        }
     }
 
     #[test]
@@ -2064,6 +2849,15 @@ mod tests {
         let mut outputs = HashMap::new();
         outputs.insert(0u16, vec![0xffu8; 4]);
         RealEthercat {
+            cycle: None,
+            staged: None,
+            sdo: crate::sdo::channel(
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicU64::new(0)),
+            )
+            .0,
             name: "axis".into(),
             channels: HashMap::new(),
             gear_routing: crate::gear::GearRouting {
@@ -2414,6 +3208,61 @@ mod tests {
             start.elapsed() < Duration::from_millis(300),
             "must return shortly after the timeout, not wait out the worker"
         );
+    }
+    #[tokio::test]
+    async fn synchronized_real_bit_packer_stages_outputs_and_latches_inputs_without_a_bus() {
+        let mut dev = device_with_outputs(false);
+        dev.pdi.lock().unwrap().outputs.get_mut(&0).unwrap().fill(0);
+        dev.pdi.lock().unwrap().inputs.insert(0, vec![5, 0]);
+        for (name, offset, direction) in [
+            ("a", 0, EthercatPdoDirection::RxPdo),
+            ("b", 2, EthercatPdoDirection::RxPdo),
+            ("feedback", 0, EthercatPdoDirection::TxPdo),
+        ] {
+            dev.channels.insert(
+                name.into(),
+                EthercatChannel {
+                    name: name.into(),
+                    slave_index: 0,
+                    direction,
+                    pdo_index: 0x7000,
+                    sub_index: 0,
+                    bit_length: 16,
+                    data_type: project::EthercatDataType::U16,
+                    pdi_byte_offset: offset,
+                    pdi_bit_offset: 0,
+                },
+            );
+        }
+        let clock = Arc::new(crate::cycle::Gate::new(Duration::from_millis(50)));
+        dev.cycle = Some(clock.clone());
+        let mirror = dev.pdi.clone();
+        let publish = async {
+            tokio::task::yield_now().await;
+            let image = mirror.lock().unwrap().clone();
+            let now = Instant::now();
+            clock.publish_at(image, now + clock.period, now);
+        };
+        let (begun, ()) = tokio::join!(dev.begin_cycle(), publish);
+        begun.unwrap();
+        mirror.lock().unwrap().inputs.insert(0, vec![9, 0]);
+        assert_eq!(dev.read_channel("feedback").await.unwrap().to_i32(), 5);
+        dev.write_channel("a", ChannelValue::U16(11)).await.unwrap();
+        assert_eq!(mirror.lock().unwrap().outputs[&0], vec![0; 4]);
+        dev.write_channel("b", ChannelValue::U16(22)).await.unwrap();
+        dev.finish_cycle().await.unwrap();
+        assert_eq!(mirror.lock().unwrap().outputs[&0], vec![0; 4]);
+        clock.consume_at(Instant::now() + clock.period, |image| {
+            mirror
+                .lock()
+                .unwrap()
+                .outputs
+                .clone_from(&image.unwrap().outputs);
+        });
+        assert_eq!(mirror.lock().unwrap().outputs[&0], vec![11, 0, 22, 0]);
+        dev.enter_failsafe().await.unwrap();
+        assert_eq!(mirror.lock().unwrap().outputs[&0], vec![0; 4]);
+        assert!(dev.begin_cycle().await.is_err());
     }
 }
 

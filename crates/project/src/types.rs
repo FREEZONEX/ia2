@@ -857,6 +857,10 @@ pub fn is_ethercat_sim_nic(nic: &str) -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct EthercatConfig {
+    /// Clock PLC scans from this bus. Requires SYNC0, no in-cycle gear,
+    /// exactly one clock source, and every PLC task at cycle_us.
+    #[serde(default)]
+    pub scan_sync: bool,
     /// Network interface bound to the MainDevice (e.g. "eth0", "en0").
     /// Persisted so the IDE can preserve the user's intent even on hosts
     /// where the NIC isn't currently up.
@@ -905,6 +909,21 @@ pub struct EthercatConfig {
     /// bytes — PLC writes to that PDO field are overwritten every cycle.
     #[serde(default)]
     pub gear: Vec<EthercatGear>,
+}
+
+impl EthercatConfig {
+    /// Shared authoring/runtime validation for the opt-in clock owner.
+    pub fn scan_sync_error(&self) -> Option<&'static str> {
+        if self.scan_sync
+            && (self.cycle_us < 100
+                || self.dc_sync != EthercatDcSync::Sync0
+                || !self.gear.is_empty())
+        {
+            Some("scan_sync requires cycle_us >= 100, dc_sync=sync0 and no gear axes")
+        } else {
+            None
+        }
+    }
 }
 
 fn default_cycle_us() -> u32 {

@@ -1,0 +1,35 @@
+# Simulation only; no drive identity, init SDO, controlword or enable command.
+name = "bus"
+protocol = "ethercat"
+nic = "_sim"
+scan_sync = true
+cycle_us = 50000
+dc_sync = "sync0"
+
+[[slaves]]
+index = 0
+name = "virtual_frame_sink"
+vendor_id = 1
+product_id = 1
+
+[[channels]]
+name = "counter"
+slave_index = 0
+direction = "rx_pdo"
+pdo_index = 28672
+sub_index = 0
+bit_length = 32
+data_type = "i32"
+pdi_byte_offset = 0
+pdi_bit_offset = 0
+
+[[channels]]
+name = "paired"
+slave_index = 0
+direction = "rx_pdo"
+pdo_index = 28673
+sub_index = 0
+bit_length = 32
+data_type = "i32"
+pdi_byte_offset = 4
+pdi_bit_offset = 0
