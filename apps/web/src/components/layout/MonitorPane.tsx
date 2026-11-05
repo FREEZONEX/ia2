@@ -289,15 +289,24 @@ export function MonitorPane({ collapsed, onToggleCollapse }: { collapsed: boolea
         </div>}
         {error && <div role="alert" className="shrink-0 border-y border-destructive/20 bg-destructive/5 px-4 py-2 text-xs text-destructive">{error}</div>}
         {pendingCommand && <div role="status" className="shrink-0 px-4 pb-2 text-xs text-muted-foreground">{pendingCommand}… waiting for confirmation</div>}
-        <div className="min-h-0 flex-1 overflow-auto">
+        <div className="min-h-0 flex-1 overflow-auto [scrollbar-gutter:stable]">
           {isRunning && <AlarmsSection onStandingChange={setAlarmCount} onErrorChange={setAlarmStatusError} />}
           {pinnedSeries.length > 0 && <div className="border-b border-border px-4 py-3"><TrendChart series={pinnedSeries} windowS={MONITOR_TREND_WINDOW_S} /></div>}
           {!lastSnapshot ? <EmptyState className="px-4 py-4 [&_h2+div]:mt-1" icon={<Play />} title={isRunning ? "Waiting for live values" : "No program running"} description={isRunning ? "The first scan snapshot will appear here." : "Run a program to inspect values and trace variables."} />
             : vars.length === 0 ? <EmptyState className="px-4 py-4 [&_h2+div]:mt-1" title="No variables in this snapshot" description="The monitor will update when variables become available." />
             : visibleVars.length === 0 ? <EmptyState className="px-4 py-4 [&_h2+div]:mt-1" title="No matching variables" description="Search by variable name or IEC type." />
-            : <table className="w-full min-w-[520px] border-collapse text-[13px]">
+            : <table className="w-full min-w-[720px] table-fixed border-collapse text-[13px]">
+              {/* Live values and growing history strips must not resize columns. */}
+              <colgroup>
+                <col className="w-10" />
+                <col className="w-[26%]" />
+                <col className="w-24" />
+                <col />
+                <col className="w-44" />
+                <col className="w-16" />
+              </colgroup>
               <thead className="sticky top-0 z-10 bg-muted text-left text-xs text-muted-foreground"><tr>
-                <th className="w-10 px-2 py-2"><span className="sr-only">Trend</span></th><th className="px-2 py-2 font-medium">Variable</th><th className="px-2 py-2 font-medium">Type</th><th className="px-2 py-2 font-medium">Recent history</th><th className="px-2 py-2 text-right font-medium">Value</th><th className="w-16 px-2 py-2 text-center font-medium">Force</th>
+                <th className="px-2 py-2"><span className="sr-only">Trend</span></th><th className="px-2 py-2 font-medium">Variable</th><th className="px-2 py-2 font-medium">Type</th><th className="px-2 py-2 font-medium">Recent history</th><th className="px-2 py-2 text-right font-medium">Value</th><th className="px-2 py-2 text-center font-medium">Force</th>
               </tr></thead>
               <tbody>{visibleVars.map((variable, index) => <VarRow key={`${index}:${variable.name}`} v={variable}
                 history={historyRef.current.get(variable.name) ?? []} isPinned={pinned.has(variable.name)} sparkColor={colorByName[variable.name]} onPin={togglePin}
@@ -457,11 +466,11 @@ function VarRow({ v, history, isPinned, sparkColor, onPin, stale, canWrite, forc
   const forceable = writable || (canWrite && forced && canWriteMonitorType(v.type_name))
   return <tr className={cn("h-9 border-b border-border/50 hover:bg-muted/50", (stale || inputStale) && "text-muted-foreground", isPinned && "bg-selection/50")}>
     <td className="px-2">{trendable && <Button variant="ghost" size="icon-xs" aria-label={`${isPinned ? "Unpin" : "Pin"} ${v.name} ${isPinned ? "from" : "to"} trend`} aria-pressed={isPinned} onClick={() => onPin(v.name)} title={isPinned ? "Unpin from trend" : "Pin to trend"}><Pin className={cn(isPinned ? "text-foreground" : "text-muted-foreground", isPinned && "fill-current rotate-45")} /></Button>}</td>
-    <th scope="row" className="max-w-56 truncate px-2 text-left font-mono font-normal" title={v.name}>{v.name}
+    <th scope="row" className="truncate px-2 text-left font-mono font-normal" title={v.name}>{v.name}
       {inputStale && <span className="ml-2 text-xs text-warn" title="Last-known input, not live feedback">Stale · {v.input!.device}/{v.input!.channel}</span>}
     </th>
-    <td className="px-2 font-mono text-xs text-muted-foreground">{v.type_name}</td>
-    <td className="w-1/3 min-w-24 px-2"><div className="h-5 max-w-72"><CategoryVisual cat={category} v={v} history={history} sparkColor={sparkColor} /></div></td>
+    <td className="truncate px-2 font-mono text-xs text-muted-foreground" title={v.type_name}>{v.type_name}</td>
+    <td className="overflow-hidden px-2"><div className="h-5 w-full min-w-0 max-w-72 overflow-hidden"><CategoryVisual cat={category} v={v} history={history} sparkColor={sparkColor} /></div></td>
     <td className="px-2 text-right"><ValueCell v={v} cat={category} canWrite={writable} onWrite={onWrite} /></td>
     <td className="px-2 text-center">{forceable ? <Button variant="ghost" size="icon-xs" aria-label={`${forced ? "Unforce" : "Force"} ${v.name}`} aria-pressed={forced} onClick={() => onToggleForce(v)} title={forced ? `Unforce ${v.name} (resume program control)` : `Force ${v.name} = current value`}>
       {forced ? <Lock className="text-destructive" /> : <Unlock className="text-muted-foreground" />}
@@ -475,7 +484,7 @@ function ValueCell({ v, cat, canWrite, onWrite }: { v: VarValue; cat: VarCategor
     return <button type="button" onClick={() => void onWrite(on ? 0 : 1)} className={cn("h-7 min-w-20 rounded px-2 text-right font-mono text-[13px]", on ? "bg-highlight/10 text-highlight" : "bg-muted text-foreground")} aria-label={`Toggle ${v.name}`} title="Click to toggle">{on ? "TRUE" : "FALSE"}</button>
   }
   if (canWrite && cat === "numeric") return <NumericEditor name={v.name} typeName={v.type_name} value={v.value} onWrite={onWrite} />
-  return <span className="inline-block min-w-20 font-mono text-[13px] tabular-nums" title={!canWriteMonitorType(v.type_name) ? "Read only" : undefined}>{renderValue(cat, v)}</span>
+  return <span className="inline-block max-w-full truncate align-middle font-mono text-[13px] tabular-nums" title={v.value}>{renderValue(cat, v)}</span>
 }
 
 /** Draft state stays local while snapshots continue. A ref consumes the draft

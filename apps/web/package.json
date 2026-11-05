@@ -9,7 +9,8 @@
     "dev": "vite dev --port 3000",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:monitor-layout": "node scripts/check-monitor-layout.mjs"
   },
   "dependencies": {
     "@carbon/icons-react": "11.88.0",
@@ -45,6 +46,7 @@
     "@types/react-dom": "^19.2.0",
     "@vitejs/plugin-react": "^6.0.1",
     "jsdom": "^28.1.0",
+    "playwright-core": "1.62.1",
     "typescript": "^6.0.2",
     "vite": "8.1.6",
     "vitest": "^4.1.5"

@@ -25,6 +25,36 @@ This project uses [Vitest](https://vitest.dev/) for testing. You can run the tes
 pnpm test
 ```
 
+### Monitor layout regression
+
+From the repository root, install the pinned dependencies and WebKit, then run
+the browser check against a fresh production build:
+
+```bash
+pnpm install --frozen-lockfile
+pnpm --filter @cs/web exec playwright-core install webkit
+pnpm --filter @cs/web build
+pnpm --filter @cs/web test:monitor-layout
+```
+
+On Linux, WebKit may also require system libraries installed with
+`pnpm --filter @cs/web exec playwright-core install-deps webkit`.
+
+The check serves the built IDE on a temporary loopback port and mocks all API
+reads and snapshot events. It does not require a server or connected edge.
+It measures all six Monitor column positions and widths across 90 changing
+snapshots at each of four viewport widths (1836, 1280, 800, and 480 pixels),
+including integer, real, boolean, and string values. It fails on column movement,
+page overflow, missing history, or unexpected requests. Narrow windows keep
+horizontal scrolling inside the Monitor pane.
+
+Screenshots and `result.json` are saved in a new directory under
+`target/monitor-layout/`. Pass `--output ../../target/monitor-layout/custom-run`
+to choose a directory, or `--dist ../../target/monitor-layout/baseline-dist`
+to compare the same fixture with another build (paths are relative to `apps/web`).
+For a negative control, the unpatched Monitor's automatic table layout must fail
+this check when the changing values redistribute column widths.
+
 ## Styling
 
 This project uses [Tailwind CSS](https://tailwindcss.com/) for styling.
