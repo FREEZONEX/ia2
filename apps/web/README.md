@@ -44,9 +44,15 @@ The check serves the built IDE on a temporary loopback port and mocks all API
 reads and snapshot events. It does not require a server or connected edge.
 It measures all six Monitor column positions and widths across 90 changing
 snapshots at each of four viewport widths (1836, 1280, 800, and 480 pixels),
-including integer, real, boolean, and string values. It fails on column movement,
+including integer, real, boolean, and string values. At each width, another six
+snapshots exercise fresh → stale → recovered inputs in both read-only and local
+running states, with medium and long variable names. The check measures whether
+the full `Stale` label fits inside its cell and clipping ancestors, and verifies
+that write/force controls disappear for stale inputs and return on recovery.
+It fails on column movement, clipped/missing stale labels, incorrect controls,
 page overflow, missing history, or unexpected requests. Narrow windows keep
-horizontal scrolling inside the Monitor pane.
+horizontal scrolling inside the Monitor pane; stale labels retain their own
+space while variable names truncate, with device/channel details in a tooltip.
 
 Screenshots and `result.json` are saved in a new directory under
 `target/monitor-layout/`. Pass `--output ../../target/monitor-layout/custom-run`

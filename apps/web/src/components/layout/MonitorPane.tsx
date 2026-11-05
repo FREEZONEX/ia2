@@ -466,8 +466,11 @@ function VarRow({ v, history, isPinned, sparkColor, onPin, stale, canWrite, forc
   const forceable = writable || (canWrite && forced && canWriteMonitorType(v.type_name))
   return <tr className={cn("h-9 border-b border-border/50 hover:bg-muted/50", (stale || inputStale) && "text-muted-foreground", isPinned && "bg-selection/50")}>
     <td className="px-2">{trendable && <Button variant="ghost" size="icon-xs" aria-label={`${isPinned ? "Unpin" : "Pin"} ${v.name} ${isPinned ? "from" : "to"} trend`} aria-pressed={isPinned} onClick={() => onPin(v.name)} title={isPinned ? "Unpin from trend" : "Pin to trend"}><Pin className={cn(isPinned ? "text-foreground" : "text-muted-foreground", isPinned && "fill-current rotate-45")} /></Button>}</td>
-    <th scope="row" className="truncate px-2 text-left font-mono font-normal" title={v.name}>{v.name}
-      {inputStale && <span className="ml-2 text-xs text-warn" title="Last-known input, not live feedback">Stale · {v.input!.device}/{v.input!.channel}</span>}
+    <th scope="row" className="px-2 text-left font-mono font-normal" title={v.name}>
+      <div className="flex min-w-0 items-center gap-2">
+        <span className="min-w-0 truncate">{v.name}</span>
+        {inputStale && <span className="shrink-0 text-xs text-warn" title={`Last-known input, not live feedback: ${v.input!.device}/${v.input!.channel}`}>Stale</span>}
+      </div>
     </th>
     <td className="truncate px-2 font-mono text-xs text-muted-foreground" title={v.type_name}>{v.type_name}</td>
     <td className="overflow-hidden px-2"><div className="h-5 w-full min-w-0 max-w-72 overflow-hidden"><CategoryVisual cat={category} v={v} history={history} sparkColor={sparkColor} /></div></td>

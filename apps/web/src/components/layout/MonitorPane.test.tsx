@@ -100,14 +100,14 @@ describe("confirmed Monitor controls", () => {
     mocks.snapshot.mockReturnValue({ timestamp_us: 2000000n, scan_count: 2n,
       vars: [{ ...level, input: { device: "sensor_io", channel: "level", stale: true } }, vars[1]] })
     view.rerender(<MonitorPane collapsed={false} onToggleCollapse={vi.fn()} />)
-    expect(screen.getByText("Stale · sensor_io/level")).toBeTruthy()
+    expect(screen.getByText("Stale").getAttribute("title")).toBe("Last-known input, not live feedback: sensor_io/level")
     expect(screen.getByText("2.5")).toBeTruthy()
     expect(screen.queryByRole("button", { name: "Force level" })).toBeNull()
     fireEvent.click(screen.getByRole("button", { name: "Toggle run" }))
     await waitFor(() => expect(mocks.writeVariable).toHaveBeenCalledWith("run", 0, "BOOL"))
     mocks.snapshot.mockReturnValue({ timestamp_us: 3000000n, scan_count: 3n, vars })
     view.rerender(<MonitorPane collapsed={false} onToggleCollapse={vi.fn()} />)
-    expect(screen.queryByText("Stale · sensor_io/level")).toBeNull()
+    expect(screen.queryByText("Stale")).toBeNull()
     const row = screen.getByRole("button", { name: "Force level" }).closest("tr")!
     expect(row.querySelectorAll("polyline").length).toBe(2) // separate fresh segments
   })
