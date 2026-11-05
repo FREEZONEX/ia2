@@ -591,3 +591,15 @@ false and does not change existing project files. Source/offline validation is
 not hardware acceptance. Read the [contract and hardware boundary](scan-cycle-handoff.md)
 before preparing a synchronized edge deployment; keep initialization SDO policy
 and any existing read-only maintenance launcher intact.
+
+For a measured deep-idle wakeup problem, Linux synchronized deployments can
+also opt into `IA2_EC_MAX_IDLE_LATENCY_US` (integer microseconds, 0–1000000).
+The worker opens `/dev/cpu_dma_latency`, submits the constraint and checks the
+effective limit before initialization. It needs read/write access to that
+device; denial fails startup rather than silently falling back. The request
+persists only while the worker owns the descriptor, including safe shutdown;
+closing it releases the request. This is an aggregate system-wide CPU idle
+constraint and may increase idle power. It does not alter persistent OS
+configuration, scheduling priorities, EtherCAT DC limits or the fault latch.
+Validate both its effect on idle states and sustained disabled bus continuity
+on the target; setting a value alone is not a real-time guarantee.

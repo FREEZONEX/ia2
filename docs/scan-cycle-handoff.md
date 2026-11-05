@@ -76,6 +76,22 @@ deployment options do not guarantee a deadline or change the missing-frame
 latch; load, blocking, interrupt handling and device latency still require
 field acceptance. Neither option modifies drive parameters.
 
+Real-time scheduling does not bound the time to leave a deep CPU idle state.
+On Linux, `IA2_EC_MAX_IDLE_LATENCY_US=0..1000000` optionally holds a CPU latency
+PM QoS request through `/dev/cpu_dma_latency` for the synchronized bus worker's
+lifetime. For example, `50` permits idle states with a reported exit latency
+up to 50 microseconds. Choose and qualify the value on the target hardware.
+The effective aggregate limit is read back before bus initialization; invalid
+values, unavailable devices, denied requests or an insufficient readback fail
+initialization. Omitting it preserves the OS policy. Unsynchronized and
+non-Linux workers do not request it.
+
+The constraint is system-wide while its file is open, can increase idle power,
+and is released automatically on worker teardown or process exit. It does not
+change CPU affinity, priorities, drive parameters or any cycle deadline, and
+does not guarantee wakeup latency against other kernel or firmware delays.
+See the Linux [CPU idle PM QoS interface](https://docs.kernel.org/admin-guide/pm/cpuidle.html).
+
 During synchronized startup the worker follows the reference clock while
 sending zero outputs. It waits for four adjacent DC slots with all devices
 in OP and the expected working counter, then retains the next deadline
@@ -149,6 +165,15 @@ the prior timer entry margin, the time from prior exchange completion to timer
 entry, and the current pre-exchange and exchange durations.
 An expired ticket publication additionally records the time from exchange
 completion to publication.
+
+The first expired DC output-selection window also records its sequence,
+previous reference-clock sample, excess over the send limit, wakeup lateness,
+time from loop entry to the locked selection check, and prior timer-entry
+margin/late time. This covers sub-period misses that do not reach the
+whole-period warning threshold. Selection delay includes any lock wait or
+preemption between loop entry and the check; a scheduler trace is still needed
+to distinguish those causes. The report is emitted after selecting zero outputs
+and releasing the gate lock, once per latch. It does not change any deadline.
 
 ## Offline proof and hardware boundary
 
