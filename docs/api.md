@@ -597,6 +597,12 @@ its edge/device names, for example
 `edges/plant%2Fsdo%2Fedge-a/sdo/motion%2Fsdo%2Fbus/1/0x2008/1`.
 SDO name escapes are decoded once; encode a literal `%` as `%25`.
 
+For edge requests, SDO matching also requires decimal slave/subindex fields and
+a decimal or `0x` hexadecimal index. Numeric ranges are checked by the server.
+Other suffixes retain normal edge configuration/subread meaning, even under a
+folder named `sdo`. If an edge name itself matches the entire SDO grammar, read
+its configuration with `cs api GET /api/edges/<percent-encoded-full-name>`.
+
 ### Bus-clocked scan diagnostics
 
 The existing local runtime status and edge status surfaces include optional

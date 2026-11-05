@@ -1036,6 +1036,62 @@ fn a_named_ipv6_origin_works_with_browser_canonical_headers_and_preflights() {
 }
 
 #[test]
+fn sdo_directories_preserve_edge_configuration_and_subread_routes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("edge_paths");
+    let store = project::ProjectStore::create(proj.clone(), "edge_paths").unwrap();
+    let names = [
+        "plant/sdo/area/line/cell/rack/edge",
+        "plant/sdo/area/line/sdo/rack/edge",
+    ];
+    for name in names {
+        store.create_edge(name, "127.0.0.1").unwrap();
+    }
+    // A name matching the entire reserved SDO grammar is still readable
+    // through the raw API, with the complete name encoded as one component.
+    let reserved_name = "plant/sdo/bus/1/0x2008/1";
+    store.create_edge(reserved_name, "127.0.0.1").unwrap();
+    let server = spawn_server(tmp.path());
+    server.open_project(&proj);
+    for name in names {
+        let output = cs(&server.base)
+            .args(["get", &format!("edges/{name}")])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let edge: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(edge["name"], name);
+        // Missing targets stop before any network access. The exact name in
+        // the 404 proves the CLI reached the intended edge subroute, not SDO.
+        let missing = format!("missing/{name}");
+        for subread in ["status", "logs", "audit", "scan", "probe", "system"] {
+            cs(&server.base)
+                .args(["get", &format!("edges/{missing}/{subread}")])
+                .assert()
+                .code(2)
+                .stderr(predicates::str::contains(format!(
+                    "edge '{missing}' not found"
+                )));
+        }
+    }
+    let encoded =
+        percent_encoding::utf8_percent_encode(reserved_name, percent_encoding::NON_ALPHANUMERIC);
+    cs(&server.base)
+        .args(["api", "GET", &format!("/api/edges/{encoded}")])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(reserved_name));
+    // Out-of-range numeric addresses must still reach SDO validation.
+    cs(&server.base)
+        .args(["get", "edges/missing/sdo/motion/bus/1/0x10000/1"])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("index must be a u16"));
+}
+
+#[test]
 fn sdo_resource_is_read_only_and_keeps_the_idle_scenario_running() {
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("sdo_idle");

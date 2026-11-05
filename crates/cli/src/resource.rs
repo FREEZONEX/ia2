@@ -166,6 +166,27 @@ pub(crate) fn resolve_ls(path: Option<&str>) -> Result<Option<Plan>> {
     }
 }
 
+/// Recognize numeric address spelling without validating its range. The server
+/// owns range errors; the CLI only distinguishes SDO from ordinary edge names.
+fn sdo_address_suffix(parts: &[String]) -> bool {
+    fn decimal(part: &str) -> bool {
+        let digits = part
+            .strip_prefix('+')
+            .or_else(|| part.strip_prefix('-'))
+            .unwrap_or(part);
+        !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+    }
+    let [slave, index, subindex] = parts else {
+        return false;
+    };
+    decimal(slave)
+        && decimal(subindex)
+        && index.strip_prefix("0x").map_or_else(
+            || decimal(index),
+            |hex| !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()),
+        )
+}
+
 /// Resolve `cs get <path>`.
 pub(crate) fn resolve_get(path: &str) -> Result<Plan> {
     let (kind, rest) = split(path);
@@ -182,7 +203,9 @@ pub(crate) fn resolve_get(path: &str) -> Result<Plan> {
     let address_at = rest.len().saturating_sub(3);
     let sdo_at = match kind {
         "runtime" if rest.first().map(String::as_str) == Some("sdo") => Some(0),
-        "edges" => {
+        // A folder called `sdo` alone must not capture ordinary configuration
+        // reads or reserved subreads such as /status, /logs and /audit.
+        "edges" if sdo_address_suffix(&rest[address_at..]) => {
             let mut markers = rest.iter().enumerate().filter_map(|(i, part)| {
                 (i > 0 && i + 1 < address_at && part == "sdo").then_some(i)
             });
@@ -463,6 +486,71 @@ mod tests {
             ("runtime/sdo/车间/总线/0/8192/0", "/api/runtime/sdo?device=%E8%BD%A6%E9%97%B4%2F%E6%80%BB%E7%BA%BF&slave=0&index=8192&subindex=0"),
         ] {
             assert_eq!(get_url(path), expected, "{path}");
+        }
+    }
+
+    #[test]
+    fn sdo_directories_do_not_capture_edge_configuration_reads() {
+        for name in [
+            "plant/sdo/area/line/cell/rack/edge",
+            "plant/sdo/area/line/sdo/rack/edge",
+            "plant/sdo/bus/1/axis/0",
+            "plant/sdo/bus/1/0x2008/name",
+            "plant/sdo/bus/name/0x2008/1",
+            "plant/sdo/bus/1/0xnothex/1",
+            "plant/%73do/area/line/cell/rack/edge",
+        ] {
+            assert_eq!(
+                get_url(&format!("edges/{name}")),
+                format!("/api/edges/{}", url_encode(name)),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn sdo_directories_do_not_capture_edge_subreads() {
+        for name in [
+            "plant/sdo/area/line/cell/rack/edge",
+            "plant/sdo/area/line/sdo/rack/edge",
+            "plant/sdo/bus/1/0x2008/1",
+        ] {
+            for &subread in EDGE_SUBREADS {
+                let route = if subread == "scan" {
+                    "discover"
+                } else {
+                    subread
+                };
+                assert_eq!(
+                    get_url(&format!("edges/{name}/{subread}")),
+                    format!("/api/edges/{}/{route}", url_encode(name)),
+                    "{name}/{subread}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn edge_sdo_numeric_ranges_are_validated_by_the_server() {
+        for address in [
+            "65536/0x2008/1",
+            "1/0x10000/1",
+            "1/0x2008/256",
+            "-1/0x2008/1",
+            "1/-1/1",
+            "+1/+8192/+1",
+            "999999999999/0xFFFFFFFFFFFF/999999999999",
+        ] {
+            let parts: Vec<_> = address.split('/').collect();
+            assert_eq!(
+                get_url(&format!("edges/edge-a/sdo/motion/bus/{address}")),
+                format!(
+                    "/api/edges/edge-a/sdo?device=motion%2Fbus&slave={}&index={}&subindex={}",
+                    url_encode(parts[0]),
+                    url_encode(parts[1]),
+                    url_encode(parts[2])
+                )
+            );
         }
     }
 
