@@ -3,6 +3,7 @@
 use std::{io, time::Instant};
 
 const RT_PRIORITY_ENV: &str = "IA2_EC_SYNC_RT_PRIORITY";
+const IDLE_LATENCY_ENV: &str = "IA2_EC_MAX_IDLE_LATENCY_US";
 
 pub(crate) fn configured_rt_priority() -> io::Result<Option<i32>> {
     iocore::realtime::configured_priority(RT_PRIORITY_ENV)
@@ -10,11 +11,24 @@ pub(crate) fn configured_rt_priority() -> io::Result<Option<i32>> {
 
 pub(crate) struct CycleTimer {
     native: bool,
+    // Own the PM QoS lease until the cyclic worker finishes its safe shutdown.
+    _idle_latency: Option<iocore::realtime::CpuIdleLatency>,
 }
 
 impl CycleTimer {
     pub(crate) fn new(synchronized: bool, rt_priority: Option<i32>) -> io::Result<Self> {
         let native = synchronized && cfg!(target_os = "linux");
+        let idle_latency = if native {
+            iocore::realtime::CpuIdleLatency::from_environment(IDLE_LATENCY_ENV)?
+        } else {
+            None
+        };
+        if let Some(request) = &idle_latency {
+            tracing::info!(
+                effective_us = request.effective_us(),
+                "EtherCAT worker holds CPU idle latency constraint"
+            );
+        }
         #[cfg(target_os = "linux")]
         if native {
             // SAFETY: PR_SET_TIMERSLACK takes an unsigned long in nanoseconds
@@ -28,7 +42,10 @@ impl CycleTimer {
         }
         #[cfg(not(target_os = "linux"))]
         debug_assert!(rt_priority.is_none());
-        Ok(Self { native })
+        Ok(Self {
+            native,
+            _idle_latency: idle_latency,
+        })
     }
 
     pub(crate) fn uses_native_clock(&self) -> bool {

@@ -76,6 +76,34 @@ deployment options do not guarantee a deadline or change the missing-frame
 latch; load, blocking, interrupt handling and device latency still require
 field acceptance. Neither option modifies drive parameters.
 
+Real-time scheduling does not bound the time to leave a deep CPU idle state.
+On Linux, `IA2_EC_MAX_IDLE_LATENCY_US=0..1000000` optionally holds a CPU latency
+PM QoS request through `/dev/cpu_dma_latency` for the synchronized bus worker's
+lifetime. For example, `50` permits idle states with a reported exit latency
+up to 50 microseconds, including a state reporting 18 microseconds. It does
+not mean "C1 only". Choose and qualify the value on the target hardware;
+verify per-CPU idle counters as described in the
+[deployment procedure](edge-deploy.md#opt-in-bus-clocked-scans).
+The effective aggregate limit is read back before bus initialization; invalid
+values, unavailable devices, denied requests or an insufficient readback fail
+initialization. Omitting it preserves the OS policy. Unsynchronized and
+non-Linux workers do not request it.
+
+The constraint is system-wide while its file is open, can increase idle power,
+and is released automatically on worker teardown or process exit. It does not
+change CPU affinity, priorities, drive parameters or any cycle deadline, and
+does not guarantee wakeup latency against other kernel or firmware delays.
+See the Linux [CPU idle PM QoS interface](https://docs.kernel.org/admin-guide/pm/cpuidle.html).
+
+Idle wake latency and runnable-task dispatch latency are different. An idle
+constraint does not make kernel code preemptible. On a `PREEMPT_DYNAMIC` host,
+verify the selected mode as well as the bus/scan priorities: `voluntary` can
+leave a ready realtime thread waiting behind ordinary kernel work. A qualified
+deployment may require `full` preemption before it starts the cyclic worker;
+that host policy is separate from this runtime's process-owned PM QoS lease.
+Preserve wakeup, context-switch and packet timing evidence to distinguish a
+late timer, delayed dispatch, lock wait and actual network latency.
+
 During synchronized startup the worker follows the reference clock while
 sending zero outputs. It waits for four adjacent DC slots with all devices
 in OP and the expected working counter, then retains the next deadline
@@ -150,6 +178,15 @@ entry, and the current pre-exchange and exchange durations.
 An expired ticket publication additionally records the time from exchange
 completion to publication.
 
+The first expired DC output-selection window also records its sequence,
+previous reference-clock sample, excess over the send limit, wakeup lateness,
+time from loop entry to the locked selection check, and prior timer-entry
+margin/late time. This covers sub-period misses that do not reach the
+whole-period warning threshold. Selection delay includes any lock wait or
+preemption between loop entry and the check; a scheduler trace is still needed
+to distinguish those causes. The report is emitted after selecting zero outputs
+and releasing the gate lock, once per latch. It does not change any deadline.
+
 ## Offline proof and hardware boundary
 
 `examples/cycle_handoff` uses only `_sim`, two scalar output fields and a 50 ms
@@ -160,6 +197,26 @@ The CLI e2e also reads the HTTP event stream and checks consecutive consumed
 sequences. Unit tests exercise 10,000 deterministic 2 ms complete frames, old
 mailbox repeat/skip behavior, invalid submissions, failsafe persistence, fixed
 inputs, and the real adapter's byte packing without opening a NIC.
+
+`real::dc_pipeline_tests` combines the production output-selection gate and
+returned-DC continuity hook in worker order, followed by input publication and
+PLC begin/commit. Run it with
+`cargo test -p iomap-ethercat real::dc_pipeline_tests`. It covers:
+
+- 10,000 complete, exactly-once handoffs with adjacent DC slots and varying phase;
+- five DC phases at one nanosecond before, exactly at, and one nanosecond after
+  the send limit, before arming, before the first ticket, and with a pending frame;
+- a slot skip after an on-time nonzero selection, refusing the next ticket;
+- zero, backwards, duplicate, skipped and wrapped DC samples;
+- first-fault retention, zero selection and no rearming over 64 later exchanges;
+- the host deadline inside an otherwise open DC send window, and response/input
+  copy work that exhausts the next publication deadline.
+
+The deterministic clock helpers are compiled only for tests. A post-selection
+delay test explicitly permits the already selected frame and verifies inhibition
+of subsequent frames; it does not claim that the first late frame was prevented.
+Preserving the first fault does not assert that a secondary DC diagnostic exists
+after a selection-expiry fault.
 
 These tests prove state transitions and data ownership, not host jitter at a 2 ms
 hardware deadline. Hardware acceptance still needs actual process scheduling,
