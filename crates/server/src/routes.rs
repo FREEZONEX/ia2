@@ -1,12 +1,7 @@
 //! HTTP route handlers.
 //!
 //! Grouped by concern (project lifecycle / POUs / devices / iomap / runtime
-//! / health), with library and device-catalog handlers in a child module.
-
-mod library_catalog;
-pub use library_catalog::{
-    import_library, list_device_catalog, list_libraries, match_device_catalog, remove_library,
-};
+//! / health), with extracted handlers in dedicated child modules.
 
 use crate::conditional::{self, Versioned};
 use axum::http::HeaderMap;
@@ -49,6 +44,11 @@ use crate::error::ApiError;
 use crate::events::{topic, AppEvent, MutationDetail};
 use crate::state::RunningProgram;
 use serde::Deserialize as SerdeDeserialize;
+
+mod library_catalog;
+pub use library_catalog::{
+    import_library, list_device_catalog, list_libraries, match_device_catalog, remove_library,
+};
 
 /// HTTP header name used by every multi-project-aware client. The web
 /// app sets it from the `?project=` URL search param; CLI sets it
