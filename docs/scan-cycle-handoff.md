@@ -195,6 +195,26 @@ sequences. Unit tests exercise 10,000 deterministic 2 ms complete frames, old
 mailbox repeat/skip behavior, invalid submissions, failsafe persistence, fixed
 inputs, and the real adapter's byte packing without opening a NIC.
 
+`real::dc_pipeline_tests` combines the production output-selection gate and
+returned-DC continuity hook in worker order, followed by input publication and
+PLC begin/commit. Run it with
+`cargo test -p iomap-ethercat real::dc_pipeline_tests`. It covers:
+
+- 10,000 complete, exactly-once handoffs with adjacent DC slots and varying phase;
+- five DC phases at one nanosecond before, exactly at, and one nanosecond after
+  the send limit, before arming, before the first ticket, and with a pending frame;
+- a slot skip after an on-time nonzero selection, refusing the next ticket;
+- zero, backwards, duplicate, skipped and wrapped DC samples;
+- first-fault retention, zero selection and no rearming over 64 later exchanges;
+- the host deadline inside an otherwise open DC send window, and response/input
+  copy work that exhausts the next publication deadline.
+
+The deterministic clock helpers are compiled only for tests. A post-selection
+delay test explicitly permits the already selected frame and verifies inhibition
+of subsequent frames; it does not claim that the first late frame was prevented.
+Preserving the first fault does not assert that a secondary DC diagnostic exists
+after a selection-expiry fault.
+
 These tests prove state transitions and data ownership, not host jitter at a 2 ms
 hardware deadline. Hardware acceptance still needs actual process scheduling,
 wire traces/WKC, DC phase, compute budget and stop behavior under load. A deadline

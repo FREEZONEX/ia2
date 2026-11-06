@@ -2363,6 +2363,10 @@ fn smol_main(
 }
 
 #[cfg(test)]
+#[path = "dc_pipeline_tests.rs"]
+mod dc_pipeline_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

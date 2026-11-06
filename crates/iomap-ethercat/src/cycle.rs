@@ -259,6 +259,14 @@ impl<T: Clone> Gate<T> {
 // Production callers always sample the monotonic clock after acquiring the lock.
 #[cfg(test)]
 impl<T: Clone> Gate<T> {
+    pub(crate) fn consume_before_at(
+        &self,
+        now: Instant,
+        limit: Instant,
+        apply: impl FnOnce(Option<&T>),
+    ) {
+        self.consume_with_clock(|| now, Some(limit), apply);
+    }
     pub(crate) fn commit_at(&self, ticket: Ticket, image: T, now: Instant) -> Result<(), IoError> {
         self.commit_with_clock(ticket, image, || now)
     }
