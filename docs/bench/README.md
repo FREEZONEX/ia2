@@ -27,6 +27,10 @@ claim. Raw capture files are never silently cleaned up to obtain a pass.
 
 ## Documents
 
+- [`ethercat-dc-qualification-20261106.md`](ethercat-dc-qualification-20261106.md)
+  — supplemental DC pipeline tests, recurrence with 50 us + full preemption,
+  and a 30-minute disabled qualification with 2 us + full; measurement
+  transcript and archive hashes, with motion still unqualified.
 - [`ethercat-2ms-dc-sync.md`](ethercat-2ms-dc-sync.md) — 2 ms scan
   cadence on a non-RT kernel, DC-SYNC0 CiA402 motion, electronic-gear
   accuracy, watchdog latch A/B, bus-loss self-heal.
