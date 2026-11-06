@@ -1,10 +1,7 @@
 //! HTTP route handlers.
 //!
 //! Grouped by concern (project lifecycle / POUs / devices / iomap / runtime
-//! / health). The LSP WebSocket bridge lives in its own submodule.
-
-mod lsp;
-pub use lsp::lsp;
+//! / health), with extracted handlers in dedicated child modules.
 
 use crate::conditional::{self, Versioned};
 use axum::http::HeaderMap;
@@ -2951,6 +2948,9 @@ pub async fn poke_demo_slave(
     }
     Ok(Json(RunResponse { ok: true }))
 }
+
+mod lsp;
+pub use lsp::lsp;
 
 // ============================================================
 //  Helpers
