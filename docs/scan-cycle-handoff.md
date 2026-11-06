@@ -80,7 +80,10 @@ Real-time scheduling does not bound the time to leave a deep CPU idle state.
 On Linux, `IA2_EC_MAX_IDLE_LATENCY_US=0..1000000` optionally holds a CPU latency
 PM QoS request through `/dev/cpu_dma_latency` for the synchronized bus worker's
 lifetime. For example, `50` permits idle states with a reported exit latency
-up to 50 microseconds. Choose and qualify the value on the target hardware.
+up to 50 microseconds, including a state reporting 18 microseconds. It does
+not mean "C1 only". Choose and qualify the value on the target hardware;
+verify per-CPU idle counters as described in the
+[deployment procedure](edge-deploy.md#opt-in-bus-clocked-scans).
 The effective aggregate limit is read back before bus initialization; invalid
 values, unavailable devices, denied requests or an insufficient readback fail
 initialization. Omitting it preserves the OS policy. Unsynchronized and

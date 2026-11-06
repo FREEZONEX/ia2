@@ -604,6 +604,23 @@ configuration, scheduling priorities, EtherCAT DC limits or the fault latch.
 Validate both its effect on idle states and sustained disabled bus continuity
 on the target; setting a value alone is not a real-time guarantee.
 
+Choose the limit from the target's reported idle-state latencies, not from a
+state name or an earlier passing run. For example, when C1 reports 1 us, C2
+18 us and C3 350 us, a 50 us request still permits C2; a 2 us request excludes
+both C2 and C3. These are example values, not a default for every host. Read
+each online CPU's `cpuidle/state*/{name,latency,usage,time}` under
+`/sys/devices/system/cpu/cpuN/`. Compare usage and time counters over the
+qualification window while the worker's lease is held: excluded states must
+not accumulate entries or residency. Preserve the online CPU set, effective
+QoS readback, process identity and per-thread scheduling policies with the
+wire capture. Missing counters or a changed CPU set leave this check unknown.
+
+Keep a passing window's duration and workload explicit. A later recurrence
+invalidates acceptance of that deployment profile; it must not be dismissed
+because the same settings previously passed. Retain the earlier evidence,
+distinguish pre-wakeup delay from run-queue delay, and qualify any revised
+profile with the existing DC deadlines and zero-output latch intact.
+
 Qualify kernel preemption separately. A `PREEMPT_DYNAMIC` kernel can still be
 running in `voluntary` mode: an ordinary kernel worker can defer an already
 runnable `SCHED_RR` bus thread until a voluntary scheduling point. Read the
