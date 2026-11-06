@@ -4395,3 +4395,6 @@ mod deploy_precheck_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod library_catalog_tests;
