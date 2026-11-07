@@ -1,47 +1,11 @@
 //! Deadline wait for the dedicated synchronized EtherCAT worker.
 
-use std::{env, io, time::Instant};
+use std::{io, time::Instant};
 
 const RT_PRIORITY_ENV: &str = "IA2_EC_SYNC_RT_PRIORITY";
 
 pub(crate) fn configured_rt_priority() -> io::Result<Option<i32>> {
-    match env::var(RT_PRIORITY_ENV) {
-        Ok(value) => parse_rt_priority(&value).map(Some),
-        Err(env::VarError::NotPresent) => Ok(None),
-        Err(error) => Err(io::Error::new(io::ErrorKind::InvalidInput, error)),
-    }
-}
-
-fn parse_rt_priority(value: &str) -> io::Result<i32> {
-    if !cfg!(target_os = "linux") {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            format!("{RT_PRIORITY_ENV} requires Linux"),
-        ));
-    }
-    value
-        .parse::<i32>()
-        .ok()
-        .filter(|p| (1..=20).contains(p))
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("{RT_PRIORITY_ENV} must be 1..=20"),
-            )
-        })
-}
-
-#[cfg(target_os = "linux")]
-fn set_round_robin(priority: i32) -> io::Result<()> {
-    let params = libc::sched_param {
-        sched_priority: priority,
-    };
-    // SAFETY: pid 0 selects only the current thread. params is initialized
-    // and is read by the kernel during this call.
-    if unsafe { libc::sched_setscheduler(0, libc::SCHED_RR, &params) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    iocore::realtime::configured_priority(RT_PRIORITY_ENV)
 }
 
 pub(crate) struct CycleTimer {
@@ -59,7 +23,7 @@ impl CycleTimer {
                 return Err(io::Error::last_os_error());
             }
             if let Some(priority) = rt_priority {
-                set_round_robin(priority)?;
+                iocore::realtime::set_current_thread_round_robin(priority)?;
             }
         }
         #[cfg(not(target_os = "linux"))]
@@ -225,11 +189,11 @@ mod tests {
     #[test]
     fn real_time_priority_is_explicit_bounded_and_linux_only() {
         assert_eq!(
-            parse_rt_priority("10").ok(),
+            iocore::realtime::parse_priority(RT_PRIORITY_ENV, "10").ok(),
             cfg!(target_os = "linux").then_some(10)
         );
         for invalid in ["", "0", "-1", "21", "99", "bogus"] {
-            assert!(parse_rt_priority(invalid).is_err());
+            assert!(iocore::realtime::parse_priority(RT_PRIORITY_ENV, invalid).is_err());
         }
     }
 
