@@ -445,7 +445,7 @@ origin header to the runtime, where every write — whatever it claimed
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/api/lsp` | WebSocket upgrade. Bridges to a freshly-spawned ironplc LSP process (JSON-RPC). | Frame format = bare JSON-RPC bodies — proxy adds/strips Content-Length headers for stdio |
+| `GET` | `/api/lsp` | WebSocket upgrade. Bridges to a freshly-spawned ironplc LSP process (JSON-RPC). Frame format = bare JSON-RPC bodies — proxy adds/strips Content-Length headers for stdio. If the launcher cannot start, closes with code `1011` and a short reinstall message; the server log includes the full launcher path. |
 
 ## Internal / debug aids
 
