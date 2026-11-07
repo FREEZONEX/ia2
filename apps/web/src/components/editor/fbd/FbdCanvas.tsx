@@ -261,7 +261,7 @@ export function FbdCanvas({
         const powered =
           liveValues && srcBlock ? liveValues.pin(srcBlock, o.from_pin) : null
         return (
-          <g key={`out-${i}`}>
+          <g key={`out-${i}`} pointerEvents="none">
             <line
               x1={x1}
               y1={y1}
