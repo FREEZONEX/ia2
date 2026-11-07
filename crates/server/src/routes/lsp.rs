@@ -57,12 +57,10 @@ async fn handle_lsp_ws(mut socket: WebSocket) {
             let _ = socket
                 .send(Message::Close(Some(axum::extract::ws::CloseFrame {
                     code: 1011, // internal error
-                    reason: format!(
-                        "lsp-launcher not available at {} — reinstall (the \
-                         binary ships alongside ia2-server)",
-                        cmd.display()
-                    )
-                    .into(),
+                    // Close reasons allow only 123 UTF-8 bytes; the full path
+                    // is already in the server log and may be arbitrarily long.
+                    reason: "lsp-launcher not available — reinstall (the binary ships alongside ia2-server)"
+                        .into(),
                 })))
                 .await;
             return;
