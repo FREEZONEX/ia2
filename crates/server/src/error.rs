@@ -37,6 +37,8 @@ impl From<StoreError> for ApiError {
             StoreError::EdgeNotFound(n) => Self::NotFound(format!("edge '{n}' not found")),
             StoreError::FolderNotFound(n) => Self::NotFound(format!("folder '{n}' not found")),
             StoreError::FolderNotEmpty(n) => Self::Conflict(format!("folder '{n}' not empty")),
+            e @ (StoreError::LibraryPathConflict(..)
+            | StoreError::LibraryPermissionConflict { .. }) => Self::Conflict(e.to_string()),
             e @ (StoreError::LibraryBusy
             | StoreError::LibraryRecoveryRequired(..)
             | StoreError::LibraryCommitUnconfirmed(..)) => Self::Unavailable(e.to_string()),

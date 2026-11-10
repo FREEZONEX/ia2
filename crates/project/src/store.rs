@@ -552,24 +552,7 @@ impl ProjectStore {
     /// Delete is serialized with import and recovery. Missing directories
     /// remain idempotent. The delete operation retains its original semantics.
     pub fn remove_library(&self, library: &str) -> Result<(), StoreError> {
-        validate_single_segment(library)?;
-        let _guard = library_transaction::write_guard(&self.root)?;
-        let directories = library_transaction::existing_library_dirs(&self.root, library)?;
-        let lib_root = self.root.join("pous").join(LIBRARY_SLUG_PREFIX);
-        if directories == 3 {
-            fs::remove_dir_all(lib_root.join(library))?;
-        }
-        if directories >= 2 && fs::read_dir(&lib_root)?.next().is_none() {
-            fs::remove_dir(&lib_root)?;
-        }
-        let mut table = self.read_manifest_table()?;
-        if let Some(toml::Value::Table(libs)) = table.get_mut("libraries") {
-            libs.remove(library);
-            if libs.is_empty() {
-                table.remove("libraries");
-            }
-        }
-        self.write_manifest_table(&table)
+        library_transaction::remove(&self.root, library)
     }
 
     /// Copy a source tree under the same guard as compiler input reads.
@@ -585,14 +568,6 @@ impl ProjectStore {
     fn read_manifest_table(&self) -> Result<toml::Table, StoreError> {
         let text = fs::read_to_string(self.root.join("project.toml"))?;
         Ok(toml::from_str(&text)?)
-    }
-
-    fn write_manifest_table(&self, table: &toml::Table) -> Result<(), StoreError> {
-        write_atomic(
-            self.root.join("project.toml"),
-            toml::to_string_pretty(table)?,
-        )?;
-        Ok(())
     }
 
     // ---------------- Devices ----------------

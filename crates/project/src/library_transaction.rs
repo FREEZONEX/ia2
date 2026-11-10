@@ -6,12 +6,13 @@
 
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions, Permissions};
-use std::io::{self, ErrorKind, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::library_permissions;
 use crate::store::{validate_single_segment, LIBRARY_SLUG_PREFIX};
 use crate::StoreError;
 
@@ -148,13 +149,16 @@ struct Change {
 struct Image {
     sha256: String,
     mode: u32,
+    #[serde(default)]
+    access: String,
 }
 
 impl Image {
-    fn of(bytes: &[u8], mode: u32) -> Self {
+    fn of(bytes: &[u8], mode: u32, access: String) -> Self {
         Self {
             sha256: format!("{:x}", Sha256::digest(bytes)),
             mode,
+            access,
         }
     }
 }
@@ -176,8 +180,12 @@ impl Journal {
                 return Err(invalid("duplicate journal block").into());
             }
         }
-        if self.format != 1
-            || self.existing_directories > 3
+        if self.format != 2 {
+            return Err(
+                invalid("library journal format lacks supported permission evidence").into(),
+            );
+        }
+        if self.existing_directories > 3
             || self.files.len() != self.blocks.len() + 1
             || self
                 .files
@@ -192,8 +200,15 @@ impl Journal {
         }
         for change in &self.files {
             let original_mode = change.before.as_ref().map_or(0o600, |image| image.mode);
-            if original_mode & !0o7777 != 0 || change.after.mode != original_mode {
-                return Err(invalid("inconsistent file mode in library journal").into());
+            if original_mode & !0o7777 != 0
+                || change.after.mode != original_mode
+                || change.after.access.is_empty()
+                || change
+                    .before
+                    .as_ref()
+                    .is_some_and(|image| image.access != change.after.access)
+            {
+                return Err(invalid("inconsistent permissions in library journal").into());
             }
         }
         Ok(())
@@ -216,14 +231,8 @@ pub(crate) fn import(
 ) -> Result<(), StoreError> {
     validate_single_segment(library)?;
     let _guard = write_guard(root)?;
-    let stage = root.join(STAGE);
-    cleanup_stage(root)?;
     checkpoint(Phase::BeforeStage)?;
-    let owner = owner_marker(&stage)?;
-    private_directory(&stage)?;
-    write_private(&stage.join(owner), b"", 0o600)?;
-    sync_directory(&stage)?;
-
+    let stage = create_stage(root)?;
     let active = root.join(ACTIVE);
     let journal = match prepare(root, &stage, library, version, files).and_then(|journal| {
         checkpoint(Phase::Prepared)?;
@@ -244,23 +253,27 @@ pub(crate) fn import(
             fs::create_dir(dir)?;
             sync_directory(dir.parent().expect("library directory has parent"))?;
         }
+        check_current_library_path(root, library)?;
         for (index, change) in journal.files.iter().enumerate() {
             checkpoint(Phase::BeforeInstall(index))?;
             existing_library_dirs(root, library)?;
             let target = journal.target(root, index);
             if current(&target)?.as_ref() != change.before.as_ref() {
-                return Err(conflict(&target));
+                return Err(conflict(&target).into());
             }
             replace(&active, &target, index, &change.after, "new")?;
             checkpoint(Phase::AfterInstall(index))?;
         }
         checkpoint(Phase::BeforeCommit)?;
         verify_installed(root, &journal)?;
-        fs::rename(active.join(PREPARED), active.join(COMMITTED))
+        fs::rename(active.join(PREPARED), active.join(COMMITTED))?;
+        Ok::<(), StoreError>(())
     })();
     if let Err(error) = install {
-        return match rollback(root, &active, &journal).and_then(|()| retire(root)) {
-            Ok(()) => Err(error.into()),
+        return match rollback(root, &active, &journal)
+            .and_then(|()| retire(root).map_err(Into::into))
+        {
+            Ok(()) => Err(error),
             Err(rollback_error) => Err(recovery_required(format!(
                 "import failed ({error}); rollback stopped ({rollback_error})"
             ))),
@@ -275,6 +288,71 @@ pub(crate) fn import(
     Ok(())
 }
 
+pub(crate) fn remove(root: &Path, library: &str) -> Result<(), StoreError> {
+    validate_single_segment(library)?;
+    let _guard = write_guard(root)?;
+    let manifest = root.join(MANIFEST);
+    let (before, contents) = read_image(&manifest)?
+        .ok_or_else(|| StoreError::NotFound(manifest.display().to_string()))?;
+    let mut table = decode_manifest(&contents)?;
+    let count = check_library_path(root, library, &table, None)?;
+    let dirs = library_dirs(root, library);
+    let Some(toml::Value::Table(libraries)) = table.get_mut("libraries") else {
+        return Ok(remove_library_dirs(&dirs, count)?);
+    };
+    if libraries.remove(library).is_none() {
+        return Ok(remove_library_dirs(&dirs, count)?);
+    }
+    if libraries.is_empty() {
+        table.remove("libraries");
+    }
+    #[cfg(windows)]
+    if before.mode & 0o200 == 0 {
+        return Err(StoreError::LibraryPermissionConflict {
+            path: manifest.display().to_string(),
+            reason: "the manifest is read-only".into(),
+        });
+    }
+
+    // Verify the new manifest before removing the library directory.
+    let stage = create_stage(root)?;
+    let result = (|| {
+        let path = stage.join("replace.tmp");
+        let file = write_private(
+            &path,
+            toml::to_string_pretty(&table)?.as_bytes(),
+            before.mode,
+        )?;
+        check_replacement_access(&file, &manifest, before.mode, Some(&before.access))?;
+        drop(file);
+        remove_library_dirs(&dirs, count)?;
+        fs::rename(path, &manifest)?;
+        Ok(sync_directory(root)?)
+    })();
+    warn_cleanup(root, cleanup_stage(root));
+    result
+}
+
+fn remove_library_dirs(dirs: &[PathBuf; 3], count: usize) -> io::Result<()> {
+    if count == 3 {
+        fs::remove_dir_all(&dirs[2])?;
+    }
+    if count >= 2 && fs::read_dir(&dirs[1])?.next().is_none() {
+        fs::remove_dir(&dirs[1])?;
+    }
+    Ok(())
+}
+
+fn create_stage(root: &Path) -> io::Result<PathBuf> {
+    cleanup_stage(root)?;
+    let stage = root.join(STAGE);
+    let owner = owner_marker(&stage)?;
+    private_directory(&stage)?;
+    write_private(&stage.join(owner), b"", 0o600)?;
+    sync_directory(&stage)?;
+    Ok(stage)
+}
+
 fn prepare(
     root: &Path,
     stage: &Path,
@@ -282,41 +360,52 @@ fn prepare(
     version: &str,
     files: &[(String, String)],
 ) -> Result<Journal, StoreError> {
-    let existing_directories = existing_library_dirs(root, library)?;
+    let manifest = root.join(MANIFEST);
+    let (old, old_manifest) = read_image(&manifest)?
+        .ok_or_else(|| StoreError::NotFound(manifest.display().to_string()))?;
+    let table = decode_manifest(&old_manifest)?;
+    let names = stage.join("names");
+    private_directory(&names)?;
+    let existing_directories = check_library_path(root, library, &table, Some(&names))?;
+    let new_manifest = updated_manifest(table, library, version)?;
     let mut journal = Journal {
-        format: 1,
+        format: 2,
         library: library.into(),
         version: version.into(),
         existing_directories,
         blocks: Vec::new(),
         files: Vec::new(),
     };
-    let manifest = root.join(MANIFEST);
-    let (old, old_manifest) = read_image(&manifest)?
-        .ok_or_else(|| StoreError::NotFound(manifest.display().to_string()))?;
-    let new_manifest = updated_manifest(&old_manifest, library, version)?;
 
-    // Check filesystem aliases (case and normalization) on the target
-    // filesystem before publishing. Exact repeats are compatible with the
-    // old HTTP response but only require a single on-disk change.
-    let names = stage.join("names");
-    private_directory(&names)?;
+    // Check aliases among selected block names on this filesystem.
+    // Exact repeats still appear in the response and need one write.
     let mut unique = HashSet::new();
     for (name, contents) in files {
         validate_block(name)?;
         if !unique.insert(name) {
             continue;
         }
-        OpenOptions::new()
+        match OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(names.join(name))?;
+            .open(names.join(name))
+        {
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                return Err(StoreError::LibraryPathConflict(format!(
+                    "selected block '{name}' aliases another selected file"
+                )));
+            }
+            Err(error) => return Err(error.into()),
+        }
         let index = journal.blocks.len();
         journal.blocks.push(name.clone());
+        let target = journal.target(root, index);
         journal.files.push(stage_change(
             stage,
             index,
-            read_image(&journal.target(root, index))?,
+            &target,
+            read_image(&target)?,
             contents.as_bytes(),
         )?);
     }
@@ -324,6 +413,7 @@ fn prepare(
     journal.files.push(stage_change(
         stage,
         journal.blocks.len(),
+        &manifest,
         Some((old, old_manifest)),
         new_manifest.as_bytes(),
     )?);
@@ -336,11 +426,18 @@ fn prepare(
     Ok(journal)
 }
 
-fn updated_manifest(bytes: &[u8], library: &str, version: &str) -> Result<String, StoreError> {
+fn decode_manifest(bytes: &[u8]) -> Result<toml::Table, StoreError> {
     let text = std::str::from_utf8(bytes).map_err(io::Error::other)?;
-    let mut table: toml::Table = toml::from_str(text)?;
     let typed: crate::ProjectManifest = toml::from_str(text)?;
     typed.governance.validate().map_err(invalid)?;
+    Ok(toml::from_str(text)?)
+}
+
+fn updated_manifest(
+    mut table: toml::Table,
+    library: &str,
+    version: &str,
+) -> Result<String, StoreError> {
     let libraries = table
         .entry("libraries")
         .or_insert_with(|| toml::Value::Table(toml::Table::new()))
@@ -353,9 +450,31 @@ fn updated_manifest(bytes: &[u8], library: &str, version: &str) -> Result<String
 fn stage_change(
     stage: &Path,
     index: usize,
+    target: &Path,
     before: Option<(Image, Vec<u8>)>,
     after: &[u8],
-) -> io::Result<Change> {
+) -> Result<Change, StoreError> {
+    let original = before.as_ref().map(|(image, _)| image);
+    let mode = original.map_or(0o600, |image| image.mode);
+    #[cfg(windows)]
+    if original.is_some_and(|image| image.mode & 0o200 == 0) {
+        return Err(StoreError::LibraryPermissionConflict {
+            path: target.display().to_string(),
+            reason: "the destination is read-only".into(),
+        });
+    }
+    // The published journal is renamed in place. A replacement created
+    // under it will inherit the same access metadata as this empty probe.
+    let probe = stage.join("replace.tmp");
+    let file = write_private(&probe, b"", 0o600)?;
+    let access = check_replacement_access(
+        &file,
+        target,
+        0o600,
+        original.map(|image| image.access.as_str()),
+    )?;
+    drop(file);
+    fs::remove_file(probe)?;
     let before = match before {
         Some((image, bytes)) => {
             checkpoint(Phase::BeforeBackup(index))?;
@@ -364,12 +483,11 @@ fn stage_change(
         }
         None => None,
     };
-    let mode = before.as_ref().map_or(0o600, |image| image.mode);
     checkpoint(Phase::BeforeStageContents(index))?;
     write_private(&blob(stage, "new", index), after, 0o600)?;
     Ok(Change {
         before,
-        after: Image::of(after, mode),
+        after: Image::of(after, mode, access),
     })
 }
 
@@ -386,18 +504,18 @@ fn recover(root: &Path) -> Result<(), StoreError> {
         warn_cleanup(root, retire(root));
     } else {
         rollback(root, &active, &journal)
-            .and_then(|()| retire(root))
+            .and_then(|()| retire(root).map_err(Into::into))
             .map_err(recovery_required)?;
     }
     Ok(())
 }
 
-fn verify_installed(root: &Path, journal: &Journal) -> io::Result<()> {
-    existing_library_dirs(root, &journal.library)?;
+fn verify_installed(root: &Path, journal: &Journal) -> Result<(), StoreError> {
+    check_current_library_path(root, &journal.library)?;
     for (index, change) in journal.files.iter().enumerate() {
         let target = journal.target(root, index);
         if current(&target)?.as_ref() != Some(&change.after) {
-            return Err(conflict(&target));
+            return Err(conflict(&target).into());
         }
     }
     Ok(())
@@ -424,22 +542,26 @@ fn read_journal(active: &Path) -> Result<(Journal, bool), StoreError> {
         change.before.as_ref().expect("validated manifest"),
     )?;
     let after = read_blob(active, "new", manifest_index, &change.after)?;
-    let expected = updated_manifest(&before, &journal.library, &journal.version)?;
+    let expected = updated_manifest(
+        decode_manifest(&before)?,
+        &journal.library,
+        &journal.version,
+    )?;
     if after != expected.as_bytes() {
         return Err(invalid("library journal would change unrelated manifest data").into());
     }
     Ok((journal, committed))
 }
 
-fn rollback(root: &Path, active: &Path, journal: &Journal) -> io::Result<()> {
-    existing_library_dirs(root, &journal.library)?;
+fn rollback(root: &Path, active: &Path, journal: &Journal) -> Result<(), StoreError> {
+    check_current_library_path(root, &journal.library)?;
     // Validate the entire rollback first, including each backup, before
     // changing any file. Preserve an unexpected external edit in place.
     for (index, change) in journal.files.iter().enumerate() {
         let target = journal.target(root, index);
         let now = current(&target)?;
         if now != change.before && now.as_ref() != Some(&change.after) {
-            return Err(conflict(&target));
+            return Err(conflict(&target).into());
         }
         if let Some(before) = &change.before {
             read_blob(active, "old", index, before)?;
@@ -459,7 +581,7 @@ fn rollback(root: &Path, active: &Path, journal: &Journal) -> io::Result<()> {
             continue;
         }
         if now.as_ref() != Some(&change.after) {
-            return Err(conflict(&target));
+            return Err(conflict(&target).into());
         }
         match &change.before {
             Some(before) => replace(active, &target, index, before, "old")?,
@@ -475,7 +597,7 @@ fn rollback(root: &Path, active: &Path, journal: &Journal) -> io::Result<()> {
             Ok(()) => sync_directory(dir.parent().expect("library directory parent"))?,
             // Leave external additions in place.
             Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::DirectoryNotEmpty) => {}
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         }
     }
     Ok(())
@@ -487,9 +609,9 @@ fn blob(active: &Path, kind: &str, index: usize) -> PathBuf {
 
 fn read_blob(active: &Path, kind: &str, index: usize, expected: &Image) -> io::Result<Vec<u8>> {
     let path = blob(active, kind, index);
-    let (image, bytes) =
-        read_image(&path)?.ok_or_else(|| invalid("library journal blob missing"))?;
-    if image.sha256 != expected.sha256 || expected.mode & !0o7777 != 0 {
+    require_type(&path, fs::symlink_metadata(&path)?.is_file())?;
+    let bytes = fs::read(&path)?;
+    if format!("{:x}", Sha256::digest(&bytes)) != expected.sha256 || expected.mode & !0o7777 != 0 {
         return Err(invalid(format!(
             "library journal blob or mode invalid: {}",
             path.display()
@@ -504,7 +626,7 @@ fn replace(
     index: usize,
     image: &Image,
     kind: &str,
-) -> io::Result<()> {
+) -> Result<(), StoreError> {
     let bytes = read_blob(active, kind, index, image)?;
     // Keep crash leftovers in the excluded journal directory. The rename
     // is within the project filesystem, even for newly created blocks.
@@ -513,10 +635,12 @@ fn replace(
         require_type(&replacement, meta.is_file())?;
         fs::remove_file(&replacement)?;
     }
-    write_private(&replacement, &bytes, image.mode)?;
+    let file = write_private(&replacement, &bytes, image.mode)?;
+    check_replacement_access(&file, target, image.mode, Some(&image.access))?;
+    drop(file);
     fs::rename(replacement, target)?;
     sync_directory(target.parent().expect("target parent"))?;
-    sync_directory(active)
+    Ok(sync_directory(active)?)
 }
 
 fn library_dirs(root: &Path, library: &str) -> [PathBuf; 3] {
@@ -526,7 +650,7 @@ fn library_dirs(root: &Path, library: &str) -> [PathBuf; 3] {
     [pous, lib, target]
 }
 
-pub(crate) fn existing_library_dirs(root: &Path, library: &str) -> io::Result<usize> {
+fn existing_library_dirs(root: &Path, library: &str) -> Result<usize, StoreError> {
     #[cfg(unix)]
     let device = {
         use std::os::unix::fs::MetadataExt;
@@ -545,11 +669,101 @@ pub(crate) fn existing_library_dirs(root: &Path, library: &str) -> io::Result<us
                 return Err(invalid(format!(
                     "library directory is on a different filesystem: {}",
                     dir.display()
-                )));
+                ))
+                .into());
             }
         }
     }
+    require_exact_name(&dirs[2])?;
     Ok(dirs.len())
+}
+
+fn check_current_library_path(root: &Path, library: &str) -> Result<usize, StoreError> {
+    let manifest = root.join(MANIFEST);
+    let (_, bytes) = read_image(&manifest)?
+        .ok_or_else(|| StoreError::NotFound(manifest.display().to_string()))?;
+    check_library_path(root, library, &decode_manifest(&bytes)?, None)
+}
+
+fn check_library_path(
+    root: &Path,
+    library: &str,
+    table: &toml::Table,
+    probe: Option<&Path>,
+) -> Result<usize, StoreError> {
+    let count = existing_library_dirs(root, library)?;
+    let registered = table
+        .get("libraries")
+        .map(|value| {
+            value
+                .as_table()
+                .ok_or_else(|| invalid("[libraries] must be a table"))
+        })
+        .transpose()?;
+    let other_names = registered
+        .into_iter()
+        .flat_map(|libs| libs.keys())
+        .filter(|name| name.as_str() != library && validate_single_segment(name).is_ok());
+    if count == 3 {
+        let target = &library_dirs(root, library)[2];
+        for other in other_names {
+            if shares_library_directory(target, &target.with_file_name(other))? {
+                return Err(library_alias(library, other));
+            }
+        }
+    } else if let Some(probe) = probe {
+        // A legacy manifest may still name a deleted library. Test name
+        // resolution on the project filesystem before creating the real path.
+        let target = probe.join(library);
+        fs::create_dir(&target)?;
+        require_exact_name(&target)?;
+        for other in other_names {
+            if metadata(&probe.join(other))?.is_some() {
+                return Err(library_alias(library, other));
+            }
+        }
+        fs::remove_dir(target)?;
+    }
+    Ok(count)
+}
+
+fn shares_library_directory(target: &Path, other: &Path) -> io::Result<bool> {
+    let metadata = match fs::metadata(other) {
+        Ok(metadata) if metadata.is_dir() => metadata,
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let target = fs::metadata(target)?;
+        Ok((metadata.dev(), metadata.ino()) == (target.dev(), target.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        same_file::is_same_file(target, other)
+    }
+}
+
+fn library_alias(library: &str, other: &str) -> StoreError {
+    StoreError::LibraryPathConflict(format!(
+        "library '{library}' resolves to the same directory as registered library '{other}'"
+    ))
+}
+
+fn require_exact_name(path: &Path) -> Result<(), StoreError> {
+    let name = path.file_name().expect("library path has a file name");
+    for entry in fs::read_dir(path.parent().expect("library path has a parent"))? {
+        if entry?.file_name() == name {
+            return Ok(());
+        }
+    }
+    Err(StoreError::LibraryPathConflict(format!(
+        "{} resolves through a different directory entry spelling",
+        path.display()
+    )))
 }
 
 fn retire(root: &Path) -> io::Result<()> {
@@ -670,17 +884,58 @@ fn require_type(path: &Path, expected: bool) -> io::Result<()> {
     }
 }
 
-fn current(path: &Path) -> io::Result<Option<Image>> {
+fn current(path: &Path) -> Result<Option<Image>, StoreError> {
     Ok(read_image(path)?.map(|(image, _)| image))
 }
 
-fn read_image(path: &Path) -> io::Result<Option<(Image, Vec<u8>)>> {
+fn read_image(path: &Path) -> Result<Option<(Image, Vec<u8>)>, StoreError> {
     let Some(meta) = metadata(path)? else {
         return Ok(None);
     };
     require_type(path, meta.is_file())?;
-    let bytes = fs::read(path)?;
-    Ok(Some((Image::of(&bytes, mode(&meta.permissions())), bytes)))
+    require_exact_name(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path)?;
+    let meta = file.metadata()?;
+    require_type(path, meta.is_file())?;
+    let access = access_fingerprint(&file, path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(Some((
+        Image::of(&bytes, mode(&meta.permissions()), access),
+        bytes,
+    )))
+}
+
+fn access_fingerprint(file: &File, path: &Path) -> Result<String, StoreError> {
+    library_permissions::fingerprint(file).map_err(|error| StoreError::LibraryPermissionConflict {
+        path: path.display().to_string(),
+        reason: error.to_string(),
+    })
+}
+
+fn check_replacement_access(
+    file: &File,
+    target: &Path,
+    expected_mode: u32,
+    expected_access: Option<&str>,
+) -> Result<String, StoreError> {
+    let access = access_fingerprint(file, target)?;
+    if mode(&file.metadata()?.permissions()) != expected_mode
+        || expected_access.is_some_and(|expected| expected != access)
+    {
+        return Err(StoreError::LibraryPermissionConflict {
+            path: target.display().to_string(),
+            reason: "staged file has different access metadata".into(),
+        });
+    }
+    Ok(access)
 }
 
 fn mode(permissions: &Permissions) -> u32 {
@@ -699,9 +954,9 @@ fn mode(permissions: &Permissions) -> u32 {
     }
 }
 
-fn write_private(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+fn write_private(path: &Path, bytes: &[u8], mode: u32) -> io::Result<File> {
     let mut options = OpenOptions::new();
-    options.create_new(true).write(true);
+    options.create_new(true).read(true).write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -720,7 +975,8 @@ fn write_private(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
         permissions.set_readonly(mode & 0o200 == 0);
         file.set_permissions(permissions)?;
     }
-    file.sync_all()
+    file.sync_all()?;
+    Ok(file)
 }
 
 fn private_directory(path: &Path) -> io::Result<()> {

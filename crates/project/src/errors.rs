@@ -5,6 +5,12 @@ pub enum StoreError {
     #[error("project library transaction is busy; retry the read after it finishes")]
     LibraryBusy,
 
+    #[error("library path conflict: {0}")]
+    LibraryPathConflict(String),
+
+    #[error("library permissions cannot be preserved for {path}: {reason}")]
+    LibraryPermissionConflict { path: String, reason: String },
+
     #[error("library import recovery required: {0}")]
     LibraryRecoveryRequired(String),
 

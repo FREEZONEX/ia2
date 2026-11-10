@@ -309,7 +309,10 @@ An import commits the selected files and the version entry together. If
 `cs` prints a recovery or commit-unconfirmed message (exit 3), or the
 response is lost, reopen the project if needed and inspect `cs ls library`
 and the imported POU sources before retrying. A transient busy message
-during a read means the project is currently being updated.
+during a read means the project is currently being updated. A library path
+or permission conflict (HTTP 409, exit 2) means the project needs attention
+before the import or removal can proceed. Preserve the existing files and
+inspect the reported library name or access permissions.
 
 ### Projects & sessions
 

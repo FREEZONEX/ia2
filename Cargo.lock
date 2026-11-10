@@ -3660,6 +3660,8 @@ name = "project"
 version = "0.0.1"
 dependencies = [
  "dirs",
+ "libc",
+ "same-file",
  "serde",
  "serde_json",
  "sha2",
@@ -3668,6 +3670,7 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "ts-rs",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

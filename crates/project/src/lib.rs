@@ -28,6 +28,7 @@ mod gear_channels;
 pub mod hmi;
 mod iomap_check;
 mod ld;
+mod library_permissions;
 mod library_transaction;
 mod paths;
 mod sfc;

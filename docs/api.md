@@ -217,6 +217,8 @@ read-only device-template catalog used to pre-fill devices from a bus scan.
 | `GET` | `/api/device-catalog/match?vendor_id=&product_id=` | Resolve a discovered slave's identity to a catalog template (pre-fill a device from an EtherCAT scan instead of hand-typing PDI offsets). Returns `CatalogEntry`; 404 when the identity isn't catalogued. |
 
 Library import publishes the existing project mutation after commit.
+Import and removal return 409 for aliases on the project filesystem or
+when a required replacement cannot preserve file access permissions.
 A failure before commit rolls back the selected files and version entry.
 If rollback needs intervention or the commit result cannot be confirmed,
 the API returns 503 with a recovery or commit message. Library state reads

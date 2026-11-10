@@ -252,7 +252,23 @@ fn rejects_bad_journal_and_library_symlink_without_touching_sentinel() {
     )
     .unwrap_err();
     let record = root.join(ACTIVE).join(PREPARED);
-    let mut journal: Journal = toml::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+    let raw = fs::read_to_string(&record).unwrap();
+    let mut legacy: toml::Table = toml::from_str(&raw).unwrap();
+    legacy.insert("format".into(), 1.into());
+    for file in legacy.get_mut("files").unwrap().as_array_mut().unwrap() {
+        for (_, image) in file.as_table_mut().unwrap().iter_mut() {
+            image.as_table_mut().unwrap().remove("access");
+        }
+    }
+    fs::write(&record, toml::to_string_pretty(&legacy).unwrap()).unwrap();
+    let error = store.read_pous().unwrap_err();
+    assert!(matches!(error, StoreError::LibraryRecoveryRequired(_)));
+    assert!(error
+        .to_string()
+        .contains("journal format lacks supported permission evidence"));
+    assert!(root.join(ACTIVE).join("old-0").is_file());
+
+    let mut journal: Journal = toml::from_str(&raw).unwrap();
     journal.blocks[0] = "../../../../outside.st".into();
     fs::write(&record, toml::to_string_pretty(&journal).unwrap()).unwrap();
     assert!(matches!(
@@ -292,6 +308,225 @@ fn copied_recovery_record_cannot_roll_back_a_different_project() {
         .contains("does not belong to this project"));
     assert_eq!(identity(other.root()), before);
     assert!(copied.join("old-0").is_file());
+}
+
+#[test]
+fn library_paths_follow_actual_filesystem_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = seeded(tmp.path());
+    let root = store.root();
+    let lower = root.join("pous/lib/controls");
+    let upper = root.join("pous/lib/Controls");
+    let aliases = upper.is_dir();
+    let manifest = root.join(MANIFEST);
+    let before = identity(root);
+
+    let result = store.import_library("Controls", "2.0", &blocks(FIRST_NEW, SECOND_NEW));
+    if aliases {
+        assert!(matches!(result, Err(StoreError::LibraryPathConflict(_))));
+        assert!(matches!(
+            store.remove_library("Controls"),
+            Err(StoreError::LibraryPathConflict(_))
+        ));
+        assert_eq!(identity(root), before);
+        assert!(!root.join(ACTIVE).exists());
+
+        // Old versions could register both names for the same directory.
+        let mut table = decode_manifest(&fs::read(&manifest).unwrap()).unwrap();
+        table["libraries"]
+            .as_table_mut()
+            .unwrap()
+            .insert("Controls".into(), "2.0".into());
+        fs::write(&manifest, toml::to_string_pretty(&table).unwrap()).unwrap();
+        let legacy = identity(root);
+        assert!(matches!(
+            update(&store),
+            Err(StoreError::LibraryPathConflict(_))
+        ));
+        assert!(matches!(
+            store.remove_library("controls"),
+            Err(StoreError::LibraryPathConflict(_))
+        ));
+        assert_eq!(identity(root), legacy);
+
+        // A stale registration must also prevent a new alias when no
+        // destination directory exists at all.
+        fs::remove_dir_all(lower).unwrap();
+        table["libraries"]
+            .as_table_mut()
+            .unwrap()
+            .remove("Controls");
+        let stale = toml::to_string_pretty(&table).unwrap();
+        fs::write(&manifest, &stale).unwrap();
+        assert!(matches!(
+            store.import_library("Controls", "2.0", &blocks(FIRST_NEW, SECOND_NEW)),
+            Err(StoreError::LibraryPathConflict(_))
+        ));
+        assert!(!upper.exists());
+        assert_eq!(fs::read_to_string(manifest).unwrap(), stale);
+    } else {
+        result.unwrap();
+        assert_eq!(
+            fs::read_to_string(upper.join("first.st")).unwrap(),
+            FIRST_NEW
+        );
+        assert_eq!(
+            fs::read_to_string(lower.join("first.st")).unwrap(),
+            FIRST_OLD
+        );
+        store.remove_library("Controls").unwrap();
+        assert!(!upper.exists());
+        assert_eq!(
+            fs::read_to_string(lower.join("first.st")).unwrap(),
+            FIRST_OLD
+        );
+        assert_eq!(store.read_libraries().unwrap()["controls"], "1.0");
+    }
+    eprintln!("case variant aliases an existing directory: {aliases}");
+}
+
+#[test]
+fn recovery_rechecks_library_directory_binding() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = seeded(tmp.path());
+    let root = store.root();
+    let directory = root.join("pous/lib/controls");
+    if !root.join("pous/lib/Controls").is_dir() {
+        eprintln!("case-sensitive filesystem; exercised independent names in the path test");
+        return;
+    }
+    with_fault(
+        |point| fail_at(point, &[Phase::BeforeInstall(1), Phase::Rollback(0)]),
+        || update(&store),
+    )
+    .unwrap_err();
+    let manifest = root.join(MANIFEST);
+    let mut table = decode_manifest(&fs::read(&manifest).unwrap()).unwrap();
+    table["libraries"]
+        .as_table_mut()
+        .unwrap()
+        .insert("Controls".into(), "2.0".into());
+    fs::write(&manifest, toml::to_string_pretty(&table).unwrap()).unwrap();
+    let before = identity(root);
+
+    let error = store.read_pous().unwrap_err();
+    assert!(matches!(error, StoreError::LibraryRecoveryRequired(_)));
+    assert!(error
+        .to_string()
+        .contains("same directory as registered library"));
+    assert_eq!(identity(root), before);
+    assert_eq!(
+        fs::read_to_string(directory.join("first.st")).unwrap(),
+        FIRST_NEW
+    );
+    assert!(root.join(ACTIVE).join("old-0").is_file());
+}
+
+#[cfg(target_os = "macos")]
+fn restrict_writes(path: &Path) {
+    assert!(Command::new("/bin/chmod")
+        .args(["+a", "everyone deny write"])
+        .arg(path)
+        .status()
+        .unwrap()
+        .success());
+    assert_acl_denies_writes(path);
+}
+
+#[cfg(target_os = "macos")]
+fn assert_acl_denies_writes(path: &Path) {
+    if unsafe { libc::geteuid() } != 0 {
+        assert_eq!(
+            File::options().write(true).open(path).unwrap_err().kind(),
+            ErrorKind::PermissionDenied,
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn clear_fixture_acl(path: &Path) {
+    assert!(Command::new("/bin/chmod")
+        .arg("-N")
+        .arg(path)
+        .status()
+        .unwrap()
+        .success());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn acl_blocks_import_and_manifest_replacement_before_any_official_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = seeded(tmp.path());
+    let root = store.root();
+    let manifest = root.join(MANIFEST);
+    let before = identity(root);
+    let first = root.join("pous/lib/controls/first.st");
+    let second = root.join("pous/lib/controls/second.st");
+    restrict_writes(&second);
+
+    let error = update(&store).unwrap_err();
+    assert!(matches!(
+        error,
+        StoreError::LibraryPermissionConflict { .. }
+    ));
+    assert!(error.to_string().contains("extended ACL"), "{error}");
+    assert_eq!(fs::read_to_string(&first).unwrap(), FIRST_OLD);
+    assert_eq!(fs::read_to_string(&second).unwrap(), SECOND_OLD);
+    assert!(!root.join(ACTIVE).exists());
+    assert!(library_permissions::fingerprint(&File::open(&second).unwrap()).is_err());
+    assert_acl_denies_writes(&second);
+    clear_fixture_acl(&second);
+    assert_eq!(identity(root), before);
+
+    restrict_writes(&manifest);
+    let error = store.remove_library("controls").unwrap_err();
+    assert!(matches!(
+        error,
+        StoreError::LibraryPermissionConflict { .. }
+    ));
+    assert!(first.is_file() && second.is_file());
+    assert!(library_permissions::fingerprint(&File::open(&manifest).unwrap()).is_err());
+    assert_acl_denies_writes(&manifest);
+    clear_fixture_acl(&manifest);
+    assert_eq!(identity(root), before);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn rollback_preserves_acl_added_after_a_partial_install() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = seeded(tmp.path());
+    let root = store.root();
+    let before = identity(root);
+    let first = root.join("pous/lib/controls/first.st");
+    let changed = first.clone();
+    let error = with_fault(
+        move |point| {
+            if point == Phase::BeforeInstall(1) {
+                restrict_writes(&changed);
+                return Err(io::Error::other("fixture stopped after an ACL change"));
+            }
+            Ok(())
+        },
+        || update(&store),
+    )
+    .unwrap_err();
+    assert!(matches!(error, StoreError::LibraryRecoveryRequired(_)));
+    assert!(error.to_string().contains("extended ACL"), "{error}");
+    assert_eq!(fs::read_to_string(&first).unwrap(), FIRST_NEW);
+    assert!(root.join(ACTIVE).join("old-0").is_file());
+    assert!(matches!(
+        store.read_pous(),
+        Err(StoreError::LibraryRecoveryRequired(_))
+    ));
+    assert!(library_permissions::fingerprint(&File::open(&first).unwrap()).is_err());
+    assert_acl_denies_writes(&first);
+
+    clear_fixture_acl(&first);
+    ProjectStore::open(root.into()).unwrap();
+    assert_eq!(identity(root), before);
+    assert!(!root.join(ACTIVE).exists());
 }
 
 #[test]

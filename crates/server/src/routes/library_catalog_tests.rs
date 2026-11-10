@@ -392,6 +392,59 @@ async fn library_remove_is_scoped_idempotent_and_rejects_path_traversal() {
 }
 
 #[tokio::test]
+async fn library_alias_conflict_has_no_success_event_or_partial_write() {
+    let mut f = Fixture::new(&["A"]);
+    let registry = f.dir.path().join("registry/case-variant");
+    fs::create_dir_all(registry.join("pous")).unwrap();
+    fs::write(
+        registry.join("library.toml"),
+        "name = 'Controls'\nversion = '2.0'\n",
+    )
+    .unwrap();
+    fs::write(registry.join("pous/first.st"), SECOND).unwrap();
+    f.ok(
+        "POST",
+        "/api/library/import",
+        Some("A"),
+        json!({"library": "controls"}),
+    )
+    .await;
+    f.assert_event("A", "library_imported");
+    let root = f.dir.path().join("A");
+    let original = root.join("pous/lib/controls/first.st");
+    let alias = root.join("pous/lib/Controls");
+    if !alias.is_dir() {
+        // On this filesystem the variant is a distinct library.
+        f.ok(
+            "POST",
+            "/api/library/import",
+            Some("A"),
+            json!({"library": "Controls"}),
+        )
+        .await;
+        assert_eq!(fs::read_to_string(alias.join("first.st")).unwrap(), SECOND);
+        assert_eq!(fs::read_to_string(original).unwrap(), FIRST);
+        return;
+    }
+    let manifest = fs::read(root.join("project.toml")).unwrap();
+    for (method, path, body) in [
+        (
+            "POST",
+            "/api/library/import",
+            json!({"library": "Controls"}),
+        ),
+        ("DELETE", "/api/library/Controls", Value::Null),
+    ] {
+        let (status, body) = f.request(method, path, Some("A"), body).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{method}: {body}");
+        assert!(body.contains("library path conflict"), "{body}");
+        f.assert_quiet();
+        assert_eq!(fs::read(root.join("project.toml")).unwrap(), manifest);
+        assert_eq!(fs::read_to_string(&original).unwrap(), FIRST);
+    }
+}
+
+#[tokio::test]
 async fn library_generic_pou_writes_stay_read_only_while_reads_work() {
     let mut f = Fixture::new(&["A"]);
     f.ok(

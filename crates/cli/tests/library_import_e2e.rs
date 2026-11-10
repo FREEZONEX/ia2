@@ -292,7 +292,7 @@ fn library_compile_rejects_a_project_while_writer_owns_its_lock() {
 
 #[test]
 fn library_cli_does_not_replay_when_committed_response_is_lost() {
-    use std::io::{BufRead, BufReader, Read};
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc;
 
@@ -300,10 +300,10 @@ fn library_cli_does_not_replay_when_committed_response_is_lost() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let proxy_url = format!("http://{}", listener.local_addr().unwrap());
-    let destination = format!("{}/api/library/import", fixture.url);
-    let (done, finished) = mpsc::channel();
+    let upstream = fixture.url.clone();
+    let (done, finished) = mpsc::channel::<()>();
     let proxy = std::thread::spawn(move || {
-        let mut writes = 0;
+        let mut requests = Vec::new();
         let agent = ureq::AgentBuilder::new()
             .try_proxy_from_env(false)
             .timeout(Duration::from_secs(5))
@@ -315,9 +315,16 @@ fn library_cli_does_not_replay_when_committed_response_is_lost() {
                         .set_read_timeout(Some(Duration::from_secs(5)))
                         .unwrap();
                     let mut reader = BufReader::new(stream);
+                    let mut request = String::new();
+                    reader.read_line(&mut request).unwrap();
+                    let mut request = request.split_whitespace();
+                    assert_eq!(request.next(), Some("POST"));
+                    let path = request.next().unwrap();
+                    assert!(matches!(
+                        path,
+                        "/api/agent/heartbeat" | "/api/library/import"
+                    ));
                     let mut line = String::new();
-                    reader.read_line(&mut line).unwrap();
-                    assert!(line.starts_with("POST /api/library/import "));
                     let mut length = None;
                     loop {
                         line.clear();
@@ -333,21 +340,32 @@ fn library_cli_does_not_replay_when_committed_response_is_lost() {
                     let mut body = vec![0; length.expect("Content-Length")];
                     reader.read_exact(&mut body).unwrap();
                     let body = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
-                    agent
-                        .post(&destination)
+                    let response = agent
+                        .post(&format!("{upstream}{path}"))
                         .set("X-IA2-Project", PROJECT)
                         .send_json(body)
                         .unwrap();
-                    writes += 1;
-                    // Drop this client connection after the real server
-                    // committed and replied, without forwarding that reply.
+                    let status = response.status();
+                    let body = response.into_string().unwrap();
+                    requests.push((path.to_owned(), status));
+                    eprintln!("proxy POST {path}: upstream {status} {body}");
+                    if path == "/api/agent/heartbeat" {
+                        write!(
+                            reader.get_mut(),
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
+                            body.len(),
+                        )
+                        .unwrap();
+                    }
+                    // Only the import response is lost, after the real
+                    // server has committed it and returned HTTP 200.
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     if !matches!(
                         finished.recv_timeout(Duration::from_millis(10)),
                         Err(mpsc::RecvTimeoutError::Timeout)
                     ) {
-                        return writes;
+                        return requests;
                     }
                 }
                 Err(error) => panic!("fixture proxy: {error}"),
@@ -366,13 +384,23 @@ fn library_cli_does_not_replay_when_committed_response_is_lost() {
         ])
         .output()
         .unwrap();
-    done.send(()).unwrap();
+    drop(done);
     assert_eq!(
         proxy.join().unwrap(),
-        1,
-        "only one write request reached the server"
+        [
+            ("/api/agent/heartbeat".into(), 200),
+            ("/api/library/import".into(), 200),
+        ],
+        "only one import request reached the server",
     );
+    let error = String::from_utf8_lossy(&output.stderr);
+    eprintln!("client {}: {error}", output.status);
     assert_eq!(output.status.code(), Some(3), "{output:?}");
+    assert!(error.contains("/api/library/import"), "{error}");
+    let readback = fixture.ok(&["--json", "ls", "library"]);
+    let libraries: serde_json::Value = serde_json::from_slice(&readback.stdout).unwrap();
+    assert_eq!(libraries[0]["name"], LIBRARY);
+    assert_eq!(libraries[0]["imported_version"], "2.0");
     assert_eq!(fixture.store.read_libraries().unwrap()[LIBRARY], "2.0");
     fixture.prove(22);
 }

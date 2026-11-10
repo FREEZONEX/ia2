@@ -9,7 +9,8 @@ A rollback restores the original bytes of every file it replaced.
 
 1. Under the project lock, IA2 validates the destination paths and stages
    new contents, copies of existing files, and a text journal. The journal
-   records the transaction format, file names, content hashes and modes.
+   records the transaction format, file names, content hashes and access
+   metadata.
    An ownership marker binds the journal to its project directory. A
    journal copied to another project is refused even if the files match
    the recorded hashes.
@@ -23,8 +24,11 @@ A rollback restores the original bytes of every file it replaced.
    scratch contents. If cleanup fails after commit, the new files remain
    authoritative and cleanup can resume on reopen.
 
-A reopened project with a prepared journal rolls back. A committed journal
-keeps the installed version and resumes cleanup. Recovery is safe to retry
+A reopened project with a valid prepared journal rolls back. A valid
+committed journal keeps the installed version and resumes cleanup.
+Version 1 journals lack the access information required for this check.
+IA2 retains those journals and reports that recovery needs intervention.
+Recovery is safe to retry
 after interruption. If the commit marker was renamed but syncing it failed,
 the import reports an unconfirmed outcome. Reopen and read back the version
 and selected POU files to resolve it.
@@ -42,6 +46,21 @@ POU snapshots and deployment copies either obtain consistent inputs or
 report busy/recovery. Compilation uses those copied inputs after releasing
 the lock. Recovery paths stay in the project and reject symlinked targets
 or library directories. Deployment omits the root transaction paths.
+
+An existing library directory and its selected files must have the requested
+names on disk. Two registered names must resolve to separate directories.
+IA2 checks these rules against the project filesystem for import, removal
+and recovery. Names that resolve to separate directories can coexist.
+
+On macOS and Linux, IA2 checks the mode, owner and group of each replacement
+and refuses extended file ACLs before changing an installed file. If an
+ACL appears during a pending import, recovery keeps that file and its
+journal for inspection. On Windows, the read-only flag and a fingerprint
+of the owner, group, DACL and mandatory label must match the staged
+replacement. A permission query error stops the operation.
+[Darwin ACL API](https://raw.githubusercontent.com/apple-oss-distributions/Libc/main/posix1e/acl_file.c)
+· [Linux extended attributes](https://man7.org/linux/man-pages/man7/xattr.7.html)
+· [Windows file security descriptors](https://learn.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-getsecurityinfo)
 
 Use a local filesystem with atomic same-volume rename and reliable file
 locking. On Unix the project directory serves as the lock and directory
