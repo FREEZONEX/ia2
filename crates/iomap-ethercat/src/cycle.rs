@@ -6,7 +6,10 @@ use iocore::{
 };
 use std::{
     collections::VecDeque,
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex, MutexGuard,
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::watch;
@@ -23,19 +26,57 @@ struct State<T> {
     pending: Option<T>,
     begun: u64,
     status: CycleStatus,
-    events: VecDeque<CycleEvent>,
+    events: VecDeque<GateEvent>,
 }
+
+/// A fixed-size record for the realtime path. Allocate the public strings
+/// only when a consumer reads diagnostics.
+#[derive(Clone, Copy)]
+struct GateEvent {
+    sequence: u64,
+    kind: &'static str,
+    host_us: u64,
+    deadline_us: Option<u64>,
+}
+
+#[cfg(target_os = "linux")]
+fn clock_origin() -> (Instant, Option<u64>, Option<u64>) {
+    let before = Instant::now();
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: ts is writable storage for the timespec filled by the kernel.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0 {
+        return (before, None, None);
+    }
+    let width = before.elapsed();
+    let mono_ns = ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64;
+    (
+        before + width / 2,
+        Some(mono_ns),
+        Some(width.as_nanos() as u64),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn clock_origin() -> (Instant, Option<u64>, Option<u64>) {
+    (Instant::now(), None, None)
+}
+
 pub(crate) struct Gate<T> {
     pub period: Duration,
     origin: Instant,
     state: Mutex<State<T>>,
+    faulted: AtomicBool,
     wake: watch::Sender<u64>,
 }
 impl<T: Clone> Gate<T> {
     pub fn new(period: Duration) -> Self {
+        let (origin, host_mono_origin_ns, host_mono_uncertainty_ns) = clock_origin();
         Self {
             period,
-            origin: Instant::now(),
+            origin,
             state: Mutex::new(State {
                 armed: false,
                 ticket: None,
@@ -43,17 +84,20 @@ impl<T: Clone> Gate<T> {
                 begun: 0,
                 status: CycleStatus {
                     period_us: period.as_micros() as u64,
+                    host_mono_origin_ns,
+                    host_mono_uncertainty_ns,
                     ..Default::default()
                 },
                 events: VecDeque::with_capacity(TRACE_CAPACITY),
             }),
+            faulted: AtomicBool::new(false),
             wake: watch::channel(0).0,
         }
     }
     fn event(
         &self,
         s: &mut State<T>,
-        kind: &str,
+        kind: &'static str,
         sequence: u64,
         now: Instant,
         deadline: Option<Instant>,
@@ -62,9 +106,9 @@ impl<T: Clone> Gate<T> {
             s.events.pop_front();
             s.status.events_dropped += 1;
         }
-        s.events.push_back(CycleEvent {
+        s.events.push_back(GateEvent {
             sequence,
-            kind: kind.into(),
+            kind,
             host_us: now.saturating_duration_since(self.origin).as_micros() as u64,
             deadline_us: deadline
                 .map(|d| d.saturating_duration_since(self.origin).as_micros() as u64),
@@ -73,7 +117,9 @@ impl<T: Clone> Gate<T> {
     fn fail(&self, s: &mut State<T>, reason: &str, now: Instant) {
         if s.status.fault.is_none() {
             s.status.fault = Some(reason.into());
-            self.event(s, "fault", s.status.issued, now, None);
+            let deadline = s.ticket.as_ref().map(|(ticket, _)| ticket.deadline);
+            self.event(s, "fault", s.status.issued, now, deadline);
+            self.faulted.store(true, Ordering::Release);
         }
         s.pending = None;
         self.wake.send_modify(|v| *v = v.wrapping_add(1));
@@ -86,17 +132,31 @@ impl<T: Clone> Gate<T> {
         );
     }
     pub fn is_faulted(&self) -> bool {
-        self.state
-            .lock()
-            .expect("cycle gate poisoned")
-            .status
-            .fault
-            .is_some()
+        self.faulted.load(Ordering::Acquire)
     }
     pub fn status(&self) -> CycleStatus {
-        let s = self.state.lock().expect("cycle gate poisoned");
-        let mut status = s.status.clone();
-        status.events = s.events.iter().cloned().collect();
+        Self::copy_status(self.state.lock().expect("cycle gate poisoned"))
+    }
+    pub fn try_status(&self) -> Option<CycleStatus> {
+        self.state.try_lock().ok().map(Self::copy_status)
+    }
+    fn copy_status(state: MutexGuard<'_, State<T>>) -> CycleStatus {
+        let mut events = [None; TRACE_CAPACITY];
+        for (slot, event) in events.iter_mut().zip(&state.events) {
+            *slot = Some(*event);
+        }
+        let mut status = state.status.clone();
+        drop(state);
+        status.events = events
+            .into_iter()
+            .flatten()
+            .map(|event| CycleEvent {
+                sequence: event.sequence,
+                kind: event.kind.into(),
+                host_us: event.host_us,
+                deadline_us: event.deadline_us,
+            })
+            .collect();
         status
     }
     pub async fn begin(&self) -> Result<(Ticket, T), IoError> {
@@ -192,9 +252,21 @@ impl<T: Clone> Gate<T> {
             }
         }
         if s.status.fault.is_none() {
-            if let Some((ticket, _)) = s.ticket.take() {
-                if now >= ticket.deadline + self.period || s.pending.is_none() {
-                    self.fail(&mut s, "missing output frame or missed bus cycle", now);
+            if let Some((ticket, _)) = s.ticket.as_ref() {
+                let ticket = *ticket;
+                let failure = if now >= ticket.deadline + self.period {
+                    Some("bus cycle missed output selection deadline")
+                } else if s.pending.is_none() {
+                    if s.begun == ticket.sequence {
+                        Some("scan began but did not commit output frame")
+                    } else {
+                        Some("scan did not begin before output selection")
+                    }
+                } else {
+                    None
+                };
+                if let Some(reason) = failure {
+                    self.fail(&mut s, reason, now);
                 } else {
                     s.status.consumed += 1;
                     self.event(
@@ -205,6 +277,7 @@ impl<T: Clone> Gate<T> {
                         Some(ticket.deadline),
                     );
                 }
+                s.ticket = None;
             }
         }
         apply(s.pending.as_ref());
@@ -354,6 +427,27 @@ mod tests {
             assert_eq!(g.status().consumed, 0);
         }
     }
+    #[test]
+    fn reports_a_missing_begin_separately_from_a_missing_commit_and_late_bus() {
+        for (begin, consume_periods, reason) in [
+            (false, 1, "scan did not begin before output selection"),
+            (true, 1, "scan began but did not commit output frame"),
+            (true, 2, "bus cycle missed output selection deadline"),
+        ] {
+            let gate = armed();
+            let now = gate.origin;
+            gate.publish_at([0, 0], now + gate.period, now);
+            if begin {
+                begin_at(&gate);
+            }
+            gate.consume_at(now + gate.period * consume_periods, |frame| {
+                assert!(frame.is_none())
+            });
+            gate.trip("later secondary fault");
+            assert_eq!(gate.status().fault.as_deref(), Some(reason));
+        }
+    }
+
     #[tokio::test]
     async fn begin_wakes_from_bus_issue_and_input_snapshot_is_fixed() {
         let g = std::sync::Arc::new(Gate::new(Duration::from_millis(20)));

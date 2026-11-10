@@ -24,12 +24,19 @@ use std::time::{Duration, Instant};
 use crate::execution::{run_scan, ScanOutcome};
 use crate::retain;
 use iocore::{ChannelValue, IoDevice};
+
+#[path = "runtime_failsafe.rs"]
+mod runtime_failsafe;
+#[path = "runtime_snapshot.rs"]
+mod runtime_snapshot;
 use ironplc_container::debug_format::VariableRenderer;
 use ironplc_container::debug_section::iec_type_tag;
 use ironplc_container::Container;
 use ironplc_container::VarIndex;
 use ironplc_vm::{Vm, VmBuffers, VmRunning};
 use project::{Direction, Mapping, ProtocolConfig, WriteGovernance, WriteMode};
+use runtime_failsafe::FailsafeJobs;
+use runtime_snapshot::SnapshotPublisher;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use ts_rs::TS;
@@ -177,6 +184,8 @@ pub enum RuntimeWriteError {
     UnknownVariable(String),
     #[error("scan loop has stopped — no writes will reach the VM")]
     Disconnected,
+    #[error("scan command queue is full")]
+    Busy,
     #[error("vm trap during write: {0}")]
     Vm(String),
     /// Denied by the project's `[governance]` table. The payload is the
@@ -218,6 +227,16 @@ pub enum OutputLatchError {
 }
 
 type SharedFailsafeStatus = Arc<std::sync::Mutex<Option<FailsafeStatus>>>;
+
+type LatchAck = tokio::sync::oneshot::Sender<Result<bool, OutputLatchError>>;
+
+struct LatchRequest {
+    reason: String,
+    ack: LatchAck,
+}
+
+const COMMAND_QUEUE_CAPACITY: usize = 128;
+const COMMANDS_PER_ROUND: usize = 16;
 
 /// Out-of-band commands the scan loop drains between rounds. Used so
 /// HTTP handlers (in the server's tokio runtime) can poke the VM (which
@@ -263,14 +282,6 @@ enum RuntimeCommand {
     UnforceVariable {
         name: String,
         ack: tokio::sync::oneshot::Sender<Result<(), RuntimeWriteError>>,
-    },
-    /// Inhibit ordinary outputs, then request adapter safe values. Failure
-    /// leaves inhibition in place and returns per-device errors. An explicit
-    /// repeat retries only unconfirmed adapters; the first reason stands.
-    /// Success says whether this command newly inhibited the outputs.
-    LatchOutputsOff {
-        reason: String,
-        ack: tokio::sync::oneshot::Sender<Result<bool, OutputLatchError>>,
     },
     /// Fault injection: stall each of the next `scans` **ticks** by
     /// `stall_ms` of real wall-clock time. The stall happens INSIDE the
@@ -352,7 +363,8 @@ fn finish_step_tick(mode: &std::sync::Mutex<RuntimeMode>) {
 pub struct ProgramHandle {
     stop: Arc<AtomicBool>,
     snapshot_tx: broadcast::Sender<VarSnapshot>,
-    cmd_tx: tokio::sync::mpsc::UnboundedSender<RuntimeCommand>,
+    cmd_tx: tokio::sync::mpsc::Sender<RuntimeCommand>,
+    latch_tx: tokio::sync::mpsc::Sender<LatchRequest>,
     /// Shared mutable mode. `Arc<Mutex>` because the scan loop reads
     /// it once per cycle and the HTTP layer writes to it from an
     /// arbitrary tokio thread — a Mutex is cheap relative to a scan
@@ -572,6 +584,7 @@ impl ProgramHandle {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
             .send(RuntimeCommand::ResetPulse { token, ack: ack_tx })
+            .await
             .map_err(|_| RuntimeWriteError::Disconnected)?;
         ack_rx.await.map_err(|_| RuntimeWriteError::Disconnected)?
     }
@@ -584,12 +597,14 @@ impl ProgramHandle {
     ) -> Result<iocore::sdo::SdoValue, iocore::sdo::SdoError> {
         use iocore::sdo::SdoError;
         let (ack, rx) = tokio::sync::oneshot::channel();
-        self.cmd_tx
-            .send(RuntimeCommand::SdoHandle {
-                name: device.into(),
-                ack,
-            })
-            .map_err(|_| SdoError::Unavailable("program stopped".into()))?;
+        self.queue_command(RuntimeCommand::SdoHandle {
+            name: device.into(),
+            ack,
+        })
+        .map_err(|error| match error {
+            RuntimeWriteError::Busy => SdoError::Busy,
+            _ => SdoError::Unavailable("program stopped".into()),
+        })?;
         let handle = tokio::time::timeout(Duration::from_secs(1), rx)
             .await
             .map_err(|_| SdoError::Timeout)?
@@ -606,6 +621,14 @@ impl ProgramHandle {
         self.queue_write(name, value, pulse_owner)?.await
     }
 
+    fn queue_command(&self, command: RuntimeCommand) -> Result<(), RuntimeWriteError> {
+        use tokio::sync::mpsc::error::TrySendError;
+        self.cmd_tx.try_send(command).map_err(|error| match error {
+            TrySendError::Full(_) => RuntimeWriteError::Busy,
+            TrySendError::Closed(_) => RuntimeWriteError::Disconnected,
+        })
+    }
+
     /// Send the write command now; the returned future waits for its ack.
     fn queue_write(
         &self,
@@ -617,14 +640,12 @@ impl ProgramHandle {
         RuntimeWriteError,
     > {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        self.cmd_tx
-            .send(RuntimeCommand::WriteVariable {
-                name: name.to_string(),
-                value,
-                pulse_owner,
-                ack: ack_tx,
-            })
-            .map_err(|_| RuntimeWriteError::Disconnected)?;
+        self.queue_command(RuntimeCommand::WriteVariable {
+            name: name.to_string(),
+            value,
+            pulse_owner,
+            ack: ack_tx,
+        })?;
         Ok(async move { ack_rx.await.unwrap_or(Err(RuntimeWriteError::Disconnected)) })
     }
 
@@ -639,13 +660,11 @@ impl ProgramHandle {
     /// the variable, `instance.variable` → that unit explicitly.
     pub async fn force_variable(&self, name: &str, value: i32) -> Result<i32, RuntimeWriteError> {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        self.cmd_tx
-            .send(RuntimeCommand::ForceVariable {
-                name: name.to_string(),
-                value,
-                ack: ack_tx,
-            })
-            .map_err(|_| RuntimeWriteError::Disconnected)?;
+        self.queue_command(RuntimeCommand::ForceVariable {
+            name: name.to_string(),
+            value,
+            ack: ack_tx,
+        })?;
         ack_rx.await.map_err(|_| RuntimeWriteError::Disconnected)?
     }
 
@@ -665,13 +684,11 @@ impl ProgramHandle {
         scans: u32,
     ) -> Result<(), RuntimeWriteError> {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        self.cmd_tx
-            .send(RuntimeCommand::InjectScanStall {
-                stall_ms,
-                scans,
-                ack: ack_tx,
-            })
-            .map_err(|_| RuntimeWriteError::Disconnected)?;
+        self.queue_command(RuntimeCommand::InjectScanStall {
+            stall_ms,
+            scans,
+            ack: ack_tx,
+        })?;
         ack_rx.await.map_err(|_| RuntimeWriteError::Disconnected)
     }
 
@@ -679,12 +696,10 @@ impl ProgramHandle {
     /// behaviour next scan. No-op if the variable wasn't forced.
     pub async fn unforce_variable(&self, name: &str) -> Result<(), RuntimeWriteError> {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        self.cmd_tx
-            .send(RuntimeCommand::UnforceVariable {
-                name: name.to_string(),
-                ack: ack_tx,
-            })
-            .map_err(|_| RuntimeWriteError::Disconnected)?;
+        self.queue_command(RuntimeCommand::UnforceVariable {
+            name: name.to_string(),
+            ack: ack_tx,
+        })?;
         ack_rx.await.map_err(|_| RuntimeWriteError::Disconnected)?
     }
 
@@ -802,11 +817,12 @@ impl ProgramHandle {
         reason: impl Into<String>,
     ) -> Result<bool, OutputLatchError> {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        self.cmd_tx
-            .send(RuntimeCommand::LatchOutputsOff {
+        self.latch_tx
+            .send(LatchRequest {
                 reason: reason.into(),
                 ack: ack_tx,
             })
+            .await
             .map_err(|_| OutputLatchError::Disconnected)?;
         ack_rx.await.map_err(|_| OutputLatchError::Disconnected)?
     }
@@ -965,7 +981,8 @@ fn validate_scan_clock(
     }
 }
 
-async fn latch_cycle_fault(
+fn latch_cycle_fault(
+    jobs: &mut FailsafeJobs,
     devices: &mut [Box<dyn IoDevice>],
     latch: &AtomicBool,
     reason: &std::sync::Mutex<Option<String>>,
@@ -979,9 +996,7 @@ async fn latch_cycle_fault(
     note_latch_reason(reason, format!("cycle handoff fault: {why}"));
     latch.store(true, Ordering::Release);
     tracing::error!(%why, "cycle handoff fault; outputs latched off until program restart");
-    for dev in devices {
-        let _ = attempt_device_failsafe(dev.as_mut(), failsafe_status).await;
-    }
+    jobs.start(devices, failsafe_status, |_, _| true);
 }
 
 async fn acquire_devices(
@@ -1061,7 +1076,8 @@ fn spawn_units_with_grace(
     let scan_overruns = Arc::new(AtomicU64::new(0));
     let consecutive_scan_overruns = Arc::new(AtomicU32::new(0));
     let (snapshot_tx, _) = broadcast::channel(64);
-    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(COMMAND_QUEUE_CAPACITY);
+    let (latch_tx, latch_rx) = tokio::sync::mpsc::channel(1);
     let mode = Arc::new(std::sync::Mutex::new(RuntimeMode::Running));
     let forces = Arc::new(std::sync::Mutex::new(HashMap::<String, i32>::new()));
     let device_reports = Arc::new(std::sync::Mutex::new(Vec::<DeviceReport>::new()));
@@ -1146,6 +1162,13 @@ fn spawn_units_with_grace(
                 return;
             }
         };
+        let io_handle = io_rt.handle().clone();
+        let (retain_tx, retain_task) = state_path
+            .as_ref()
+            .filter(|_| units.iter().any(|unit| !unit.retain_vars.is_empty()))
+            .map(|path| retain_writer(path.clone(), &io_handle))
+            .unzip();
+
         rt.block_on(async move {
             // Seed health from the connect outcomes: configured devices
             // that failed to connect start unhealthy (the per-round
@@ -1211,7 +1234,10 @@ fn spawn_units_with_grace(
             // we're about to discard the VMs anyway.
             use futures_util::FutureExt;
             use std::panic::AssertUnwindSafe;
+            let mut failsafe_jobs = FailsafeJobs::new(io_handle.clone());
             let result = AssertUnwindSafe(run_loop_async(
+                &io_handle,
+                &mut failsafe_jobs,
                 expected_cycle,
                 units,
                 &mut devices,
@@ -1220,6 +1246,7 @@ fn spawn_units_with_grace(
                 stop_clone,
                 snapshot_tx_clone,
                 cmd_rx,
+                latch_rx,
                 mode_clone,
                 forces_clone,
                 device_health_clone,
@@ -1231,6 +1258,7 @@ fn spawn_units_with_grace(
                 fault_tx,
                 &reconnect,
                 state_path,
+                retain_tx.as_ref(),
             ))
             .catch_unwind()
             .await;
@@ -1251,16 +1279,16 @@ fn spawn_units_with_grace(
             // Always attempt each adapter's configured safe values before
             // teardown, including after a failed or panicking earlier attempt.
             let dev_count = devices.len();
-            begin_failsafe_attempts(
-                &failsafe_status_clone,
-                devices.iter().map(|dev| dev.name()),
-            );
-            let mut failsafe_failed = 0usize;
-            for dev in devices.iter_mut() {
-                if attempt_device_failsafe(dev.as_mut(), &failsafe_status_clone).await.is_err() {
-                    failsafe_failed += 1;
-                }
-            }
+            // All already-started jobs retain ownership until they return.
+            // Give each device its cleanup attempt, independently of its peers.
+            failsafe_jobs.collect(&mut devices, &failsafe_status_clone, true).await;
+            failsafe_jobs.start(&mut devices, &failsafe_status_clone, |_, _| true);
+            failsafe_jobs.collect(&mut devices, &failsafe_status_clone, true).await;
+            let failsafe_failed = failsafe_status_clone
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .map_or(0, |status| status.unconfirmed.len());
             // Allow an asynchronous adapter worker a brief flush opportunity
             // before teardown. This delay does not establish transmission or
             // physical state; paid once, on shutdown.
@@ -1270,24 +1298,23 @@ fn spawn_units_with_grace(
             // closed cleanly but could not confirm its last output returns
             // an error, which is counted below. Runs on both the clean and
             // panicked paths (before re-panic); errors are recorded.
-            let mut shutdown_failed = 0usize;
-            for dev in devices.iter_mut() {
+            let shutdown_failed = futures_util::future::join_all(devices.iter_mut().map(|dev| async {
                 match isolate_device_call(dev.shutdown()).await {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => false,
                     Ok(Err(e)) => {
-                        shutdown_failed += 1;
                         tracing::warn!(device = %dev.name(), %e, "device shutdown failed");
+                        true
                     }
                     Err(panic) => {
-                        shutdown_failed += 1;
-                        tracing::error!(
-                            device = %dev.name(),
-                            %panic,
-                            "device shutdown PANICKED; continuing with the remaining devices"
-                        );
+                        tracing::error!(device = %dev.name(), %panic, "device shutdown panicked");
+                        true
                     }
                 }
-            }
+            }))
+            .await
+            .into_iter()
+            .filter(|failed| *failed)
+            .count();
             // Failsafe + teardown done: release the reconnect worker (it
             // holds the runtime that late-connected adapters' background
             // tasks live on, and must outlive the writes above).
@@ -1298,6 +1325,15 @@ fn spawn_units_with_grace(
                 Some(thread) => collect_reconnect_worker(thread, reconnect_join_grace).await,
                 None => ReconnectEnd::default(),
             };
+            // Finish the last RETAIN checkpoint only after the field devices
+            // have been driven safe and drained. No writer from this run may
+            // remain when a replacement run reloads the same checkpoint.
+            drop(retain_tx);
+            if let Some(task) = retain_task {
+                if let Err(error) = task.await {
+                    tracing::warn!(%error, "retain writer failed");
+                }
+            }
             // "Cleanly" only when nothing faulted AND no device's failsafe or
             // shutdown call failed: a VM trap or a failed start also returns
             // normally, and a panicking or erroring adapter used to leave this
@@ -1370,6 +1406,7 @@ fn spawn_units_with_grace(
         stop,
         snapshot_tx,
         cmd_tx,
+        latch_tx,
         mode,
         forces,
         scan_overruns,
@@ -1497,6 +1534,55 @@ fn begin_failsafe_attempts<'a>(
     }
 }
 
+fn acknowledge_latch(ack: LatchAck, newly: bool, shared: &SharedFailsafeStatus) {
+    let errors = shared
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|status| status.unconfirmed.clone())
+        .unwrap_or_default();
+    let _ = ack.send(if errors.is_empty() {
+        Ok(newly)
+    } else {
+        Err(OutputLatchError::FailsafeUnconfirmed { errors })
+    });
+}
+
+fn failsafe_ack_pending(shared: &SharedFailsafeStatus) -> bool {
+    shared
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|status| !status.pending.is_empty())
+}
+
+fn record_failsafe_result(
+    shared: &SharedFailsafeStatus,
+    name: &str,
+    error: Option<DeviceFailsafeError>,
+) {
+    let mut slot = shared.lock().unwrap_or_else(|e| e.into_inner());
+    let status = slot.get_or_insert_with(FailsafeStatus::default);
+    status.pending.retain(|pending| pending != name);
+    status.unconfirmed.retain(|failure| failure.device != name);
+    if let Some(error) = error {
+        status
+            .acknowledged
+            .retain(|acknowledged| acknowledged != name);
+        status.unconfirmed.push(error);
+    } else if !status
+        .acknowledged
+        .iter()
+        .any(|acknowledged| acknowledged == name)
+    {
+        status.acknowledged.push(name.into());
+    }
+}
+
+/// Publish an unconfirmed result after the observation window. The owner
+/// continues its safe-value operation so a slow link can finish its sweep.
+const FAILSAFE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Every runtime-owned safe-value pass uses the same per-device accounting
 /// and panic boundary. Callers mark the target batch pending first.
 async fn attempt_device_failsafe(
@@ -1504,7 +1590,25 @@ async fn attempt_device_failsafe(
     shared: &SharedFailsafeStatus,
 ) -> Result<(), DeviceFailsafeError> {
     let name = device.name().to_string();
-    let result = match isolate_device_call(device.enter_failsafe()).await {
+    let started = Instant::now();
+    let operation = isolate_device_call(device.enter_failsafe());
+    tokio::pin!(operation);
+    let outcome = match tokio::time::timeout(FAILSAFE_ACK_TIMEOUT, &mut operation).await {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            record_failsafe_result(
+                shared,
+                &name,
+                Some(DeviceFailsafeError {
+                    device: name.clone(),
+                    error: "safe-value acknowledgement timed out; attempt still in progress".into(),
+                }),
+            );
+            tracing::warn!(device = %name, "adapter failsafe acknowledgement timed out");
+            operation.await
+        }
+    };
+    let result = match outcome {
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => Err(DeviceFailsafeError {
             device: name.clone(),
@@ -1515,25 +1619,9 @@ async fn attempt_device_failsafe(
             error: format!("adapter panicked: {panic}"),
         }),
     };
-    {
-        let mut slot = shared.lock().unwrap_or_else(|e| e.into_inner());
-        let status = slot.get_or_insert_with(FailsafeStatus::default);
-        status.pending.retain(|pending| pending != &name);
-        status.unconfirmed.retain(|error| error.device != name);
-        match &result {
-            Ok(()) => {
-                if !status.acknowledged.contains(&name) {
-                    status.acknowledged.push(name);
-                }
-            }
-            Err(error) => {
-                status
-                    .acknowledged
-                    .retain(|acknowledged| acknowledged != &name);
-                status.unconfirmed.push(error.clone());
-            }
-        }
-    }
+    tracing::info!(device = %name, elapsed_us = started.elapsed().as_micros() as u64,
+        acknowledged = result.is_ok(), "adapter failsafe attempt finished");
+    record_failsafe_result(shared, &name, result.as_ref().err().cloned());
     if let Err(error) = &result {
         tracing::error!(device = %error.device, error = %error.error, "adapter safe-value call unconfirmed; ordinary output inhibition is unchanged");
     }
@@ -2373,6 +2461,8 @@ impl Drop for ExitGuard {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_loop_async(
+    io_handle: &tokio::runtime::Handle,
+    failsafe_jobs: &mut FailsafeJobs,
     expected_cycle: Option<Duration>,
     mut units: Vec<ProgramUnit>,
     // Devices are borrowed so the outer wrapper retains ownership for
@@ -2383,7 +2473,8 @@ async fn run_loop_async(
     governance: WriteGovernance,
     stop: Arc<AtomicBool>,
     snapshot_tx: broadcast::Sender<VarSnapshot>,
-    mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<RuntimeCommand>,
+    mut cmd_rx: tokio::sync::mpsc::Receiver<RuntimeCommand>,
+    mut latch_rx: tokio::sync::mpsc::Receiver<LatchRequest>,
     mode: Arc<std::sync::Mutex<RuntimeMode>>,
     forces: Arc<std::sync::Mutex<HashMap<String, i32>>>,
     device_health: Arc<std::sync::Mutex<Vec<DeviceHealth>>>,
@@ -2405,6 +2496,7 @@ async fn run_loop_async(
     fault: &tokio::sync::watch::Sender<Option<String>>,
     reconnect: &ReconnectState,
     state_path: Option<PathBuf>,
+    retain_tx: Option<&RetainSender>,
 ) {
     if units.is_empty() {
         tracing::error!("no program units to run — scan loop not started");
@@ -2505,10 +2597,12 @@ async fn run_loop_async(
         }
     }
 
-    let debug_maps: Vec<VariableRenderer> = units
-        .iter()
-        .map(|u| VariableRenderer::new(&u.container))
-        .collect();
+    let debug_maps: Arc<Vec<VariableRenderer>> = Arc::new(
+        units
+            .iter()
+            .map(|u| VariableRenderer::new(&u.container))
+            .collect(),
+    );
     let var_index_by_name: Vec<HashMap<String, u16>> = units
         .iter()
         .map(|unit| {
@@ -2702,6 +2796,15 @@ async fn run_loop_async(
         }
     }
 
+    let snapshots = SnapshotPublisher::new(
+        io_handle,
+        snapshot_tx,
+        &runnings,
+        debug_maps.clone(),
+        instances.clone(),
+        shared_names,
+    );
+
     // ---- Scan loop ----
     #[cfg(feature = "scan-trace")]
     let scan_trace = crate::scan_trace::Recorder::from_env(&instances);
@@ -2747,6 +2850,8 @@ async fn run_loop_async(
     // state answers "are outputs latched off" for both the loop and the
     // HTTP layer.
     let mut prev_paused = false;
+    let mut using_observation_clock = false;
+    let mut pending_latch_ack: Option<(bool, LatchAck)> = None;
     let mut scan_aborted = false;
     // Pending fault injection (InjectScanStall). Owned by the loop:
     // written from the command drain, consumed one TICK at a time.
@@ -2759,6 +2864,15 @@ async fn run_loop_async(
         let trace_tick = scan_trace.point();
         if stop.load(Ordering::Relaxed) {
             break;
+        }
+
+        failsafe_jobs
+            .collect(devices, &failsafe_status, false)
+            .await;
+        if pending_latch_ack.is_some() && !failsafe_ack_pending(&failsafe_status) {
+            if let Some((newly, ack)) = pending_latch_ack.take() {
+                acknowledge_latch(ack, newly, &failsafe_status);
+            }
         }
 
         // Adopt any devices the background reconnect worker delivered:
@@ -2804,10 +2918,8 @@ async fn run_loop_async(
             // OPC UA the explicit failsafe VALUES (not just zeros) would
             // never be written at all.
             if watchdog_tripped.load(Ordering::Relaxed) {
-                if let Some(dev) = devices.last_mut() {
-                    begin_failsafe_attempts(&failsafe_status, [name.as_str()]);
-                    let _ = attempt_device_failsafe(dev.as_mut(), &failsafe_status).await;
-                }
+                let last = devices.len() - 1;
+                failsafe_jobs.start(devices, &failsafe_status, |index, _| index == last);
             }
         }
 
@@ -2815,12 +2927,14 @@ async fn run_loop_async(
         // Cheap: one atomic load per device, and the lock is uncontended
         // except when an HTTP handler snapshots it. Entries for devices
         // that never connected aren't in `devices` and stay `false`.
-        if let Ok(mut health) = device_health.lock() {
+        if let Ok(mut health) = device_health.try_lock() {
             for entry in health.iter_mut() {
                 if let Some(d) = devices.iter().find(|d| d.name() == entry.name) {
                     entry.healthy = d.is_healthy();
                     if last_cycle_diagnostics.elapsed() >= SNAPSHOT_PERIOD {
-                        entry.cycle = d.cycle_status();
+                        if let Some(cycle) = d.cycle_status() {
+                            entry.cycle = Some(cycle);
+                        }
                     }
                 }
             }
@@ -2830,11 +2944,51 @@ async fn run_loop_async(
             last_cycle_diagnostics = Instant::now();
         }
 
-        // Drain any pending out-of-band commands (variable writes,
-        // forces, unforces). Done EVERY iteration including when
-        // paused — that's the whole point of pausing, you want to
-        // poke values without scanning.
-        while let Ok(cmd) = cmd_rx.try_recv() {
+        if pending_latch_ack.is_none() {
+            if let Ok(LatchRequest { reason, ack }) = latch_rx.try_recv() {
+                let newly = !watchdog_tripped.load(Ordering::Relaxed);
+                if newly {
+                    begin_failsafe_attempts(&failsafe_status, devices.iter().map(|dev| dev.name()));
+                    note_latch_reason(&latch_reason, reason.clone());
+                    watchdog_tripped.store(true, Ordering::Release);
+                    tracing::error!(%reason, "outputs inhibited on request; requesting adapter safe values");
+                    failsafe_jobs.start(devices, &failsafe_status, |_, _| true);
+                } else {
+                    let unconfirmed: Vec<String> = failsafe_status
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                        .map(|status| {
+                            status
+                                .unconfirmed
+                                .iter()
+                                .map(|error| error.device.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    failsafe_jobs.start(devices, &failsafe_status, |_, name| {
+                        unconfirmed.iter().any(|device| device == name)
+                    });
+                }
+                if !failsafe_ack_pending(&failsafe_status) {
+                    acknowledge_latch(ack, newly, &failsafe_status);
+                } else {
+                    pending_latch_ack = Some((newly, ack));
+                }
+            }
+        }
+
+        // Ordinary commands can arrive faster than a scan can apply them.
+        // Keep FIFO order across rounds and leave most of the bus period to
+        // the cycle handoff. Admit one command even at very short periods.
+        let command_deadline = expected_cycle.map(|period| Instant::now() + period / 8);
+        for index in 0..COMMANDS_PER_ROUND {
+            if stop.load(Ordering::Relaxed)
+                || (index > 0 && command_deadline.is_some_and(|end| Instant::now() >= end))
+            {
+                break;
+            }
+            let Ok(cmd) = cmd_rx.try_recv() else { break };
             match cmd {
                 RuntimeCommand::SdoHandle { name, ack } => {
                     if !ack.is_closed() {
@@ -2951,50 +3105,6 @@ async fn run_loop_async(
                     }
                     let _ = ack.send(Ok(()));
                 }
-                RuntimeCommand::LatchOutputsOff { reason, ack } => {
-                    let newly = !watchdog_tripped.load(Ordering::Relaxed);
-                    let targets: Vec<String> = if newly {
-                        devices.iter().map(|dev| dev.name().to_string()).collect()
-                    } else {
-                        failsafe_status
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .as_ref()
-                            .map(|status| {
-                                status
-                                    .unconfirmed
-                                    .iter()
-                                    .map(|e| e.device.clone())
-                                    .collect()
-                            })
-                            .unwrap_or_default()
-                    };
-                    begin_failsafe_attempts(&failsafe_status, targets.iter().map(String::as_str));
-                    if newly {
-                        note_latch_reason(&latch_reason, reason.clone());
-                        // Publish inhibition before awaiting any adapter. A
-                        // failed or panicking safe-value call never re-arms it.
-                        watchdog_tripped.store(true, Ordering::Release);
-                        tracing::error!(%reason, "outputs inhibited on request; requesting adapter safe values");
-                    }
-                    for dev in devices.iter_mut() {
-                        if targets.iter().any(|name| name == dev.name()) {
-                            let _ = attempt_device_failsafe(dev.as_mut(), &failsafe_status).await;
-                        }
-                    }
-                    let errors = failsafe_status
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .as_ref()
-                        .map(|status| status.unconfirmed.clone())
-                        .unwrap_or_default();
-                    let result = if errors.is_empty() {
-                        Ok(newly)
-                    } else {
-                        Err(OutputLatchError::FailsafeUnconfirmed { errors })
-                    };
-                    let _ = ack.send(result);
-                }
                 RuntimeCommand::InjectScanStall {
                     stall_ms,
                     scans,
@@ -3026,6 +3136,10 @@ async fn run_loop_async(
             }
         }
 
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+
         // Mode check. Paused → skip every unit's cycle (no input read, no
         // run, no output push); adapter workers keep running, see
         // `RuntimeMode::Paused`. Step{remaining}
@@ -3039,35 +3153,24 @@ async fn run_loop_async(
             && !watchdog_tripped.load(Ordering::Relaxed)
         {
             latch_cycle_fault(
+                failsafe_jobs,
                 devices,
                 &watchdog_tripped,
                 &latch_reason,
                 &failsafe_status,
                 "pause/step interrupts synchronized scans",
-            )
-            .await;
+            );
         }
         if matches!(current_mode, RuntimeMode::Paused) {
             prev_paused = true;
             if last_snapshot.elapsed() >= SNAPSHOT_PERIOD {
-                let now_us = start.elapsed().as_micros() as u64;
-                let mut snapshot = build_snapshot(
+                snapshots.publish(
                     &runnings,
-                    &debug_maps,
-                    &instances,
-                    &shared_names,
-                    &clocks,
-                    now_us,
-                );
-                annotate_input_quality(
-                    &mut snapshot,
                     &mut input_quality,
-                    &debug_maps,
-                    &instances,
-                    &shared_names,
                     &device_health,
+                    start.elapsed().as_micros() as u64,
+                    max_scan_count(&clocks),
                 );
-                let _ = snapshot_tx.send(snapshot);
                 last_snapshot = Instant::now();
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -3114,26 +3217,29 @@ async fn run_loop_async(
             if stop.load(Ordering::Relaxed) {
                 break;
             }
-            match wait {
-                Ok(Ok(())) => {}
-                _ => {
-                    latch_cycle_fault(
-                        devices,
-                        &watchdog_tripped,
-                        &latch_reason,
-                        &failsafe_status,
-                        "cycle wait failed or clock stopped",
-                    )
-                    .await;
-                    continue;
-                }
+            let reason = match wait {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(format!("cycle wait failed: {error}")),
+                Err(_) => Some("cycle clock wait timed out".to_owned()),
+            };
+            if let Some(reason) = reason {
+                latch_cycle_fault(
+                    failsafe_jobs,
+                    devices,
+                    &watchdog_tripped,
+                    &latch_reason,
+                    &failsafe_status,
+                    &reason,
+                );
+                continue;
             }
         }
         let tick_now = Instant::now();
-        if sync_active {
+        if sync_active || (sync_device.is_some() && !using_observation_clock) {
             for clock in &mut clocks {
                 clock.next_due = tick_now;
             }
+            using_observation_clock = !sync_active;
         }
         let mut ran_any = false;
 
@@ -3204,13 +3310,13 @@ async fn run_loop_async(
                         tracing::debug!(channel = %rm.channel, %e, "input read failed");
                         if sync_active {
                             latch_cycle_fault(
+                                failsafe_jobs,
                                 devices,
                                 &watchdog_tripped,
                                 &latch_reason,
                                 &failsafe_status,
                                 &format!("cycle input failed: {e}"),
-                            )
-                            .await;
+                            );
                             break;
                         }
                     }
@@ -3313,13 +3419,13 @@ async fn run_loop_async(
                     if let Err(e) = dev.write_channel(&rm.channel, value).await {
                         if sync_active {
                             latch_cycle_fault(
+                                failsafe_jobs,
                                 devices,
                                 &watchdog_tripped,
                                 &latch_reason,
                                 &failsafe_status,
                                 &format!("cycle output failed: {e}"),
-                            )
-                            .await;
+                            );
                             break;
                         }
                         // RTSO-HOLD-0731: debug-level swallowing meant we could
@@ -3421,9 +3527,7 @@ async fn run_loop_async(
                         ),
                     );
                     watchdog_tripped.store(true, Ordering::Release);
-                    for dev in devices.iter_mut() {
-                        let _ = attempt_device_failsafe(dev.as_mut(), &failsafe_status).await;
-                    }
+                    failsafe_jobs.start(devices, &failsafe_status, |_, _| true);
                 }
                 clocks[i].next_due = after + clocks[i].interval;
             }
@@ -3443,13 +3547,13 @@ async fn run_loop_async(
         }
         if sync_active && !matches!(*lock_mode(&mode), RuntimeMode::Running) {
             latch_cycle_fault(
+                failsafe_jobs,
                 devices,
                 &watchdog_tripped,
                 &latch_reason,
                 &failsafe_status,
                 "pause/step interrupts synchronized scans",
-            )
-            .await;
+            );
         }
         if sync_active && !watchdog_tripped.load(Ordering::Relaxed) {
             if stop.load(Ordering::Relaxed) {
@@ -3460,13 +3564,13 @@ async fn run_loop_async(
                 .await
             {
                 latch_cycle_fault(
+                    failsafe_jobs,
                     devices,
                     &watchdog_tripped,
                     &latch_reason,
                     &failsafe_status,
                     &format!("cycle commit failed: {e}"),
-                )
-                .await;
+                );
             }
         }
 
@@ -3481,44 +3585,22 @@ async fn run_loop_async(
         // Snapshot at ~10 Hz (also when no unit was due this tick —
         // idle wake-ups are capped at SNAPSHOT_PERIOD below).
         if last_snapshot.elapsed() >= SNAPSHOT_PERIOD {
-            let now_us = start.elapsed().as_micros() as u64;
-            let mut snapshot = build_snapshot(
+            snapshots.publish(
                 &runnings,
-                &debug_maps,
-                &instances,
-                &shared_names,
-                &clocks,
-                now_us,
-            );
-            annotate_input_quality(
-                &mut snapshot,
                 &mut input_quality,
-                &debug_maps,
-                &instances,
-                &shared_names,
                 &device_health,
+                start.elapsed().as_micros() as u64,
+                max_scan_count(&clocks),
             );
-            let _ = snapshot_tx.send(snapshot);
             last_snapshot = Instant::now();
         }
 
-        // Persist RETAIN values on a coarse cadence. The window of
-        // potential loss on power-cut is bounded by RETAIN_FLUSH_INTERVAL.
-        // Writes are atomic (tmp + rename) so a crash during flush
-        // can't corrupt the file. Skipped entirely when no retain
-        // vars are declared or no path was configured.
-        if !retain_entries.is_empty()
-            && state_path.is_some()
-            && last_retain_flush.elapsed() >= RETAIN_FLUSH_INTERVAL
-        {
-            let now_us = start.elapsed().as_micros() as u64;
-            persist_retain_values(
-                state_path.as_deref().unwrap(),
-                &retain_entries,
-                &runnings,
-                now_us,
-                max_scan_count(&clocks),
-            );
+        // Only sample the VM here. Encoding and storage run on the
+        // single checkpoint writer, which coalesces pending checkpoints.
+        if let Some(writer) = retain_tx.filter(|_| {
+            !retain_entries.is_empty() && last_retain_flush.elapsed() >= RETAIN_FLUSH_INTERVAL
+        }) {
+            queue_retain_values(writer, &retain_entries, &runnings, start, &clocks);
             last_retain_flush = Instant::now();
         }
 
@@ -3550,18 +3632,8 @@ async fn run_loop_async(
     // value to reload on next startup. Skipped after an abort (VM trap,
     // exhausted budget, or a Stop that found a hung scan): the interrupted
     // unit's variables are partial, so the last periodic checkpoint stands.
-    if !scan_aborted && !retain_entries.is_empty() {
-        if let Some(path) = state_path.as_deref() {
-            let now_us = start.elapsed().as_micros() as u64;
-            persist_retain_values(
-                path,
-                &retain_entries,
-                &runnings,
-                now_us,
-                max_scan_count(&clocks),
-            );
-            tracing::info!(?path, "final retain flush on stop");
-        }
+    if let Some(writer) = retain_tx.filter(|_| !scan_aborted && !retain_entries.is_empty()) {
+        queue_retain_values(writer, &retain_entries, &runnings, start, &clocks);
     }
 
     for running in runnings {
@@ -3622,126 +3694,58 @@ fn lookup_retain_value(vars: &HashMap<String, u64>, instance: &str, key: &str) -
         .copied()
 }
 
-/// Snapshot every RETAIN variable's current VM value (across all units)
-/// and atomically write the one merged state file. Keys are already
-/// canonical (`instance.variable` when several units run, bare names
-/// otherwise) — see the retain_entries construction. Raw slot values
-/// verbatim (schema 2): lossless for every IEC type including LREAL /
-/// LINT / ULINT / LWORD. Errors are logged but don't crash the scan
-/// loop — losing one flush window is acceptable; halting the program
-/// is not.
-fn persist_retain_values(
-    state_path: &std::path::Path,
+type RetainSender = tokio::sync::watch::Sender<Option<Arc<crate::retain::RetainState>>>;
+
+fn retain_writer(
+    path: PathBuf,
+    io: &tokio::runtime::Handle,
+) -> (RetainSender, tokio::task::JoinHandle<()>) {
+    spawn_retain_writer(io, move |state| {
+        if let Err(error) = crate::retain::save(&path, state) {
+            tracing::warn!(?path, %error, "retain flush failed");
+        }
+    })
+}
+
+fn spawn_retain_writer(
+    io: &tokio::runtime::Handle,
+    mut save: impl FnMut(&crate::retain::RetainState) + Send + 'static,
+) -> (RetainSender, tokio::task::JoinHandle<()>) {
+    let (tx, mut rx) = tokio::sync::watch::channel::<Option<Arc<crate::retain::RetainState>>>(None);
+    let runtime = io.clone();
+    let task = io.spawn_blocking(move || {
+        while runtime.block_on(rx.changed()).is_ok() {
+            let state = rx.borrow_and_update().clone();
+            if let Some(state) = state {
+                save(&state);
+            }
+        }
+    });
+    (tx, task)
+}
+
+/// Sample raw slots losslessly, including LREAL and 64-bit integer lanes.
+fn queue_retain_values(
+    writer: &RetainSender,
     retain_entries: &[(usize, String, u16)],
     runnings: &[VmRunning],
-    now_us: u64,
-    scan_count: u64,
+    start: Instant,
+    clocks: &[UnitClock],
 ) {
-    let mut vars: HashMap<String, u64> = HashMap::with_capacity(retain_entries.len());
+    let mut vars = HashMap::with_capacity(retain_entries.len());
     for (unit, key, idx) in retain_entries {
         if let Ok(raw) = runnings[*unit].read_variable_raw(VarIndex::new(*idx)) {
             vars.insert(key.clone(), raw);
         }
     }
-    let state = crate::retain::build(vars, now_us, scan_count);
-    if let Err(e) = crate::retain::save(state_path, &state) {
-        tracing::warn!(?state_path, %e, "retain flush failed");
-    }
-}
-
-/// Merge every unit's variables into one snapshot. Names declared by
-/// more than one unit are disambiguated as `instance.variable`
-/// (`shared_names` is precomputed at startup); unique names — and
-/// everything in a single-unit run — stay bare so today's projects see
-/// no UI churn.
-fn build_snapshot(
-    runnings: &[VmRunning],
-    debug_maps: &[VariableRenderer],
-    instances: &[String],
-    shared_names: &std::collections::HashSet<String>,
-    clocks: &[UnitClock],
-    now_us: u64,
-) -> VarSnapshot {
-    let mut vars = Vec::new();
-    for (u, running) in runnings.iter().enumerate() {
-        let num_vars = running.num_variables();
-        vars.reserve(num_vars as usize);
-        // STRING bytes live in this unit's data region, not the var slot;
-        // read from the SAME unit `u` we're iterating so multi-PROGRAM
-        // instances never cross-read each other's strings.
-        let data_region = running.data_region();
-        // Skip slots that have no debug-map entry (unnamed VM scratch
-        // storage for FB internals / non-instantiated POUs) and dedup
-        // names that collide within the unit — a unit's source carries
-        // every FB/FUNCTION POU, so two POUs declaring the same
-        // variable name both get debug entries with that name. We keep
-        // the first-seen slot; surfacing the same name twice in the
-        // Monitor pane is worse than hiding the inactive duplicate
-        // (which is usually idle at zero anyway).
-        let mut seen = std::collections::HashSet::<String>::new();
-        for i in 0..num_vars {
-            let raw = match running.read_variable_raw(VarIndex::new(i)) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            let Some(info) = debug_maps[u].var(i) else {
-                continue;
-            };
-            if !seen.insert(info.name.clone()) {
-                continue;
-            }
-            let name = if shared_names.contains(&info.name) {
-                format!("{}.{}", instances[u], info.name)
-            } else {
-                info.name.clone()
-            };
-            vars.push(VarValue {
-                name,
-                type_name: info.type_name.clone(),
-                value: debug_maps[u].render(i, raw, data_region).text,
-                bits: raw,
-                input: None,
-            });
-        }
-    }
-    VarSnapshot {
-        timestamp_us: now_us,
-        scan_count: max_scan_count(clocks),
+    let now_us = start.elapsed().as_micros() as u64;
+    writer.send_replace(Some(Arc::new(crate::retain::build(
         vars,
-        device_health: None,
-    }
+        now_us,
+        max_scan_count(clocks),
+    ))));
 }
 
-/// Attach quality using the very same instance/name rules as the snapshot.
-/// Observing link loss latches stale until an input phase acquires a live value;
-/// merely recovering the transport (especially while paused) cannot clear it.
-fn annotate_input_quality(
-    snap: &mut VarSnapshot,
-    inputs: &mut [HashMap<u16, InputQuality>],
-    debug_maps: &[VariableRenderer],
-    instances: &[String],
-    shared_names: &std::collections::HashSet<String>,
-    health: &std::sync::Mutex<Vec<DeviceHealth>>,
-) {
-    let health = health.lock().map(|h| h.clone()).unwrap_or_default();
-    for (u, vars) in inputs.iter_mut().enumerate() {
-        for (idx, quality) in vars {
-            quality.stale |= !health.iter().any(|h| h.name == quality.device && h.healthy);
-            let Some(info) = debug_maps[u].var(*idx) else {
-                continue;
-            };
-            let name = if shared_names.contains(&info.name) {
-                format!("{}.{}", instances[u], info.name)
-            } else {
-                info.name.clone()
-            };
-            if let Some(var) = snap.vars.iter_mut().find(|v| v.name == name) {
-                var.input = Some(quality.clone());
-            }
-        }
-    }
-    snap.device_health = Some(health);
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6527,6 +6531,29 @@ mod tests {
 
     /// A PROGRAM with one RETAIN variable that the scan loop never
     /// modifies, so a restored value stays observable in the snapshot.
+    #[tokio::test]
+    async fn stalled_retain_storage_coalesces_and_flushes_the_final_checkpoint() {
+        let (saved, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let (release, stalled) = std::sync::mpsc::channel();
+        let (writer, task) =
+            spawn_retain_writer(&tokio::runtime::Handle::current(), move |state| {
+                saved.send(state.scan_count).unwrap();
+                if state.scan_count == 1 {
+                    stalled.recv().unwrap();
+                }
+            });
+        let checkpoint = |n| Some(Arc::new(crate::retain::build(HashMap::new(), 0, n)));
+        writer.send_replace(checkpoint(1));
+        assert_eq!(received.recv().await, Some(1));
+        writer.send_replace(checkpoint(2));
+        writer.send_replace(checkpoint(3));
+        drop(writer);
+        release.send(()).unwrap();
+        task.await.unwrap();
+        assert_eq!(received.recv().await, Some(3));
+        assert_eq!(received.recv().await, None);
+    }
+
     fn retain_container() -> Container {
         crate::compile(
             "PROGRAM main\n\
@@ -6862,6 +6889,11 @@ mod tests {
             consumed
         );
         assert!(h.device_health()[0].cycle.as_ref().unwrap().fault.is_some());
+        assert_eq!(
+            h.scan_overruns(),
+            0,
+            "the synchronized fault is not an observation overrun"
+        );
         h.shutdown().await;
     }
     #[tokio::test]

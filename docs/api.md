@@ -360,6 +360,10 @@ This contract is shared by the IDE server and the edge runtime's `/write`.
 | `DELETE` | `/api/runtime/forces/{name}` | Release a forced variable. Idempotent (200 even if it wasn't forced). |
 | `POST` | `/api/runtime/inject-scan-stall` | Fault injection (test primitive): stall the next `scans` scans by `stall_ms` each so the scan watchdog trips through its real overrun path. Body: `{ stall_ms, scans? }` (`scans` defaults to threshold + 1). Backs the scenario DSL's `inject` step; on a live plant this deliberately drives the runtime into latched failsafe — only a program restart recovers. 409 if stopped. |
 
+Server and edge debug writes, force changes and scan-stall injection return
+HTTP 429 when the scan command queue is full. Rejection happens before enqueueing. Stop and output inhibition have their own paths. See the
+[cycle handoff contract](scan-cycle-handoff.md) for timing and fault fields.
+
 ## Runtime history & alarms
 
 Snapshots include `device_health: [{ name, healthy }]` and, on each mapped

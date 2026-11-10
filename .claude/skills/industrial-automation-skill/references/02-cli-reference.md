@@ -355,7 +355,10 @@ DC-slot limit. Steady DC discontinuities include raw previous/current DC
 nanoseconds in the first fault reason. `consumed` means selected for bus exchange, not proven drive
 application. Pause/step or a missed cycle latches `watchdog_tripped`; resume and
 bus recovery cannot re-arm it. The option defaults off and requires one SYNC0
-clock source, no gear, and matching PLC task periods. See
+clock source, no gear, and matching PLC task periods. A full runtime debug
+command queue returns HTTP 429. Cycle diagnostics distinguish a missing
+begin, missing commit and late bus selection. Linux cycle status can include
+a monotonic origin for correlation with scan traces. See
 [the contract](../../../../docs/scan-cycle-handoff.md).
 
 ### Output latch confirmation
@@ -365,5 +368,7 @@ When reading runtime status or `cs probe`, distinguish `watchdog_tripped`
 safe-value attempts). Its `pending` names and `unconfirmed` device/error rows
 require attention even when transport health is good. `acknowledged` has the
 adapter's scope, not physical readback; `null` is no report. Check device health
-for configured adapters that never connected. Restart remains the existing
+for configured adapters that never connected. Independent adapters can
+confirm while another is pending. A timed-out acknowledgement remains
+unconfirmed until the owner returns a result. Restart remains the existing
 re-arm boundary. Do not describe a latch flag as proof that every output is zero.

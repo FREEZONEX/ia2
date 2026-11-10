@@ -430,3 +430,35 @@ async fn pulse_dropped_while_queued_is_held_for_its_time_and_then_cleared() {
     assert_eq!(before_deadline, 1, "the queue time must not shorten the pulse");
     assert_eq!(cleared, 0, "and the reset still runs");
 }
+
+#[tokio::test]
+async fn a_full_command_queue_cannot_park_the_scan_or_delay_output_inhibition() {
+    let (handle, mut gate) = gated_pulse_handle();
+    gate.park().await;
+    let mut replies = Vec::new();
+    for value in 0..COMMAND_QUEUE_CAPACITY {
+        replies.push(handle.queue_write("x", value as i32, None).unwrap());
+    }
+    assert!(matches!(handle.queue_write("x", 0, None), Err(RuntimeWriteError::Busy)));
+    // Park the next input too. It must be reached before the backlog is empty.
+    gate.arm();
+    gate.release();
+    tokio::time::timeout(Duration::from_secs(1), gate.parked()).await.unwrap();
+    let remaining = handle.cmd_tx.max_capacity() - handle.cmd_tx.capacity();
+    assert!(remaining >= COMMAND_QUEUE_CAPACITY - COMMANDS_PER_ROUND);
+    for _ in remaining..COMMAND_QUEUE_CAPACITY {
+        replies.push(handle.queue_write("x", 7, None).unwrap());
+    }
+
+    let latch = handle.latch_outputs_off("priority request");
+    let mut latch = std::pin::pin!(latch);
+    assert!(queue_once(&mut latch).await);
+    gate.release();
+    assert!(tokio::time::timeout(Duration::from_secs(1), latch).await.unwrap().unwrap());
+    assert!(handle.watchdog_tripped());
+    assert!(handle.cmd_tx.capacity() < COMMAND_QUEUE_CAPACITY);
+    for reply in replies {
+        reply.await.unwrap();
+    }
+    handle.shutdown().await;
+}

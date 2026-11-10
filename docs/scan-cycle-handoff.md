@@ -95,15 +95,26 @@ private staging image until the whole scan commits. Channel errors fail the
 synchronized scan closed. Direct adapter writes outside an active scan are refused;
 HTTP variable writes still enter the VM and are processed by subsequent scans.
 
-Pause or step also trips the synchronized run. The common runtime sets the existing
-`watchdog_tripped` latch and keeps serving diagnostics; it does not exit/restart on
-this fault. The first cause appears in `latch_reason`; adapter safe-value attempts
-use the shared `failsafe_status` reporting and panic isolation. An adapter's
-acknowledgement does not establish physical output state. Transport recovery or
-re-walk cannot clear the gate. Explicit program
-restart creates a new gate; it is not an automatic retry of a failed trajectory.
-Stopping still invokes the existing failsafe/shutdown sequence. An already handed
-off/in-flight bus frame cannot be retracted by a later software stop.
+Ordinary runtime commands use a bounded FIFO. A full queue rejects new debug
+commands with HTTP 429. Each scan round applies at most 16 commands and, for
+bus-clocked runs, stops admitting work once it has spent one eighth of a
+period on commands. It admits one command for progress even at short periods.
+Stop and output inhibition do not queue behind those commands. The scan
+samples monitor and RETAIN values. Separate bounded workers format monitor
+snapshots and write RETAIN checkpoints, so a slow formatter or storage device
+cannot make the scan wait for a completed operation. A full monitor mailbox
+skips that sample. The RETAIN writer keeps the newest pending checkpoint and
+is drained after device teardown.
+
+Pause, step and missed handoffs latch normal outputs off. The first cause
+appears in `latch_reason`. Each adapter keeps sole ownership of its transport
+while its independent safe-value attempt runs. The scan can resume in a
+latched observation mode, with inputs from an adapter marked stale while its
+attempt owns it. On Modbus, queued ordinary writes are discarded once fenced.
+An already in-flight transfer may still reach the device. Adapter acknowledgement
+has the scope documented in [edge deployment](edge-deploy.md#shutdown-and-failsafe-evidence).
+The latch survives transport recovery and re-walk. Explicit restart creates a
+new gate, after ownership from the previous run has drained.
 
 ## Observability
 
@@ -119,14 +130,22 @@ the existing edge status proxy carry `device_health[].cycle` for clock owners:
 | `fault` | First latched reason; null before fault |
 | `events` | Last 32 issue/begin/commit/consume/dc_send_expired/fault events |
 | `events_dropped` | Earlier events evicted from the bounded ring |
+| `host_mono_origin_ns`, `host_mono_uncertainty_ns` | Optional Linux CLOCK_MONOTONIC origin and calibration bracket width in ns |
 
-Events have a sequence, `host_us`, and optional `deadline_us`, all relative to one
-monotonic host-clock origin. They are not UTC timestamps or EtherCAT DC timestamps.
-Status snapshots refresh approximately every 100 ms; read counters as snapshots,
-not an atomic live transaction with other status fields. No per-cycle file I/O is
-performed. A cycle fault makes the device unhealthy until restart. Independent
-scheduler `scan_overruns` is not used to decide synchronized deadlines: the gate
-and `watchdog_tripped` report that path.
+Events have a sequence, `host_us`, and optional `deadline_us`, relative to one
+monotonic host-clock origin. On Linux, add `host_mono_origin_ns` to `host_us × 1000`
+to align with scan trace and scheduler data. The calibration width and
+microsecond quantization bound the timestamp mapping. EtherCAT DC uses a
+separate clock. The gate distinguishes a scan that never began, one that
+began without a commit, and a bus that missed its selection deadline. A
+first fault records the active ticket deadline when available. Status
+refreshes approximately every 100 ms and may retain its previous cycle
+sample during lock contention.
+
+The gate and `watchdog_tripped` report synchronized deadline failures.
+`scan_overruns` counts timer-driven deadlines. After a synchronized fault,
+the observation timer starts from a fresh anchor. Safe-value processing and
+the abandoned bus deadline stay separate from observation overrun accounting.
 
 When the DC worker resumes a whole period late, the runtime journal records
 the prior timer entry margin, the time from prior exchange completion to timer

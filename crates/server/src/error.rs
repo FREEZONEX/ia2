@@ -10,6 +10,7 @@ pub enum ApiError {
     NoProject,
     NotFound(String),
     Conflict(String),
+    TooManyRequests(String),
     PreconditionFailed,
     BadRequest(String),
     /// 422 — the request was well-formed but the resulting state fails
@@ -62,6 +63,7 @@ impl From<ironplc_bridge::RuntimeWriteError> for ApiError {
         match e {
             E::UnknownVariable(n) => Self::NotFound(format!("variable '{n}' not declared")),
             E::Disconnected => Self::Conflict("scan loop has stopped".into()),
+            E::Busy => Self::TooManyRequests(e.to_string()),
             E::Vm(msg) => Self::Internal(msg),
             E::GovernanceDenied(n) => {
                 Self::Forbidden(format!("write to '{n}' rejected by project governance"))
@@ -76,6 +78,7 @@ impl IntoResponse for ApiError {
             Self::NoProject => (StatusCode::CONFLICT, "no project open".to_string()),
             Self::NotFound(s) => (StatusCode::NOT_FOUND, s),
             Self::Conflict(s) => (StatusCode::CONFLICT, s),
+            Self::TooManyRequests(s) => (StatusCode::TOO_MANY_REQUESTS, s),
             Self::PreconditionFailed => (StatusCode::PRECONDITION_FAILED,
                 "document changed since it was read; re-read it and reapply your edit (local edits have not been saved)".into()),
             Self::BadRequest(s) => (StatusCode::BAD_REQUEST, s),

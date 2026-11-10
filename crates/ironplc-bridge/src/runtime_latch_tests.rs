@@ -203,37 +203,56 @@ async fn latch_isolates_adapter_panic_and_attempts_remaining_devices() {
 }
 
 #[tokio::test]
-async fn latch_publishes_all_pending_devices_and_inhibit_before_blocked_adapter_attempt() {
-    let gate = Arc::new(tokio::sync::Notify::new());
+async fn an_unresponsive_adapter_does_not_block_its_peer_or_scan_observation() {
+    let slow_ack = Arc::new(tokio::sync::Notify::new());
     let blocked = LatchProbeState::new(false);
     let accepted = LatchProbeState::new(false);
     let handle = latch_test_handle(vec![
         Box::new(LatchProbeDevice {
             name: "blocked".into(),
             state: blocked,
-            first_attempt_gate: Some(gate.clone()),
+            first_attempt_gate: Some(slow_ack.clone()),
         }),
         latch_probe("accepted", &accepted),
     ]);
+    let mut snapshots = handle.subscribe();
     let request = tokio::spawn({
         let handle = handle.clone();
         async move { handle.latch_outputs_off("blocked cause").await }
     });
-    wait_latch_condition(|| handle.watchdog_tripped()).await;
-    assert!(!request.is_finished(), "adapter response is still pending");
+    wait_latch_condition(|| {
+        handle.failsafe_status().is_some_and(|status| {
+            status.acknowledged == ["accepted"] && status.pending == ["blocked"]
+        })
+    })
+    .await;
+    assert!(handle.watchdog_tripped());
     assert_eq!(handle.latch_reason().as_deref(), Some("blocked cause"));
-    assert_eq!(
-        handle.failsafe_status().unwrap(),
-        FailsafeStatus {
-            pending: vec!["blocked".into(), "accepted".into()],
-            acknowledged: Vec::new(),
-            unconfirmed: Vec::new(),
-        }
-    );
-    assert_eq!(accepted.calls.load(Ordering::Relaxed), 0);
-    gate.notify_one();
-    assert!(request.await.unwrap().unwrap());
-    assert!(handle.failsafe_status().unwrap().pending.is_empty());
+    assert_eq!(accepted.output.load(Ordering::Relaxed), -7);
+    let snapshot = tokio::time::timeout(Duration::from_millis(500), snapshots.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let next = tokio::time::timeout(Duration::from_millis(500), snapshots.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(next.scan_count > snapshot.scan_count);
+    assert!(!request.is_finished(), "the slow adapter is still pending");
+
+    let result = request.await.unwrap().unwrap_err();
+    assert!(matches!(result, OutputLatchError::FailsafeUnconfirmed { errors }
+        if errors.len() == 1 && errors[0].device == "blocked"
+           && errors[0].error.contains("timed out")));
+    // A timeout reports uncertainty and leaves the original safe operation
+    // with its adapter. Late success must update the truthful receipt.
+    slow_ack.notify_one();
+    wait_latch_condition(|| {
+        handle.failsafe_status().is_some_and(|status| {
+            status.unconfirmed.is_empty() && status.acknowledged.contains(&"blocked".into())
+        })
+    })
+    .await;
     handle.shutdown().await;
 }
 

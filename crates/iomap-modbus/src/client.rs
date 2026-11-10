@@ -196,6 +196,7 @@ pub struct ModbusDevice {
     /// `UNHEALTHY_AFTER_FAILURES` consecutive failed refreshes, `true`
     /// again on the first successful poll.
     healthy: Arc<AtomicBool>,
+    outputs_inhibited: Arc<AtomicBool>,
     /// Last value successfully *queued* per channel — the write-on-change
     /// cache. Shared with the poll task, which evicts entries whose wire
     /// write failed and clears the whole map on link loss / failsafe /
@@ -243,6 +244,7 @@ impl ModbusDevice {
             .map_err(|e| annotate_rtu_connect_failure(&config.transport, e.into_io()))?;
 
         let healthy = Arc::new(AtomicBool::new(true));
+        let outputs_inhibited = Arc::new(AtomicBool::new(false));
         let last_written: Arc<Mutex<HashMap<String, ChannelValue>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
@@ -254,6 +256,7 @@ impl ModbusDevice {
             mirror.clone(),
             cmd_rx,
             healthy.clone(),
+            outputs_inhibited.clone(),
             last_written.clone(),
         ));
 
@@ -270,6 +273,7 @@ impl ModbusDevice {
             channels,
             mirror,
             healthy,
+            outputs_inhibited,
             last_written,
             cmd_tx,
             task: Some(task),
@@ -827,6 +831,7 @@ async fn poll_task(
     mirror: Arc<RwLock<HashMap<String, ChannelValue>>>,
     mut cmd_rx: mpsc::Receiver<Cmd>,
     healthy: Arc<AtomicBool>,
+    outputs_inhibited: Arc<AtomicBool>,
     last_written: Arc<Mutex<HashMap<String, ChannelValue>>>,
 ) {
     // Declared before anything that can panic, so it drops (and flips the
@@ -848,6 +853,10 @@ async fn poll_task(
         tokio::select! {
             cmd = cmd_rx.recv() => match cmd {
                 Some(Cmd::Write { channel, value, ack }) => {
+                    if outputs_inhibited.load(Ordering::Acquire) {
+                        let _ = ack.send(Err(inhibited_output_error()));
+                        continue;
+                    }
                     let res = match link.as_mut() {
                         Some(client) => do_write(client, &channel, value, timeout).await,
                         None => Err(XferError::Transport(
@@ -968,6 +977,10 @@ async fn poll_task(
     tracing::debug!(device = %device, "modbus poll task exited");
 }
 
+fn inhibited_output_error() -> IoError {
+    IoError::Transport("modbus ordinary outputs are inhibited".into())
+}
+
 #[async_trait]
 impl IoDevice for ModbusDevice {
     fn name(&self) -> &str {
@@ -994,6 +1007,9 @@ impl IoDevice for ModbusDevice {
     }
 
     async fn write_channel(&mut self, channel: &str, value: ChannelValue) -> Result<(), IoError> {
+        if self.outputs_inhibited.load(Ordering::Acquire) {
+            return Err(inhibited_output_error());
+        }
         let ch = self.channel(channel)?;
         // Reject read-only kinds before the round-trip to the poll task —
         // same `TypeMismatch` the write used to produce, just earlier.
@@ -1046,7 +1062,12 @@ impl IoDevice for ModbusDevice {
         self.healthy.load(Ordering::Relaxed)
     }
 
+    fn inhibit_outputs(&mut self) {
+        self.outputs_inhibited.store(true, Ordering::Release);
+    }
+
     async fn enter_failsafe(&mut self) -> Result<(), IoError> {
+        self.inhibit_outputs();
         let (ack, rx) = oneshot::channel();
         self.cmd_tx
             .send(Cmd::Failsafe { ack })
@@ -1292,6 +1313,7 @@ mod tests {
                 channels,
                 mirror: Arc::new(RwLock::new(HashMap::new())),
                 healthy: Arc::new(AtomicBool::new(true)),
+                outputs_inhibited: Arc::new(AtomicBool::new(false)),
                 last_written: Arc::new(Mutex::new(HashMap::new())),
                 cmd_tx,
                 task: None,

@@ -163,6 +163,13 @@ impl IoDevice for EthercatDevice {
         }
     }
 
+    fn inhibit_outputs(&mut self) {
+        match &mut self.0 {
+            Inner::Sim(s) => s.inhibit_outputs(),
+            Inner::Real(r) => r.inhibit_outputs(),
+        }
+    }
+
     async fn enter_failsafe(&mut self) -> Result<(), IoError> {
         match &mut self.0 {
             Inner::Sim(s) => s.enter_failsafe().await,

@@ -10,6 +10,14 @@ pub struct CycleStatus {
     pub committed: u64,
     pub consumed: u64,
     pub fault: Option<String>,
+    /// Linux CLOCK_MONOTONIC timestamp corresponding to host_us = 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub host_mono_origin_ns: Option<u64>,
+    /// Width of the origin calibration bracket, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub host_mono_uncertainty_ns: Option<u64>,
     /// Recent events only; monotonic host microseconds from this gate's birth.
     pub events: Vec<CycleEvent>,
     pub events_dropped: u64,

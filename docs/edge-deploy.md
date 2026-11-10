@@ -322,9 +322,13 @@ has the adapter's scope: for EtherCAT it confirms mirror preparation for a
 later exchange, not a transmission fence. Safe values for opted-in OPC UA or
 CANopen channels may be nonzero. No physical readback is implied.
 
-A rejected explicit latch request still inhibits normal outputs and returns an
-error. Another explicit request retries only unconfirmed devices, preserving
-the original latch reason. This does not add automatic retries or re-arming.
+Safe-value attempts on independent adapters proceed independently. If a
+cooperative attempt is still waiting after two seconds, the runtime reports
+its acknowledgement as unconfirmed. The original owner continues that
+attempt and updates the receipt if a result arrives. An explicit repeat
+can retry unconfirmed devices whose previous attempts ended and preserves
+the original latch reason. A replacement run waits for teardown
+and ownership to finish.
 The IDE clears its live report when it releases a stopped handle; teardown
 logs remain the evidence for that run.
 

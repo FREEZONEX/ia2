@@ -308,3 +308,27 @@ async fn later_transport_failure_takes_precedence_over_earlier_protocol_rejectio
     device.shutdown().await.unwrap();
     peer.await.unwrap();
 }
+
+#[tokio::test]
+async fn inhibited_device_drops_buffered_ordinary_writes_before_the_safe_sweep() {
+    use WriteReply::Accept;
+    let (mut device, writes, peer) = faulting_slave([Accept; 3]).await;
+    // This single-thread test does not yield between the enqueue and inhibit.
+    device
+        .write_channel("output_0", ChannelValue::U16(10))
+        .await
+        .unwrap();
+    device
+        .write_channel("output_1", ChannelValue::U16(20))
+        .await
+        .unwrap();
+    device.inhibit_outputs();
+    assert!(device
+        .write_channel("output_2", ChannelValue::U16(30))
+        .await
+        .is_err());
+    device.enter_failsafe().await.unwrap();
+    assert_eq!(*writes.lock().unwrap(), vec![(0, 0), (1, 0), (2, 0)]);
+    device.shutdown().await.unwrap();
+    peer.await.unwrap();
+}

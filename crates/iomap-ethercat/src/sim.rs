@@ -264,7 +264,7 @@ impl IoDevice for SimEthercat {
         self.cycle.as_ref().map(|c| c.period)
     }
     fn cycle_status(&self) -> Option<iocore::cycle::CycleStatus> {
-        self.cycle.as_ref().map(|c| c.status())
+        self.cycle.as_ref().and_then(|c| c.try_status())
     }
     async fn begin_cycle(&mut self) -> Result<(), IoError> {
         if let Some(cycle) = &self.cycle {
@@ -333,14 +333,18 @@ impl IoDevice for SimEthercat {
         Ok(())
     }
 
+    fn inhibit_outputs(&mut self) {
+        if let Some(cycle) = &self.cycle {
+            cycle.trip("failsafe requested; restart required");
+        }
+    }
+
     /// Zero every RxPDO (output) channel. TxPDO entries are inputs from
     /// the bus and stay untouched. Matches `RealEthercat::enter_failsafe`
     /// semantics so sim and real behave identically from the scan
     /// loop's perspective.
     async fn enter_failsafe(&mut self) -> Result<(), IoError> {
-        if let Some(cycle) = &self.cycle {
-            cycle.trip("failsafe requested; restart required");
-        }
+        self.inhibit_outputs();
         self.staged = None;
         let to_zero: Vec<(String, EthercatDataType)> = self
             .channels

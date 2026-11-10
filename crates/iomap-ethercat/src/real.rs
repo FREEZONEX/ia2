@@ -859,7 +859,7 @@ impl IoDevice for RealEthercat {
         self.cycle.as_ref().map(|c| c.period)
     }
     fn cycle_status(&self) -> Option<iocore::cycle::CycleStatus> {
-        self.cycle.as_ref().map(|c| c.status())
+        self.cycle.as_ref().and_then(|c| c.try_status())
     }
     async fn begin_cycle(&mut self) -> Result<(), IoError> {
         if let Some(cycle) = &self.cycle {
@@ -977,6 +977,12 @@ impl IoDevice for RealEthercat {
         )
     }
 
+    fn inhibit_outputs(&mut self) {
+        if let Some(cycle) = &self.cycle {
+            cycle.trip("failsafe requested; restart required");
+        }
+    }
+
     /// Zero the entire output PDI mirror for every discovered slave.
     /// The next cyclic tick on the worker thread copies these zeros
     /// onto the bus surface and `tx_rx`'s them out — at default cycle
@@ -987,9 +993,7 @@ impl IoDevice for RealEthercat {
     /// unavailable during an unhealthy bus/re-walk. The mirror is still
     /// zeroed even when transmission cannot be confirmed.
     async fn enter_failsafe(&mut self) -> Result<(), IoError> {
-        if let Some(cycle) = &self.cycle {
-            cycle.trip("failsafe requested; restart required");
-        }
+        self.inhibit_outputs();
         self.staged = None;
         // Gear axes first: drop every engage request so the engines fall
         // back to shadow/hold instead of re-driving targets over the

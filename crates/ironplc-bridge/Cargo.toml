@@ -19,6 +19,7 @@ ironplc-vm = { path = "../../vendor/ironplc/compiler/vm" }
 ironplc-dsl = { path = "../../vendor/ironplc/compiler/dsl" }
 
 tokio.workspace = true
+async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -42,6 +43,3 @@ iomap-canopen = { path = "../iomap-canopen" }
 tokio = { workspace = true, features = ["test-util"] }
 blake3 = "1"
 tempfile = "3"
-# Implement the `IoDevice` trait (which is `#[async_trait]`) for the mock
-# device used in the shutdown-sequencing tests.
-async-trait.workspace = true
