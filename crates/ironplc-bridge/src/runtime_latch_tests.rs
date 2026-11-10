@@ -3,6 +3,7 @@
 
 struct LatchProbeState {
     calls: AtomicU64,
+    shutdowns: AtomicU64,
     writes: AtomicU64,
     output: std::sync::atomic::AtomicI32,
     reject: AtomicBool,
@@ -13,6 +14,7 @@ impl LatchProbeState {
     fn new(reject: bool) -> Arc<Self> {
         Arc::new(Self {
             calls: AtomicU64::new(0),
+            shutdowns: AtomicU64::new(0),
             writes: AtomicU64::new(0),
             output: std::sync::atomic::AtomicI32::new(123),
             reject: AtomicBool::new(reject),
@@ -59,6 +61,11 @@ impl IoDevice for LatchProbeDevice {
         }
         // A configured safe value need not be zero.
         self.state.output.store(-7, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn shutdown(&mut self) -> Result<(), IoError> {
+        self.state.shutdowns.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -241,9 +248,11 @@ async fn an_unresponsive_adapter_does_not_block_its_peer_or_scan_observation() {
     assert!(!request.is_finished(), "the slow adapter is still pending");
 
     let result = request.await.unwrap().unwrap_err();
-    assert!(matches!(result, OutputLatchError::FailsafeUnconfirmed { errors }
+    assert!(
+        matches!(result, OutputLatchError::FailsafeUnconfirmed { errors }
         if errors.len() == 1 && errors[0].device == "blocked"
-           && errors[0].error.contains("timed out")));
+           && errors[0].error.contains("timed out"))
+    );
     // A timeout reports uncertainty and leaves the original safe operation
     // with its adapter. Late success must update the truthful receipt.
     slow_ack.notify_one();
@@ -254,6 +263,55 @@ async fn an_unresponsive_adapter_does_not_block_its_peer_or_scan_observation() {
     })
     .await;
     handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn stop_drives_a_queued_reconnect_safe_while_a_previous_owner_waits() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let blocked = LatchProbeState::new(false);
+    let ready = LatchProbeState::new(false);
+    let late = LatchProbeState::new(false);
+    let mut devices: Vec<Box<dyn IoDevice>> = vec![
+        Box::new(LatchProbeDevice {
+            name: "blocked".into(),
+            state: blocked.clone(),
+            first_attempt_gate: Some(release.clone()),
+        }),
+        latch_probe("ready", &ready),
+    ];
+    let status = Arc::new(std::sync::Mutex::new(None));
+    let mut jobs = FailsafeJobs::new(tokio::runtime::Handle::current());
+    jobs.start(&mut devices, &status, |_, _| true);
+    wait_latch_condition(|| blocked.calls.load(Ordering::Relaxed) == 1).await;
+
+    // Stop wins before the next scan can adopt the delivered adapter.
+    let reconnect = ReconnectState::default();
+    assert!(reconnect.deliver(latch_probe("late", &late)).is_ok());
+    devices.extend(reconnect.finish());
+    let (shutdown_failures, (peers_closed, blocked_calls, blocked_shutdowns)) =
+        tokio::join!(jobs.shutdown(&mut devices, &status), async {
+            let peers_closed = tokio::time::timeout(Duration::from_secs(3), async {
+                while ready.shutdowns.load(Ordering::Relaxed) == 0
+                    || late.shutdowns.load(Ordering::Relaxed) == 0
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+            let blocked_calls = blocked.calls.load(Ordering::Relaxed);
+            let blocked_shutdowns = blocked.shutdowns.load(Ordering::Relaxed);
+            release.notify_one();
+            (peers_closed, blocked_calls, blocked_shutdowns)
+        });
+    peers_closed.expect("independent peers must reach shutdown while the first owner waits");
+    assert_eq!(blocked_calls, 1, "the blocked adapter still has one owner");
+    assert_eq!(blocked_shutdowns, 0);
+    assert_eq!(late.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(late.output.load(Ordering::Relaxed), -7);
+    assert_eq!(ready.calls.load(Ordering::Relaxed), 2);
+    assert_eq!(blocked.calls.load(Ordering::Relaxed), 2);
+    assert_eq!(blocked.shutdowns.load(Ordering::Relaxed), 1);
+    assert_eq!(shutdown_failures, 0);
 }
 
 #[tokio::test]

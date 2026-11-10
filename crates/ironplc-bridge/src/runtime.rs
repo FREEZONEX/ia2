@@ -15,7 +15,7 @@
 //! Devices stay owned by the thread and are shared across units
 //! sequentially — no concurrency on the bus.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -169,14 +169,6 @@ pub struct WriteOutcome {
     pub undelivered_device: Option<String>,
 }
 
-/// Identity of one accepted pulse. The scan thread records it against the
-/// resolved VM slot, so bare/qualified aliases share ownership. Arc identity
-/// avoids wrapping generations and is private to this run's command queue.
-pub(crate) struct PulseToken {
-    name: String,
-    owner: Arc<()>,
-}
-
 /// Reasons a variable write can't be honoured.
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeWriteError {
@@ -237,6 +229,42 @@ struct LatchRequest {
 
 const COMMAND_QUEUE_CAPACITY: usize = 128;
 const COMMANDS_PER_ROUND: usize = 16;
+const PULSE_RESETS_PER_ROUND: usize = 16;
+
+type VarSlot = (usize, u16);
+
+/// Keep only the current pulse per resolved slot. The deadline index lets
+/// the scan check for expired pulses without walking long-running timers.
+#[derive(Default)]
+struct PulseDeadlines {
+    slots: HashMap<VarSlot, Instant>,
+    deadlines: BTreeSet<(Instant, VarSlot)>,
+}
+
+impl PulseDeadlines {
+    fn clear(&mut self, slot: VarSlot) {
+        if let Some(deadline) = self.slots.remove(&slot) {
+            self.deadlines.remove(&(deadline, slot));
+        }
+    }
+
+    fn set(&mut self, slot: VarSlot, deadline: Option<Instant>) {
+        self.clear(slot);
+        if let Some(deadline) = deadline {
+            self.slots.insert(slot, deadline);
+            self.deadlines.insert((deadline, slot));
+        }
+    }
+
+    fn pop_expired(&mut self, now: Instant) -> Option<VarSlot> {
+        let &(deadline, slot) = self.deadlines.first()?;
+        if deadline > now {
+            return None;
+        }
+        self.clear(slot);
+        Some(slot)
+    }
+}
 
 /// Out-of-band commands the scan loop drains between rounds. Used so
 /// HTTP handlers (in the server's tokio runtime) can poke the VM (which
@@ -258,14 +286,8 @@ enum RuntimeCommand {
     WriteVariable {
         name: String,
         value: i32,
-        pulse_owner: Option<Arc<()>>,
+        pulse_ms: Option<u32>,
         ack: tokio::sync::oneshot::Sender<Result<WriteOutcome, RuntimeWriteError>>,
-    },
-    /// Runtime-owned write-zero, conditional on this pulse still owning the
-    /// slot. Validation and application happen together on the scan thread.
-    ResetPulse {
-        token: PulseToken,
-        ack: tokio::sync::oneshot::Sender<Result<Option<WriteOutcome>, RuntimeWriteError>>,
     },
     /// Pin a variable's value: every scan begins by writing `value`
     /// into the VM after the input phase but before `run_round`, so the
@@ -538,55 +560,17 @@ impl ProgramHandle {
         name: &str,
         value: i32,
     ) -> Result<WriteOutcome, RuntimeWriteError> {
-        self.send_write(name, value, None).await
+        self.queue_write(name, value, None)?.await
     }
 
-    /// Register ownership only after a governed write succeeds in the VM.
-    /// `write_with_pulse` uses `queue_pulse`; tests start pulses with this.
-    #[cfg(test)]
-    pub(crate) async fn start_pulse(
+    /// The scan owns both halves of the pulse as soon as it applies the write.
+    pub(crate) async fn write_pulse(
         &self,
         name: &str,
         value: i32,
-    ) -> Result<(WriteOutcome, PulseToken), RuntimeWriteError> {
-        let (landed, token) = self.queue_pulse(name, value)?;
-        Ok((landed.await?, token))
-    }
-
-    /// Queue a pulse's first write now, in the caller's command order, and
-    /// return what resolves once the scan loop has applied it. Ownership is
-    /// still registered only if that write succeeds.
-    pub(crate) fn queue_pulse(
-        &self,
-        name: &str,
-        value: i32,
-    ) -> Result<
-        (
-            impl std::future::Future<Output = Result<WriteOutcome, RuntimeWriteError>> + Send + 'static,
-            PulseToken,
-        ),
-        RuntimeWriteError,
-    > {
-        let token = PulseToken {
-            name: name.to_string(),
-            owner: Arc::new(()),
-        };
-        let landed = self.queue_write(name, value, Some(token.owner.clone()))?;
-        Ok((landed, token))
-    }
-
-    /// Bypass governance for the runtime's own reset (ADR-0002), but never
-    /// overwrite a later accepted write or force. None means superseded.
-    pub(crate) async fn reset_pulse(
-        &self,
-        token: PulseToken,
-    ) -> Result<Option<WriteOutcome>, RuntimeWriteError> {
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        self.cmd_tx
-            .send(RuntimeCommand::ResetPulse { token, ack: ack_tx })
-            .await
-            .map_err(|_| RuntimeWriteError::Disconnected)?;
-        ack_rx.await.map_err(|_| RuntimeWriteError::Disconnected)?
+        pulse_ms: u32,
+    ) -> Result<WriteOutcome, RuntimeWriteError> {
+        self.queue_write(name, value, Some(pulse_ms))?.await
     }
 
     /// Resolve on the scan thread, then await the mailbox OUTSIDE that thread.
@@ -612,15 +596,6 @@ impl ProgramHandle {
         handle.upload(address).await
     }
 
-    async fn send_write(
-        &self,
-        name: &str,
-        value: i32,
-        pulse_owner: Option<Arc<()>>,
-    ) -> Result<WriteOutcome, RuntimeWriteError> {
-        self.queue_write(name, value, pulse_owner)?.await
-    }
-
     fn queue_command(&self, command: RuntimeCommand) -> Result<(), RuntimeWriteError> {
         use tokio::sync::mpsc::error::TrySendError;
         self.cmd_tx.try_send(command).map_err(|error| match error {
@@ -634,7 +609,7 @@ impl ProgramHandle {
         &self,
         name: &str,
         value: i32,
-        pulse_owner: Option<Arc<()>>,
+        pulse_ms: Option<u32>,
     ) -> Result<
         impl std::future::Future<Output = Result<WriteOutcome, RuntimeWriteError>> + Send + 'static,
         RuntimeWriteError,
@@ -643,7 +618,7 @@ impl ProgramHandle {
         self.queue_command(RuntimeCommand::WriteVariable {
             name: name.to_string(),
             value,
-            pulse_owner,
+            pulse_ms,
             ack: ack_tx,
         })?;
         Ok(async move { ack_rx.await.unwrap_or(Err(RuntimeWriteError::Disconnected)) })
@@ -1276,45 +1251,15 @@ fn spawn_units_with_grace(
                 );
             }
 
-            // Always attempt each adapter's configured safe values before
-            // teardown, including after a failed or panicking earlier attempt.
+            // Each device gets a final safe attempt before its own shutdown.
+            // A previous owner can hold its slot, but cannot delay peers.
             let dev_count = devices.len();
-            // All already-started jobs retain ownership until they return.
-            // Give each device its cleanup attempt, independently of its peers.
-            failsafe_jobs.collect(&mut devices, &failsafe_status_clone, true).await;
-            failsafe_jobs.start(&mut devices, &failsafe_status_clone, |_, _| true);
-            failsafe_jobs.collect(&mut devices, &failsafe_status_clone, true).await;
+            let shutdown_failed = failsafe_jobs.shutdown(&mut devices, &failsafe_status_clone).await;
             let failsafe_failed = failsafe_status_clone
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .as_ref()
                 .map_or(0, |status| status.unconfirmed.len());
-            // Allow an asynchronous adapter worker a brief flush opportunity
-            // before teardown. This delay does not establish transmission or
-            // physical state; paid once, on shutdown.
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            // Graceful per-device teardown: request shutdown and join owned
-            // workers according to each adapter's contract. An adapter that
-            // closed cleanly but could not confirm its last output returns
-            // an error, which is counted below. Runs on both the clean and
-            // panicked paths (before re-panic); errors are recorded.
-            let shutdown_failed = futures_util::future::join_all(devices.iter_mut().map(|dev| async {
-                match isolate_device_call(dev.shutdown()).await {
-                    Ok(Ok(())) => false,
-                    Ok(Err(e)) => {
-                        tracing::warn!(device = %dev.name(), %e, "device shutdown failed");
-                        true
-                    }
-                    Err(panic) => {
-                        tracing::error!(device = %dev.name(), %panic, "device shutdown panicked");
-                        true
-                    }
-                }
-            }))
-            .await
-            .into_iter()
-            .filter(|failed| *failed)
-            .count();
             // Failsafe + teardown done: release the reconnect worker (it
             // holds the runtime that late-connected adapters' background
             // tasks live on, and must outlive the writes above).
@@ -2287,7 +2232,7 @@ fn mapped_write_outcome(
 /// decision; a governed force would no longer be a debug override, and
 /// an ungoverned exported force would be a hole — so force is simply
 /// never exported on any northbound surface). The monitor's pulse
-/// reset bypasses too, via `reset_pulse`: it is the
+/// reset bypasses too: it is the
 /// runtime's own safety action, not an external write.
 fn enforce_write_governance(
     governance: &WriteGovernance,
@@ -2810,7 +2755,7 @@ async fn run_loop_async(
     let scan_trace = crate::scan_trace::Recorder::from_env(&instances);
     #[cfg(feature = "scan-trace")]
     let mut trace_sleep = None;
-    let mut pulse_owners: HashMap<(usize, u16), Arc<()>> = HashMap::new();
+    let mut pulses = PulseDeadlines::default();
     let start = Instant::now();
     let mut last_snapshot = Instant::now() - Duration::from_secs(1);
     let mut last_retain_flush = Instant::now();
@@ -2866,9 +2811,7 @@ async fn run_loop_async(
             break;
         }
 
-        failsafe_jobs
-            .collect(devices, &failsafe_status, false)
-            .await;
+        failsafe_jobs.collect_ready(devices, &failsafe_status).await;
         if pending_latch_ack.is_some() && !failsafe_ack_pending(&failsafe_status) {
             if let Some((newly, ack)) = pending_latch_ack.take() {
                 acknowledge_latch(ack, newly, &failsafe_status);
@@ -2981,7 +2924,8 @@ async fn run_loop_async(
         // Ordinary commands can arrive faster than a scan can apply them.
         // Keep FIFO order across rounds and leave most of the bus period to
         // the cycle handoff. Admit one command even at very short periods.
-        let command_deadline = expected_cycle.map(|period| Instant::now() + period / 8);
+        let command_start = Instant::now();
+        let command_deadline = expected_cycle.map(|period| command_start + period / 8);
         for index in 0..COMMANDS_PER_ROUND {
             if stop.load(Ordering::Relaxed)
                 || (index > 0 && command_deadline.is_some_and(|end| Instant::now() >= end))
@@ -3012,7 +2956,7 @@ async fn run_loop_async(
                 RuntimeCommand::WriteVariable {
                     name,
                     value,
-                    pulse_owner,
+                    pulse_ms,
                     ack,
                 } => {
                     let result = match resolve_var(&name, &instances, &var_index_by_name) {
@@ -3031,11 +2975,13 @@ async fn run_loop_async(
                                     Ok(()) => {
                                         // Only an accepted write supersedes a pulse;
                                         // governance/VM failures leave its reset live.
-                                        if let Some(owner) = pulse_owner {
-                                            pulse_owners.insert((u, idx), owner);
-                                        } else {
-                                            pulse_owners.remove(&(u, idx));
-                                        }
+                                        pulses.set(
+                                            (u, idx),
+                                            pulse_ms.map(|ms| {
+                                                Instant::now()
+                                                    + Duration::from_millis(u64::from(ms))
+                                            }),
+                                        );
                                         Ok(mapped_write_outcome(
                                             v,
                                             idx,
@@ -3053,37 +2999,6 @@ async fn run_loop_async(
                     };
                     let _ = ack.send(result);
                 }
-                RuntimeCommand::ResetPulse { token, ack } => {
-                    let result = match resolve_var(&token.name, &instances, &var_index_by_name) {
-                        Some((u, idx)) => {
-                            if pulse_owners
-                                .get(&(u, idx))
-                                .is_some_and(|owner| Arc::ptr_eq(owner, &token.owner))
-                            {
-                                // No await between ownership validation and the
-                                // write: a queued later write cannot be erased.
-                                let result = runnings[u]
-                                    .write_variable(VarIndex::new(idx), 0)
-                                    .map(|()| {
-                                        Some(mapped_write_outcome(
-                                            0,
-                                            idx,
-                                            &unit_outputs[u],
-                                            &parked_output_device[u],
-                                            devices,
-                                        ))
-                                    })
-                                    .map_err(|trap| RuntimeWriteError::Vm(format!("{trap:?}")));
-                                pulse_owners.remove(&(u, idx));
-                                result
-                            } else {
-                                Ok(None)
-                            }
-                        }
-                        None => Err(RuntimeWriteError::UnknownVariable(token.name)),
-                    };
-                    let _ = ack.send(result);
-                }
                 RuntimeCommand::ForceVariable { name, value, ack } => {
                     // Reject unknown names early so the caller gets
                     // immediate feedback instead of a silent no-op.
@@ -3091,7 +3006,7 @@ async fn run_loop_async(
                         if let Some(slot) = resolve_var(&name, &instances, &var_index_by_name) {
                             if let Ok(mut f) = forces.lock() {
                                 f.insert(name.clone(), value);
-                                pulse_owners.remove(&slot);
+                                pulses.clear(slot);
                             }
                             Ok(value)
                         } else {
@@ -3138,6 +3053,30 @@ async fn run_loop_async(
 
         if stop.load(Ordering::Relaxed) {
             break;
+        }
+
+        // Reserve bounded work for expiry, independent of queue capacity.
+        // Accepted writes and forces have cancelled their old deadlines.
+        for _ in 0..PULSE_RESETS_PER_ROUND {
+            let Some((unit, index)) = pulses.pop_expired(command_start) else {
+                break;
+            };
+            let variable = debug_maps[unit].var(index).map_or("?", |info| &info.name);
+            match runnings[unit].write_variable(VarIndex::new(index), 0) {
+                Ok(()) => {
+                    let outcome = mapped_write_outcome(
+                        0,
+                        index,
+                        &unit_outputs[unit],
+                        &parked_output_device[unit],
+                        devices,
+                    );
+                    if let Some(device) = outcome.undelivered_device {
+                        tracing::warn!(variable, %device, "pulse reset applied to the VM but device delivery is unconfirmed");
+                    }
+                }
+                Err(trap) => tracing::warn!(variable, ?trap, "pulse reset write failed"),
+            }
         }
 
         // Mode check. Paused → skip every unit's cycle (no input read, no

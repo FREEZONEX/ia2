@@ -853,7 +853,13 @@ async fn poll_task(
         tokio::select! {
             cmd = cmd_rx.recv() => match cmd {
                 Some(Cmd::Write { channel, value, ack }) => {
-                    if outputs_inhibited.load(Ordering::Acquire) {
+                    // Order transport admission and inhibition on the same atomic.
+                    // An admitted request may finish after inhibition. This task
+                    // finishes it before taking another write or the safe sweep.
+                    let admitted = outputs_inhibited
+                        .compare_exchange(false, false, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok();
+                    if !admitted {
                         let _ = ack.send(Err(inhibited_output_error()));
                         continue;
                     }

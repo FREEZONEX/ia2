@@ -1,7 +1,7 @@
 //! One outstanding ticket, one complete frame, one consumer. No queue catch-up.
 //! Both real and simulated bus workers use this exact state machine.
 use iocore::{
-    cycle::{CycleEvent, CycleStatus},
+    cycle::{CycleEvent, CycleStatus, CycleTiming},
     IoError,
 };
 use std::{
@@ -18,13 +18,14 @@ const TRACE_CAPACITY: usize = 32;
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Ticket {
     pub sequence: u64,
+    issued_at: Instant,
     deadline: Instant,
 }
 struct State<T> {
     armed: bool,
     ticket: Option<(Ticket, T)>,
     pending: Option<T>,
-    begun: u64,
+    begun: Option<(u64, Instant)>,
     status: CycleStatus,
     events: VecDeque<GateEvent>,
 }
@@ -81,7 +82,7 @@ impl<T: Clone> Gate<T> {
                 armed: false,
                 ticket: None,
                 pending: None,
-                begun: 0,
+                begun: None,
                 status: CycleStatus {
                     period_us: period.as_micros() as u64,
                     host_mono_origin_ns,
@@ -169,15 +170,12 @@ impl<T: Clone> Gate<T> {
                 }
                 s.armed = true;
                 if let Some((ticket, image)) = s.ticket.clone() {
-                    if ticket.sequence > s.begun {
-                        s.begun = ticket.sequence;
-                        self.event(
-                            &mut s,
-                            "begin",
-                            ticket.sequence,
-                            Instant::now(),
-                            Some(ticket.deadline),
-                        );
+                    if s.begun
+                        .is_none_or(|(sequence, _)| ticket.sequence > sequence)
+                    {
+                        let now = Instant::now();
+                        s.begun = Some((ticket.sequence, now));
+                        self.event(&mut s, "begin", ticket.sequence, now, Some(ticket.deadline));
                         return Ok((ticket, image));
                     }
                 }
@@ -202,19 +200,42 @@ impl<T: Clone> Gate<T> {
         if let Some(why) = &s.status.fault {
             return Err(IoError::Transport(why.clone()));
         }
+        let began = s
+            .begun
+            .filter(|(sequence, _)| *sequence == ticket.sequence)
+            .map(|(_, at)| at);
         let valid = s
             .ticket
             .as_ref()
             .is_some_and(|(t, _)| t.sequence == ticket.sequence)
-            && s.begun == ticket.sequence
             && s.pending.is_none()
             && now < ticket.deadline;
-        if !valid {
+        let Some(began) = began.filter(|_| valid) else {
             self.fail(&mut s, "late, duplicate or stale cycle commit", now);
             return Err(IoError::Transport(
                 "cycle commit refused; restart required".into(),
             ));
-        }
+        };
+        // Update before the bounded event ring can discard any timestamp.
+        let us_between =
+            |end: Instant, start: Instant| end.saturating_duration_since(start).as_micros() as u64;
+        let timing = CycleTiming {
+            max_issue_to_begin_us: us_between(began, ticket.issued_at),
+            max_begin_to_commit_us: us_between(now, began),
+            min_begin_margin_us: us_between(ticket.deadline, began),
+            min_commit_margin_us: us_between(ticket.deadline, now),
+        };
+        let extrema = s.status.handoff_timing.get_or_insert(timing);
+        extrema.max_issue_to_begin_us = extrema
+            .max_issue_to_begin_us
+            .max(timing.max_issue_to_begin_us);
+        extrema.max_begin_to_commit_us = extrema
+            .max_begin_to_commit_us
+            .max(timing.max_begin_to_commit_us);
+        extrema.min_begin_margin_us = extrema.min_begin_margin_us.min(timing.min_begin_margin_us);
+        extrema.min_commit_margin_us = extrema
+            .min_commit_margin_us
+            .min(timing.min_commit_margin_us);
         s.pending = Some(image);
         s.status.committed += 1;
         self.event(
@@ -257,7 +278,9 @@ impl<T: Clone> Gate<T> {
                 let failure = if now >= ticket.deadline + self.period {
                     Some("bus cycle missed output selection deadline")
                 } else if s.pending.is_none() {
-                    if s.begun == ticket.sequence {
+                    if s.begun
+                        .is_some_and(|(sequence, _)| sequence == ticket.sequence)
+                    {
                         Some("scan began but did not commit output frame")
                     } else {
                         Some("scan did not begin before output selection")
@@ -300,6 +323,7 @@ impl<T: Clone> Gate<T> {
         s.status.issued += 1;
         let ticket = Ticket {
             sequence: s.status.issued,
+            issued_at: now,
             deadline,
         };
         s.ticket = Some((ticket, image));
@@ -340,8 +364,38 @@ mod tests {
     fn begin_at(g: &Gate<[u64; 2]>) -> Ticket {
         let mut s = g.state.lock().unwrap();
         let t = s.ticket.as_ref().unwrap().0;
-        s.begun = t.sequence;
+        s.begun = Some((t.sequence, t.issued_at));
         t
+    }
+    #[test]
+    fn timing_extrema_cover_commits_evicted_from_the_event_ring() {
+        let gate = armed();
+        let mut now = gate.origin;
+        assert!(gate.status().handoff_timing.is_none());
+        for cycle in 0..TRACE_CAPACITY {
+            gate.publish_at([0, 0], now + gate.period, now);
+            let ticket = begin_at(&gate);
+            let begin_us = if cycle == 0 { 900 } else { 100 };
+            let commit_us = if cycle == 0 { 1950 } else { 300 };
+            gate.state.lock().unwrap().begun =
+                Some((ticket.sequence, now + Duration::from_micros(begin_us)));
+            gate.commit_at(ticket, [1, 1], now + Duration::from_micros(commit_us))
+                .unwrap();
+            now += gate.period;
+            gate.consume_at(now, |frame| assert_eq!(frame, Some(&[1, 1])));
+        }
+        let status = gate.status();
+        assert!(status.events.iter().all(|event| event.sequence > 1));
+        assert_eq!(status.committed, TRACE_CAPACITY as u64);
+        assert_eq!(
+            status.handoff_timing,
+            Some(CycleTiming {
+                max_issue_to_begin_us: 900,
+                max_begin_to_commit_us: 1050,
+                min_begin_margin_us: 1100,
+                min_commit_margin_us: 50,
+            })
+        );
     }
     #[test]
     fn ten_thousand_two_ms_frames_are_complete_and_exactly_once_under_work_jitter() {

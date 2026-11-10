@@ -336,23 +336,24 @@ Online debugging of the locally-running program (the IDE-side bridge). For
 the *deployed* edge runtime, proxy the same ops through
 `POST /api/edges/{name}/runtime/{op}`. All return `409` when nothing is running.
 
-Variable writes accept optional `pulse_ms: <u32>`: the runtime writes zero
-after that delay, counted from when the write was applied (time it spent
-queued behind a slow scan does not shorten the pulse), including while
-paused. A later accepted pulse, ordinary
-write (including MQTT), or force to the same resolved variable supersedes
-the earlier reset; bare and qualified names share ownership. Rejected writes
-leave the existing reset active. The current reset bypasses write governance
-so a positive minimum cannot prevent zero. If its device is disconnected,
-zero still lands in the VM and the runtime logs the failed delivery; normal
-output synchronization sends the current value when the link returns.
-Once the request has been read, neither the write nor its reset depends on
-the client: one that disconnects before the answer still gets both.
+Variable writes accept optional `pulse_ms: <u32>`. The duration starts when
+the write is applied to the VM. The runtime services due resets on the first
+eligible scan round at or after expiry, including while paused. Each round
+has a separate budget of up to 16 due resets, earliest deadline first. Any
+remaining expiries carry over to subsequent rounds. A later accepted pulse,
+ordinary write (including MQTT), or force to the same resolved variable
+supersedes the earlier reset. Bare and qualified names share ownership.
+Rejected writes leave the existing reset active. The reset bypasses write
+governance so a positive minimum cannot prevent zero. If its device is
+disconnected, zero still lands in the VM and the runtime logs that delivery
+is unconfirmed. Normal output synchronization sends the current value when
+the link returns. Once enqueued, the pulse write and its reset survive a
+client disconnect.
 This contract is shared by the IDE server and the edge runtime's `/write`.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/api/runtime/pause` | Halt the scan loop: the program stops advancing and no new outputs are pushed, but adapter workers (the EtherCAT cyclic thread, Modbus polling) keep running and keep sending the last values — a debug stop, not a safe state; stopping the program runs the failsafe pass. Returns `ModeResponse { mode }`. |
+| `POST` | `/api/runtime/pause` | Pause program execution. In timer-driven mode, adapter workers continue and may hold the last output values. In bus-clocked mode, pause latches normal outputs off until restart. Check `failsafe_status` for adapter acknowledgements. Returns `ModeResponse { mode }`. |
 | `POST` | `/api/runtime/resume` | Resume free-running. Returns `ModeResponse`. |
 | `POST` | `/api/runtime/step` | Advance N cycles while paused. Body: `StepRequest { cycles }` (default 1). Returns `ModeResponse`. |
 | `GET` | `/api/runtime/forces` | List currently-forced variables. Returns `ForceEntry[]` (`[]` when not running). |
@@ -532,7 +533,7 @@ the IDE server. The legacy-browser limitation above also applies here.
 | `GET` | `/logs/stream` | SSE stream of log lines as they're emitted (no backlog; pair with `/logs` for history). |
 | `GET` | `/discover` | Per-device connect reports + discovered EtherCAT topology. Powers `cs get edges/<n>/scan`. |
 | `GET` | `/system` | Edge NICs / serial ports / arch, for authoring device configs against real edge facts. Powers `cs get edges/<n>/system`. |
-| `POST` | `/pause` | Halt the scan loop: the program stops advancing and no new outputs are pushed, but adapter workers (the EtherCAT cyclic thread, Modbus polling) keep running and keep sending the last values — a debug stop, not a safe state; stopping the program runs the failsafe pass. Returns `{ mode }`. |
+| `POST` | `/pause` | Pause program execution with the same output semantics as `/api/runtime/pause`. Returns `{ mode }`. |
 | `POST` | `/resume` | Resume free-running. Returns `{ mode }`. |
 | `POST` | `/step` | Advance N cycles while paused. Body: `{ cycles }`. Returns `{ mode }`. |
 | `POST` | `/write` | One-shot write of a variable. Body: `{ name, value }`. Returns the applied value. Subject to the deployed project's `[governance]` (project.toml): `write_mode = "allowlist"` rejects writes to variables with no matching `[[governance.rules]]` entry (403), and a rule's `min`/`max` clamp the value (the response echoes the clamped value — a clamp is also logged and lands in `/audit` as `result: "clamped"` with both `requested` and `applied`, never silent). A write no honest clamp exists for is denied 403 instead: `NaN` to a min/max-ruled REAL, or a rule range containing no representable value of the variable's type. The response also carries `undelivered_device`: when the variable has an Output mapping onto a device whose transport is down, the write is still applied (a Stop that flushes when the link returns beats one never commanded) and this names that device, so a caller must not report a bare success. `null` on a healthy link or an internal variable — and it is transport health only, never proof that the value took effect. |
@@ -612,10 +613,11 @@ its configuration with `cs api GET /api/edges/<percent-encoded-full-name>`.
 The existing local runtime status and edge status surfaces include optional
 `device_health[].cycle` for `scan_sync` EtherCAT devices. It contains period,
 issued/committed/consumed counters, the first latched fault, and a bounded ring
-of monotonic host-time events. A cycle fault sets `watchdog_tripped` and makes
-that device unhealthy; resuming or bus recovery does not clear it. The CLI
-resource is unchanged: `cs get runtime/status`. Details and timing limits:
-[cycle handoff contract](scan-cycle-handoff.md).
+of monotonic host-time events. Optional `handoff_timing` aggregates timings
+over every accepted commit since the gate was created. `committed` gives its
+coverage. A cycle fault sets `watchdog_tripped` and makes that device unhealthy.
+Explicit program restart creates a new gate. See the field definitions in
+the [cycle handoff contract](scan-cycle-handoff.md).
 
 ### Output inhibition and device acknowledgement
 

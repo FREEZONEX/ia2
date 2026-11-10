@@ -3,9 +3,11 @@
 // until its owner returns it. Teardown joins the owners before reuse.
 
 use super::{
-    attempt_device_failsafe, begin_failsafe_attempts, ChannelValue, IoDevice, SharedFailsafeStatus,
+    attempt_device_failsafe, begin_failsafe_attempts, isolate_device_call, record_failsafe_result,
+    ChannelValue, DeviceFailsafeError, IoDevice, SharedFailsafeStatus,
 };
 use iocore::{cycle::CycleStatus, IoError};
+use std::time::Duration;
 use tokio::{runtime::Handle, task::JoinHandle};
 
 pub(super) struct FailsafeJobs {
@@ -72,34 +74,106 @@ impl FailsafeJobs {
         }
     }
 
-    pub(super) async fn collect(
+    pub(super) async fn collect_ready(
         &mut self,
         devices: &mut [Box<dyn IoDevice>],
         status: &SharedFailsafeStatus,
-        wait: bool,
     ) {
         let mut i = 0;
         while i < self.jobs.len() {
-            if wait || self.jobs[i].1.is_finished() {
+            if self.jobs[i].1.is_finished() {
                 let (index, job) = self.jobs.swap_remove(i);
-                match job.await {
-                    Ok(device) => devices[index] = device,
-                    Err(error) => {
-                        let name = devices[index].name();
-                        super::record_failsafe_result(
-                            status,
-                            name,
-                            Some(super::DeviceFailsafeError {
-                                device: name.into(),
-                                error: format!("failsafe owner failed: {error}"),
-                            }),
-                        );
-                        tracing::error!(device = %name, %error, "failsafe owner failed");
-                    }
+                if let Some(device) = join_owner(job, devices[index].name(), status).await {
+                    devices[index] = device;
                 }
             } else {
                 i += 1;
             }
+        }
+    }
+
+    /// Each device reaches its final safe attempt and shutdown as soon as
+    /// its own owner is available. A queued reconnect gets fenced and driven
+    /// safe even when an unrelated adapter's previous attempt is still stuck.
+    pub(super) async fn shutdown(
+        &mut self,
+        devices: &mut [Box<dyn IoDevice>],
+        status: &SharedFailsafeStatus,
+    ) -> usize {
+        let previous_jobs = self.jobs.len();
+        self.start(devices, status, |_, _| true);
+        let jobs = std::mem::take(&mut self.jobs);
+        let io = &self.io;
+        let closes = jobs
+            .into_iter()
+            .enumerate()
+            .map(|(position, (index, job))| {
+                let name = devices[index].name().to_owned();
+                async move {
+                    let Some(mut device) = join_owner(job, &name, status).await else {
+                        return true;
+                    };
+                    let runtime = io.clone();
+                    let status = status.clone();
+                    let result = io
+                        .spawn_blocking(move || {
+                            runtime.block_on(async move {
+                                // start appended a final pass for every ready slot.
+                                // A previous owner still owes that pass after returning.
+                                if position < previous_jobs {
+                                    begin_failsafe_attempts(&status, [device.name()]);
+                                    let _ = attempt_device_failsafe(device.as_mut(), &status).await;
+                                }
+                                // Give the adapter worker a flush opportunity. This
+                                // delay does not establish transmission or safety.
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                isolate_device_call(device.shutdown()).await
+                            })
+                        })
+                        .await;
+                    match result {
+                        Ok(Ok(Ok(()))) => false,
+                        Ok(Ok(Err(error))) => {
+                            tracing::warn!(device = %name, %error, "device shutdown failed");
+                            true
+                        }
+                        Ok(Err(panic)) => {
+                            tracing::error!(device = %name, %panic, "device shutdown panicked");
+                            true
+                        }
+                        Err(error) => {
+                            tracing::error!(device = %name, %error, "device shutdown owner failed");
+                            true
+                        }
+                    }
+                }
+            });
+        futures_util::future::join_all(closes)
+            .await
+            .into_iter()
+            .filter(|failed| *failed)
+            .count()
+    }
+}
+
+async fn join_owner(
+    job: JoinHandle<Box<dyn IoDevice>>,
+    name: &str,
+    status: &SharedFailsafeStatus,
+) -> Option<Box<dyn IoDevice>> {
+    match job.await {
+        Ok(device) => Some(device),
+        Err(error) => {
+            record_failsafe_result(
+                status,
+                name,
+                Some(DeviceFailsafeError {
+                    device: name.into(),
+                    error: format!("failsafe owner failed: {error}"),
+                }),
+            );
+            tracing::error!(device = %name, %error, "failsafe owner failed");
+            None
         }
     }
 }

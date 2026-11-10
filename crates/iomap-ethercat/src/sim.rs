@@ -36,6 +36,7 @@ pub struct SimEthercat {
     /// Slow-plane routing for in-cycle gear parameter channels (same
     /// surface as the real device).
     gear_routing: crate::gear::GearRouting,
+    outputs_inhibited: Arc<AtomicBool>,
     /// Stops the sim gear ticker thread on drop/shutdown.
     gear_stop: Arc<AtomicBool>,
     discovered: Vec<crate::SlaveDiscovery>,
@@ -134,6 +135,7 @@ impl SimEthercat {
             config.channels.iter().map(|c| c.name.as_str()).collect();
         crate::gear::validate_channels(&config.gear, &pdo_names).map_err(IoError::Connect)?;
         let (engines, gear_routing) = crate::gear::build(&config.gear);
+        let outputs_inhibited = Arc::new(AtomicBool::new(false));
         let gear_stop = Arc::new(AtomicBool::new(false));
         if !engines.is_empty() {
             // Surface each engine's live target through its follower's
@@ -154,6 +156,7 @@ impl SimEthercat {
                 })
                 .collect();
             let values_t = values.clone();
+            let inhibited = outputs_inhibited.clone();
             let stop_t = gear_stop.clone();
             let cycle = std::time::Duration::from_micros(config.cycle_us.max(100) as u64);
             let mut engines = engines;
@@ -165,6 +168,10 @@ impl SimEthercat {
                     let mut last: Vec<i32> = vec![0; engines.len()];
                     while !stop_t.load(Ordering::Relaxed) {
                         for (i, eng) in engines.iter_mut().enumerate() {
+                            if inhibited.load(Ordering::Acquire) {
+                                eng.inhibit_outputs();
+                                continue;
+                            }
                             let master = match eng.master {
                                 crate::gear::MasterSrc::Virtual => None,
                                 crate::gear::MasterSrc::Axis { .. } => Some(0),
@@ -173,7 +180,9 @@ impl SimEthercat {
                             last[i] = t;
                             if let Some(Some(name)) = target_names.get(i) {
                                 if let Ok(mut v) = values_t.lock() {
-                                    v.insert(name.clone(), ChannelValue::I32(t));
+                                    if !inhibited.load(Ordering::Acquire) {
+                                        v.insert(name.clone(), ChannelValue::I32(t));
+                                    }
                                 }
                             }
                         }
@@ -233,6 +242,7 @@ impl SimEthercat {
             values,
             channels,
             gear_routing,
+            outputs_inhibited,
             gear_stop,
             discovered,
         })
@@ -305,6 +315,11 @@ impl IoDevice for SimEthercat {
     }
 
     async fn write_channel(&mut self, channel: &str, value: ChannelValue) -> Result<(), IoError> {
+        if self.outputs_inhibited.load(Ordering::Acquire) {
+            return Err(IoError::Transport(
+                "ethercat ordinary outputs are inhibited".into(),
+            ));
+        }
         if let Some(res) = self.gear_routing.write(channel, &value) {
             return res;
         }
@@ -334,8 +349,19 @@ impl IoDevice for SimEthercat {
     }
 
     fn inhibit_outputs(&mut self) {
+        self.outputs_inhibited.store(true, Ordering::Release);
         if let Some(cycle) = &self.cycle {
-            cycle.trip("failsafe requested; restart required");
+            if !cycle.is_faulted() {
+                cycle.trip("failsafe requested; restart required");
+            }
+        }
+        self.staged = None;
+        self.gear_routing.disengage_all();
+        let mut values = self.values.lock().expect("sim values poisoned");
+        for channel in self.channels.values() {
+            if channel.direction == EthercatPdoDirection::RxPdo {
+                values.insert(channel.name.clone(), zero_for(channel.data_type));
+            }
         }
     }
 
@@ -345,18 +371,6 @@ impl IoDevice for SimEthercat {
     /// loop's perspective.
     async fn enter_failsafe(&mut self) -> Result<(), IoError> {
         self.inhibit_outputs();
-        self.staged = None;
-        let to_zero: Vec<(String, EthercatDataType)> = self
-            .channels
-            .values()
-            .filter(|c| c.direction == EthercatPdoDirection::RxPdo)
-            .map(|c| (c.name.clone(), c.data_type))
-            .collect();
-        self.gear_routing.disengage_all();
-        let mut values = self.values.lock().expect("sim values poisoned");
-        for (name, ty) in to_zero {
-            values.insert(name, zero_for(ty));
-        }
         tracing::info!(device = %self.name, "ethercat (sim) failsafe applied");
         Ok(())
     }

@@ -7,7 +7,7 @@
 //! `DemoSlave` bound to an ephemeral localhost port — same path the IDE's
 //! demo mode uses, so the test exercises the production code path.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use iocore::{ChannelValue, IoDevice, IoError};
 use iomap_modbus::{run_demo_slave, DemoSlave, ModbusDevice};
@@ -16,6 +16,7 @@ use project::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::Notify;
 
 /// Bind the demo slave to `127.0.0.1:0` (kernel-assigned port), spawn the
 /// server, and return the assigned port. Caller is expected to drop the
@@ -201,15 +202,18 @@ async fn write_to_access_read_channel_is_rejected() {
     );
 }
 
-#[derive(Clone, Copy)]
 enum WriteReply {
     Accept,
     Reject,
     Disconnect,
+    HoldOrdinary {
+        received: Arc<Notify>,
+        release: Arc<Notify>,
+    },
 }
 
 /// A loopback-only Modbus peer: all reads succeed, but each register's
-/// write can be accepted, rejected by an exception PDU, or lose the link.
+/// write can be accepted, rejected, held before its reply, or lose the link.
 /// Inspect the received requests, not just the returned error strings.
 async fn faulting_slave(
     replies: [WriteReply; 3],
@@ -243,10 +247,17 @@ async fn faulting_slave(
                     let address = u16::from_be_bytes([pdu[1], pdu[2]]);
                     let value = u16::from_be_bytes([pdu[3], pdu[4]]);
                     observed.lock().unwrap().push((address, value));
-                    match replies[address as usize] {
+                    match &replies[address as usize] {
                         WriteReply::Accept => pdu,
                         WriteReply::Reject => vec![0x86, 2], // Illegal data address
                         WriteReply::Disconnect => break,
+                        WriteReply::HoldOrdinary { received, release } => {
+                            if value != 0 {
+                                received.notify_one();
+                                release.notified().await;
+                            }
+                            pdu
+                        }
                     }
                 }
                 function => panic!("unexpected Modbus function {function}"),
@@ -257,7 +268,7 @@ async fn faulting_slave(
         }
     });
     let mut cfg = config_with_mixed_channels(port);
-    cfg.timeout_ms = Some(200);
+    cfg.timeout_ms = Some(2_000);
     cfg.channels = (0..3)
         .map(|address| ModbusChannel {
             name: format!("output_{address}"),
@@ -312,7 +323,7 @@ async fn later_transport_failure_takes_precedence_over_earlier_protocol_rejectio
 #[tokio::test]
 async fn inhibited_device_drops_buffered_ordinary_writes_before_the_safe_sweep() {
     use WriteReply::Accept;
-    let (mut device, writes, peer) = faulting_slave([Accept; 3]).await;
+    let (mut device, writes, peer) = faulting_slave([Accept, Accept, Accept]).await;
     // This single-thread test does not yield between the enqueue and inhibit.
     device
         .write_channel("output_0", ChannelValue::U16(10))
@@ -329,6 +340,49 @@ async fn inhibited_device_drops_buffered_ordinary_writes_before_the_safe_sweep()
         .is_err());
     device.enter_failsafe().await.unwrap();
     assert_eq!(*writes.lock().unwrap(), vec![(0, 0), (1, 0), (2, 0)]);
+    device.shutdown().await.unwrap();
+    peer.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inhibition_allows_the_admitted_write_to_finish_but_discards_queued_writes() {
+    use WriteReply::*;
+    let received = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let (mut device, writes, peer) = faulting_slave([
+        HoldOrdinary {
+            received: received.clone(),
+            release: release.clone(),
+        },
+        Accept,
+        Accept,
+    ])
+    .await;
+
+    device
+        .write_channel("output_0", ChannelValue::U16(10))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), received.notified())
+        .await
+        .expect("the peer must receive the first ordinary write");
+    // The connection owner is waiting for the reply, so this write is queued.
+    device
+        .write_channel("output_1", ChannelValue::U16(20))
+        .await
+        .unwrap();
+    device.inhibit_outputs();
+    assert!(device
+        .write_channel("output_2", ChannelValue::U16(30))
+        .await
+        .is_err());
+
+    release.notify_one();
+    device.enter_failsafe().await.unwrap();
+    assert_eq!(
+        *writes.lock().unwrap(),
+        vec![(0, 10), (0, 0), (1, 0), (2, 0)]
+    );
     device.shutdown().await.unwrap();
     peer.await.unwrap();
 }
