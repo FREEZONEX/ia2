@@ -2294,6 +2294,7 @@ name = "iocore"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "libc",
  "serde",
  "thiserror 2.0.18",
  "ts-rs",

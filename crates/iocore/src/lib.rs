@@ -8,6 +8,7 @@
 
 pub mod cycle;
 mod health;
+pub mod realtime;
 pub mod sdo;
 
 use async_trait::async_trait;

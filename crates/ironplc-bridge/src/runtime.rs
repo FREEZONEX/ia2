@@ -2804,6 +2804,30 @@ async fn run_loop_async(
     let mut inject_stall_scans: u32 = 0;
     let mut last_cycle_diagnostics = Instant::now() - SNAPSHOT_PERIOD;
 
+    // Device I/O, reconnect and diagnostic writer threads already exist. Apply
+    // only to this dedicated scan thread, before the first begin_cycle arms the
+    // output gate. A requested policy must never silently fall back to CFS.
+    if sync_device.is_some() {
+        match iocore::realtime::configured_priority("IA2_SCAN_SYNC_RT_PRIORITY").and_then(
+            |priority| {
+                if let Some(priority) = priority {
+                    iocore::realtime::set_current_thread_round_robin(priority)?;
+                    tracing::info!(priority, "synchronized PLC scan thread uses SCHED_RR");
+                }
+                Ok(())
+            },
+        ) {
+            Ok(()) => (),
+            Err(error) => {
+                record_fault(
+                    fault,
+                    format!("synchronized PLC scheduling failed: {error}"),
+                );
+                return; // The owning thread still executes failsafe and shutdown.
+            }
+        }
+    }
+
     loop {
         #[cfg(feature = "scan-trace")]
         let trace_tick = scan_trace.point();
@@ -6779,6 +6803,68 @@ mod tests {
         DeviceSpec {
             name: "clock".into(),
             config,
+        }
+    }
+
+    #[test]
+    fn requested_scan_scheduling_fails_before_first_scan_and_is_sync_only() {
+        const CHILD: &str = "IA2_TEST_SCAN_SCHEDULING_CHILD";
+        if let Ok(case) = std::env::var(CHILD) {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let c = counting_program();
+                let sync = case == "sync";
+                let h = spawn_units(
+                    vec![single_unit(c, 50)],
+                    if sync {
+                        vec![synchronized_spec()]
+                    } else {
+                        Vec::new()
+                    },
+                    Vec::new(),
+                    None,
+                    WriteGovernance::default(),
+                );
+                let mut snapshots = h.subscribe();
+                if sync {
+                    let reason = recorded_fault(&h)
+                        .await
+                        .expect("scheduling request rejected");
+                    assert!(
+                        reason.starts_with("synchronized PLC scheduling failed:"),
+                        "{reason}"
+                    );
+                    assert!(
+                        snapshots.try_recv().is_err(),
+                        "scan ran after rejected scheduling request"
+                    );
+                } else {
+                    tokio::time::timeout(Duration::from_secs(5), snapshots.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(*h.fault_watch().borrow(), None);
+                }
+                h.shutdown().await;
+            });
+            return;
+        }
+        // Each environment configuration gets a separate process, so parallel
+        // runtime tests never observe a transient global scheduling override.
+        for case in ["sync", "timer"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "runtime::tests::requested_scan_scheduling_fails_before_first_scan_and_is_sync_only", "--nocapture"])
+                .env(CHILD, case)
+                .env("IA2_SCAN_SYNC_RT_PRIORITY", "invalid")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
     }
 
