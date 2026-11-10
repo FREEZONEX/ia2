@@ -176,6 +176,10 @@ changed port (or a stopped service) gives a clear answer instead of a
 blind failure. A transient EtherCAT bring-up timeout is retried rather
 than left dead until a manual restart. See `docs/edge-deploy.md`.
 
+Proposed product capability: [device parameter state and change tracking](docs/field-state-design.md)
+— timestamped observations shared by the API, CLI and UI, with explicit historical
+state and evidence references. See the [review and regression plan](docs/field-state-regression.md).
+
 ## Agent skill (Claude Code · Codex · Kimi Code · Cursor · …)
 
 The repo ships an [Agent Skills](https://agentskills.io)-format skill at
