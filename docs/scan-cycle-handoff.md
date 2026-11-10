@@ -60,6 +60,22 @@ startup exchanges. Omit it
 for the normal OS scheduling policy. The service needs permission to set
 the requested scheduling policy. A rejected request fails initialization.
 
+The producer also needs to run before the ticket deadline. Raising only the
+EtherCAT worker does not prevent an ordinary-policy PLC thread from waiting in
+the OS run queue past that deadline. `IA2_SCAN_SYNC_RT_PRIORITY=1..20` explicitly
+selects Linux `SCHED_RR` for the dedicated synchronized PLC scan thread. It is
+applied after I/O, reconnect and diagnostic workers have been created, before
+the first `begin_cycle` can arm outputs. Both thread policies are read back.
+An invalid or denied PLC request records a runtime fault and executes normal
+failsafe/shutdown without starting scans. Timer-driven projects ignore this
+option. Omitting it preserves the existing policy.
+
+Choose the bus worker priority above the scan producer (for example bus 10,
+scan 9), and verify the actual per-thread policies on the target. These explicit
+deployment options do not guarantee a deadline or change the missing-frame
+latch; load, blocking, interrupt handling and device latency still require
+field acceptance. Neither option modifies drive parameters.
+
 During synchronized startup the worker follows the reference clock while
 sending zero outputs. It waits for four adjacent DC slots with all devices
 in OP and the expected working counter, then retains the next deadline
