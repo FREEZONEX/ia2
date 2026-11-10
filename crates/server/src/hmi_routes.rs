@@ -299,8 +299,8 @@ fn project_variable_directions(
     // the JSON document, not in ST the bridge can parse — same extraction
     // the generator uses, so check and generate can never disagree.
     let mut out: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
-    for path in store.list_pou_paths()? {
-        for v in pou_gen_vars(store, &path) {
+    for pou in store.read_pous()? {
+        for v in pou_gen_vars_from_source(&pou.source, pou.language) {
             out.entry(v.name).or_default().push(v.direction);
         }
     }
@@ -624,6 +624,10 @@ fn pou_gen_vars(store: &ProjectStore, pou_path: &str) -> Vec<GenVar> {
     let lang = store
         .pou_file_language(pou_path)
         .unwrap_or(project::PouLanguage::St);
+    pou_gen_vars_from_source(&source, lang)
+}
+
+fn pou_gen_vars_from_source(source: &str, lang: project::PouLanguage) -> Vec<GenVar> {
     let from_ld = |vars: &[project::LdVariable]| {
         vars.iter()
             .map(|v| GenVar {
@@ -638,7 +642,7 @@ fn pou_gen_vars(store: &ProjectStore, pou_path: &str) -> Vec<GenVar> {
             .collect()
     };
     match lang {
-        project::PouLanguage::St => ironplc_bridge::extract_variables(&source)
+        project::PouLanguage::St => ironplc_bridge::extract_variables(source)
             .into_iter()
             .map(|v| GenVar {
                 name: v.name,
@@ -646,13 +650,13 @@ fn pou_gen_vars(store: &ProjectStore, pou_path: &str) -> Vec<GenVar> {
                 direction: v.direction,
             })
             .collect(),
-        project::PouLanguage::Ld => serde_json::from_str::<project::LdProgram>(&source)
+        project::PouLanguage::Ld => serde_json::from_str::<project::LdProgram>(source)
             .map(|p| from_ld(&p.variables))
             .unwrap_or_default(),
-        project::PouLanguage::Fbd => serde_json::from_str::<project::FbdProgram>(&source)
+        project::PouLanguage::Fbd => serde_json::from_str::<project::FbdProgram>(source)
             .map(|p| from_ld(&p.variables))
             .unwrap_or_default(),
-        project::PouLanguage::Sfc => serde_json::from_str::<project::SfcProgram>(&source)
+        project::PouLanguage::Sfc => serde_json::from_str::<project::SfcProgram>(source)
             .map(|p| from_ld(&p.variables))
             .unwrap_or_default(),
     }

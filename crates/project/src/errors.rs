@@ -2,6 +2,15 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
+    #[error("project library transaction is busy; retry the read after it finishes")]
+    LibraryBusy,
+
+    #[error("library import recovery required: {0}")]
+    LibraryRecoveryRequired(String),
+
+    #[error("library import commit unconfirmed: {0}; reopen the project and inspect its imported state before retrying")]
+    LibraryCommitUnconfirmed(String),
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 

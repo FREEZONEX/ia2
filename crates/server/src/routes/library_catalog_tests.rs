@@ -143,11 +143,11 @@ impl Fixture {
 }
 
 #[tokio::test]
-async fn library_browse_without_a_project_and_bad_project_selector_preserves_plain_listing() {
+async fn library_browse_without_a_project_preserves_plain_listing() {
     let mut f = Fixture::new(&[]);
-    for project in [None, Some("missing")] {
+    {
         assert_eq!(
-            f.ok("GET", "/api/library", project, Value::Null).await,
+            f.ok("GET", "/api/library", None, Value::Null).await,
             json!([{
                 "name": "controls", "version": "1.2.3", "description": "Test blocks",
                 "blocks": [
@@ -157,6 +157,12 @@ async fn library_browse_without_a_project_and_bad_project_selector_preserves_pla
             }])
         );
     }
+    assert_eq!(
+        f.request("GET", "/api/library", Some("missing"), Value::Null)
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
     for (method, url, body) in [
         (
             "POST",
@@ -486,4 +492,27 @@ async fn library_malformed_project_encoding_is_rejected_before_any_write() {
     assert!(f.libraries("A").is_empty());
     assert_eq!(f.state.projects.lock().active_name(), Some("A"));
     f.assert_quiet();
+}
+
+#[tokio::test]
+async fn library_pending_recovery_is_visible_and_emits_no_success_mutation() {
+    let mut f = Fixture::new(&["A", "B"]);
+    let journal = f.dir.path().join("A/.ia2-library-import");
+    fs::create_dir(&journal).unwrap();
+    fs::write(journal.join("prepared.toml"), "invalid journal").unwrap();
+    for (method, path, body) in [
+        ("GET", "/api/library", Value::Null),
+        ("POST", "/api/library/import", json!({"library":"controls"})),
+        ("DELETE", "/api/library/controls", Value::Null),
+    ] {
+        let (status, body) = f.request(method, path, Some("A"), body).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains("library import recovery required"), "{body}");
+        f.assert_quiet();
+    }
+    assert!(journal.join("prepared.toml").is_file());
+    assert!(f
+        .ok("GET", "/api/library", Some("B"), Value::Null)
+        .await
+        .is_array());
 }

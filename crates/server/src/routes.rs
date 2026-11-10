@@ -620,14 +620,14 @@ pub async fn get_pou(
     AxumPath(path): AxumPath<String>,
 ) -> Result<Versioned<Pou>, ApiError> {
     with_project(&state, &project, |store| {
-        let file = conditional::file(store, "pous", &path)?;
-        conditional::read(&file, || {
-            let language = store.pou_file_language(&path)?;
-            let source = store.read_pou_source(&path)?;
-            Ok(Pou {
-                path: path.clone(),
-                declarations: ironplc_bridge::extract_pou_declarations(&source, language),
-                source,
+        store.with_pou_file(&path, |file, language| {
+            conditional::read(file, || {
+                let source = std::fs::read_to_string(file).map_err(project::StoreError::from)?;
+                Ok(Pou {
+                    path: path.clone(),
+                    declarations: ironplc_bridge::extract_pou_declarations(&source, language),
+                    source,
+                })
             })
         })
     })
@@ -2145,13 +2145,10 @@ pub async fn validate_project(
         // /alarms that claims coverage it does not have.
         {
             let alarms = store.read_alarms()?;
-            let mut sources = Vec::new();
-            for path in store.list_pou_paths()? {
-                sources.push(store.read_pou_source(&path)?);
-            }
-            let declared_names: Vec<String> = sources
+            let declared_names: Vec<String> = store
+                .read_pous()?
                 .iter()
-                .flat_map(|src| ironplc_bridge::extract_variables(src))
+                .flat_map(|pou| ironplc_bridge::extract_variables(&pou.source))
                 .map(|v| v.name)
                 .collect();
             let declared: std::collections::HashSet<&str> =
@@ -2232,11 +2229,13 @@ pub async fn project_pous(
     project: ProjectName,
 ) -> Result<Json<ProjectPous>, ApiError> {
     with_project(&state, &project, |store| {
-        let paths = store.list_pou_paths()?;
         let mut out = Vec::new();
-        for path in paths {
-            let language = store.pou_file_language(&path)?;
-            let source = store.read_pou_source(&path)?;
+        for project::PouFileSource {
+            path,
+            source,
+            language,
+        } in store.read_pous()?
+        {
             for d in ironplc_bridge::extract_pou_declarations(&source, language) {
                 out.push(PouInProject {
                     file_path: path.clone(),
@@ -2280,10 +2279,8 @@ pub async fn project_variables(
     project: ProjectName,
 ) -> Result<Json<ProjectVariables>, ApiError> {
     with_project(&state, &project, |store| {
-        let paths = store.list_pou_paths()?;
         let mut out = Vec::new();
-        for path in paths {
-            let source = store.read_pou_source(&path)?;
+        for project::PouFileSource { path, source, .. } in store.read_pous()? {
             for v in ironplc_bridge::extract_variables(&source) {
                 out.push(ProjectVariable {
                     file_path: path.clone(),
@@ -2857,7 +2854,10 @@ fn resolve_user_path(raw: &str) -> PathBuf {
 /// check): the clone is `{root, manifest}`-cheap, and compiling unlocked
 /// on `spawn_blocking` keeps the global registry responsive to every
 /// other window. Prefer `with_project` for quick metadata reads.
-fn owned_store(state: &AppState, project: &ProjectName) -> Result<ProjectStore, ApiError> {
+pub(crate) fn owned_store(
+    state: &AppState,
+    project: &ProjectName,
+) -> Result<ProjectStore, ApiError> {
     with_project(state, project, |store| Ok(store.clone()))
 }
 

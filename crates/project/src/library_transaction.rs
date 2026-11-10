@@ -1,0 +1,748 @@
+//! Recoverable updates to library blocks and their manifest entry.
+//!
+//! All cooperating readers/writers lock the project before inspecting the
+//! journal. Only a prepared journal can authorize rollback. The journal's
+//! rename to "committed" and its directory sync are the commit point.
+
+use std::collections::HashSet;
+use std::fs::{self, File, OpenOptions, Permissions};
+use std::io::{self, ErrorKind, Write};
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::store::{validate_single_segment, LIBRARY_SLUG_PREFIX};
+use crate::StoreError;
+
+const STAGE: &str = ".ia2-library-stage";
+const ACTIVE: &str = ".ia2-library-import";
+const LOCK: &str = ".ia2-library-lock";
+const PREPARED: &str = "prepared.toml";
+const COMMITTED: &str = "committed.toml";
+const MANIFEST: &str = "project.toml";
+const OWNER: &str = "ia2-library-transaction-v1";
+
+/// Root-level storage paths reserved for imports. Exclude them when copying
+/// a project under the read guard, even if deferred cleanup left one behind.
+pub fn is_library_transaction_artifact(name: &std::ffi::OsStr) -> bool {
+    [STAGE, ACTIVE, LOCK].iter().any(|path| name == *path)
+}
+
+fn lock_file(root: &Path) -> Result<File, StoreError> {
+    // An existing directory is a stable inode on Unix and needs no writes
+    // for a read-only project. Elsewhere a regular lock file is persistent
+    // (unlinking a locked file would allow two independent lock owners).
+    #[cfg(unix)]
+    let file = File::open(root)?;
+    #[cfg(not(unix))]
+    let file = {
+        let path = root.join(LOCK);
+        if let Some(meta) = metadata(&path)? {
+            require_type(&path, meta.is_file())?;
+            File::open(path)?
+        } else {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .or_else(|e| match e.kind() {
+                    ErrorKind::AlreadyExists => {
+                        require_type(&path, fs::symlink_metadata(&path)?.is_file())?;
+                        File::open(path)
+                    }
+                    _ => Err(e),
+                })?
+        }
+    };
+    Ok(file)
+}
+
+fn read_lock_error(error: fs::TryLockError) -> StoreError {
+    match error {
+        fs::TryLockError::WouldBlock => StoreError::LibraryBusy,
+        fs::TryLockError::Error(error) => error.into(),
+    }
+}
+
+pub(crate) fn read_guard(root: &Path) -> Result<File, StoreError> {
+    read_access(root, false)
+}
+
+pub(crate) fn open_guard(root: &Path) -> Result<File, StoreError> {
+    read_access(root, true)
+}
+
+fn read_access(root: &Path, clean_staging: bool) -> Result<File, StoreError> {
+    let guard = lock_file(root)?;
+    guard.try_lock_shared().map_err(read_lock_error)?;
+    if !active_exists(root)? && !(clean_staging && metadata(&root.join(STAGE))?.is_some()) {
+        return Ok(guard);
+    }
+    // Do not hold a registry lock waiting for another project reader or
+    // writer. Recheck the recovery record under exclusive access.
+    drop(guard);
+    let guard = lock_file(root)?;
+    guard.try_lock().map_err(read_lock_error)?;
+    recover(root)?;
+    if clean_staging && !active_exists(root)? {
+        warn_cleanup(root, cleanup_stage(root));
+    }
+    Ok(guard)
+}
+
+pub(crate) fn write_guard(root: &Path) -> Result<File, StoreError> {
+    let guard = lock_file(root)?;
+    guard.lock()?;
+    require_type(root, fs::symlink_metadata(root)?.is_dir())?;
+    recover(root)?;
+    if active_exists(root)? {
+        return Err(StoreError::LibraryRecoveryRequired(
+            "committed import cleanup must finish before another library write".into(),
+        ));
+    }
+    Ok(guard)
+}
+
+fn active_exists(root: &Path) -> Result<bool, StoreError> {
+    metadata(&root.join(ACTIVE))
+        .map(|entry| entry.is_some())
+        .map_err(recovery_required)
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Journal {
+    format: u32,
+    library: String,
+    version: String,
+    existing_directories: usize,
+    blocks: Vec<String>,
+    // The manifest is always the last entry. Paths are reconstructed from
+    // validated basenames, never read as arbitrary paths from the journal.
+    files: Vec<Change>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Change {
+    before: Option<Image>,
+    after: Image,
+}
+
+#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Image {
+    sha256: String,
+    mode: u32,
+}
+
+impl Image {
+    fn of(bytes: &[u8], mode: u32) -> Self {
+        Self {
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+            mode,
+        }
+    }
+}
+
+impl Journal {
+    fn target(&self, root: &Path, index: usize) -> PathBuf {
+        match self.blocks.get(index) {
+            Some(name) => library_dirs(root, &self.library)[2].join(name),
+            None => root.join(MANIFEST),
+        }
+    }
+
+    fn validate(&self) -> Result<(), StoreError> {
+        validate_single_segment(&self.library)?;
+        let mut names = HashSet::new();
+        for name in &self.blocks {
+            validate_block(name)?;
+            if !names.insert(name) {
+                return Err(invalid("duplicate journal block").into());
+            }
+        }
+        if self.format != 1
+            || self.existing_directories > 3
+            || self.files.len() != self.blocks.len() + 1
+            || self
+                .files
+                .last()
+                .is_none_or(|change| change.before.is_none())
+            || (self.existing_directories < 3
+                && self.files[..self.blocks.len()]
+                    .iter()
+                    .any(|change| change.before.is_some()))
+        {
+            return Err(invalid("inconsistent library journal").into());
+        }
+        Ok(())
+    }
+}
+
+fn validate_block(name: &str) -> Result<(), StoreError> {
+    validate_single_segment(name)?;
+    if !name.ends_with(".st") {
+        return Err(StoreError::InvalidName(name.into()));
+    }
+    Ok(())
+}
+
+pub(crate) fn import(
+    root: &Path,
+    library: &str,
+    version: &str,
+    files: &[(String, String)],
+) -> Result<(), StoreError> {
+    validate_single_segment(library)?;
+    let _guard = write_guard(root)?;
+    let stage = root.join(STAGE);
+    cleanup_stage(root)?;
+    checkpoint(Phase::BeforeStage)?;
+    private_directory(&stage)?;
+    write_private(&stage.join(OWNER), b"", 0o600)?;
+    sync_directory(&stage)?;
+
+    let active = root.join(ACTIVE);
+    let journal = match prepare(root, &stage, library, version, files).and_then(|journal| {
+        checkpoint(Phase::Prepared)?;
+        fs::rename(&stage, &active)?;
+        Ok(journal)
+    }) {
+        Ok(journal) => journal,
+        Err(error) => {
+            warn_cleanup(root, cleanup_stage(root));
+            return Err(error);
+        }
+    };
+    // Ensure the recovery record is reachable before any formal edit.
+    let install = (|| {
+        sync_directory(root)?;
+        let dirs = library_dirs(root, library);
+        for dir in &dirs[journal.existing_directories..] {
+            fs::create_dir(dir)?;
+            sync_directory(dir.parent().expect("library directory has parent"))?;
+        }
+        for (index, change) in journal.files.iter().enumerate() {
+            checkpoint(Phase::BeforeInstall(index))?;
+            existing_library_dirs(root, library)?;
+            let target = journal.target(root, index);
+            if current(&target)?.as_ref() != change.before.as_ref() {
+                return Err(conflict(&target));
+            }
+            replace(&active, &target, index, &change.after, "new")?;
+            checkpoint(Phase::AfterInstall(index))?;
+        }
+        checkpoint(Phase::BeforeCommit)?;
+        verify_installed(root, &journal)?;
+        fs::rename(active.join(PREPARED), active.join(COMMITTED))
+    })();
+    if let Err(error) = install {
+        return match rollback(root, &active, &journal).and_then(|()| retire(root)) {
+            Ok(()) => Err(error.into()),
+            Err(rollback_error) => Err(recovery_required(format!(
+                "import failed ({error}); rollback stopped ({rollback_error})"
+            ))),
+        };
+    }
+    // A visible committed record whose directory sync failed is ambiguous.
+    // Never roll it back or report success. Recovery revalidates and syncs it.
+    checkpoint(Phase::SyncCommit)
+        .and_then(|()| sync_directory(&active))
+        .map_err(|error| StoreError::LibraryCommitUnconfirmed(error.to_string()))?;
+    warn_cleanup(root, retire(root));
+    Ok(())
+}
+
+fn prepare(
+    root: &Path,
+    stage: &Path,
+    library: &str,
+    version: &str,
+    files: &[(String, String)],
+) -> Result<Journal, StoreError> {
+    let existing_directories = existing_library_dirs(root, library)?;
+    let mut journal = Journal {
+        format: 1,
+        library: library.into(),
+        version: version.into(),
+        existing_directories,
+        blocks: Vec::new(),
+        files: Vec::new(),
+    };
+    let manifest = root.join(MANIFEST);
+    let (old, old_manifest) = read_image(&manifest)?
+        .ok_or_else(|| StoreError::NotFound(manifest.display().to_string()))?;
+    let new_manifest = updated_manifest(&old_manifest, library, version)?;
+
+    // Check filesystem aliases (case and normalization) on the target
+    // filesystem before publishing. Exact repeats are compatible with the
+    // old HTTP response but only require a single on-disk change.
+    let names = stage.join("names");
+    private_directory(&names)?;
+    let mut unique = HashSet::new();
+    for (name, contents) in files {
+        validate_block(name)?;
+        if !unique.insert(name) {
+            continue;
+        }
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(names.join(name))?;
+        let index = journal.blocks.len();
+        journal.blocks.push(name.clone());
+        journal.files.push(stage_change(
+            stage,
+            index,
+            read_image(&journal.target(root, index))?,
+            contents.as_bytes(),
+        )?);
+    }
+    fs::remove_dir_all(&names)?;
+    journal.files.push(stage_change(
+        stage,
+        journal.blocks.len(),
+        Some((old, old_manifest)),
+        new_manifest.as_bytes(),
+    )?);
+    write_private(
+        &stage.join(PREPARED),
+        toml::to_string_pretty(&journal)?.as_bytes(),
+        0o600,
+    )?;
+    sync_directory(stage)?;
+    Ok(journal)
+}
+
+fn updated_manifest(bytes: &[u8], library: &str, version: &str) -> Result<String, StoreError> {
+    let text = std::str::from_utf8(bytes).map_err(io::Error::other)?;
+    let mut table: toml::Table = toml::from_str(text)?;
+    let typed: crate::ProjectManifest = toml::from_str(text)?;
+    typed.governance.validate().map_err(invalid)?;
+    let libraries = table
+        .entry("libraries")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| invalid("[libraries] must be a table"))?;
+    libraries.insert(library.into(), toml::Value::String(version.into()));
+    Ok(toml::to_string_pretty(&table)?)
+}
+
+fn stage_change(
+    stage: &Path,
+    index: usize,
+    before: Option<(Image, Vec<u8>)>,
+    after: &[u8],
+) -> io::Result<Change> {
+    let before = match before {
+        Some((image, bytes)) => {
+            checkpoint(Phase::BeforeBackup(index))?;
+            write_private(&blob(stage, "old", index), &bytes, 0o600)?;
+            Some(image)
+        }
+        None => None,
+    };
+    let mode = before.as_ref().map_or(0o600, |image| image.mode);
+    checkpoint(Phase::BeforeStageContents(index))?;
+    write_private(&blob(stage, "new", index), after, 0o600)?;
+    Ok(Change {
+        before,
+        after: Image::of(after, mode),
+    })
+}
+
+fn recover(root: &Path) -> Result<(), StoreError> {
+    if !active_exists(root)? {
+        return Ok(());
+    }
+    require_type(root, fs::symlink_metadata(root)?.is_dir()).map_err(recovery_required)?;
+    let active = root.join(ACTIVE);
+    let (journal, committed) = read_journal(&active).map_err(recovery_required)?;
+    if committed {
+        verify_installed(root, &journal).map_err(recovery_required)?;
+        sync_directory(&active).map_err(recovery_required)?;
+        warn_cleanup(root, retire(root));
+    } else {
+        rollback(root, &active, &journal)
+            .and_then(|()| retire(root))
+            .map_err(recovery_required)?;
+    }
+    Ok(())
+}
+
+fn verify_installed(root: &Path, journal: &Journal) -> io::Result<()> {
+    existing_library_dirs(root, &journal.library)?;
+    for (index, change) in journal.files.iter().enumerate() {
+        let target = journal.target(root, index);
+        if current(&target)?.as_ref() != Some(&change.after) {
+            return Err(conflict(&target));
+        }
+    }
+    Ok(())
+}
+
+fn read_journal(active: &Path) -> Result<(Journal, bool), StoreError> {
+    require_type(active, fs::symlink_metadata(active)?.is_dir())?;
+    verify_owner(active)?;
+    let prepared = metadata(&active.join(PREPARED))?;
+    let committed = metadata(&active.join(COMMITTED))?;
+    let (filename, committed) = match (prepared, committed) {
+        (Some(meta), None) if meta.is_file() => (PREPARED, false),
+        (None, Some(meta)) if meta.is_file() => (COMMITTED, true),
+        _ => return Err(invalid("expected exactly one regular library journal").into()),
+    };
+    let journal: Journal = toml::from_str(&fs::read_to_string(active.join(filename))?)?;
+    journal.validate()?;
+    let manifest_index = journal.blocks.len();
+    let change = &journal.files[manifest_index];
+    let before = read_blob(
+        active,
+        "old",
+        manifest_index,
+        change.before.as_ref().expect("validated manifest"),
+    )?;
+    let after = read_blob(active, "new", manifest_index, &change.after)?;
+    let expected = updated_manifest(&before, &journal.library, &journal.version)?;
+    if after != expected.as_bytes() {
+        return Err(invalid("library journal would change unrelated manifest data").into());
+    }
+    Ok((journal, committed))
+}
+
+fn rollback(root: &Path, active: &Path, journal: &Journal) -> io::Result<()> {
+    existing_library_dirs(root, &journal.library)?;
+    // Validate the entire rollback first, including each backup, before
+    // changing any file. Preserve an unexpected external edit in place.
+    for (index, change) in journal.files.iter().enumerate() {
+        let target = journal.target(root, index);
+        let now = current(&target)?;
+        if now != change.before && now.as_ref() != Some(&change.after) {
+            return Err(conflict(&target));
+        }
+        if let Some(before) = &change.before {
+            read_blob(active, "old", index, before)?;
+        }
+    }
+    for (index, change) in journal.files.iter().enumerate().rev() {
+        checkpoint(Phase::Rollback(index))?;
+        existing_library_dirs(root, &journal.library)?;
+        let target = journal.target(root, index);
+        let now = current(&target)?;
+        if now == change.before {
+            // A previous rollback may have renamed the old file before its
+            // directory sync failed. Retry that sync before dropping evidence.
+            if now.is_some() || target.parent().is_some_and(Path::is_dir) {
+                sync_directory(target.parent().expect("target parent"))?;
+            }
+            continue;
+        }
+        if now.as_ref() != Some(&change.after) {
+            return Err(conflict(&target));
+        }
+        match &change.before {
+            Some(before) => replace(active, &target, index, before, "old")?,
+            None => {
+                fs::remove_file(&target)?;
+                sync_directory(target.parent().expect("target parent"))?;
+            }
+        }
+    }
+    let dirs = library_dirs(root, &journal.library);
+    for dir in dirs[journal.existing_directories..].iter().rev() {
+        match fs::remove_dir(dir) {
+            Ok(()) => sync_directory(dir.parent().expect("library directory parent"))?,
+            // Leave external additions in place.
+            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::DirectoryNotEmpty) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+fn blob(active: &Path, kind: &str, index: usize) -> PathBuf {
+    active.join(format!("{kind}-{index}"))
+}
+
+fn read_blob(active: &Path, kind: &str, index: usize, expected: &Image) -> io::Result<Vec<u8>> {
+    let path = blob(active, kind, index);
+    let (image, bytes) =
+        read_image(&path)?.ok_or_else(|| invalid("library journal blob missing"))?;
+    if image.sha256 != expected.sha256 || expected.mode & !0o7777 != 0 {
+        return Err(invalid(format!(
+            "library journal blob or mode invalid: {}",
+            path.display()
+        )));
+    }
+    Ok(bytes)
+}
+
+fn replace(
+    active: &Path,
+    target: &Path,
+    index: usize,
+    image: &Image,
+    kind: &str,
+) -> io::Result<()> {
+    let bytes = read_blob(active, kind, index, image)?;
+    // Keep crash leftovers in the excluded journal directory. The rename
+    // is within the project filesystem, even for newly created blocks.
+    let replacement = active.join("replace.tmp");
+    if let Some(meta) = metadata(&replacement)? {
+        require_type(&replacement, meta.is_file())?;
+        fs::remove_file(&replacement)?;
+    }
+    write_private(&replacement, &bytes, image.mode)?;
+    fs::rename(replacement, target)?;
+    sync_directory(target.parent().expect("target parent"))?;
+    sync_directory(active)
+}
+
+fn library_dirs(root: &Path, library: &str) -> [PathBuf; 3] {
+    let pous = root.join("pous");
+    let lib = pous.join(LIBRARY_SLUG_PREFIX);
+    let target = lib.join(library);
+    [pous, lib, target]
+}
+
+pub(crate) fn existing_library_dirs(root: &Path, library: &str) -> io::Result<usize> {
+    #[cfg(unix)]
+    let device = {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(root)?.dev()
+    };
+    let dirs = library_dirs(root, library);
+    for (index, dir) in dirs.iter().enumerate() {
+        let Some(meta) = metadata(dir)? else {
+            return Ok(index);
+        };
+        require_type(dir, meta.is_dir())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if meta.dev() != device {
+                return Err(invalid(format!(
+                    "library directory is on a different filesystem: {}",
+                    dir.display()
+                )));
+            }
+        }
+    }
+    Ok(dirs.len())
+}
+
+fn retire(root: &Path) -> io::Result<()> {
+    checkpoint(Phase::BeforeCleanup)?;
+    let stage = root.join(STAGE);
+    if metadata(&stage)?.is_some() {
+        return Err(invalid(
+            "unexpected staging directory while retiring library journal",
+        ));
+    }
+    // Once retired, even an interrupted recursive removal cannot be
+    // mistaken for an incomplete live journal.
+    fs::rename(root.join(ACTIVE), stage)?;
+    sync_directory(root)?;
+    warn_cleanup(root, cleanup_stage(root));
+    Ok(())
+}
+
+fn verify_owner(directory: &Path) -> io::Result<()> {
+    let marker = directory.join(OWNER);
+    let meta = fs::symlink_metadata(&marker)?;
+    require_type(&marker, meta.is_file() && meta.len() == 0)
+}
+
+fn cleanup_stage(root: &Path) -> io::Result<()> {
+    let stage = root.join(STAGE);
+    let Some(meta) = metadata(&stage)? else {
+        return Ok(());
+    };
+    require_type(&stage, meta.is_dir())?;
+    let entries = fs::read_dir(&stage)?.collect::<Result<Vec<_>, _>>()?;
+    if !entries.is_empty() {
+        verify_owner(&stage)?;
+        for entry in &entries {
+            let name = entry.file_name();
+            let kind = entry.file_type()?;
+            let known = match name.to_str() {
+                Some("names") => kind.is_dir(),
+                Some(PREPARED | COMMITTED | OWNER | "replace.tmp") => kind.is_file(),
+                Some(name) => {
+                    kind.is_file()
+                        && name.split_once('-').is_some_and(|(prefix, id)| {
+                            matches!(prefix, "new" | "old") && id.parse::<usize>().is_ok()
+                        })
+                }
+                None => false,
+            };
+            if !known {
+                return Err(invalid(format!(
+                    "unexpected data in library stage: {}",
+                    entry.path().display()
+                )));
+            }
+        }
+        for entry in entries {
+            if entry.file_name() == OWNER {
+                continue;
+            }
+            if entry.file_type()?.is_dir() {
+                fs::remove_dir_all(entry.path())?;
+            } else {
+                fs::remove_file(entry.path())?;
+            }
+        }
+        // Keep the owner marker until no data remains. A crash after
+        // removing the marker leaves only an empty scratch directory.
+        sync_directory(&stage)?;
+        fs::remove_file(stage.join(OWNER))?;
+    }
+    fs::remove_dir(stage)?;
+    sync_directory(root)
+}
+
+fn warn_cleanup(root: &Path, result: io::Result<()>) {
+    if let Err(error) = result {
+        tracing::warn!(project = %root.display(), %error, "library import staging cleanup deferred");
+    }
+}
+
+fn metadata(path: &Path) -> io::Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => Ok(Some(meta)),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn require_type(path: &Path, expected: bool) -> io::Result<()> {
+    if expected {
+        Ok(())
+    } else {
+        Err(invalid(format!(
+            "unexpected file type (including symlinks): {}",
+            path.display()
+        )))
+    }
+}
+
+fn current(path: &Path) -> io::Result<Option<Image>> {
+    Ok(read_image(path)?.map(|(image, _)| image))
+}
+
+fn read_image(path: &Path) -> io::Result<Option<(Image, Vec<u8>)>> {
+    let Some(meta) = metadata(path)? else {
+        return Ok(None);
+    };
+    require_type(path, meta.is_file())?;
+    let bytes = fs::read(path)?;
+    Ok(Some((Image::of(&bytes, mode(&meta.permissions())), bytes)))
+}
+
+fn mode(permissions: &Permissions) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.mode() & 0o7777
+    }
+    #[cfg(not(unix))]
+    {
+        if permissions.readonly() {
+            0o400
+        } else {
+            0o600
+        }
+    }
+}
+
+fn write_private(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(Permissions::from_mode(mode))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let mut permissions = file.metadata()?.permissions();
+        permissions.set_readonly(mode & 0o200 == 0);
+        file.set_permissions(permissions)?;
+    }
+    file.sync_all()
+}
+
+fn private_directory(path: &Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
+fn sync_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    return File::open(path)?.sync_all();
+    // This platform's standard File API provides file sync, but no
+    // portable directory sync. The journal still handles process exit.
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+fn invalid(message: impl Into<String>) -> io::Error {
+    io::Error::new(ErrorKind::InvalidData, message.into())
+}
+
+fn conflict(path: &Path) -> io::Error {
+    invalid(format!(
+        "{} changed outside the library import",
+        path.display()
+    ))
+}
+
+fn recovery_required(error: impl std::fmt::Display) -> StoreError {
+    StoreError::LibraryRecoveryRequired(error.to_string())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    BeforeStage,
+    BeforeBackup(usize),
+    BeforeStageContents(usize),
+    Prepared,
+    BeforeInstall(usize),
+    AfterInstall(usize),
+    BeforeCommit,
+    SyncCommit,
+    Rollback(usize),
+    BeforeCleanup,
+}
+
+fn checkpoint(phase: Phase) -> io::Result<()> {
+    #[cfg(test)]
+    return tests::checkpoint(phase);
+    #[cfg(not(test))]
+    {
+        let _ = phase;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[path = "library_transaction_tests.rs"]
+mod tests;

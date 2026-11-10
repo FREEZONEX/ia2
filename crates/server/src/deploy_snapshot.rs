@@ -20,9 +20,12 @@ impl DeploySnapshot {
             .tempdir()
             .map_err(|e| format!("creating deploy snapshot: {e}"))?;
         let project_dir = directory.path().join("project");
-        copy_tree(source, &project_dir).map_err(|e| format!("copying deploy snapshot: {e}"))?;
-        // Concurrent edits can affect the copy while it is being created, but
-        // from here on validation and upload use these same independent bytes.
+        project::ProjectStore::with_snapshot_files(source, || {
+            copy_tree(source, &project_dir, true)
+        })
+        .map_err(|e| format!("copying deploy snapshot: {e}"))?;
+        // The library commit cannot overlap the copy. Validation and upload
+        // use these same independent bytes.
         let loaded = ironplc_bridge::load_edge_project(&project_dir)?;
         Ok(Self {
             _directory: directory,
@@ -40,13 +43,16 @@ impl DeploySnapshot {
     }
 }
 
-fn copy_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
+fn copy_tree(source: &Path, destination: &Path, project_root: bool) -> std::io::Result<()> {
     let kind = std::fs::symlink_metadata(source)?.file_type();
     if kind.is_dir() {
         std::fs::create_dir(destination)?;
         for entry in std::fs::read_dir(source)? {
             let entry = entry?;
-            copy_tree(&entry.path(), &destination.join(entry.file_name()))?;
+            if project_root && project::is_library_transaction_artifact(&entry.file_name()) {
+                continue;
+            }
+            copy_tree(&entry.path(), &destination.join(entry.file_name()), false)?;
         }
     } else if kind.is_file() {
         std::fs::copy(source, destination)?;
@@ -171,5 +177,24 @@ mod tests {
         std::os::unix::fs::symlink(&target, &original).unwrap();
         let error = DeploySnapshot::prepare(store.root()).err().unwrap();
         assert!(error.contains("symlink or special file"), "{error}");
+    }
+
+    #[test]
+    fn library_artifacts_are_excluded_and_pending_recovery_blocks_preflight() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProjectStore::create(dir.path().join("source"), "source").unwrap();
+        let staging = store.root().join(".ia2-library-stage");
+        std::fs::create_dir(&staging).unwrap();
+        std::fs::write(staging.join("new-0"), "staged bytes").unwrap();
+        let snapshot = DeploySnapshot::prepare(store.root()).unwrap();
+        assert!(!snapshot.project_dir().join(".ia2-library-stage").exists());
+        assert!(staging.join("new-0").is_file());
+        let active = store.root().join(".ia2-library-import");
+        std::fs::create_dir(&active).unwrap();
+        let error = DeploySnapshot::prepare(store.root()).err().unwrap();
+        assert!(
+            error.contains("library import recovery required"),
+            "{error}"
+        );
     }
 }

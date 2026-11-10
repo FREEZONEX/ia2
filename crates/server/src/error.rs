@@ -20,6 +20,7 @@ pub enum ApiError {
     /// 403 — the request was understood but project policy forbids it
     /// (write governance denied the write).
     Forbidden(String),
+    Unavailable(String),
     Internal(String),
 }
 
@@ -36,6 +37,9 @@ impl From<StoreError> for ApiError {
             StoreError::EdgeNotFound(n) => Self::NotFound(format!("edge '{n}' not found")),
             StoreError::FolderNotFound(n) => Self::NotFound(format!("folder '{n}' not found")),
             StoreError::FolderNotEmpty(n) => Self::Conflict(format!("folder '{n}' not empty")),
+            e @ (StoreError::LibraryBusy
+            | StoreError::LibraryRecoveryRequired(..)
+            | StoreError::LibraryCommitUnconfirmed(..)) => Self::Unavailable(e.to_string()),
             other => Self::Internal(other.to_string()),
         }
     }
@@ -84,6 +88,7 @@ impl IntoResponse for ApiError {
             Self::BadRequest(s) => (StatusCode::BAD_REQUEST, s),
             Self::Unprocessable(s) => (StatusCode::UNPROCESSABLE_ENTITY, s),
             Self::Forbidden(s) => (StatusCode::FORBIDDEN, s),
+            Self::Unavailable(s) => (StatusCode::SERVICE_UNAVAILABLE, s),
             Self::Internal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
         };
         (status, body).into_response()

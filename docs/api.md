@@ -210,11 +210,21 @@ read-only device-template catalog used to pre-fill devices from a bus scan.
 | `GET` | `/api/hmi/{path}/check` | Structural validation plus variable-existence warnings against the project's POUs. Returns `HmiIssue[]`. |
 | `POST` | `/api/hmi/{path}/generate` | Deterministic first-pass screen from project truth (alarmbar, per-POU sections, BOOL→indicator, numeric→value, `*_sp`→setpoint input, one trend). Body `{ force?, title? }`; 409 if the screen exists and `force` is absent. Returns the generated `HmiDoc`. |
 | `GET` | `/api/hmi-symbols` | The built-in symbol catalog (`HmiSymbolInfo[]`: name, bindable keys, props, default size) — an agent's palette reference. |
-| `GET` | `/api/library` | Registry libraries + per-project import state. Returns `LibrarySummary[]` (name, version, `imported_version`, `imported_files`). |
-| `POST` | `/api/library/import` | Vendor blocks into the project. Body: `ImportLibraryRequest { library, blocks?[] }` (empty `blocks` = all; re-import overwrites = the update path). Returns `ImportLibraryResponse { library, version, imported[] }`. |
+| `GET` | `/api/library` | Registry libraries and the selected project's import state. Returns `LibrarySummary[]` (name, version, `imported_version`, `imported_files`). With no project open and no selector, returns the registry alone. An explicit unknown project returns 400. |
+| `POST` | `/api/library/import` | Commit the selected block files and their version entry together. Body `ImportLibraryRequest { library, blocks?[] }`. Empty `blocks` selects all. Re-import overwrites selected files and preserves the rest. Returns `ImportLibraryResponse { library, version, imported[] }` after commit. |
 | `DELETE` | `/api/library/{name}` | Drop `pous/lib/<name>/` and the project.toml entry. Idempotent. |
 | `GET` | `/api/device-catalog` | Validated device templates from `<library-dir>/devices/`. Returns `CatalogEntry[]`. |
 | `GET` | `/api/device-catalog/match?vendor_id=&product_id=` | Resolve a discovered slave's identity to a catalog template (pre-fill a device from an EtherCAT scan instead of hand-typing PDI offsets). Returns `CatalogEntry`; 404 when the identity isn't catalogued. |
+
+Library import publishes the existing project mutation after commit.
+A failure before commit rolls back the selected files and version entry.
+If rollback needs intervention or the commit result cannot be confirmed,
+the API returns 503 with a recovery or commit message. Library state reads
+also return 503 while the selected project is busy or blocked on recovery.
+A committed import can return success while removal of its recovery files
+is pending. After losing an import response, reopen or read the project to
+determine the imported version and contents before deciding whether to retry.
+[Library import recovery](library-import.md)
 
 ## Devices
 
