@@ -52,6 +52,7 @@ RELEVANT_ENV = (
     "CARGO_BUILD_JOBS", "CARGO_BUILD_TARGET", "CARGO_TARGET_DIR", "CARGO_NET_OFFLINE",
     "RUSTFLAGS", "RUST_TEST_THREADS", "TS_RS_EXPORT_DIR", "IA2_TEST_SERVER_LOG_DIR", "TMPDIR",
 )
+CLEANUP_GRACE = 0.5
 
 
 def timestamp():
@@ -92,17 +93,86 @@ def save(report, directory):
     pending.replace(directory / "summary.json")
 
 
-def stop_group(process):
-    # Each command owns a process group. Keep descendants (e.g. a test server)
-    # in scope even when the command that launched them exits on SIGTERM first.
+def active_session_groups(process, timeout):
+    # The test launcher can create groups inside the step's private session.
+    # Darwin ps has no SID selector. Match its numeric rows with getsid.
+    # Linux ps includes threads so a zombie leader cannot hide live threads.
+    darwin = sys.platform == "darwin"
+    selection = ("-A",) if darwin else ("--sid", str(process.pid), "-L")
+    check = subprocess.run(
+        ("ps", *selection, "-o", "pid=,pgid=,stat="),
+        capture_output=True, text=True, timeout=timeout,
+    )
+    if check.returncode == 1 and not check.stdout and not check.stderr:
+        return set()  # No matching processes.
+    if check.returncode or check.stderr:
+        raise OSError(f"ps exited {check.returncode}: {check.stderr.strip()}")
+    active = set()
+    foreign = set()
+    for row in check.stdout.splitlines():
+        fields = row.split()
+        if len(fields) != 3 or not all(value.isdecimal() for value in fields[:2]):
+            raise OSError(f"unexpected ps output: {row!r}")
+        pid, pgid = map(int, fields[:2])
+        if process.returncode is not None and pid == process.pid and pgid == pid:
+            raise OSError(f"cannot verify ownership of session {pid} after reaping its leader")
+        if pgid <= 0 or pgid in active or pgid in foreign or fields[2][0] in ("Z", "X"):
+            continue
+        if darwin:
+            try:
+                if os.getsid(pid) != process.pid:
+                    foreign.add(pgid)
+                    continue
+                # A process can change groups between the snapshot and getsid.
+                pgid = os.getpgid(pid)
+            except ProcessLookupError:
+                continue
+        active.add(pgid)
+    return active
+
+
+def wait_for_session_exit(process):
+    deadline = time.monotonic() + CLEANUP_GRACE
+    while (remaining := deadline - time.monotonic()) > 0:
+        if not active_session_groups(process, remaining):
+            return True
+        time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+    return False
+
+
+def stop_session(process):
+    # Keep the leader unreaped during cleanup whenever possible so its PID
+    # cannot be reused. A normal wait can already have reaped it if the
+    # interrupt arrived just as the command exited.
+    cleanup = {"state": "FAIL", "signals": [], "errors": []}
     for signum in (signal.SIGTERM, signal.SIGKILL):
         try:
-            os.killpg(process.pid, signum)
-        except ProcessLookupError:
-            break
-        if signum == signal.SIGTERM:
-            time.sleep(0.5)
-    return process.wait()
+            groups = active_session_groups(process, CLEANUP_GRACE)
+        except (OSError, subprocess.SubprocessError) as error:
+            cleanup["errors"].append(f"checking session membership: {error}")
+            if process.returncode is not None:
+                return cleanup
+            # The unreaped leader still reserves its original group ID.
+            groups = {process.pid}
+        if not groups:
+            cleanup["state"] = "PASS"
+            return cleanup
+        cleanup["signals"].append({"signal": signum.name, "groups": sorted(groups)})
+        for pgid in sorted(groups):
+            try:
+                os.killpg(pgid, signum)
+            except ProcessLookupError:
+                pass  # Verify the entire session below.
+            except OSError as error:
+                cleanup["errors"].append(f"{signum.name} for group {pgid}: {error}")
+        try:
+            if wait_for_session_exit(process):
+                cleanup["state"] = "PASS"
+                return cleanup
+        except (OSError, subprocess.SubprocessError) as error:
+            cleanup["errors"].append(f"checking session after {signum.name}: {error}")
+    cleanup["errors"].append("session exit was not confirmed before the cleanup deadline")
+    return cleanup
 
 
 def run_step(step, directory, env, interrupted):
@@ -113,19 +183,31 @@ def run_step(step, directory, env, interrupted):
                 stdout=output, stderr=subprocess.STDOUT, start_new_session=True,
             )
         except OSError as error:
-            output.write(f"could not start command: {error}\n".encode())
-            return 127
+            step.update(exit_code=127, status_error=f"could not start command: {error}")
+            output.write(f"{step['status_error']}\n".encode())
+            return
         try:
             while not interrupted:
                 try:
-                    code = process.wait(timeout=0.2)
+                    step["exit_code"] = process.wait(timeout=0.2)
+                    break
                 except subprocess.TimeoutExpired:
-                    continue
-                return stop_group(process) if interrupted else code
-        except BaseException:
-            stop_group(process)
-            raise
-        return stop_group(process)
+                    pass
+        except (OSError, subprocess.SubprocessError) as error:
+            step["status_error"] = f"waiting for command exit: {error}"
+        finally:
+            if interrupted or step["exit_code"] is None:
+                try:
+                    step["cleanup"] = stop_session(process)
+                except Exception as error:
+                    step["cleanup"] = {
+                        "state": "FAIL", "signals": [], "errors": [f"{type(error).__name__}: {error}"],
+                    }
+                finally:
+                    try:
+                        step["exit_code"] = process.wait(timeout=CLEANUP_GRACE)
+                    except (OSError, subprocess.SubprocessError) as error:
+                        step["status_error"] = f"could not obtain exit status after cleanup: {error}"
 
 
 def main():
@@ -152,7 +234,8 @@ def main():
         {
             "name": name, "argv": STEPS[name], "log": f"{name}.log", "state": "NOT_RUN",
             "reason": "awaiting prerequisites" if name in selected else "outside selected suite",
-            "start": None, "end": None, "exit_code": None, "ignored_or_skipped": [],
+            "start": None, "end": None, "exit_code": None, "status_error": None, "cleanup": None,
+            "ignored_or_skipped": [],
         }
         for name in (*selected, *(name for name in STEPS if name not in selected))
     ]
@@ -187,24 +270,35 @@ def main():
         for step in steps[:len(selected)]:
             if interrupted:
                 break
-            step.update(start=timestamp(), reason=None)
+            step.update(state="RUNNING", start=timestamp(), reason=None)
             save(report, directory)
-            print(f"{step['name']}  {shlex.join(step['argv'])}  [{step['log']}]", flush=True)
-            code = run_step(step, directory, env, interrupted)
-            if interrupted:
-                step["reason"] = f"interrupted by signal {interrupted[0]}"
-            step.update(state="FAIL" if code or interrupted else "PASS", end=timestamp(), exit_code=code)
-            with (directory / step["log"]).open(encoding="utf-8", errors="replace") as output:
-                step["ignored_or_skipped"] = [line.strip() for line in output if SKIPPED.search(line)]
-            save(report, directory)
-            if code:
-                result = code if code > 0 else 128 - code
+            completed = False
+            try:
+                print(f"{step['name']}  {shlex.join(step['argv'])}  [{step['log']}]", flush=True)
+                run_step(step, directory, env, interrupted)
+                with (directory / step["log"]).open(encoding="utf-8", errors="replace") as output:
+                    step["ignored_or_skipped"] = [line.strip() for line in output if SKIPPED.search(line)]
+                completed = True
+            except Exception as error:
+                step["error"] = f"{type(error).__name__}: {error}"
+                raise
+            finally:
+                if interrupted:
+                    step["reason"] = f"interrupted by signal {interrupted[0]}"
+                cleanup = step["cleanup"]
+                passed = (completed and step["exit_code"] == 0 and not interrupted
+                          and not step["status_error"] and (cleanup is None or cleanup["state"] == "PASS"))
+                step.update(state="PASS" if passed else "FAIL", end=timestamp())
+                save(report, directory)
+            if step["state"] == "FAIL":
+                code = step["exit_code"]
+                result = 128 - code if code is not None and code < 0 else code or 1
                 break
         if not interrupted and identity() != report["source"]:
             report["error"] = "source identity or lock files changed while the gate ran"
             result = result or 1
-    except (OSError, subprocess.SubprocessError) as error:
-        report["error"] = str(error)
+    except Exception as error:
+        report["error"] = f"{type(error).__name__}: {error}"
         result = result or 1
     finally:
         if interrupted:

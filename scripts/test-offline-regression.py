@@ -1,5 +1,6 @@
 """Exercise the real runner with controlled tool commands in a scratch repo."""
 
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -13,7 +14,7 @@ import unittest
 
 RUNNER = Path(__file__).with_name("offline-regression.py").resolve()
 TOOL = """#!/usr/bin/env python3
-import os, pathlib, signal, subprocess, sys, time
+import os, pathlib, subprocess, sys
 name = pathlib.Path(sys.argv[0]).name
 args = sys.argv[1:]
 if args == ['--version']:
@@ -27,22 +28,39 @@ if args and args[0] == 'clippy':
     if os.getenv('IA2_FIXTURE_FAIL'):
         sys.exit(17)
     if os.getenv('IA2_FIXTURE_INTERRUPT'):
-        stopped = os.environ['IA2_FIXTURE_STOPPED']
         child_code = '''
-import pathlib, signal, sys
-def stop(*_):
-    pathlib.Path(sys.argv[1]).write_text('stopped')
-    sys.exit(0)
-signal.signal(signal.SIGTERM, stop)
-print('armed', flush=True)
-signal.pause()
+import fcntl, os, signal
+if os.environ['IA2_FIXTURE_INTERRUPT'] != 'graceful':
+    os.setpgid(0, 0)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+signal.alarm(20)
+with open(os.environ['IA2_FIXTURE_RUNNING'], 'w') as running:
+    fcntl.flock(running, fcntl.LOCK_EX)
+    print(os.getpid(), flush=True)
+    while True:
+        signal.pause()
 '''
-        child = subprocess.Popen([sys.executable, '-c', child_code, stopped], stdout=subprocess.PIPE)
-        assert child.stdout.readline() == b'armed\\n'
-        pathlib.Path(os.environ['IA2_FIXTURE_READY']).touch()
+        child = subprocess.Popen([sys.executable, '-c', child_code], stdout=subprocess.PIPE)
+        assert int(child.stdout.readline()) == child.pid
+        ready = pathlib.Path(os.environ['IA2_FIXTURE_READY'])
+        pending = ready.with_suffix('.tmp')
+        pending.write_text(str(child.pid))
+        pending.replace(ready)
         child.wait()
 if args[:3] == ['test', '--locked', '--workspace']:
     print('test manual_fixture ... ignored, manual only')
+"""
+
+DENY_KILL = """\
+import errno, os, runpy, signal, sys
+killpg = os.killpg
+def refuse_kill(pgid, signum):
+    if signum == signal.SIGKILL:
+        raise PermissionError(errno.EPERM, 'fixture refused SIGKILL')
+    killpg(pgid, signum)
+os.killpg = refuse_kill
+sys.argv.pop(0)
+runpy.run_path(sys.argv[0], run_name='__main__')
 """
 
 
@@ -94,8 +112,8 @@ class RegressionRunnerTest(unittest.TestCase):
         return subprocess.run(self.command(suite), cwd=self.root, env=self.env,
                               capture_output=True, text=True, timeout=30)
 
-    def summary(self):
-        run, = self.evidence.glob("run-*")
+    def summary(self, evidence=None):
+        run, = (evidence or self.evidence).glob("run-*")
         return run, json.loads((run / "summary.json").read_text())
 
     def test_full_records_actual_order_and_ignores(self):
@@ -137,12 +155,31 @@ class RegressionRunnerTest(unittest.TestCase):
         self.assertEqual(steps["debug-server"]["state"], "NOT_RUN")
 
     def test_interrupt_stops_descendant_and_leaves_independent_process_alone(self):
-        ready = self.root / "target" / "ready"
-        stopped = self.root / "target" / "stopped"
-        self.env.update(IA2_FIXTURE_INTERRUPT="1", IA2_FIXTURE_READY=str(ready),
-                        IA2_FIXTURE_STOPPED=str(stopped))
+        self.check_interrupt("graceful")
+
+    def test_interrupt_escalates_for_a_live_descendant(self):
+        self.check_interrupt("stubborn")
+
+    def test_interrupt_records_cleanup_error_and_real_exit_status(self):
+        self.check_interrupt("cleanup-error")
+
+    def check_interrupt(self, mode):
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            with self.subTest(signum=signum):
+                self.interrupt_fixture(mode, signum)
+
+    def interrupt_fixture(self, mode, signum):
+        evidence = self.root / "target" / signum.name
+        evidence.mkdir(parents=True)
+        ready = evidence / "ready"
+        running = evidence / "running"
+        env = dict(self.env, IA2_FIXTURE_INTERRUPT=mode, IA2_FIXTURE_READY=str(ready),
+                   IA2_FIXTURE_RUNNING=str(running))
+        command = [*self.command("full"), "--evidence-dir", str(evidence)]
+        if mode == "cleanup-error":
+            command[1:1] = ["-c", DENY_KILL]
         bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
-        runner = subprocess.Popen(self.command("full"), cwd=self.root, env=self.env,
+        runner = subprocess.Popen(command, cwd=self.root, env=env,
                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         try:
             deadline = time.monotonic() + 15
@@ -150,23 +187,55 @@ class RegressionRunnerTest(unittest.TestCase):
                 self.assertIsNone(runner.poll())
                 self.assertLess(time.monotonic(), deadline)
                 time.sleep(0.02)
-            runner.send_signal(signal.SIGINT)
+            self.assertTrue(self.holds_lock(running))
+            runner.send_signal(signum)
             output = runner.communicate(timeout=5)[0]
-            self.assertEqual(runner.returncode, 130, output)
-            self.assertEqual(stopped.read_text(), "stopped")
+            self.assertEqual(runner.returncode, 128 + signum, output)
             self.assertIsNone(bystander.poll())
-            path, report = self.summary()
-            self.assertEqual(report["signal"], signal.SIGINT)
-            self.assertIn("stderr marker", (path / "clippy.log").read_text())
-            steps = {step["name"]: step["state"] for step in report["steps"]}
-            self.assertEqual(steps["clippy"], "FAIL")
-            self.assertEqual(steps["workspace-tests"], "NOT_RUN")
+            path, report = self.summary(evidence)
+            self.assertEqual((report["signal"], report["result"]), (signum, "FAIL"))
+            steps = {step["name"]: step for step in report["steps"]}
+            step = steps["clippy"]
+            self.assertEqual((step["state"], step["exit_code"]), ("FAIL", -signal.SIGTERM))
+            self.assertIsNone(step["status_error"])
+            self.assertTrue(step["start"] and step["end"])
+            self.assertEqual(step["reason"], f"interrupted by signal {signum}")
+            self.assertEqual(steps["workspace-tests"]["state"], "NOT_RUN")
+            log = (path / step["log"]).read_text()
+            self.assertIn("stdout marker", log)
+            self.assertIn("stderr marker", log)
+            cleanup = step["cleanup"]
+            expected_signals = ["SIGTERM"] if mode == "graceful" else ["SIGTERM", "SIGKILL"]
+            self.assertEqual([attempt["signal"] for attempt in cleanup["signals"]], expected_signals)
+            if mode != "graceful":
+                self.assertEqual(cleanup["signals"][-1]["groups"], [int(ready.read_text())])
+            if mode == "cleanup-error":
+                self.assertEqual(cleanup["state"], "FAIL")
+                self.assertIn("fixture refused SIGKILL", "\n".join(cleanup["errors"]))
+                self.assertTrue(self.holds_lock(running))
+            else:
+                self.assertEqual(cleanup["state"], "PASS", cleanup)
+                self.assertFalse(self.holds_lock(running))
         finally:
             if runner.poll() is None:
                 runner.terminate()
                 runner.communicate(timeout=5)
+            if ready.exists() and self.holds_lock(running):
+                try:
+                    os.kill(int(ready.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             bystander.kill()
             bystander.wait()
+
+    @staticmethod
+    def holds_lock(path):
+        with path.open() as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+        return False
 
 
 if __name__ == "__main__":
