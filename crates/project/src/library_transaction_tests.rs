@@ -264,10 +264,42 @@ fn rejects_bad_journal_and_library_symlink_without_touching_sentinel() {
 }
 
 #[test]
+fn copied_recovery_record_cannot_roll_back_a_different_project() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = seeded(&tmp.path().join("source"));
+    let other = seeded(&tmp.path().join("other"));
+    with_fault(
+        |point| fail_at(point, &[Phase::BeforeInstall(1), Phase::Rollback(0)]),
+        || update(&source),
+    )
+    .unwrap_err();
+
+    // The destination exactly matches a recoverable mixed image, so the
+    // per-file hashes alone cannot distinguish these two projects.
+    fs::write(other.root().join("pous/lib/controls/first.st"), FIRST_NEW).unwrap();
+    assert_eq!(identity(source.root()), identity(other.root()));
+    let copied = other.root().join(ACTIVE);
+    fs::create_dir(&copied).unwrap();
+    for entry in fs::read_dir(source.root().join(ACTIVE)).unwrap() {
+        let entry = entry.unwrap();
+        fs::copy(entry.path(), copied.join(entry.file_name())).unwrap();
+    }
+    let before = identity(other.root());
+    let error = other.read_pous().unwrap_err();
+    assert!(matches!(error, StoreError::LibraryRecoveryRequired(_)));
+    assert!(error
+        .to_string()
+        .contains("does not belong to this project"));
+    assert_eq!(identity(other.root()), before);
+    assert!(copied.join("old-0").is_file());
+}
+
+#[test]
 fn writer_serializes_same_project_and_leaves_other_project_available() {
     let tmp = tempfile::tempdir().unwrap();
     let store = seeded(&tmp.path().join("one"));
     let other = seeded(&tmp.path().join("two"));
+    fs::remove_file(store.root().join("tasks.toml")).unwrap();
     let (paused, arrived) = mpsc::channel();
     let (resume, hold) = mpsc::channel();
     let writer = store.clone();
@@ -287,6 +319,10 @@ fn writer_serializes_same_project_and_leaves_other_project_available() {
     assert!(matches!(store.read_pous(), Err(StoreError::LibraryBusy)));
     assert!(matches!(
         store.library_state(),
+        Err(StoreError::LibraryBusy)
+    ));
+    assert!(matches!(
+        store.migrate_tasks(),
         Err(StoreError::LibraryBusy)
     ));
     update(&other).unwrap();

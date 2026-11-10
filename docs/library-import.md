@@ -10,6 +10,9 @@ A rollback restores the original bytes of every file it replaced.
 1. Under the project lock, IA2 validates the destination paths and stages
    new contents, copies of existing files, and a text journal. The journal
    records the transaction format, file names, content hashes and modes.
+   An ownership marker binds the journal to its project directory. A
+   journal copied to another project is refused even if the files match
+   the recorded hashes.
 2. IA2 publishes the fully prepared directory as `.ia2-library-import/`
    and syncs the project root before replacing a live file. It syncs each
    replacement and its directory. The manifest is installed last.

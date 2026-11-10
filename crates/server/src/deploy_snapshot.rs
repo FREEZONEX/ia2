@@ -27,6 +27,9 @@ impl DeploySnapshot {
         // The library commit cannot overlap the copy. Validation and upload
         // use these same independent bytes.
         let loaded = ironplc_bridge::load_edge_project(&project_dir)?;
+        #[cfg(not(unix))]
+        remove_preflight_lock(&project_dir)
+            .map_err(|e| format!("removing deploy snapshot lock: {e}"))?;
         Ok(Self {
             _directory: directory,
             project_dir,
@@ -41,6 +44,19 @@ impl DeploySnapshot {
     pub(crate) fn project_dir(&self) -> &Path {
         &self.project_dir
     }
+}
+
+#[cfg(not(unix))]
+fn remove_preflight_lock(project_dir: &Path) -> std::io::Result<()> {
+    // The filtered copy belongs to this snapshot. Opening it for preflight
+    // can create a new lock sidecar that would otherwise enter the archive.
+    for entry in std::fs::read_dir(project_dir)? {
+        let entry = entry?;
+        if project::is_library_transaction_artifact(&entry.file_name()) {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 fn copy_tree(source: &Path, destination: &Path, project_root: bool) -> std::io::Result<()> {
@@ -188,6 +204,7 @@ mod tests {
         std::fs::write(staging.join("new-0"), "staged bytes").unwrap();
         let snapshot = DeploySnapshot::prepare(store.root()).unwrap();
         assert!(!snapshot.project_dir().join(".ia2-library-stage").exists());
+        assert!(!snapshot.project_dir().join(".ia2-library-lock").exists());
         assert!(staging.join("new-0").is_file());
         let active = store.root().join(".ia2-library-import");
         std::fs::create_dir(&active).unwrap();

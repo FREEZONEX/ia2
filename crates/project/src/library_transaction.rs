@@ -59,7 +59,7 @@ fn lock_file(root: &Path) -> Result<File, StoreError> {
     Ok(file)
 }
 
-fn read_lock_error(error: fs::TryLockError) -> StoreError {
+fn try_lock_error(error: fs::TryLockError) -> StoreError {
     match error {
         fs::TryLockError::WouldBlock => StoreError::LibraryBusy,
         fs::TryLockError::Error(error) => error.into(),
@@ -76,7 +76,7 @@ pub(crate) fn open_guard(root: &Path) -> Result<File, StoreError> {
 
 fn read_access(root: &Path, clean_staging: bool) -> Result<File, StoreError> {
     let guard = lock_file(root)?;
-    guard.try_lock_shared().map_err(read_lock_error)?;
+    guard.try_lock_shared().map_err(try_lock_error)?;
     if !active_exists(root)? && !(clean_staging && metadata(&root.join(STAGE))?.is_some()) {
         return Ok(guard);
     }
@@ -84,7 +84,7 @@ fn read_access(root: &Path, clean_staging: bool) -> Result<File, StoreError> {
     // writer. Recheck the recovery record under exclusive access.
     drop(guard);
     let guard = lock_file(root)?;
-    guard.try_lock().map_err(read_lock_error)?;
+    guard.try_lock().map_err(try_lock_error)?;
     recover(root)?;
     if clean_staging && !active_exists(root)? {
         warn_cleanup(root, cleanup_stage(root));
@@ -95,6 +95,18 @@ fn read_access(root: &Path, clean_staging: bool) -> Result<File, StoreError> {
 pub(crate) fn write_guard(root: &Path) -> Result<File, StoreError> {
     let guard = lock_file(root)?;
     guard.lock()?;
+    check_writable_project(root)?;
+    Ok(guard)
+}
+
+pub(crate) fn try_write_guard(root: &Path) -> Result<File, StoreError> {
+    let guard = lock_file(root)?;
+    guard.try_lock().map_err(try_lock_error)?;
+    check_writable_project(root)?;
+    Ok(guard)
+}
+
+fn check_writable_project(root: &Path) -> Result<(), StoreError> {
     require_type(root, fs::symlink_metadata(root)?.is_dir())?;
     recover(root)?;
     if active_exists(root)? {
@@ -102,7 +114,7 @@ pub(crate) fn write_guard(root: &Path) -> Result<File, StoreError> {
             "committed import cleanup must finish before another library write".into(),
         ));
     }
-    Ok(guard)
+    Ok(())
 }
 
 fn active_exists(root: &Path) -> Result<bool, StoreError> {
@@ -178,6 +190,12 @@ impl Journal {
         {
             return Err(invalid("inconsistent library journal").into());
         }
+        for change in &self.files {
+            let original_mode = change.before.as_ref().map_or(0o600, |image| image.mode);
+            if original_mode & !0o7777 != 0 || change.after.mode != original_mode {
+                return Err(invalid("inconsistent file mode in library journal").into());
+            }
+        }
         Ok(())
     }
 }
@@ -201,8 +219,9 @@ pub(crate) fn import(
     let stage = root.join(STAGE);
     cleanup_stage(root)?;
     checkpoint(Phase::BeforeStage)?;
+    let owner = owner_marker(&stage)?;
     private_directory(&stage)?;
-    write_private(&stage.join(OWNER), b"", 0o600)?;
+    write_private(&stage.join(owner), b"", 0o600)?;
     sync_directory(&stage)?;
 
     let active = root.join(ACTIVE);
@@ -549,10 +568,31 @@ fn retire(root: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn verify_owner(directory: &Path) -> io::Result<()> {
-    let marker = directory.join(OWNER);
-    let meta = fs::symlink_metadata(&marker)?;
-    require_type(&marker, meta.is_file() && meta.len() == 0)
+fn owner_marker(directory: &Path) -> io::Result<String> {
+    let root = directory
+        .parent()
+        .expect("transaction directory has a parent");
+    #[cfg(unix)]
+    let identity = {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::metadata(root)?;
+        format!("{:x}-{:x}", meta.dev(), meta.ino())
+    };
+    #[cfg(not(unix))]
+    let identity = format!(
+        "{:x}",
+        Sha256::digest(fs::canonicalize(root)?.as_os_str().as_encoded_bytes())
+    );
+    Ok(format!("{OWNER}-{identity}"))
+}
+
+fn verify_owner(directory: &Path) -> io::Result<String> {
+    let owner = owner_marker(directory)?;
+    let marker = directory.join(&owner);
+    let meta = metadata(&marker)?
+        .ok_or_else(|| invalid("library transaction does not belong to this project directory"))?;
+    require_type(&marker, meta.is_file() && meta.len() == 0)?;
+    Ok(owner)
 }
 
 fn cleanup_stage(root: &Path) -> io::Result<()> {
@@ -563,13 +603,14 @@ fn cleanup_stage(root: &Path) -> io::Result<()> {
     require_type(&stage, meta.is_dir())?;
     let entries = fs::read_dir(&stage)?.collect::<Result<Vec<_>, _>>()?;
     if !entries.is_empty() {
-        verify_owner(&stage)?;
+        let owner = verify_owner(&stage)?;
         for entry in &entries {
             let name = entry.file_name();
             let kind = entry.file_type()?;
             let known = match name.to_str() {
                 Some("names") => kind.is_dir(),
-                Some(PREPARED | COMMITTED | OWNER | "replace.tmp") => kind.is_file(),
+                Some(PREPARED | COMMITTED | "replace.tmp") => kind.is_file(),
+                Some(name) if name == owner => kind.is_file(),
                 Some(name) => {
                     kind.is_file()
                         && name.split_once('-').is_some_and(|(prefix, id)| {
@@ -586,7 +627,7 @@ fn cleanup_stage(root: &Path) -> io::Result<()> {
             }
         }
         for entry in entries {
-            if entry.file_name() == OWNER {
+            if entry.file_name() == owner.as_str() {
                 continue;
             }
             if entry.file_type()?.is_dir() {
@@ -598,7 +639,7 @@ fn cleanup_stage(root: &Path) -> io::Result<()> {
         // Keep the owner marker until no data remains. A crash after
         // removing the marker leaves only an empty scratch directory.
         sync_directory(&stage)?;
-        fs::remove_file(stage.join(OWNER))?;
+        fs::remove_file(stage.join(owner))?;
     }
     fs::remove_dir(stage)?;
     sync_directory(root)

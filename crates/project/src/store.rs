@@ -911,7 +911,11 @@ impl ProjectStore {
         if self.read_tasks()?.is_some() {
             return Ok(MigrationReport::Skipped);
         }
-        let _guard = library_transaction::write_guard(&self.root)?;
+        // The server calls this while it holds the registry lock.
+        let _guard = library_transaction::try_write_guard(&self.root)?;
+        if self.read_tasks()?.is_some() {
+            return Ok(MigrationReport::Skipped);
+        }
         let pou_paths = self.list_pou_paths_unlocked()?;
         let mut tasks: Vec<Task> = Vec::new();
         let mut programs: Vec<ProgramInstance> = Vec::new();
