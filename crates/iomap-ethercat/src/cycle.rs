@@ -1,12 +1,15 @@
 //! One outstanding ticket, one complete frame, one consumer. No queue catch-up.
 //! Both real and simulated bus workers use this exact state machine.
 use iocore::{
-    cycle::{CycleEvent, CycleStatus},
+    cycle::{CycleEvent, CycleStatus, CycleTiming},
     IoError,
 };
 use std::{
     collections::VecDeque,
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex, MutexGuard,
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::watch;
@@ -15,45 +18,87 @@ const TRACE_CAPACITY: usize = 32;
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Ticket {
     pub sequence: u64,
+    issued_at: Instant,
     deadline: Instant,
 }
 struct State<T> {
     armed: bool,
     ticket: Option<(Ticket, T)>,
     pending: Option<T>,
-    begun: u64,
+    begun: Option<(u64, Instant)>,
     status: CycleStatus,
-    events: VecDeque<CycleEvent>,
+    events: VecDeque<GateEvent>,
 }
+
+/// A fixed-size record for the realtime path. Allocate the public strings
+/// only when a consumer reads diagnostics.
+#[derive(Clone, Copy)]
+struct GateEvent {
+    sequence: u64,
+    kind: &'static str,
+    host_us: u64,
+    deadline_us: Option<u64>,
+}
+
+#[cfg(target_os = "linux")]
+fn clock_origin() -> (Instant, Option<u64>, Option<u64>) {
+    let before = Instant::now();
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: ts is writable storage for the timespec filled by the kernel.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0 {
+        return (before, None, None);
+    }
+    let width = before.elapsed();
+    let mono_ns = ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64;
+    (
+        before + width / 2,
+        Some(mono_ns),
+        Some(width.as_nanos() as u64),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn clock_origin() -> (Instant, Option<u64>, Option<u64>) {
+    (Instant::now(), None, None)
+}
+
 pub(crate) struct Gate<T> {
     pub period: Duration,
     origin: Instant,
     state: Mutex<State<T>>,
+    faulted: AtomicBool,
     wake: watch::Sender<u64>,
 }
 impl<T: Clone> Gate<T> {
     pub fn new(period: Duration) -> Self {
+        let (origin, host_mono_origin_ns, host_mono_uncertainty_ns) = clock_origin();
         Self {
             period,
-            origin: Instant::now(),
+            origin,
             state: Mutex::new(State {
                 armed: false,
                 ticket: None,
                 pending: None,
-                begun: 0,
+                begun: None,
                 status: CycleStatus {
                     period_us: period.as_micros() as u64,
+                    host_mono_origin_ns,
+                    host_mono_uncertainty_ns,
                     ..Default::default()
                 },
                 events: VecDeque::with_capacity(TRACE_CAPACITY),
             }),
+            faulted: AtomicBool::new(false),
             wake: watch::channel(0).0,
         }
     }
     fn event(
         &self,
         s: &mut State<T>,
-        kind: &str,
+        kind: &'static str,
         sequence: u64,
         now: Instant,
         deadline: Option<Instant>,
@@ -62,9 +107,9 @@ impl<T: Clone> Gate<T> {
             s.events.pop_front();
             s.status.events_dropped += 1;
         }
-        s.events.push_back(CycleEvent {
+        s.events.push_back(GateEvent {
             sequence,
-            kind: kind.into(),
+            kind,
             host_us: now.saturating_duration_since(self.origin).as_micros() as u64,
             deadline_us: deadline
                 .map(|d| d.saturating_duration_since(self.origin).as_micros() as u64),
@@ -73,7 +118,9 @@ impl<T: Clone> Gate<T> {
     fn fail(&self, s: &mut State<T>, reason: &str, now: Instant) {
         if s.status.fault.is_none() {
             s.status.fault = Some(reason.into());
-            self.event(s, "fault", s.status.issued, now, None);
+            let deadline = s.ticket.as_ref().map(|(ticket, _)| ticket.deadline);
+            self.event(s, "fault", s.status.issued, now, deadline);
+            self.faulted.store(true, Ordering::Release);
         }
         s.pending = None;
         self.wake.send_modify(|v| *v = v.wrapping_add(1));
@@ -86,17 +133,31 @@ impl<T: Clone> Gate<T> {
         );
     }
     pub fn is_faulted(&self) -> bool {
-        self.state
-            .lock()
-            .expect("cycle gate poisoned")
-            .status
-            .fault
-            .is_some()
+        self.faulted.load(Ordering::Acquire)
     }
     pub fn status(&self) -> CycleStatus {
-        let s = self.state.lock().expect("cycle gate poisoned");
-        let mut status = s.status.clone();
-        status.events = s.events.iter().cloned().collect();
+        Self::copy_status(self.state.lock().expect("cycle gate poisoned"))
+    }
+    pub fn try_status(&self) -> Option<CycleStatus> {
+        self.state.try_lock().ok().map(Self::copy_status)
+    }
+    fn copy_status(state: MutexGuard<'_, State<T>>) -> CycleStatus {
+        let mut events = [None; TRACE_CAPACITY];
+        for (slot, event) in events.iter_mut().zip(&state.events) {
+            *slot = Some(*event);
+        }
+        let mut status = state.status.clone();
+        drop(state);
+        status.events = events
+            .into_iter()
+            .flatten()
+            .map(|event| CycleEvent {
+                sequence: event.sequence,
+                kind: event.kind.into(),
+                host_us: event.host_us,
+                deadline_us: event.deadline_us,
+            })
+            .collect();
         status
     }
     pub async fn begin(&self) -> Result<(Ticket, T), IoError> {
@@ -109,15 +170,12 @@ impl<T: Clone> Gate<T> {
                 }
                 s.armed = true;
                 if let Some((ticket, image)) = s.ticket.clone() {
-                    if ticket.sequence > s.begun {
-                        s.begun = ticket.sequence;
-                        self.event(
-                            &mut s,
-                            "begin",
-                            ticket.sequence,
-                            Instant::now(),
-                            Some(ticket.deadline),
-                        );
+                    if s.begun
+                        .is_none_or(|(sequence, _)| ticket.sequence > sequence)
+                    {
+                        let now = Instant::now();
+                        s.begun = Some((ticket.sequence, now));
+                        self.event(&mut s, "begin", ticket.sequence, now, Some(ticket.deadline));
                         return Ok((ticket, image));
                     }
                 }
@@ -142,19 +200,42 @@ impl<T: Clone> Gate<T> {
         if let Some(why) = &s.status.fault {
             return Err(IoError::Transport(why.clone()));
         }
+        let began = s
+            .begun
+            .filter(|(sequence, _)| *sequence == ticket.sequence)
+            .map(|(_, at)| at);
         let valid = s
             .ticket
             .as_ref()
             .is_some_and(|(t, _)| t.sequence == ticket.sequence)
-            && s.begun == ticket.sequence
             && s.pending.is_none()
             && now < ticket.deadline;
-        if !valid {
+        let Some(began) = began.filter(|_| valid) else {
             self.fail(&mut s, "late, duplicate or stale cycle commit", now);
             return Err(IoError::Transport(
                 "cycle commit refused; restart required".into(),
             ));
-        }
+        };
+        // Update before the bounded event ring can discard any timestamp.
+        let us_between =
+            |end: Instant, start: Instant| end.saturating_duration_since(start).as_micros() as u64;
+        let timing = CycleTiming {
+            max_issue_to_begin_us: us_between(began, ticket.issued_at),
+            max_begin_to_commit_us: us_between(now, began),
+            min_begin_margin_us: us_between(ticket.deadline, began),
+            min_commit_margin_us: us_between(ticket.deadline, now),
+        };
+        let extrema = s.status.handoff_timing.get_or_insert(timing);
+        extrema.max_issue_to_begin_us = extrema
+            .max_issue_to_begin_us
+            .max(timing.max_issue_to_begin_us);
+        extrema.max_begin_to_commit_us = extrema
+            .max_begin_to_commit_us
+            .max(timing.max_begin_to_commit_us);
+        extrema.min_begin_margin_us = extrema.min_begin_margin_us.min(timing.min_begin_margin_us);
+        extrema.min_commit_margin_us = extrema
+            .min_commit_margin_us
+            .min(timing.min_commit_margin_us);
         s.pending = Some(image);
         s.status.committed += 1;
         self.event(
@@ -192,9 +273,23 @@ impl<T: Clone> Gate<T> {
             }
         }
         if s.status.fault.is_none() {
-            if let Some((ticket, _)) = s.ticket.take() {
-                if now >= ticket.deadline + self.period || s.pending.is_none() {
-                    self.fail(&mut s, "missing output frame or missed bus cycle", now);
+            if let Some((ticket, _)) = s.ticket.as_ref() {
+                let ticket = *ticket;
+                let failure = if now >= ticket.deadline + self.period {
+                    Some("bus cycle missed output selection deadline")
+                } else if s.pending.is_none() {
+                    if s.begun
+                        .is_some_and(|(sequence, _)| sequence == ticket.sequence)
+                    {
+                        Some("scan began but did not commit output frame")
+                    } else {
+                        Some("scan did not begin before output selection")
+                    }
+                } else {
+                    None
+                };
+                if let Some(reason) = failure {
+                    self.fail(&mut s, reason, now);
                 } else {
                     s.status.consumed += 1;
                     self.event(
@@ -205,6 +300,7 @@ impl<T: Clone> Gate<T> {
                         Some(ticket.deadline),
                     );
                 }
+                s.ticket = None;
             }
         }
         apply(s.pending.as_ref());
@@ -227,6 +323,7 @@ impl<T: Clone> Gate<T> {
         s.status.issued += 1;
         let ticket = Ticket {
             sequence: s.status.issued,
+            issued_at: now,
             deadline,
         };
         s.ticket = Some((ticket, image));
@@ -267,8 +364,38 @@ mod tests {
     fn begin_at(g: &Gate<[u64; 2]>) -> Ticket {
         let mut s = g.state.lock().unwrap();
         let t = s.ticket.as_ref().unwrap().0;
-        s.begun = t.sequence;
+        s.begun = Some((t.sequence, t.issued_at));
         t
+    }
+    #[test]
+    fn timing_extrema_cover_commits_evicted_from_the_event_ring() {
+        let gate = armed();
+        let mut now = gate.origin;
+        assert!(gate.status().handoff_timing.is_none());
+        for cycle in 0..TRACE_CAPACITY {
+            gate.publish_at([0, 0], now + gate.period, now);
+            let ticket = begin_at(&gate);
+            let begin_us = if cycle == 0 { 900 } else { 100 };
+            let commit_us = if cycle == 0 { 1950 } else { 300 };
+            gate.state.lock().unwrap().begun =
+                Some((ticket.sequence, now + Duration::from_micros(begin_us)));
+            gate.commit_at(ticket, [1, 1], now + Duration::from_micros(commit_us))
+                .unwrap();
+            now += gate.period;
+            gate.consume_at(now, |frame| assert_eq!(frame, Some(&[1, 1])));
+        }
+        let status = gate.status();
+        assert!(status.events.iter().all(|event| event.sequence > 1));
+        assert_eq!(status.committed, TRACE_CAPACITY as u64);
+        assert_eq!(
+            status.handoff_timing,
+            Some(CycleTiming {
+                max_issue_to_begin_us: 900,
+                max_begin_to_commit_us: 1050,
+                min_begin_margin_us: 1100,
+                min_commit_margin_us: 50,
+            })
+        );
     }
     #[test]
     fn ten_thousand_two_ms_frames_are_complete_and_exactly_once_under_work_jitter() {
@@ -354,6 +481,27 @@ mod tests {
             assert_eq!(g.status().consumed, 0);
         }
     }
+    #[test]
+    fn reports_a_missing_begin_separately_from_a_missing_commit_and_late_bus() {
+        for (begin, consume_periods, reason) in [
+            (false, 1, "scan did not begin before output selection"),
+            (true, 1, "scan began but did not commit output frame"),
+            (true, 2, "bus cycle missed output selection deadline"),
+        ] {
+            let gate = armed();
+            let now = gate.origin;
+            gate.publish_at([0, 0], now + gate.period, now);
+            if begin {
+                begin_at(&gate);
+            }
+            gate.consume_at(now + gate.period * consume_periods, |frame| {
+                assert!(frame.is_none())
+            });
+            gate.trip("later secondary fault");
+            assert_eq!(gate.status().fault.as_deref(), Some(reason));
+        }
+    }
+
     #[tokio::test]
     async fn begin_wakes_from_bus_issue_and_input_snapshot_is_fixed() {
         let g = std::sync::Arc::new(Gate::new(Duration::from_millis(20)));

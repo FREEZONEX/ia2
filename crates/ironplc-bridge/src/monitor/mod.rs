@@ -215,7 +215,7 @@ pub fn step(handle: &ProgramHandle, cycles: u32) -> ModeResponse {
 /// or suspended tablet can't leave a momentary command latched.
 /// A later accepted write (pulse or plain) or force supersedes the old reset,
 /// including bare/qualified aliases of the same variable. Rejected writes do
-/// not supersede it. Ownership is checked atomically in the scan command queue.
+/// not supersede it. The scan thread owns the deadline by resolved VM slot.
 ///
 /// This is the single implementation of that safety guarantee — the
 /// IDE server and the edge runtime both call it.
@@ -226,73 +226,18 @@ pub fn step(handle: &ProgramHandle, cycles: u32) -> ModeResponse {
 /// Otherwise a rule with `min > 0` would clamp the reset up to `min`
 /// and silently latch the momentary command forever.
 ///
-/// The pulse write is queued when this is called, in the caller's command
-/// order. Waiting for it to land and the reset run in a task of their own,
-/// not in the caller's future: an HTTP server drops a handler's future when
-/// the client disconnects, and a write already queued to the scan loop lands
-/// anyway. Tied to the caller, its reset was never scheduled and the value
-/// latched. The value is held for `pulse_ms` from the moment the write
-/// landed: time spent queued behind a slow scan does not shorten it.
+/// The write and its duration are enqueued together. The deadline starts
+/// when the write lands, survives a disconnected caller, and is serviced
+/// by the scan independently of the ordinary queue.
 pub async fn write_with_pulse(
     handle: &ProgramHandle,
     name: &str,
     value: i32,
     pulse_ms: Option<u32>,
 ) -> Result<WriteOutcome, RuntimeWriteError> {
-    if let Some(ms) = pulse_ms {
-        let (landed, token) = handle.queue_pulse(name, value)?;
-        let h = handle.clone();
-        let n = name.to_string();
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let outcome = match landed.await {
-                Ok(outcome) => outcome,
-                Err(e) => {
-                    let _ = started_tx.send(Err(e));
-                    return;
-                }
-            };
-            let deadline =
-                tokio::time::Instant::now() + std::time::Duration::from_millis(ms as u64);
-            // The caller may be gone; the reset runs regardless.
-            let _ = started_tx.send(Ok(outcome));
-            tokio::time::sleep_until(deadline).await;
-            match h.reset_pulse(token).await {
-                // The program may have stopped in the window — that also
-                // clears the variable, so a failed reset is benign then;
-                // log it so a live-program failure is still visible.
-                Err(e) => tracing::warn!(variable = %n, ?e, "pulse reset write failed"),
-                // Applied to the VM but NOT reaching the field: the link went
-                // down inside the pulse window. The momentary value is still
-                // on the wire from the first half of this write, and stays
-                // there for the outage — which is exactly the latch `pulse_ms`
-                // exists to prevent, so it cannot pass silently.
-                //
-                // Self-correcting, not permanent: the output phase flushes the
-                // current VM value every scan, so the 0 lands when the link
-                // returns. What is lost without this line is any record that
-                // the plant held the command in between.
-                Ok(None) => {} // A later accepted command owns the slot.
-                Ok(Some(o)) => {
-                    if let Some(device) = o.undelivered_device {
-                        tracing::warn!(
-                            variable = %n,
-                            %device,
-                            "pulse reset applied to the VM but not delivered — that \
-                             device's link is down, so the field holds the momentary \
-                             value until it returns"
-                        );
-                    }
-                }
-            }
-        });
-        // The sender is dropped unanswered only if the task was cancelled
-        // (the Tokio runtime shutting down) or panicked.
-        started_rx
-            .await
-            .unwrap_or(Err(RuntimeWriteError::Disconnected))
-    } else {
-        handle.write_variable(name, value).await
+    match pulse_ms {
+        Some(ms) => handle.write_pulse(name, value, ms).await,
+        None => handle.write_variable(name, value).await,
     }
 }
 

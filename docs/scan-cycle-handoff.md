@@ -111,15 +111,36 @@ private staging image until the whole scan commits. Channel errors fail the
 synchronized scan closed. Direct adapter writes outside an active scan are refused;
 HTTP variable writes still enter the VM and are processed by subsequent scans.
 
-Pause or step also trips the synchronized run. The common runtime sets the existing
-`watchdog_tripped` latch and keeps serving diagnostics; it does not exit/restart on
-this fault. The first cause appears in `latch_reason`; adapter safe-value attempts
-use the shared `failsafe_status` reporting and panic isolation. An adapter's
-acknowledgement does not establish physical output state. Transport recovery or
-re-walk cannot clear the gate. Explicit program
-restart creates a new gate; it is not an automatic retry of a failed trajectory.
-Stopping still invokes the existing failsafe/shutdown sequence. An already handed
-off/in-flight bus frame cannot be retracted by a later software stop.
+Ordinary runtime commands use a bounded FIFO. A full queue rejects new debug
+commands with HTTP 429. Each scan round applies at most 16 commands and, for
+bus-clocked runs, stops admitting work once it has spent one eighth of a
+period on commands. It admits one command for progress even at short periods.
+Stop and output inhibition have separate paths. A pulse duration starts at
+VM application. Each round has a separate budget of up to 16 pulse resets,
+earliest expiry first, including while paused. A reset is eligible when the
+round's command phase starts at or after expiry. An accepted write or force
+to the same resolved VM variable can supersede it. The scan samples monitor
+and RETAIN values. Separate bounded workers format monitor snapshots and
+write RETAIN checkpoints, so a slow formatter or storage device
+cannot make the scan wait for a completed operation. A full monitor mailbox
+skips that sample. The RETAIN writer keeps the newest pending checkpoint and
+is drained after device teardown.
+
+In a bus-clocked run, pause, step and missed handoffs latch normal outputs off.
+The first cause appears in `latch_reason`. Each adapter keeps sole ownership of its transport
+while its independent safe-value attempt runs. The scan can resume in a
+latched observation mode. Safe-value and teardown workers are created from
+the ordinary I/O runtime and do not inherit the scan's optional real-time
+priority. Inputs from an adapter are marked stale while its
+attempt owns it. Modbus discards queued ordinary writes after the fence. A
+previously admitted write may still start or finish after the fence. The same
+owner then starts the safe-value sweep. Timer-driven EtherCAT selects an
+all-zero image at the worker's admission point after the fence, including
+gear outputs.
+Adapter acknowledgement has the scope documented in [edge deployment](edge-deploy.md#shutdown-and-failsafe-evidence).
+The latch survives transport recovery and re-walk. Each adapter proceeds to
+final cleanup independently. Explicit restart creates a new gate after all
+ownership from the previous run has drained.
 
 ## Observability
 
@@ -132,17 +153,40 @@ the existing edge status proxy carry `device_health[].cycle` for clock owners:
 | `issued` | Tickets published after successful exchanges |
 | `committed` | Complete frames accepted before their deadlines |
 | `consumed` | Frames selected for exchange, not proof of drive application |
+| `handoff_timing` | Optional timing extrema for all `committed` frames since this gate was created |
 | `fault` | First latched reason; null before fault |
 | `events` | Last 32 issue/begin/commit/consume/dc_send_expired/fault events |
 | `events_dropped` | Earlier events evicted from the bounded ring |
+| `host_mono_origin_ns`, `host_mono_uncertainty_ns` | Optional Linux CLOCK_MONOTONIC origin and calibration bracket width in ns |
 
-Events have a sequence, `host_us`, and optional `deadline_us`, all relative to one
-monotonic host-clock origin. They are not UTC timestamps or EtherCAT DC timestamps.
-Status snapshots refresh approximately every 100 ms; read counters as snapshots,
-not an atomic live transaction with other status fields. No per-cycle file I/O is
-performed. A cycle fault makes the device unhealthy until restart. Independent
-scheduler `scan_overruns` is not used to decide synchronized deadlines: the gate
-and `watchdog_tripped` report that path.
+Events have a sequence, `host_us`, and optional `deadline_us`, relative to one
+monotonic host-clock origin. On Linux, add `host_mono_origin_ns` to `host_us × 1000`
+to align with scan trace and scheduler data. The calibration width and
+microsecond quantization bound the timestamp mapping. EtherCAT DC uses a
+separate clock. The gate distinguishes a scan that never began, one that
+began without a commit, and a bus that missed its selection deadline. A
+first fault records the active ticket deadline when available. Status
+refreshes approximately every 100 ms and may retain its previous cycle
+sample during lock contention.
+
+`handoff_timing` is absent until the first accepted commit and on older
+runtimes. All four values use host monotonic time in microseconds.
+
+| Field | Meaning |
+|---|---|
+| `max_issue_to_begin_us` | Longest elapsed time from ticket issue to scan begin |
+| `max_begin_to_commit_us` | Longest elapsed time from scan begin to accepted commit |
+| `min_begin_margin_us` | Smallest time remaining at scan begin before that ticket's deadline |
+| `min_commit_margin_us` | Smallest time remaining at commit before that ticket's deadline |
+
+The gate updates these extrema on every accepted commit, independently of
+event retention. `committed` is the sample count. Use the event ring to
+inspect recent sequence details and the fault to identify failed handoffs.
+
+The gate and `watchdog_tripped` report synchronized deadline failures.
+`scan_overruns` counts timer-driven deadlines. After a synchronized fault,
+the observation timer starts from a fresh anchor. Safe-value processing and
+the abandoned bus deadline stay separate from observation overrun accounting.
 
 When the DC worker resumes a whole period late, the runtime journal records
 the prior timer entry margin, the time from prior exchange completion to timer
@@ -161,9 +205,12 @@ sequences. Unit tests exercise 10,000 deterministic 2 ms complete frames, old
 mailbox repeat/skip behavior, invalid submissions, failsafe persistence, fixed
 inputs, and the real adapter's byte packing without opening a NIC.
 
-These tests prove state transitions and data ownership, not host jitter at a 2 ms
-hardware deadline. Hardware acceptance still needs actual process scheduling,
-wire traces/WKC, DC phase, compute budget and stop behavior under load. A deadline
-failure intentionally stops rather than silently holding or skipping a target.
-SDO uploads remain read-only but still need mailbox/CPU budget during a synchronized
-run; offline proof does not establish that budget on any particular edge host.
+These tests exercise state transitions and data ownership. Hardware acceptance
+at a 2 ms deadline needs process scheduling, wire traces/WKC, DC phase, compute
+budget and stop behavior under representative load. Use `handoff_timing` for
+extrema from gate creation through the `committed` count in that status sample.
+Status polling samples the event ring. Use a complete timestamp trace with
+verified coverage for extrema within a specific load interval of an existing run.
+Check gate faults and wire evidence separately, including the transition to
+safe output and fresh device feedback. SDO uploads remain read-only and still
+need mailbox and CPU budget during a synchronized run.

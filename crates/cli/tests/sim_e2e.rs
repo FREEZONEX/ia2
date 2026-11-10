@@ -1175,6 +1175,11 @@ fn cycle_handoff_scenarios_expose_exact_sequence_and_latched_fault_over_http() {
     let clock = &status["device_health"][0]["cycle"];
     assert!(clock["consumed"].as_u64().unwrap() >= 5, "{status}");
     assert!(clock["fault"].is_null(), "{status}");
+    let timing = &clock["handoff_timing"];
+    let min_begin = timing["min_begin_margin_us"].as_u64().unwrap();
+    let min_commit = timing["min_commit_margin_us"].as_u64().unwrap();
+    assert!(min_begin >= min_commit, "{timing}");
+    assert!(min_commit > 0, "{timing}");
     let events = clock["events"].as_array().unwrap();
     let consumed: Vec<_> = events
         .iter()

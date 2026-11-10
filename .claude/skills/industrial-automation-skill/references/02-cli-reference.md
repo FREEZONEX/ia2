@@ -140,8 +140,8 @@ cs run [--program NAME [--file path.st]]  # tasks.toml schedule, or one PROGRAM
 cs stop                                    # returns when the stop is requested, not when devices are safe
 cs runtime status [--edge NAME]      # mode + forces (no variable values)
 cs runtime snapshot [--vars a,b] [--edge NAME]   # LIVE VALUES — the read you want
-cs runtime pause | resume | step [N] [--edge NAME]   # pause halts the PROGRAM only: adapters keep sending the
-                                     # last outputs — not a safe state; stopping the program runs the failsafe pass
+cs runtime pause | resume | step [N] [--edge NAME]   # timer-driven pause may hold last outputs;
+                                     # bus-clocked pause/step latches outputs off until restart
 cs runtime force <var> <value> [--edge NAME]     # pinned every scan; type-aware encoding
 cs runtime unforce <var> [--edge NAME]
 cs runtime write <var> <value> [--edge NAME]     # one-shot (program may overwrite)
@@ -152,18 +152,16 @@ Value encoding for force/write: human notation — `TRUE`/`FALSE`/`1`/`0`
 for BOOL, `50.0` for REAL (the CLI bit-packs by the variable's live
 type). Negative numbers after `--`: `cs runtime force setpoint -- -5`.
 
-HTTP variable writes also accept `pulse_ms` (via `cs api` or HMI): the
-runtime resets the value to zero after the delay, counted from when the write
-was applied (queueing behind a slow scan does not shorten it), even while
-paused. A later
-accepted pulse, plain write (including MQTT), or force supersedes that reset
-for the same resolved variable, including bare/qualified aliases. A rejected
-write leaves the reset active. Reset bypasses governance bounds; if delivery
-is impossible, it still clears the VM and logs the undelivered device. A
-caller that disconnects after the runtime read the request still gets the
-write and its reset.
-The current VM value is sent on normal link recovery; no new start edge is
-introduced by this pulse contract.
+HTTP variable writes also accept `pulse_ms` via `cs api` or HMI. The duration
+starts when the VM applies the write. The runtime services due resets on
+the first eligible scan round at or after expiry, including while paused,
+with a separate budget of 16 due resets per round, earliest deadline first.
+A later accepted pulse, plain write (including MQTT), or force supersedes
+the reset for the same resolved variable, including bare and qualified
+aliases. A rejected write leaves the reset active. A reset writes zero
+outside governance bounds and logs unconfirmed device delivery. The VM's
+current value is sent on normal link recovery. Once enqueued, the pulse
+write and reset survive a caller disconnect.
 
 A timed-out or cancelled `cs run` does not abandon the previous run's
 cleanup. Retry waits for the same teardown before starting anything.
@@ -355,7 +353,14 @@ DC-slot limit. Steady DC discontinuities include raw previous/current DC
 nanoseconds in the first fault reason. `consumed` means selected for bus exchange, not proven drive
 application. Pause/step or a missed cycle latches `watchdog_tripped`; resume and
 bus recovery cannot re-arm it. The option defaults off and requires one SYNC0
-clock source, no gear, and matching PLC task periods. See
+clock source, no gear, and matching PLC task periods. A full runtime debug
+command queue returns HTTP 429. Cycle diagnostics distinguish a missing
+begin, missing commit and late bus selection. Optional `handoff_timing`
+reports maximum issue-to-begin and begin-to-commit times and minimum deadline
+margins at begin and commit for every accepted commit since gate creation.
+Use `committed` for coverage and the bounded event ring for recent sequence
+details. Linux cycle status can include a monotonic origin for correlation
+with scan traces. See
 [the contract](../../../../docs/scan-cycle-handoff.md).
 
 ### Output latch confirmation
@@ -365,5 +370,9 @@ When reading runtime status or `cs probe`, distinguish `watchdog_tripped`
 safe-value attempts). Its `pending` names and `unconfirmed` device/error rows
 require attention even when transport health is good. `acknowledged` has the
 adapter's scope, not physical readback; `null` is no report. Check device health
-for configured adapters that never connected. Restart remains the existing
-re-arm boundary. Do not describe a latch flag as proof that every output is zero.
+for configured adapters that never connected. Ready adapters can complete
+failsafe and shutdown while another still owns its transport. A timed-out
+acknowledgement remains unconfirmed until the owner returns a result. The
+IDE waits for actual EtherCAT worker exit before a replacement run. Restart
+creates a fresh gate after teardown. Establish physical output state with
+independent feedback.

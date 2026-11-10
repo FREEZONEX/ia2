@@ -25,10 +25,12 @@ another instance already holds the port), it exits with a `binding ...` error
 without touching devices. Binding successfully is not proof of healthy devices;
 check `/health` and `/status` after startup.
 
-Pause stops program scans, not adapter workers or physical motion. Variable
-writes still update the VM while paused; force commands register overrides
-that apply on the next scan. Output synchronization resumes with `resume` or
-`step`. Stopping the program runs the failsafe pass; pause does not.
+Pause stops program execution while adapter workers keep running. Variable
+writes and due pulse resets still update the VM. Force commands register
+overrides that apply on the next scan. In timer-driven mode, adapters may
+hold the last output values, and output synchronization resumes with `resume`
+or `step`. With a bus clock, pause or step latches normal outputs off until
+restart. Stopping the program runs the failsafe pass in either mode.
 
 ## One-time edge setup
 
@@ -295,15 +297,19 @@ rollback is just "point `current` at an older version and restart".
 
 ## Shutdown and failsafe evidence
 
-A completed bridge drain means the failsafe and teardown **attempts**
-finished for the scan thread; a reconnect worker beyond its two-second
-grace is still unconfirmed. The server waits for that worker too before
-allowing another run; the edge process keeps its existing bounded exit.
-Neither proves that every physical output was confirmed safe. The scan
+A completed bridge drain means the owned adapters' failsafe and teardown
+attempts finished. A reconnect worker beyond its two-second grace is still
+unconfirmed. The server waits for that worker too before allowing another
+run. The edge process waits up to seven seconds for the overall bridge
+drain and reports a timeout if it exits before the drain finishes. The scan
 loop's final log includes `failsafe_failed` and `shutdown_failed` device
-counts; inspect the preceding device/channel errors whenever either is
-nonzero. Even zero counts do not replace physical readback or a hardware
-safety circuit.
+counts. Inspect the preceding device and channel errors whenever either is
+nonzero. Use physical readback to establish the equipment state.
+
+The Modbus connection owner rejects ordinary writes at admission after the
+fence, including buffered writes. A write admitted before the fence can
+start or finish on the wire afterwards. The same connection owner then
+processes the safe-value sweep.
 
 For Modbus, `protocol: modbus exception: …` means the slave replied but
 rejected that write; the failsafe sweep continues to the remaining
@@ -322,20 +328,33 @@ has the adapter's scope: for EtherCAT it confirms mirror preparation for a
 later exchange, not a transmission fence. Safe values for opted-in OPC UA or
 CANopen channels may be nonzero. No physical readback is implied.
 
-A rejected explicit latch request still inhibits normal outputs and returns an
-error. Another explicit request retries only unconfirmed devices, preserving
-the original latch reason. This does not add automatic retries or re-arming.
+Each adapter proceeds to its final safe-value attempt and shutdown as soon
+as its own owner is available. A slow adapter can keep its own transport
+without delaying ready peers. If a cooperative attempt is still waiting
+after two seconds, the runtime reports its acknowledgement as unconfirmed.
+The original owner continues that attempt and updates the receipt if a
+result arrives. An explicit repeat can retry unconfirmed devices whose
+previous attempts ended. The original latch reason is preserved. A
+replacement run waits for all teardown and ownership to finish.
 The IDE clears its live report when it releases a stopped handle; teardown
 logs remain the evidence for that run.
 
 ## EtherCAT mode selection
 
+For timer-driven EtherCAT, the cyclic worker checks the output fence at
+image admission. It selects a zero image once fenced, including fields that
+gear processing would otherwise populate. An image admitted before the
+fence can still be exchanged. A synchronized device latches its handoff
+gate and selects zero outputs through that gate.
+
 Each real EtherCAT transport owns its TX/RX socket task. On shutdown the
 cyclic worker attempts its final zero-output exchange, then cancels and
 waits for the socket task to release its resources before the worker exits.
-Initialization errors and worker panics also drain that task. A subsequent
-Run therefore does not inherit a detached socket from a joined worker;
-the existing bounded worker-join timeout still applies.
+Initialization errors and worker panics also drain that task. If the worker
+is still running after two seconds of waiting, the adapter logs a warning
+and retains the join handle. The IDE waits for actual worker exit before
+admitting a replacement run. The edge process has the outer drain deadline
+described above.
 
 Worker/socket closure and output delivery are reported separately. Only
 a final exchange of an entirely zero output image, returning the expected

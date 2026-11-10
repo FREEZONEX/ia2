@@ -267,6 +267,14 @@ impl GearEngine {
         self.shared.disengage();
     }
 
+    /// A transport fence is permanent for this worker. Publish disengagement
+    /// without running the gear law or waiting for fresh drive feedback.
+    pub(crate) fn inhibit_outputs(&mut self) {
+        self.disengage();
+        self.was_engaged = false;
+        self.shared.engaged_fb.store(false, Ordering::Relaxed);
+    }
+
     pub fn tick(
         &mut self,
         follower_sw: u16,
@@ -648,6 +656,88 @@ mod tests {
                 .is_err());
         }
         device.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sim_timer_fence_clears_the_target_and_stops_the_gear_before_failsafe() {
+        use iocore::IoDevice;
+        use std::time::Duration;
+
+        let config = project::EthercatConfig {
+            scan_sync: false,
+            nic: crate::SIM_NIC.into(),
+            cycle_us: 2_000,
+            bringup: Default::default(),
+            dc_sync: Default::default(),
+            dc_static_sync_iterations: 0,
+            slaves: vec![project::EthercatSlave {
+                index: 0,
+                name: "follower".into(),
+                vendor_id: 0,
+                product_id: 0,
+                dc_sync: None,
+                init_sdo: vec![],
+            }],
+            channels: vec![project::EthercatChannel {
+                name: "target".into(),
+                slave_index: 0,
+                direction: project::EthercatPdoDirection::RxPdo,
+                pdo_index: 0x7000,
+                sub_index: 1,
+                bit_length: 32,
+                data_type: project::EthercatDataType::I32,
+                pdi_byte_offset: 2,
+                pdi_bit_offset: 0,
+            }],
+            gear: vec![virtual_config()],
+        };
+        let mut device = crate::EthercatDevice::connect("sim_gear".into(), &config)
+            .await
+            .unwrap();
+        for (name, value) in [
+            ("ratio_num", 1.0),
+            ("ratio_den", 1.0),
+            ("ratio_step", 1.0),
+            ("master_vel", 10.0),
+            ("gear_max_travel", 10_000.0),
+        ] {
+            device
+                .write_channel(name, ChannelValue::F64(value))
+                .await
+                .unwrap();
+        }
+        device
+            .write_channel("gear_engage", ChannelValue::Bool(true))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while device.read_channel("target").await.unwrap().to_i32() == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("gear must advance before inhibition");
+
+        device.inhibit_outputs();
+        assert_eq!(
+            device.read_channel("target").await.unwrap(),
+            ChannelValue::I32(0)
+        );
+        assert!(device
+            .write_channel("gear_engage", ChannelValue::Bool(true))
+            .await
+            .is_err());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while device.read_channel("gear_engaged").await.unwrap() == ChannelValue::Bool(true) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("gear must disengage before failsafe");
+        assert_eq!(
+            device.read_channel("target").await.unwrap(),
+            ChannelValue::I32(0)
+        );
     }
 
     #[test]

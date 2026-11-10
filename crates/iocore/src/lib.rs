@@ -170,6 +170,12 @@ pub trait IoDevice: Send {
         true
     }
 
+    /// Fence new ordinary output transfers before scheduling safe-value I/O.
+    /// This hook must finish without transport I/O. Buffered adapters should
+    /// invalidate pending writes and synchronized adapters should latch their
+    /// handoff. A transfer already in flight may still reach the device.
+    fn inhibit_outputs(&mut self) {}
+
     /// Drive all writable outputs to a known-safe state (zero / "off").
     ///
     /// Called by the bridge scan loop in three situations:
