@@ -348,7 +348,10 @@ fence can still be exchanged. A synchronized device latches its handoff
 gate and selects zero outputs through that gate.
 
 Each real EtherCAT transport owns its TX/RX socket task. On shutdown the
-cyclic worker attempts its final zero-output exchange, then cancels and
+cyclic worker attempts its final zero-output exchange in OP. If it is
+acknowledged, the worker requests SAFE-OP from the configured stations and
+continues transmitting the same zero output image while it reads their AL
+status. After confirmation or a bounded failure, the worker cancels and
 waits for the socket task to release its resources before the worker exits.
 Initialization errors and worker panics also drain that task. If the worker
 is still running after two seconds of waiting, the adapter logs a warning
@@ -362,6 +365,12 @@ LRW working counter and all configured subdevices in OP, is logged as
 `final zero-output exchange acknowledged`. This is protocol evidence,
 not measured voltage, torque, or actuator position. DC and free-run modes
 use the same check, including PDI split across multiple LRWs.
+
+The SAFE-OP step has its own 250 ms budget and a separate receipt.
+The master does not acknowledge AL errors or reset drives during that step.
+If a station refuses the transition or confirmation is unavailable, the
+adapter releases the transport and returns a shutdown error that preserves
+the earlier zero-output delivery receipt.
 
 During an unhealthy bus or re-walk/backoff, failsafe still disengages gears
 and zeros the local mirror, but reports that delivery is unconfirmed. Stop
