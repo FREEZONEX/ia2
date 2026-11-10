@@ -132,10 +132,6 @@ fn wait_ready(
     bound_rx: &Receiver<SocketAddr>,
     deadline: Instant,
 ) -> Result<String, String> {
-    let agent = ureq::AgentBuilder::new()
-        .redirects(0)
-        .try_proxy_from_env(false)
-        .build();
     let mut base = None;
     loop {
         process.check_exit()?;
@@ -159,11 +155,18 @@ fn wait_ready(
             }
         }
         if let Some(base) = &base {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if !remaining.is_zero()
-                && agent
+            let attempt = deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(250));
+            // ureq's connect timeout takes precedence over the request timeout.
+            if !attempt.is_zero()
+                && ureq::AgentBuilder::new()
+                    .redirects(0)
+                    .try_proxy_from_env(false)
+                    .timeout_connect(attempt)
+                    .build()
                     .get(&format!("{base}/health"))
-                    .timeout(remaining.min(Duration::from_millis(250)))
+                    .timeout(attempt)
                     .call()
                     .is_ok_and(|response| response.status() == 200)
                 && Instant::now() <= deadline
