@@ -129,7 +129,9 @@ is drained after device teardown.
 In a bus-clocked run, pause, step and missed handoffs latch normal outputs off.
 The first cause appears in `latch_reason`. Each adapter keeps sole ownership of its transport
 while its independent safe-value attempt runs. The scan can resume in a
-latched observation mode, with inputs from an adapter marked stale while its
+latched observation mode. Safe-value and teardown workers are created from
+the ordinary I/O runtime and do not inherit the scan's optional real-time
+priority. Inputs from an adapter are marked stale while its
 attempt owns it. Modbus discards queued ordinary writes after the fence. A
 previously admitted write may still start or finish after the fence. The same
 owner then starts the safe-value sweep. Timer-driven EtherCAT selects an

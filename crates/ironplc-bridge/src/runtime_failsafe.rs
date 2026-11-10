@@ -64,7 +64,7 @@ impl FailsafeJobs {
             // Poll independent adapters on separate blocking workers.
             // Even a synchronous driver section cannot park another
             // adapter's attempt or the scan's observation path.
-            let job = self.io.spawn_blocking(move || {
+            let job = spawn_blocking_on_io(&self.io, move || {
                 runtime
                     .block_on(attempt_device_failsafe(device.as_mut(), &status))
                     .ok();
@@ -115,22 +115,21 @@ impl FailsafeJobs {
                     };
                     let runtime = io.clone();
                     let status = status.clone();
-                    let result = io
-                        .spawn_blocking(move || {
-                            runtime.block_on(async move {
-                                // start appended a final pass for every ready slot.
-                                // A previous owner still owes that pass after returning.
-                                if position < previous_jobs {
-                                    begin_failsafe_attempts(&status, [device.name()]);
-                                    let _ = attempt_device_failsafe(device.as_mut(), &status).await;
-                                }
-                                // Give the adapter worker a flush opportunity. This
-                                // delay does not establish transmission or safety.
-                                tokio::time::sleep(Duration::from_millis(50)).await;
-                                isolate_device_call(device.shutdown()).await
-                            })
+                    let result = spawn_blocking_on_io(io, move || {
+                        runtime.block_on(async move {
+                            // start appended a final pass for every ready slot.
+                            // A previous owner still owes that pass after returning.
+                            if position < previous_jobs {
+                                begin_failsafe_attempts(&status, [device.name()]);
+                                let _ = attempt_device_failsafe(device.as_mut(), &status).await;
+                            }
+                            // Give the adapter worker a flush opportunity. This
+                            // delay does not establish transmission or safety.
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            isolate_device_call(device.shutdown()).await
                         })
-                        .await;
+                    })
+                    .await;
                     match result {
                         Ok(Ok(Ok(()))) => false,
                         Ok(Ok(Err(error))) => {
@@ -154,6 +153,19 @@ impl FailsafeJobs {
             .filter(|failed| *failed)
             .count()
     }
+}
+
+fn spawn_blocking_on_io<T: Send + 'static>(
+    io: &Handle,
+    operation: impl FnOnce() -> T + Send + 'static,
+) -> JoinHandle<T> {
+    // Tokio may create a native thread at spawn_blocking's call site. Dispatch
+    // from the ordinary I/O worker so it cannot inherit the scan's SCHED_RR.
+    io.spawn(async move {
+        tokio::task::spawn_blocking(operation)
+            .await
+            .expect("I/O blocking worker failed")
+    })
 }
 
 async fn join_owner(

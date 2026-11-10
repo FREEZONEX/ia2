@@ -6816,7 +6816,7 @@ mod tests {
                 .unwrap();
             rt.block_on(async {
                 let c = counting_program();
-                let sync = case == "sync";
+                let sync = case != "timer";
                 let h = spawn_units(
                     vec![single_unit(c, 50)],
                     if sync {
@@ -6829,7 +6829,7 @@ mod tests {
                     WriteGovernance::default(),
                 );
                 let mut snapshots = h.subscribe();
-                if sync {
+                if case == "sync" {
                     let reason = recorded_fault(&h)
                         .await
                         .expect("scheduling request rejected");
@@ -6848,17 +6848,51 @@ mod tests {
                         .unwrap();
                     assert_eq!(*h.fault_watch().borrow(), None);
                 }
+                if case == "sync-rt" {
+                    h.latch_outputs_off("verify worker scheduling")
+                        .await
+                        .unwrap();
+                    let mut io_workers = 0;
+                    for entry in std::fs::read_dir("/proc/self/task").unwrap() {
+                        let path = entry.unwrap().path();
+                        if std::fs::read_to_string(path.join("comm")).unwrap().trim() != "ia2-io" {
+                            continue;
+                        }
+                        let stat = std::fs::read_to_string(path.join("stat")).unwrap();
+                        // Field 41 is policy; field 3 follows the final ')' of comm.
+                        let policy: u32 = stat
+                            .rsplit_once(") ")
+                            .unwrap()
+                            .1
+                            .split_whitespace()
+                            .nth(38)
+                            .unwrap()
+                            .parse()
+                            .unwrap();
+                        eprintln!("I/O worker {} policy {policy}", path.display());
+                        assert_eq!(policy, 0, "I/O worker inherited scan realtime scheduling");
+                        io_workers += 1;
+                    }
+                    assert!(
+                        io_workers >= 3,
+                        "failsafe must exercise a newly created worker"
+                    );
+                }
                 h.shutdown().await;
             });
             return;
         }
         // Each environment configuration gets a separate process, so parallel
         // runtime tests never observe a transient global scheduling override.
-        for case in ["sync", "timer"] {
+        let mut cases = vec![("sync", "invalid"), ("timer", "invalid")];
+        if cfg!(target_os = "linux") && std::env::var_os("IA2_REQUIRE_RT_TEST").is_some() {
+            cases.push(("sync-rt", "9"));
+        }
+        for (case, priority) in cases {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "runtime::tests::requested_scan_scheduling_fails_before_first_scan_and_is_sync_only", "--nocapture"])
                 .env(CHILD, case)
-                .env("IA2_SCAN_SYNC_RT_PRIORITY", "invalid")
+                .env("IA2_SCAN_SYNC_RT_PRIORITY", priority)
                 .output().unwrap();
             assert!(
                 output.status.success(),
