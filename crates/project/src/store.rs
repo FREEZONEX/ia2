@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::errors::StoreError;
 use crate::fsutil::write_atomic;
+use crate::library_transaction;
 use crate::types::{
     Device, Edge, IoMap, ModbusConfig, PouFileSource, PouLanguage, PouType, ProgramInstance,
     ProjectManifest, ProjectTreeSkeleton, Protocol, ProtocolConfig, Task, Tasks,
@@ -28,11 +29,16 @@ impl ProjectStore {
     /// here it just held POU source files) and the rename brings the
     /// on-disk layout into line with the rest of the model.
     pub fn open(root: PathBuf) -> Result<Self, StoreError> {
-        let manifest_path = root.join("project.toml");
-        if !manifest_path.exists() {
+        if !root.is_dir() {
             return Err(StoreError::NotFound(root.display().to_string()));
         }
-        let text = fs::read_to_string(&manifest_path)?;
+        let _library_guard = library_transaction::open_guard(&root)?;
+        let text = match fs::read_to_string(root.join("project.toml")) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StoreError::NotFound(root.display().to_string()));
+            }
+            result => result?,
+        };
         let manifest: ProjectManifest = toml::from_str(&text)?;
         // A semantically bad [governance] table (nan/inf bounds, min >
         // max, empty/duplicate variables) must be a loud load error —
@@ -151,6 +157,7 @@ impl ProjectStore {
     /// loud error, never a silently-open policy. Same per-call
     /// freshness contract as `read_tasks` / `read_alarms`.
     pub fn read_governance(&self) -> Result<crate::types::WriteGovernance, StoreError> {
+        let _guard = library_transaction::read_guard(&self.root)?;
         let text = fs::read_to_string(self.root.join("project.toml"))?;
         let manifest: ProjectManifest = toml::from_str(&text)?;
         manifest.governance.validate().map_err(invalid_governance)?;
@@ -162,17 +169,8 @@ impl ProjectStore {
     /// source. Doing it this way keeps the project crate parser-free
     /// (no dependency on the bridge / ironplc).
     pub fn tree_skeleton(&self) -> Result<ProjectTreeSkeleton, StoreError> {
-        let pou_paths = self.list_pou_paths()?;
-        let mut pous = Vec::with_capacity(pou_paths.len());
-        for path in pou_paths {
-            let language = self.pou_file_language(&path)?;
-            let source = self.read_pou_source(&path)?;
-            pous.push(PouFileSource {
-                path,
-                source,
-                language,
-            });
-        }
+        let _guard = library_transaction::read_guard(&self.root)?;
+        let pous = self.read_pous_unlocked()?;
         let devices = self.list_devices()?;
         let edges = self.list_edges()?;
         let pou_folders = self.list_folders("pous")?;
@@ -297,6 +295,11 @@ impl ProjectStore {
     }
 
     pub fn list_pou_paths(&self) -> Result<Vec<String>, StoreError> {
+        let _guard = library_transaction::read_guard(&self.root)?;
+        self.list_pou_paths_unlocked()
+    }
+
+    fn list_pou_paths_unlocked(&self) -> Result<Vec<String>, StoreError> {
         let root = self.root.join("pous");
         if !root.exists() {
             return Ok(vec![]);
@@ -337,27 +340,74 @@ impl ProjectStore {
         None
     }
 
-    /// Read the raw on-disk contents of a POU file, regardless of
-    /// language. For `.st` this is the IEC source; for `.ld.json` it's
-    /// the JSON literal — the caller (typically the bridge) decides
-    /// what to do with it based on the language hint from
-    /// [`pou_file_language`](Self::pou_file_language).
-    pub fn read_pou_source(&self, path: &str) -> Result<String, StoreError> {
-        validate_path(path)?;
-        let (file, _lang) = self
-            .pou_file_path(path)
-            .ok_or_else(|| StoreError::PouNotFound(path.into()))?;
-        Ok(fs::read_to_string(&file)?)
+    /// Read a complete set of POU inputs before parsing or compiling. A
+    /// clone of the store and a separate process use the same project lock.
+    pub fn read_pous(&self) -> Result<Vec<PouFileSource>, StoreError> {
+        let _guard = library_transaction::read_guard(&self.root)?;
+        self.read_pous_unlocked()
     }
 
-    /// Read the language of an existing POU. Returns `PouNotFound` if
-    /// the slug doesn't resolve to a file on disk.
-    pub fn pou_file_language(&self, path: &str) -> Result<PouLanguage, StoreError> {
+    fn read_pous_unlocked(&self) -> Result<Vec<PouFileSource>, StoreError> {
+        self.list_pou_paths_unlocked()?
+            .iter()
+            .map(|path| self.read_pou_unlocked(path))
+            .collect()
+    }
+
+    /// Snapshot an optional primary POU and the best-effort sibling context
+    /// used by editor checks and isolated runs. A broken sibling can be
+    /// skipped as before, but a pending library transaction fails the read.
+    pub fn read_pou_context(
+        &self,
+        primary: Option<&str>,
+    ) -> Result<(Option<PouFileSource>, Vec<PouFileSource>), StoreError> {
+        let _guard = library_transaction::read_guard(&self.root)?;
+        let own = primary
+            .map(|path| self.read_pou_unlocked(path))
+            .transpose()?;
+        let siblings = self
+            .list_pou_paths_unlocked()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|path| Some(path.as_str()) != primary)
+            .filter_map(|path| self.read_pou_unlocked(&path).ok())
+            .collect();
+        Ok((own, siblings))
+    }
+
+    fn read_pou_unlocked(&self, path: &str) -> Result<PouFileSource, StoreError> {
         validate_path(path)?;
-        let (_, lang) = self
+        let (file, language) = self
             .pou_file_path(path)
             .ok_or_else(|| StoreError::PouNotFound(path.into()))?;
-        Ok(lang)
+        Ok(PouFileSource {
+            path: path.into(),
+            source: fs::read_to_string(file)?,
+            language,
+        })
+    }
+
+    /// A single file read can hold the same guard across content and
+    /// version reads, so an HTTP ETag describes the returned source.
+    pub fn with_pou_file<T, E: From<StoreError>>(
+        &self,
+        path: &str,
+        read: impl FnOnce(&Path, PouLanguage) -> Result<T, E>,
+    ) -> Result<T, E> {
+        validate_path(path)?;
+        let _guard = library_transaction::read_guard(&self.root)?;
+        let (file, language) = self
+            .pou_file_path(path)
+            .ok_or_else(|| StoreError::PouNotFound(path.into()))?;
+        read(&file, language)
+    }
+
+    pub fn read_pou_source(&self, path: &str) -> Result<String, StoreError> {
+        self.with_pou_file(path, |file, _| Ok(fs::read_to_string(file)?))
+    }
+
+    pub fn pou_file_language(&self, path: &str) -> Result<PouLanguage, StoreError> {
+        self.with_pou_file(path, |_, language| Ok(language))
     }
 
     /// Overwrite the POU file at `path`. The on-disk language is
@@ -452,13 +502,34 @@ impl ProjectStore {
     // Which libraries (and versions) were imported is recorded in
     // project.toml's `[libraries]` table.
 
-    /// `[libraries]` table from project.toml: library name → version.
-    /// Read fresh from disk each call — the file is tiny and this keeps
-    /// the in-memory manifest immutable.
+    /// Read the registry decoration as one consistent project view.
+    pub fn library_state(
+        &self,
+    ) -> Result<(std::collections::BTreeMap<String, String>, Vec<String>), StoreError> {
+        let _guard = library_transaction::read_guard(&self.root)?;
+        Ok((
+            self.read_libraries_unlocked()?,
+            self.list_pou_paths_unlocked()?,
+        ))
+    }
+
     pub fn read_libraries(&self) -> Result<std::collections::BTreeMap<String, String>, StoreError> {
+        let _guard = library_transaction::read_guard(&self.root)?;
+        self.read_libraries_unlocked()
+    }
+
+    fn read_libraries_unlocked(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, String>, StoreError> {
         let table = self.read_manifest_table()?;
         let mut out = std::collections::BTreeMap::new();
-        if let Some(toml::Value::Table(libs)) = table.get("libraries") {
+        if let Some(libs) = table.get("libraries") {
+            let libs = libs.as_table().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "[libraries] must be a table",
+                )
+            })?;
             for (k, v) in libs {
                 if let toml::Value::String(ver) = v {
                     out.insert(k.clone(), ver.clone());
@@ -468,83 +539,35 @@ impl ProjectStore {
         Ok(out)
     }
 
-    /// Record (or version-bump) a library in project.toml. Preserves
-    /// every other key in the manifest verbatim.
-    pub fn set_library_entry(&self, library: &str, version: &str) -> Result<(), StoreError> {
-        validate_single_segment(library)?;
-        let mut table = self.read_manifest_table()?;
-        let libs = table
-            .entry("libraries".to_string())
-            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-        if let toml::Value::Table(libs) = libs {
-            libs.insert(
-                library.to_string(),
-                toml::Value::String(version.to_string()),
-            );
-        }
-        self.write_manifest_table(&table)
-    }
-
-    /// Drop a library's entry from project.toml. Removing the last one
-    /// removes the `[libraries]` table entirely.
-    pub fn remove_library_entry(&self, library: &str) -> Result<(), StoreError> {
-        let mut table = self.read_manifest_table()?;
-        if let Some(toml::Value::Table(libs)) = table.get_mut("libraries") {
-            libs.remove(library);
-            if libs.is_empty() {
-                table.remove("libraries");
-            }
-        }
-        self.write_manifest_table(&table)
-    }
-
-    /// Write one imported block file under `pous/lib/<library>/`.
-    /// `file_name` is the bare on-disk name (e.g. `fb_pid.st`).
-    pub fn write_library_file(
+    /// Commit the selected block contents and the library version together.
+    pub fn import_library(
         &self,
         library: &str,
-        file_name: &str,
-        content: &str,
+        version: &str,
+        files: &[(String, String)],
     ) -> Result<(), StoreError> {
-        validate_single_segment(library)?;
-        validate_single_segment(file_name)?;
-        let dir = self
-            .root
-            .join("pous")
-            .join(LIBRARY_SLUG_PREFIX)
-            .join(library);
-        fs::create_dir_all(&dir)?;
-        write_atomic(dir.join(file_name), content)?;
-        Ok(())
+        library_transaction::import(&self.root, library, version, files)
     }
 
-    /// Remove `pous/lib/<library>/` and everything in it; prunes the
-    /// now-empty `pous/lib/` too so an empty shell doesn't linger in
-    /// the tree. Missing dir is fine — removal is idempotent.
-    pub fn remove_library_dir(&self, library: &str) -> Result<(), StoreError> {
-        validate_single_segment(library)?;
-        let lib_root = self.root.join("pous").join(LIBRARY_SLUG_PREFIX);
-        let dir = lib_root.join(library);
-        if dir.exists() {
-            fs::remove_dir_all(&dir)?;
-        }
-        if lib_root.exists() && fs::read_dir(&lib_root)?.next().is_none() {
-            fs::remove_dir(&lib_root)?;
-        }
-        Ok(())
+    /// Delete is serialized with import and recovery. Missing directories
+    /// remain idempotent. The delete operation retains its original semantics.
+    pub fn remove_library(&self, library: &str) -> Result<(), StoreError> {
+        library_transaction::remove(&self.root, library)
+    }
+
+    /// Copy a source tree under the same guard as compiler input reads.
+    /// The caller excludes the root-level library transaction artifacts.
+    pub fn with_snapshot_files<T>(
+        root: &Path,
+        copy: impl FnOnce() -> std::io::Result<T>,
+    ) -> Result<T, StoreError> {
+        let _guard = library_transaction::read_guard(root)?;
+        Ok(copy()?)
     }
 
     fn read_manifest_table(&self) -> Result<toml::Table, StoreError> {
         let text = fs::read_to_string(self.root.join("project.toml"))?;
         Ok(toml::from_str(&text)?)
-    }
-
-    fn write_manifest_table(&self, table: &toml::Table) -> Result<(), StoreError> {
-        write_atomic(
-            self.root.join("project.toml"),
-            toml::to_string_pretty(table)?,
-        )?;
-        Ok(())
     }
 
     // ---------------- Devices ----------------
@@ -863,7 +886,12 @@ impl ProjectStore {
         if self.read_tasks()?.is_some() {
             return Ok(MigrationReport::Skipped);
         }
-        let pou_paths = self.list_pou_paths()?;
+        // The server calls this while it holds the registry lock.
+        let _guard = library_transaction::try_write_guard(&self.root)?;
+        if self.read_tasks()?.is_some() {
+            return Ok(MigrationReport::Skipped);
+        }
+        let pou_paths = self.list_pou_paths_unlocked()?;
         let mut tasks: Vec<Task> = Vec::new();
         let mut programs: Vec<ProgramInstance> = Vec::new();
         let mut stripped: Vec<String> = Vec::new();
@@ -871,7 +899,7 @@ impl ProjectStore {
         let mut seen_instance_names = std::collections::HashSet::<String>::new();
 
         for path in &pou_paths {
-            let source = self.read_pou_source(path)?;
+            let source = self.read_pou_unlocked(path)?.source;
             let extracted = extract_inline_configuration(&source);
             if extracted.is_empty() {
                 continue;
@@ -1263,7 +1291,7 @@ fn validate_alarm_ids(config: &crate::types::AlarmConfig) -> Result<(), StoreErr
     Ok(())
 }
 
-fn validate_single_segment(name: &str) -> Result<(), StoreError> {
+pub(crate) fn validate_single_segment(name: &str) -> Result<(), StoreError> {
     if name.contains('/') {
         return Err(StoreError::InvalidName(name.into()));
     }

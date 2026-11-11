@@ -17,7 +17,7 @@
 //! └── northbound.toml       # MQTT publication
 //! ```
 //!
-//! Every file here is written through [`write_atomic`].
+//! Single-file edits use [`write_atomic`]. Library import journals coordinate multiple replacements.
 
 mod alarm_check;
 mod device_check;
@@ -28,6 +28,8 @@ mod gear_channels;
 pub mod hmi;
 mod iomap_check;
 mod ld;
+mod library_permissions;
+mod library_transaction;
 mod paths;
 mod sfc;
 mod store;
@@ -57,6 +59,7 @@ pub use ld::{
     LdCoil, LdCoilKind, LdComparator, LdFbInput, LdNode, LdOperand, LdPouType, LdProgram, LdRung,
     LdVarSection, LdVariable,
 };
+pub use library_transaction::is_library_transaction_artifact;
 pub use paths::{
     default_projects_dir, default_state_path, home_dir, load_last_opened, migrate_legacy_dirs,
     save_last_opened,
