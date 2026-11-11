@@ -78,7 +78,7 @@ pub(crate) fn open_guard(root: &Path) -> Result<File, StoreError> {
 fn read_access(root: &Path, clean_staging: bool) -> Result<File, StoreError> {
     let guard = lock_file(root)?;
     guard.try_lock_shared().map_err(try_lock_error)?;
-    if !active_exists(root)? && !(clean_staging && metadata(&root.join(STAGE))?.is_some()) {
+    if !(active_exists(root)? || clean_staging && metadata(&root.join(STAGE))?.is_some()) {
         return Ok(guard);
     }
     // Do not hold a registry lock waiting for another project reader or
