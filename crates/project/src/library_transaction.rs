@@ -67,17 +67,30 @@ fn try_lock_error(error: fs::TryLockError) -> StoreError {
     }
 }
 
-pub(crate) fn read_guard(root: &Path) -> Result<File, StoreError> {
+pub(crate) struct LibraryGuard(File);
+
+impl Drop for LibraryGuard {
+    fn drop(&mut self) {
+        // A concurrent fork can inherit the open file description until exec.
+        // Closing only our descriptor would leave its lock held by that child.
+        if let Err(error) = self.0.unlock() {
+            tracing::warn!(%error, "could not explicitly release project library lock");
+        }
+    }
+}
+
+pub(crate) fn read_guard(root: &Path) -> Result<LibraryGuard, StoreError> {
     read_access(root, false)
 }
 
-pub(crate) fn open_guard(root: &Path) -> Result<File, StoreError> {
+pub(crate) fn open_guard(root: &Path) -> Result<LibraryGuard, StoreError> {
     read_access(root, true)
 }
 
-fn read_access(root: &Path, clean_staging: bool) -> Result<File, StoreError> {
+fn read_access(root: &Path, clean_staging: bool) -> Result<LibraryGuard, StoreError> {
     let guard = lock_file(root)?;
     guard.try_lock_shared().map_err(try_lock_error)?;
+    let guard = LibraryGuard(guard);
     if !(active_exists(root)? || clean_staging && metadata(&root.join(STAGE))?.is_some()) {
         return Ok(guard);
     }
@@ -86,6 +99,7 @@ fn read_access(root: &Path, clean_staging: bool) -> Result<File, StoreError> {
     drop(guard);
     let guard = lock_file(root)?;
     guard.try_lock().map_err(try_lock_error)?;
+    let guard = LibraryGuard(guard);
     recover(root)?;
     if clean_staging && !active_exists(root)? {
         warn_cleanup(root, cleanup_stage(root));
@@ -93,16 +107,18 @@ fn read_access(root: &Path, clean_staging: bool) -> Result<File, StoreError> {
     Ok(guard)
 }
 
-pub(crate) fn write_guard(root: &Path) -> Result<File, StoreError> {
+pub(crate) fn write_guard(root: &Path) -> Result<LibraryGuard, StoreError> {
     let guard = lock_file(root)?;
     guard.lock()?;
+    let guard = LibraryGuard(guard);
     check_writable_project(root)?;
     Ok(guard)
 }
 
-pub(crate) fn try_write_guard(root: &Path) -> Result<File, StoreError> {
+pub(crate) fn try_write_guard(root: &Path) -> Result<LibraryGuard, StoreError> {
     let guard = lock_file(root)?;
     guard.try_lock().map_err(try_lock_error)?;
+    let guard = LibraryGuard(guard);
     check_writable_project(root)?;
     Ok(guard)
 }

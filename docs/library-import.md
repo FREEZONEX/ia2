@@ -42,6 +42,8 @@ a verified original or installed file lets IA2 retry automatic recovery.
 ## Filesystem boundary
 
 IA2 coordinates cooperating processes with a project-level filesystem lock.
+Each operation explicitly unlocks before closing its descriptor, so a
+concurrent child-process launch cannot retain a finished operation's lock.
 POU snapshots and deployment copies either obtain consistent inputs or
 report busy/recovery. Compilation uses those copied inputs after releasing
 the lock. Recovery paths stay in the project and reject symlinked targets

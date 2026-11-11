@@ -673,6 +673,36 @@ fn subprocess(root: &Path, action: &str) -> Command {
 
 #[test]
 fn killed_import_is_recovered_twice_by_fresh_processes() {
+    #[cfg(target_os = "linux")]
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = seeded(tmp.path());
+        let guard = write_guard(store.root()).unwrap();
+        // Hold a real fork child before exec closes inherited descriptors.
+        // Finishing the parent operation must release its project lock now.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
+        if pid == 0 {
+            // Only async-signal-safe calls in the forked test process.
+            unsafe {
+                libc::alarm(5);
+                libc::pause();
+                libc::_exit(0);
+            }
+        }
+        struct ForkChild(libc::pid_t);
+        impl Drop for ForkChild {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                    libc::waitpid(self.0, std::ptr::null_mut(), 0);
+                }
+            }
+        }
+        let _child = ForkChild(pid);
+        drop(guard);
+        ProjectStore::open(store.root().into()).unwrap();
+    }
     for action in ["prepared", "first", "manifest", "committed"] {
         let tmp = tempfile::tempdir().unwrap();
         let root = std::env::var_os("IA2_LIBRARY_CRASH_CASES")
