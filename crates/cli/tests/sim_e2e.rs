@@ -13,42 +13,22 @@
 //! `TestServer::open_project`: the server persists per-user state, and those
 //! two keep it inside the test's tempdir.
 
-use std::net::TcpListener;
+use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command as StdCommand, Stdio};
+use std::process::Command as StdCommand;
 
 use assert_cmd::Command;
+
+#[path = "support/test_server.rs"]
+mod test_server;
+#[path = "support/test_server_fixtures.rs"]
+mod test_server_fixtures;
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .canonicalize()
         .unwrap()
-}
-
-fn server_binary() -> PathBuf {
-    // assert_cmd resolves custom CARGO_TARGET_DIR, target triples, and
-    // release profiles. The server is a sibling, including `.exe` on Windows.
-    let cs = assert_cmd::cargo::cargo_bin("cs");
-    let p = cs
-        .parent()
-        .expect("cs binary directory")
-        .join(format!("server{}", std::env::consts::EXE_SUFFIX));
-    assert!(
-        p.is_file(),
-        "sim_e2e requires {}: run cargo build -p server with the same target/profile first",
-        p.display()
-    );
-    p
-}
-
-struct ServerGuard(Child);
-
-impl Drop for ServerGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
 }
 
 fn cs(server: &str) -> Command {
@@ -62,7 +42,7 @@ struct TestServer {
     base: String,
     sandbox: PathBuf,
     home: PathBuf,
-    _child: ServerGuard,
+    _child: test_server::ServerProcess,
 }
 
 /// Start a real server on a free loopback port and wait for `/health`.
@@ -91,53 +71,36 @@ fn spawn_server_on(
     args: &[&str],
     envs: &[(&str, &str)],
 ) -> TestServer {
-    let server_bin = server_binary();
-
-    // Free port: bind-then-drop; the server grabs it a moment later.
-    let l = TcpListener::bind((bind_ip, 0)).unwrap();
-    let port = l.local_addr().unwrap().port();
-    drop(l);
-    let base = format!("http://127.0.0.1:{port}");
+    let bind = SocketAddr::new(bind_ip.parse().unwrap(), 0);
+    let server_bin = test_server::server_binary();
+    let log_root = std::env::var_os("IA2_TEST_SERVER_LOG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| server_bin.parent().unwrap().join("ia2-test-server-logs"));
+    std::fs::create_dir_all(&log_root).expect("create test server log directory");
+    let logs = tempfile::Builder::new()
+        .prefix("server-")
+        .tempdir_in(log_root)
+        .expect("create unique test server logs")
+        .keep();
 
     let home = sandbox.join("home");
     std::fs::create_dir_all(&home).unwrap();
 
-    let child = StdCommand::new(&server_bin)
+    let mut command = StdCommand::new(&server_bin);
+    command
         .arg("--bind")
-        .arg(std::net::SocketAddr::new(bind_ip.parse().unwrap(), port).to_string())
-        // No demo slave — keeps the test from fighting over port 5502
-        // with a dev server on the same machine.
-        .arg("--demo-modbus-addr")
-        .arg("")
+        .arg(bind.to_string())
+        .args(["--demo-modbus-addr", ""])
         .args(args)
         .env_remove("IA2_ALLOWED_ORIGINS")
         .envs(envs.iter().copied())
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
-        .current_dir(sandbox)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn server");
-    let child = ServerGuard(child);
-
-    // Wait for /health (up to ~5 s).
-    let mut up = false;
-    for _ in 0..50 {
-        let ok = cs(&base)
-            .arg("api")
-            .arg("GET")
-            .arg("/health")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if ok {
-            up = true;
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    assert!(up, "server did not come up on {base}");
+        .env("IA2_PRINT_LISTEN_ADDR", "1")
+        .current_dir(sandbox);
+    let (base, child) =
+        test_server::start(command, bind, &logs, std::time::Duration::from_secs(10))
+            .unwrap_or_else(|error| panic!("{error}"));
 
     TestServer {
         base,

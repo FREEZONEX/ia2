@@ -467,6 +467,11 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     let local = listener.local_addr()?;
+    // Opt-in machine-readable bind result for subprocess callers. Publish
+    // only after this process owns the listener.
+    if std::env::var("IA2_PRINT_LISTEN_ADDR").as_deref() == Ok("1") {
+        println!("IA2_LISTEN_ADDR={local}");
+    }
     tracing::info!(addr = %local, "server listening");
     // Agent-activity watchdog: every 500 ms, check whether the last
     // CLI heartbeat aged out past the TTL; if so, flip `active=false`

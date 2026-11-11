@@ -2071,6 +2071,7 @@ dependencies = [
  "percent-encoding",
  "predicates",
  "project",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "tempfile",
