@@ -104,11 +104,18 @@ cs api POST /api/devices/rio/esi-assemble --from -    # {"detected":[16,17]} on 
 cs api POST /api/devices/dcs/opcua-browse --from -    # {"node_id":"ns=2;s=Line1"} (null = ObjectsFolder)
 cs api POST /api/project/migrate-tasks
 cs api GET  /api/edges/pi/logs --query tail=500
+cs api POST /api/axis-replay --from replay.json      # offline axis captures and parameter comparisons
 ```
 
 Full API parity is guaranteed by construction — if the GUI can do it,
 `cs api` can. Prefer porcelain when it exists (better output + exit
 semantics).
+
+Axis replay needs no open project. Submit normalized PDO samples with
+measured DC timestamps and archived PLC evidence; see the [request
+contract](../../../../docs/api.md#offline-axis-replay). A successful HTTP
+request can include excluded runs and comparisons. Check each run's
+`status` and each comparison's `exclusion_reason`.
 
 ## Domain verbs
 
