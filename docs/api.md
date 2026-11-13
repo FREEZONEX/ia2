@@ -114,6 +114,86 @@ Clients must associate versions with individual edit buffers, not a global
 latest-version cache: another agent/tab's new GET must never validate an
 older buffer. A conflict must preserve the local edits and stop Save/Run.
 
+## Offline axis replay
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/api/axis-replay` | Analyze captured axis samples and compare matched parameter trials. Stateless, usable without an open project. Accepts normalized JSON samples and returns per-run evidence and comparison results. |
+
+Use `cs api POST /api/axis-replay --from replay.json`. The server analyzes
+the request in memory. Source paths are labels carried into the response.
+The importer verifies archive hashes and attests PLC events and parameter
+readbacks before submission.
+
+### Request schema v1
+
+| Field | Shape |
+|---|---|
+| `schema_version` | `1` |
+| `sampling` | `{cycle_ns, counts_per_revolution, expected_wkc}`. Positive integers. The cycle must divide 20 ms exactly. All runs in a request use this sampling configuration. |
+| `runs[]` | `{id, source, evidence, cohort?, profile?, parameter_readback?, samples}`. Run IDs must be unique. |
+| `source` | `{path, sha256}`. Capture label and 64-hex-digit digest. |
+| `evidence` | `{zero_capture_drops, request_consumed, plc_started?, normal_completion, terminal_reason?}`. The first four fields are booleans. Omit or send `null` for unverified `plc_started`. |
+| `samples[]` | `{dc_ns, position_counts, target_counts, following_error_counts, torque_permille, controlword, statusword, error_code, wkc}`. One row per PDO return in capture order. Position and target are unwrapped motor encoder counts in the same coordinate frame, with magnitude at most 2⁵². Torque is in tenths of a percent of rated torque. CiA 402 control and status words are unsigned. |
+| `profile` | Single move or a continuous reversal profile as defined below. Supply a profile for normally completed runs. |
+| `cohort` | An importer-provided identity for comparable runs. Use the same value only when the axis, load, runtime, and preceding conditions match. |
+| `parameter_readback` | Object mapping parameter IDs to their independently read byte arrays. Use stable IDs and byte order across runs. |
+| `comparisons[]` | Optional `{id, parameter, max_start_span_counts, max_relative_target_delta_counts, design}`. `design` is `{kind:"pair", reference, candidate}` or `{kind:"aba", before, candidate, after}`, referring to run IDs. Send the A/B/A captures in their measured roles. |
+
+- A single move uses `{kind:"single", command_rpm, steady_slots, settle_ns, encoder_span?}`.
+  The sign of `command_rpm` sets direction. Target-position increments identify
+  the plateau on the nominal clock. After `settle_ns`, the optional
+  `[low, high]` encoder span restricts the evaluation to a complete traversal
+  of the specified range.
+- Continuous reversal uses `{kind:"reversal", command_rpm, endpoints, ramp_slots,
+  steady_slots, decel_slots, hold_slots, legs, steady_tail_slots}`. Supply a
+  positive speed, `[low, high]` endpoints, and an even leg count of at least
+  two. Legs start from the low endpoint and alternate direction. The
+  analyzer anchors the sequence at the recorded disable command and checks
+  every target against the declared trapezoid and endpoint holds.
+
+Each request may contain up to 24 MiB, 100,000 samples total, 32 runs,
+32 comparisons, and 256 parameter readbacks of up to 1 KiB each per run.
+Use separate requests for separate experiments. Invalid schema, oversized
+readbacks, duplicate IDs, and unknown comparison references
+return HTTP 400.
+A body over the byte limit returns HTTP 413. When two replays are already
+being processed, a further request returns HTTP 503; retry after a replay finishes.
+
+### Results
+
+- A run has `status`, `reason`, `terminal_reason`, `capture`, and `metrics`.
+  `analyzed` requires a consumed request, confirmed PLC start and normal
+  completion, and one continuous enable command with matching feedback.
+  It includes a two-second startup window, enabled speed/torque peaks,
+  and per-leg steady statistics. Feedback speed uses the measured DC time
+  over 20 ms or 100 ms of nominal slots. Steady RMS is the population RMS
+  after subtracting mean speed. Reversals include overshoot, hold-end
+  error, and turnaround torque.
+- An excluded run has `metrics:null`. `dc_discontinuity` includes counts of
+  discontinuities and missing slots, and the first pair of DC timestamps.
+  `pre_enable_abort` requires a consumed request, verified absence of a PLC
+  start, and zero enable commands and feedback. Other exclusions cover
+  insufficient capture or a missing (zero) DC reference time, WKC mismatch,
+  drive fault, incomplete execution,
+  and invalid profiles. Counts with magnitude above 2⁵² exclude that run
+  with `status: "invalid_profile"` and `metrics:null`; the request still
+  returns HTTP 200 so other runs can be evaluated.
+- A comparison returns either `result` or `exclusion_reason`. It requires
+  analyzed, distinct captures in the same cohort and profile, starts inside
+  the declared span, and readbacks differing only for the selected
+  parameter. The recorded target intervals must have the same slot count.
+  Subtract each capture's target at enable before checking the per-slot
+  difference between the candidate and each reference. Metrics use the
+  median of each group and direction. An A/B/A comparison reports both
+  reference medians, their spread, and the change
+  relative to their mean. `assessment` indicates where the candidate falls
+  relative to the observed references. These are descriptive comparisons
+  scoped to the measured conditions.
+
+See the [axis tuning milestone and roadmap](axis-tuning.md) for acceptance
+coverage and the next integration stages.
+
 ## Health & lifecycle
 
 | Method | Path | Purpose | Notes |

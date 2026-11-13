@@ -13,6 +13,7 @@ pub enum ApiError {
     TooManyRequests(String),
     PreconditionFailed,
     BadRequest(String),
+    PayloadTooLarge(String),
     /// 422 — the request was well-formed but the resulting state fails
     /// validation (e.g. an HMI ops batch whose result has structural
     /// errors).
@@ -88,6 +89,7 @@ impl IntoResponse for ApiError {
             Self::PreconditionFailed => (StatusCode::PRECONDITION_FAILED,
                 "document changed since it was read; re-read it and reapply your edit (local edits have not been saved)".into()),
             Self::BadRequest(s) => (StatusCode::BAD_REQUEST, s),
+            Self::PayloadTooLarge(s) => (StatusCode::PAYLOAD_TOO_LARGE, s),
             Self::Unprocessable(s) => (StatusCode::UNPROCESSABLE_ENTITY, s),
             Self::Forbidden(s) => (StatusCode::FORBIDDEN, s),
             Self::Unavailable(s) => (StatusCode::SERVICE_UNAVAILABLE, s),

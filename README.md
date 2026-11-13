@@ -134,6 +134,10 @@ HTTP 412 / CLI exit 2: re-read and reapply your edit, without discarding the
 other writer's changes. New named resources need no flag. Raw `cs api`
 requests remain compatible and unconditional unless a precondition is sent.
 
+Use `cs api POST /api/axis-replay --from replay.json` to evaluate
+recorded axis motion and compare parameter trials offline. See the
+[axis tuning milestone and roadmap](docs/axis-tuning.md).
+
 ## Project on disk
 
 ```

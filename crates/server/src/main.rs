@@ -1,3 +1,4 @@
+mod axis_replay;
 mod catalog;
 mod conditional;
 #[cfg(test)]
@@ -317,6 +318,7 @@ async fn main() -> anyhow::Result<()> {
         // Compile / runtime
         .route("/api/check", post(routes::check))
         .route("/api/symbols", post(routes::symbols))
+        .route("/api/axis-replay", axis_replay::route())
         .route("/api/run", post(routes::run))
         .route("/api/stop", post(routes::stop))
         .route("/api/events", get(routes::events))
