@@ -65,6 +65,29 @@ it("marks only stale-bound nodes, blocks their interlock, and leaves explicit St
   expect(screen.queryByText("Stale · remote_io/permit")).toBeNull()
 })
 
+it("rechecks a WORD interlock against live feedback before dispatch", async () => {
+  const screenDoc = structuredClone(doc)
+  const button = rootChildren(screenDoc)[0]
+  button.bind = { enable: { variable: "status", expr: "x % 8 >= 4", format: null, map: null } }
+  vi.mocked(host.fetchDoc).mockResolvedValue(screenDoc)
+  const snapshot = (tick: bigint, value: string) => liveFeedStore.setSnapshot({
+    timestamp_us: tick, scan_count: tick,
+    vars: [{ name: "level", type_name: "REAL", value: "2.5", bits: 0 },
+      { name: "status", type_name: "WORD", value, bits: 0 }],
+  })
+  snapshot(2n, "16#0027")
+  render(canvas("operate"))
+  const set = await screen.findByRole("button", { name: "Set level" }) as HTMLButtonElement
+  expect(set.disabled).toBe(false)
+  fireEvent.click(set)
+  expect(await screen.findByRole("dialog")).toBeTruthy()
+
+  act(() => snapshot(3n, "16#0021"))
+  fireEvent.click(screen.getByRole("button", { name: "Confirm" }))
+  expect(await screen.findByRole("alert")).toHaveProperty("textContent", expect.stringMatching(/control is no longer enabled/i))
+  expect(host.write).not.toHaveBeenCalled()
+})
+
 describe("Arrange-mode drag", () => {
   // An agent's `cs hmi op` lands on disk; this canvas has not reloaded yet
   // (the SSE mutation is still in flight — here it never arrives). Moving an

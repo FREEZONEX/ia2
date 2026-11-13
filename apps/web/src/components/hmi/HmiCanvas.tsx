@@ -26,13 +26,13 @@ import {
 } from "@/lib/hmi-action"
 import { canHostAction } from "@/lib/hmi-actions"
 import {
+  bindingNumber,
   bindingVariable,
   colorBinding,
   cssColor,
   displayBinding,
   lookupVar,
   snapshotVariable,
-  toNumber,
   resolveBinding,
   resolveOn,
 } from "@/lib/hmi-binding"
@@ -214,7 +214,7 @@ export function HmiCanvas({
     const t = Number(snapshot.timestamp_us) / 1e6
     for (const [name, windowS] of trendWindows(doc)) {
       const found = lookupVar(snapshot, name)
-      const parsed = found ? toNumber(found.raw) : NaN
+      const parsed = found ? bindingNumber(found.raw, found.type_name) : NaN
       const n = Number.isFinite(parsed) ? parsed : null
       let buf = historyRef.current.get(name)
       if (!buf) {

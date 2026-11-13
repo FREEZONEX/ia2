@@ -99,6 +99,34 @@ describe("resolveBinding + formatBinding", () => {
     expect(resolveBinding(snap, b)).toBe(0.425)
     expect(formatBinding(b, 0.425)).toBe("0.425")
   })
+  it.each([
+    ["BYTE", "2#1000_0000", 128],
+    ["WORD", "8#10__0_", 64],
+    ["WORD", "16#0027", 39],
+    ["DWORD", "16#FFFFFFFF", 4_294_967_295],
+    ["LWORD", "16#001FFFFFFFFFFFFF", Number.MAX_SAFE_INTEGER],
+  ])("reads %s feedback %s at full precision", (type_name, value, expected) => {
+    const feedback = { ...snap, vars: [{ name: "status", type_name, value, bits: 0 }] }
+    expect(resolveBinding(feedback, "status")).toBe(expected)
+    expect(displayBinding(feedback, "status")).toBe(value)
+    expect(displayBinding(feedback, { variable: "status", format: "%d", expr: null, map: null })).toBe(String(expected))
+  })
+  it.each([
+    ["WORD", "16#"],
+    ["WORD", "16#_27"],
+    ["WORD", "16#27Z"],
+    ["WORD", "2#102"],
+    ["WORD", "8#89"],
+    ["BYTE", "16#100"],
+    ["LWORD", "16#0020000000000000"],
+    ["LWORD", "16#FFFFFFFFFFFFFFFF"],
+    ["STRING", "16#0027"],
+  ])("keeps %s feedback %s out of numeric bindings", (type_name, value) => {
+    const feedback = { ...snap, vars: [{ name: "status", type_name, value, bits: 0 }] }
+    expect(resolveBinding(feedback, "status")).toBeNull()
+    expect(displayBinding(feedback, "status")).toBe(value)
+    expect(displayBinding(feedback, { variable: "status", expr: "x + 1", format: null, map: null })).toBeNull()
+  })
   it("formats %d and defaults sanely", () => {
     expect(formatBinding("v", 3)).toBe("3")
     expect(formatBinding("v", 3.14159)).toBe("3.14")
@@ -121,6 +149,19 @@ describe("resolveBinding + formatBinding", () => {
 })
 
 describe("resolveOn", () => {
+  it("uses fresh status words in expressions and maps", () => {
+    const feedback = (value: string, stale = false): VarSnapshot => ({ ...snap, vars: [{
+      name: "status", type_name: "WORD", value, bits: 0,
+      input: { device: "drive", channel: "status", stale },
+    }] })
+    const enabled = { variable: "status", expr: "x % 8 == 7", format: null, map: null }
+    const label = { ...enabled, map: [{ eq: 1, min: null, max: null, out: "Enabled" }] }
+    expect(resolveOn(feedback("16#0021"), enabled)).toBe(false)
+    expect(resolveOn(feedback("16#0027"), enabled)).toBe(true)
+    expect(displayBinding(feedback("16#0027"), label)).toBe("Enabled")
+    expect(resolveOn(feedback("16#0027", true), enabled)).toBe(false)
+    expect(displayBinding(feedback("16#0027", true), label)).toBeNull()
+  })
   it("reads truthy values as on", () => {
     expect(resolveOn(snap, "pump_run")).toBe(true)
     expect(resolveOn(snap, "level_pct")).toBe(true)
