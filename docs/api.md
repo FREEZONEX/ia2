@@ -154,8 +154,8 @@ readbacks before submission.
 
 Each request may contain up to 24 MiB, 100,000 samples total, 32 runs,
 32 comparisons, and 256 parameter readbacks of up to 1 KiB each per run.
-Use separate requests for separate experiments. Invalid schema, out-of-range
-counts or readback sizes, duplicate IDs, and unknown comparison references
+Use separate requests for separate experiments. Invalid schema, oversized
+readbacks, duplicate IDs, and unknown comparison references
 return HTTP 400.
 A body over the byte limit returns HTTP 413. When two replays are already
 being processed, a further request returns HTTP 503; retry after a replay finishes.
@@ -176,7 +176,9 @@ being processed, a further request returns HTTP 503; retry after a replay finish
   start, and zero enable commands and feedback. Other exclusions cover
   insufficient capture or a missing (zero) DC reference time, WKC mismatch,
   drive fault, incomplete execution,
-  and invalid profiles.
+  and invalid profiles. Counts with magnitude above 2⁵² exclude that run
+  with `status: "invalid_profile"` and `metrics:null`; the request still
+  returns HTTP 200 so other runs can be evaluated.
 - A comparison returns either `result` or `exclusion_reason`. It requires
   analyzed, distinct captures in the same cohort and profile, starts inside
   the declared span, and readbacks differing only for the selected
