@@ -62,6 +62,28 @@ export function toNumber(raw: string): number {
   return Number.isFinite(n) ? n : NaN
 }
 
+const BIT_STRING_MAX: Readonly<Partial<Record<string, number>>> = {
+  BYTE: 0xff,
+  WORD: 0xffff,
+  DWORD: 0xffffffff,
+  LWORD: Number.MAX_SAFE_INTEGER,
+}
+// Match the IronPLC radix tokens: a digit first, then digits and separators.
+const IEC_RADIX_LITERAL = /^(?:2#[01][01_]*|8#[0-7][0-7_]*|16#[0-9A-F][0-9A-F_]*)$/
+
+/** Decode bit-string feedback for HMI bindings and plots from its exact
+ *  display text. The JSON `bits` number can already have rounded a LWORD. */
+export function bindingNumber(raw: string, typeName: string): number {
+  const text = raw.trim()
+  if (!IEC_RADIX_LITERAL.test(text)) return toNumber(text)
+
+  const max = BIT_STRING_MAX[typeName.toUpperCase()]
+  if (max === undefined) return NaN
+  const [base, digits] = text.split("#")
+  const value = Number.parseInt(digits.replaceAll("_", ""), Number(base))
+  return value <= max ? value : NaN
+}
+
 /** Everything a binding can produce: the post-expr number (null when the
  *  variable is unresolved, ambiguous, non-numeric, or the expr failed /
  *  overflowed — never NaN/Infinity), the first matching map output, and
@@ -79,7 +101,7 @@ export function resolveOutput(
 ): ResolvedOutput {
   const found = lookupVar(snapshot, bindingVariable(b))
   if (!found) return { num: null, out: null, raw: null, type_name: null }
-  let value = toNumber(found.raw)
+  let value = bindingNumber(found.raw, found.type_name)
   const spec = typeof b === "string" ? null : b
   if (spec?.expr && Number.isFinite(value)) {
     const v = evalExpr(spec.expr, value)
@@ -134,8 +156,8 @@ function stripQuotes(raw: string): string {
 
 /** Display text for a binding, in priority order: map output; `%s` (raw
  *  snapshot text, quotes stripped); explicit numeric format; BOOLs as
- *  TRUE/FALSE; non-numeric variables (STRING content, `16#…` bit-field
- *  literals) verbatim; then the compact numeric default. Null = "—"
+ *  TRUE/FALSE; unformatted bit strings and STRING content verbatim;
+ *  then the compact numeric default. Null = "—"
  *  (unresolved variable, or an expr that failed / blew up — an expr
  *  declares numeric intent, so its failures never fall back to text). */
 export function displayBinding(
@@ -154,6 +176,7 @@ export function displayBinding(
   if (!fmt && r.type_name?.toUpperCase() === "BOOL") {
     return r.raw.trim().toUpperCase()
   }
+  if (!fmt && !spec?.expr && IEC_RADIX_LITERAL.test(r.raw.trim())) return r.raw.trim()
   return formatBinding(b, r.num)
 }
 
