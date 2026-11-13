@@ -185,6 +185,12 @@ impl<'a> Trace<'a> {
             return Err("single move needs nonzero speed and a plateau longer than 100 ms");
         }
         let direction = if rpm > 0.0 { 1 } else { -1 };
+        if self.samples[self.enabled.start + 1..self.command_off]
+            .windows(2)
+            .any(|pair| i64::from(direction) * (pair[1].target_counts - pair[0].target_counts) < 0)
+        {
+            return Err("commanded target moves opposite the single-move direction");
+        }
         let counts = f64::from(self.sampling.counts_per_revolution.get());
         let rpm_per_count = 60e9 / (counts * SPEED_NS as f64);
         let tolerance = 0.05_f64.min(rpm.abs() * 0.05);

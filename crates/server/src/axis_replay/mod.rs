@@ -24,6 +24,7 @@ const MAX_CONCURRENT_REQUESTS: usize = 2;
 const MAX_RUNS: usize = 32;
 const MAX_COMPARISONS: usize = 32;
 const MAX_SAMPLES: usize = 100_000;
+const MAX_PARAMETERS_PER_RUN: usize = 256;
 const MAX_READBACK_BYTES: usize = 1024;
 const MAX_ABS_COUNTS: u64 = 1 << 52;
 
@@ -172,11 +173,15 @@ fn inspect_capture(samples: &[Sample], sampling: Sampling) -> CaptureQuality {
         quality.enabled_frames += usize::from(sample.enabled());
         quality.enable_command_frames += usize::from(sample.enable_command());
     }
+    let min_interval = (period / 2).max(1);
+    let max_interval = period + period / 2;
     for (index, pair) in samples.windows(2).enumerate() {
         let previous = pair[0].dc_ns;
         let current = pair[1].dc_ns;
         let slot_step = (current / period).saturating_sub(previous / period);
-        if slot_step != 1 {
+        let interval = current.checked_sub(previous);
+        if slot_step != 1 || !interval.is_some_and(|dt| (min_interval..=max_interval).contains(&dt))
+        {
             let missing_slots = slot_step.saturating_sub(1);
             quality.dc_discontinuities += 1;
             quality.dc_missing_slots = quality.dc_missing_slots.saturating_add(missing_slots);
@@ -295,6 +300,12 @@ fn analyze(request: ReplayRequest) -> Result<ReplayResult, String> {
         {
             return Err(format!(
                 "{} requires a source path label and SHA-256",
+                run.id
+            ));
+        }
+        if run.parameter_readback.len() > MAX_PARAMETERS_PER_RUN {
+            return Err(format!(
+                "{} exceeds {MAX_PARAMETERS_PER_RUN} parameter readbacks",
                 run.id
             ));
         }

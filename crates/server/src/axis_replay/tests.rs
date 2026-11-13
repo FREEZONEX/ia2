@@ -9,7 +9,7 @@ use tower::ServiceExt;
 
 use super::{
     analyze, route, ReplayRequest, Status, MAX_BODY_BYTES, MAX_COMPARISONS,
-    MAX_CONCURRENT_REQUESTS, MAX_READBACK_BYTES, MAX_RUNS,
+    MAX_CONCURRENT_REQUESTS, MAX_PARAMETERS_PER_RUN, MAX_READBACK_BYTES, MAX_RUNS,
 };
 
 fn run(id: &str, byte: u8, position_step: i64) -> Value {
@@ -175,13 +175,25 @@ fn request_bounds_limit_run_comparison_and_readback_amplification() {
         .unwrap()
         .contains("comparisons per request"));
 
-    let mut oversized_readback = payload;
+    let mut oversized_readback = payload.clone();
     oversized_readback["runs"][0]["parameter_readback"]["feedforward"] =
         readback(MAX_READBACK_BYTES + 1, 30);
     assert!(evaluate(oversized_readback)
         .err()
         .unwrap()
         .contains("readback exceeds"));
+
+    let mut too_many_parameters = payload;
+    let params = too_many_parameters["runs"][0]["parameter_readback"]
+        .as_object_mut()
+        .unwrap();
+    for i in 0..MAX_PARAMETERS_PER_RUN {
+        params.insert(format!("p-{i}"), json!([1]));
+    }
+    assert!(evaluate(too_many_parameters)
+        .err()
+        .unwrap()
+        .contains("parameter readbacks"));
 }
 
 #[test]
@@ -204,8 +216,18 @@ fn incomplete_and_discontinuous_runs_cannot_produce_metrics() {
     unconsumed["evidence"]["request_consumed"] = json!(false);
     let mut no_clock = run("no-clock", 40, 1);
     no_clock["samples"][0]["dc_ns"] = json!(0);
+    let mut boundary_straddle = run("boundary-straddle", 40, 1);
+    boundary_straddle["samples"][0]["dc_ns"] = json!(20_000_000 - 1);
     let r: ReplayRequest = serde_json::from_value(request(
-        vec![gap, abort, unknown, bad_wkc, unconsumed, no_clock],
+        vec![
+            gap,
+            abort,
+            unknown,
+            bad_wkc,
+            unconsumed,
+            no_clock,
+            boundary_straddle,
+        ],
         vec![],
     ))
     .unwrap();
@@ -217,6 +239,7 @@ fn incomplete_and_discontinuous_runs_cannot_produce_metrics() {
         Status::InvalidWkc,
         Status::Incomplete,
         Status::InvalidCapture,
+        Status::DcDiscontinuity,
     ]) {
         assert_eq!(run.status, status);
         assert!(run.metrics.is_none());
@@ -224,6 +247,8 @@ fn incomplete_and_discontinuous_runs_cannot_produce_metrics() {
     assert_eq!(result.runs[0].capture.dc_missing_slots, 1);
     assert_eq!(result.runs[0].capture.wkc_mismatches, 0);
     assert_eq!(result.runs[5].capture.dc_discontinuities, 0);
+    assert_eq!(result.runs[6].capture.dc_discontinuities, 1);
+    assert_eq!(result.runs[6].capture.dc_missing_slots, 0);
 }
 
 #[test]
@@ -233,11 +258,15 @@ fn feedback_may_lag_but_the_enable_command_must_be_contiguous() {
     delayed["samples"][123]["statusword"] = json!(0x27);
     let mut retried = run("retried", 40, 1);
     retried["samples"][1]["controlword"] = json!(15);
-    let payload = request(vec![delayed, retried], vec![]);
+    let mut reversed_target = run("reversed-target", 40, 1);
+    reversed_target["samples"][4]["target_counts"] = json!(-1);
+    let payload = request(vec![delayed, retried, reversed_target], vec![]);
     let result = analyze(serde_json::from_value(payload).unwrap()).unwrap();
     assert_eq!(result.runs[0].status, Status::Analyzed);
     assert_eq!(result.runs[1].status, Status::InvalidProfile);
     assert!(result.runs[1].metrics.is_none());
+    assert_eq!(result.runs[2].status, Status::InvalidProfile);
+    assert!(result.runs[2].metrics.is_none());
 }
 
 #[test]

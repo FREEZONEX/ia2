@@ -153,9 +153,10 @@ readbacks before submission.
   every target against the declared trapezoid and endpoint holds.
 
 Each request may contain up to 24 MiB, 100,000 samples total, 32 runs,
-32 comparisons, and 1 KiB per parameter readback. Use separate requests
-for separate experiments. Invalid schema, out-of-range counts or readback
-sizes, duplicate IDs, and unknown comparison references return HTTP 400.
+32 comparisons, and 256 parameter readbacks of up to 1 KiB each per run.
+Use separate requests for separate experiments. Invalid schema, out-of-range
+counts or readback sizes, duplicate IDs, and unknown comparison references
+return HTTP 400.
 A body over the byte limit returns HTTP 413. When two replays are already
 being processed, a further request returns HTTP 503; retry after a replay finishes.
 
