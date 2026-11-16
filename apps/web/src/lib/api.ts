@@ -951,3 +951,22 @@ export async function fetchProjectVariables(): Promise<ProjectVariables> {
     "GET /api/project/variables",
   )
 }
+
+// Engineering observations are stored evidence, never an implicit hardware start.
+export type EngineeringScope = { project: string; edge?: string }
+function engineeringPath(scope: EngineeringScope): string {
+  return scope.edge
+    ? `/api/edges/${encodeURIComponent(scope.edge)}/engineering-state`
+    : "/api/runtime/engineering-state"
+}
+function engineeringHeaders(scope: EngineeringScope): HeadersInit {
+  return { "X-IA2-Project": encodeURIComponent(scope.project), "X-IA2-Project-Encoding": "percent", "Content-Type": "application/json" }
+}
+export async function fetchEngineeringHistory(scope: EngineeringScope, signal?: AbortSignal): Promise<import("@/types/generated/EngineeringHistory").EngineeringHistory> {
+  const path = engineeringPath(scope)
+  return jsonOrThrow(await apiFetch(path, { headers: engineeringHeaders(scope), signal }), `GET ${path}`)
+}
+export async function refreshEngineeringState(scope: EngineeringScope, target: import("@/types/generated/EngineeringTarget").EngineeringTarget, signal?: AbortSignal): Promise<import("@/types/generated/EngineeringRefresh").EngineeringRefresh> {
+  const path = `${engineeringPath(scope)}/refresh`
+  return jsonOrThrow(await apiFetch(path, { method: "POST", headers: engineeringHeaders(scope), body: JSON.stringify(target), signal }), `POST ${path}`)
+}

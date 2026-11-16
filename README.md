@@ -256,3 +256,14 @@ is equivalent. There is no SDO set/rm resource.
 Opt-in EtherCAT bus-clocked scans and their offline regression fixture are
 documented in [the cycle handoff contract](docs/scan-cycle-handoff.md). Inspect
 the bounded sequence diagnostics with `cs get runtime/status`.
+
+
+### Inspect the engineering state
+
+The EtherCAT device editor includes **Engineering state**: explicit read-only
+parameter observations, saved history and position-retention explanations.
+The same evidence is available through `cs get runtime/engineering-state` and
+`cs get edges/<name>/engineering-state`; refresh with `cs api POST` as documented
+in [Engineering state](docs/engineering-state.md). Stored readings carry their
+identity, time and errors. A configured absolute mode is not automatically a
+verified machine reference.

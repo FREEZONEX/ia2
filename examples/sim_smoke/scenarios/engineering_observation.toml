@@ -1,0 +1,10 @@
+description = "engineering-state reads preserve idle outputs; unsupported simulated SDO stays unknown"
+
+[[steps]]
+expect = { var = "inlet_cmd", op = "is_false", within_ms = 1000 }
+
+[[steps]]
+expect_never = { var = "overflow", op = "is_true", during_ms = 200 }
+
+[[steps]]
+expect = { var = "level", op = "eq", value = 0.0, within_ms = 1000 }

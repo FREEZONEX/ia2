@@ -392,3 +392,38 @@ acknowledgement remains unconfirmed until the owner returns a result. The
 IDE waits for actual EtherCAT worker exit before a replacement run. Restart
 creates a fresh gate after teardown. Establish physical output state with
 independent feedback.
+
+
+### Engineering-state evidence (read-only device observations)
+
+```bash
+cs --project demo get runtime/engineering-state
+cs --project demo get edges/edge-a/engineering-state
+printf '%s' '{"device":"bus","slave":1}' | cs --project demo api POST /api/runtime/engineering-state/refresh --from -
+# For the selected edge use /api/edges/edge-a/engineering-state/refresh.
+```
+
+GET reads a bounded archive without contacting hardware. POST explicitly uploads
+parameters through the existing master; it cannot start a stopped service or
+write drive parameters. Use `cs agent run` for multi-step work as usual. Inspect
+`observation.parameters[*].error`, `saved`, `storage_error`, `runtime_session`,
+identity strength and timestamps; HTTP 200 does not mean every read succeeded.
+Read failures are unknown, not zero, and prior observations remain historical.
+
+For position discrepancies, inspect `absolute_mode` (SV660N H02-01), `retention`
+and findings before asking the operator. `disabled_incremental` explains why a
+coordinate cannot be compared across drive power cycles; it does not prove a
+battery fault or actual physical movement. `configured_absolute_unverified`
+means configured only, not retention acceptance. `mechanical_reference` and
+`bus_continuity` remain `not_verified`; no record grants motion authority.
+
+Reuse applicable operator facts from the operation record with their original
+source and scope. A new chat, PID or reconnect alone does not invalidate those
+facts. Automatically re-read observable conditions; ask one focused question
+only when a fact needed for the authorized action is genuinely missing or
+contradicted. A stationary drift observation can use a new local sample interval;
+a move relying on old machine coordinates needs an established reference and
+travel budget. Never restore an offset by adding the previous position to zero,
+or reset the cumulative budget on each new session. This feature supplies the
+read evidence; it does not yet persist operator confirmations or implement a
+machine-coordinate admission gate. Details: `docs/engineering-state.md`.

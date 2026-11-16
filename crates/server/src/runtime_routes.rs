@@ -614,6 +614,89 @@ pub async fn edge_sdo_upload(
     edge_proxy_response(crate::edges::proxy_edge_runtime_get(&edge, &path).await)
 }
 
+/// Stored evidence is available even with no running program; GET never contacts a bus.
+pub async fn engineering_history(
+    State(state): State<AppState>,
+    project: ProjectName,
+) -> Result<Json<ironplc_bridge::monitor::engineering::EngineeringHistory>, ApiError> {
+    let directory = crate::routes::with_project(&state, &project, |store| {
+        Ok(store.root().join("state/engineering"))
+    })?;
+    state
+        .engineering
+        .history(directory)
+        .await
+        .map(Json)
+        .map_err(ApiError::Unavailable)
+}
+
+pub async fn engineering_refresh(
+    State(state): State<AppState>,
+    project: ProjectName,
+    Json(target): Json<ironplc_bridge::monitor::engineering::EngineeringTarget>,
+) -> Result<axum::response::Response, ApiError> {
+    use axum::response::IntoResponse;
+    target.validate().map_err(ApiError::BadRequest)?;
+    let (name, directory) = crate::routes::with_project(&state, &project, |store| {
+        Ok((
+            store.name().to_owned(),
+            store.root().join("state/engineering"),
+        ))
+    })?;
+    let handle = {
+        let program = state.program.lock();
+        let running = program.as_ref().filter(|p| p.project_name == name)
+            .ok_or_else(|| ApiError::Conflict("No program running for the selected project; observation does not start hardware".into()))?;
+        running.handle.clone()
+    };
+    Ok(
+        match state
+            .engineering
+            .refresh(directory, name, target, handle)
+            .await
+        {
+            Ok(result) => Json(result).into_response(),
+            Err((status, message)) => (
+                axum::http::StatusCode::from_u16(status).expect("engineering status"),
+                message,
+            )
+                .into_response(),
+        },
+    )
+}
+
+pub async fn edge_engineering_history(
+    State(state): State<AppState>,
+    project: ProjectName,
+    AxumPath(name): AxumPath<String>,
+) -> Result<axum::response::Response, ApiError> {
+    let edge = crate::routes::with_project(&state, &project, |store| {
+        store.read_edge(&name).map_err(Into::into)
+    })?;
+    edge_proxy_response(crate::edges::proxy_edge_runtime_get(&edge, "engineering-state").await)
+}
+
+pub async fn edge_engineering_refresh(
+    State(state): State<AppState>,
+    project: ProjectName,
+    AxumPath(name): AxumPath<String>,
+    Json(target): Json<ironplc_bridge::monitor::engineering::EngineeringTarget>,
+) -> Result<axum::response::Response, ApiError> {
+    target.validate().map_err(ApiError::BadRequest)?;
+    let edge = crate::routes::with_project(&state, &project, |store| {
+        store.read_edge(&name).map_err(Into::into)
+    })?;
+    edge_proxy_response(
+        crate::edges::proxy_edge_runtime_op(
+            &edge,
+            "engineering-state/refresh",
+            &serde_json::to_value(target).expect("target JSON"),
+            None,
+        )
+        .await,
+    )
+}
+
 #[cfg(test)]
 mod edge_proxy_tests {
     use super::*;

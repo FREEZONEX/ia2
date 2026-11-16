@@ -652,6 +652,63 @@ Access from the dev machine: open an `ssh -N -L <local>:127.0.0.1:<runtime_port>
 tunnel (see `/api/edges/{name}/attach`) and hit `http://127.0.0.1:<local>/...`.
 
 
+### Engineering-state observations
+
+| Method | Path | Result |
+|---|---|---|
+| GET | `/api/runtime/engineering-state` | Selected project's bounded stored observation history; no bus access |
+| POST | `/api/runtime/engineering-state/refresh` | Observe one device/slave using that project's existing running program, then persist evidence |
+| GET | `/api/edges/{name}/engineering-state` | Edge observation history through SSH; unavailable when the runtime is stopped |
+| POST | `/api/edges/{name}/engineering-state/refresh` | Same bounded observation through the edge proxy |
+| GET | `/engineering-state` | Edge runtime's stored observation history |
+| POST | `/engineering-state/refresh` | Edge runtime's explicit observation request |
+
+POST body: `{"device":"motion/bus","slave":1}`. `slave` is the zero-based
+bus position. Unknown fields and invalid targets are rejected. No values can be
+submitted as device evidence. GET never starts a master, accesses devices or
+creates an archive. Local refresh requires a running program belonging to the
+selected project; it does not read another open project's hardware. Existing
+SDO upload restrictions apply; this is not a PRE-OP startup or write interface.
+
+GET returns `{schema_version:1,capacity:64,observations:[...]}` in oldest-to-newest
+commit order. POST returns `{observation,saved,storage_error}`. HTTP 200 means the
+observation attempt completed, **not** that every parameter was read or saved.
+Check each parameter's `error_kind` / `error`, `complete`, and `saved` separately.
+Missing or unsupported targets produce an archived failed attempt, with null
+readings and retention `unknown`; `_sim` never supplies fabricated parameters.
+400 = invalid target; 409 = no selected-project runtime or observation already
+in progress; 503 = archive unavailable/corrupt before acquisition. Corrupt
+archives are preserved. Disk failure after acquisition returns fresh evidence
+with `saved:false`. A transport timeout has an unknown archive outcome; GET
+history before requesting another refresh. Existing edge proxy status passthrough applies.
+
+Each observation carries its ID, project name, runtime session, target, batch
+start/end time, source, profile, raw parameter evidence and derived findings.
+Each successful reading has actual vendor/product/revision/serial, upload time,
+bytes and decimal-string signed/unsigned interpretations (lossless in JavaScript).
+`data_type` selects the applicable scalar interpretation; position units remain
+drive reference units. Times are Unix milliseconds; they are **not** the device's
+internal sample clock. Reads are sequential, never an atomic multiword snapshot.
+`identity_consistent` compares returned identities inside this batch only; a zero
+serial gives `slot_and_model_only`, no identity gives `unknown`.
+
+Only the exact observed SV660N vendor/product pair selects its H02-01 profile.
+Other devices receive standard CiA 402 reads with retention unknown. Modes 1–3
+produce `configured_absolute_unverified`, never `valid_absolute`. Mode 0 gives
+`disabled_incremental`, mode 4 `single_turn_only`; encoder fault information is
+reported separately and prevents a trustworthy absolute-reference conclusion.
+Mechanical reference and bus continuity remain `not_verified` in this release.
+No refresh grants motion authority, resets cumulative travel, changes parameters,
+clears alarms, performs homing or restores a previous motion.
+
+One batch per service is admitted before entering the scan-command queue;
+individual uploads have a 500 ms wait and the read batch a 2.5 s budget. The
+adapter retains its own mailbox exclusion, including canceled uploads. Disk work
+runs outside the scan loop. The archive is an atomically replaced JSON file,
+locked across processes, retaining the latest 64 attempts (maximum 4 MiB).
+This is bounded diagnostic history, not a permanent audit journal. See
+[engineering-state behavior and agent workflow](engineering-state.md).
+
 ### Read-only live CoE upload
 
 | Method | Path | Result |

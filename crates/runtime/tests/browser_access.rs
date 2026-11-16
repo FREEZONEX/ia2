@@ -526,3 +526,51 @@ fn only_top_level_navigations_can_open_the_standalone_panel() {
         }
     }
 }
+
+#[test]
+fn engineering_archive_survives_runtime_restart_without_creating_a_reference() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let path = state.to_str().unwrap();
+    let runtime = start_with(dir.path(), &["--state-dir", path]);
+    let headers = [
+        host(runtime.port),
+        ("content-type", "application/json".into()),
+    ];
+    let response = send(
+        runtime.port,
+        "POST",
+        "/engineering-state/refresh",
+        &headers,
+        r#"{"device":"missing","slave":0}"#,
+    )
+    .unwrap();
+    assert_eq!(response.status, 200, "{}", response.body);
+    let evidence: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+    assert_eq!(evidence["saved"], true);
+    assert_eq!(evidence["observation"]["retention"], "unknown");
+    assert_eq!(
+        evidence["observation"]["mechanical_reference"],
+        "not_verified"
+    );
+    assert!(evidence["observation"]["parameters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|p| p["error_kind"] == "not_found"));
+    assert!(audit(runtime.port).as_array().unwrap().is_empty());
+    drop(runtime);
+    let restarted = start_with(dir.path(), &["--state-dir", path]);
+    let response = send(
+        restarted.port,
+        "GET",
+        "/engineering-state",
+        &[host(restarted.port)],
+        "",
+    )
+    .unwrap();
+    assert_eq!(response.status, 200);
+    let history: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+    assert_eq!(history["observations"][0], evidence["observation"]);
+    assert!(state.join("engineering/observations.json").is_file());
+}

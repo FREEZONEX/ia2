@@ -383,6 +383,7 @@ fn finish_step_tick(mode: &std::sync::Mutex<RuntimeMode>) {
 /// shutdown.
 #[derive(Clone)]
 pub struct ProgramHandle {
+    observation_session: String,
     stop: Arc<AtomicBool>,
     snapshot_tx: broadcast::Sender<VarSnapshot>,
     cmd_tx: tokio::sync::mpsc::Sender<RuntimeCommand>,
@@ -470,6 +471,10 @@ pub struct ProgramHandle {
 }
 
 impl ProgramHandle {
+    /// Identity of this run, not of a drive power cycle or a mechanical origin.
+    pub fn observation_session(&self) -> &str {
+        &self.observation_session
+    }
     /// Cooperative stop. The scan loop checks the flag between rounds, so a
     /// healthy scan in flight finishes, publishes, and the final RETAIN
     /// checkpoint is written. A scan still running `STOP_GRACE` after the flag
@@ -1348,6 +1353,7 @@ fn spawn_units_with_grace(
     });
 
     ProgramHandle {
+        observation_session: format!("{}-{}", std::process::id(), crate::monitor::wall_now_us()),
         stop,
         snapshot_tx,
         cmd_tx,

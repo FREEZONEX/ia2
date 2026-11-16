@@ -1029,7 +1029,15 @@ fn sdo_directories_preserve_edge_configuration_and_subread_routes() {
         // Missing targets stop before any network access. The exact name in
         // the 404 proves the CLI reached the intended edge subroute, not SDO.
         let missing = format!("missing/{name}");
-        for subread in ["status", "logs", "audit", "scan", "probe", "system"] {
+        for subread in [
+            "status",
+            "logs",
+            "audit",
+            "scan",
+            "probe",
+            "system",
+            "engineering-state",
+        ] {
             cs(&server.base)
                 .args(["get", &format!("edges/{missing}/{subread}")])
                 .assert()
@@ -1178,4 +1186,117 @@ fn cycle_handoff_scenarios_expose_exact_sequence_and_latched_fault_over_http() {
         serde_json::json!(["bus"])
     );
     cs(&server.base).args(["stop"]).assert().success();
+}
+
+#[test]
+fn engineering_observation_is_scoped_durable_and_does_not_drive_outputs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("engineering");
+    copy_dir(&repo_root().join("examples/sim_smoke"), &proj);
+    std::fs::create_dir_all(proj.join("devices")).unwrap();
+    std::fs::write(
+        proj.join("devices/bus.toml"),
+        "name = \"bus\"\nprotocol = \"ethercat\"\nnic = \"_sim\"\n",
+    )
+    .unwrap();
+    let server = spawn_server(tmp.path());
+    server.open_project(&proj);
+    let get = || {
+        let out = cs(&server.base)
+            .args(["get", "runtime/engineering-state"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()
+    };
+    assert_eq!(get()["observations"], serde_json::json!([]));
+    assert!(
+        !proj.join("state/engineering").exists(),
+        "GET must not create state or start hardware"
+    );
+    cs(&server.base)
+        .args([
+            "api",
+            "POST",
+            "/api/runtime/engineering-state/refresh",
+            "--from",
+            "-",
+        ])
+        .write_stdin(r#"{"device":"bus","slave":1}"#)
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains(
+            "No program running for the selected project",
+        ));
+    cs(&server.base)
+        .args(["api", "POST", "/api/run"])
+        .assert()
+        .success();
+    let out = cs(&server.base)
+        .args([
+            "api",
+            "POST",
+            "/api/runtime/engineering-state/refresh",
+            "--from",
+            "-",
+        ])
+        .write_stdin(r#"{"device":"bus","slave":1}"#)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let response: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(response["saved"], true);
+    assert_eq!(response["observation"]["retention"], "unknown");
+    assert_eq!(response["observation"]["identity_strength"], "unknown");
+    assert!(response["observation"]["parameters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|p| p["reading"].is_null() && p["error_kind"] == "unsupported"));
+    assert_eq!(get()["observations"][0], response["observation"]);
+    cs(&server.base)
+        .args(["sim", "run", "--no-run", "--keep-running"])
+        .arg(proj.join("scenarios/engineering_observation.toml"))
+        .assert()
+        .success();
+    let other = tmp.path().join("other");
+    copy_dir(&repo_root().join("examples/sim_smoke"), &other);
+    std::fs::write(
+        other.join("project.toml"),
+        "name = \"different\"\nversion = \"0.1\"\n",
+    )
+    .unwrap();
+    server.open_project(&other);
+    cs(&server.base)
+        .args([
+            "--project",
+            "different",
+            "api",
+            "POST",
+            "/api/runtime/engineering-state/refresh",
+            "--from",
+            "-",
+        ])
+        .write_stdin(r#"{"device":"bus","slave":1}"#)
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains(
+            "No program running for the selected project",
+        ));
+    assert!(!other.join("state/engineering").exists());
+    server.open_project(&proj);
+    cs(&server.base)
+        .args(["api", "POST", "/api/stop"])
+        .assert()
+        .success();
+    assert_eq!(get()["observations"][0], response["observation"]);
+    assert!(proj.join("state/engineering/observations.json").is_file());
 }

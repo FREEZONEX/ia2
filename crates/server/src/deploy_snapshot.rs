@@ -20,10 +20,8 @@ impl DeploySnapshot {
             .tempdir()
             .map_err(|e| format!("creating deploy snapshot: {e}"))?;
         let project_dir = directory.path().join("project");
-        project::ProjectStore::with_snapshot_files(source, || {
-            copy_tree(source, &project_dir, true)
-        })
-        .map_err(|e| format!("copying deploy snapshot: {e}"))?;
+        project::ProjectStore::with_snapshot_files(source, || copy_tree(source, &project_dir, 0))
+            .map_err(|e| format!("copying deploy snapshot: {e}"))?;
         // The library commit cannot overlap the copy. Validation and upload
         // use these same independent bytes.
         let loaded = ironplc_bridge::load_edge_project(&project_dir)?;
@@ -59,16 +57,24 @@ fn remove_preflight_lock(project_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn copy_tree(source: &Path, destination: &Path, project_root: bool) -> std::io::Result<()> {
+fn copy_tree(source: &Path, destination: &Path, depth: usize) -> std::io::Result<()> {
     let kind = std::fs::symlink_metadata(source)?.file_type();
     if kind.is_dir() {
         std::fs::create_dir(destination)?;
         for entry in std::fs::read_dir(source)? {
             let entry = entry?;
-            if project_root && project::is_library_transaction_artifact(&entry.file_name()) {
+            if (depth == 0 && project::is_library_transaction_artifact(&entry.file_name()))
+                || (depth == 1
+                    && source.file_name().is_some_and(|n| n == "state")
+                    && entry.file_name() == "engineering")
+            {
                 continue;
             }
-            copy_tree(&entry.path(), &destination.join(entry.file_name()), false)?;
+            copy_tree(
+                &entry.path(),
+                &destination.join(entry.file_name()),
+                depth + 1,
+            )?;
         }
     } else if kind.is_file() {
         std::fs::copy(source, destination)?;
@@ -90,6 +96,26 @@ fn copy_tree(source: &Path, destination: &Path, project_root: bool) -> std::io::
 mod tests {
     use super::*;
     use project::ProjectStore;
+
+    #[test]
+    fn local_observations_are_not_deployed_as_edge_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProjectStore::create(dir.path().join("source"), "source").unwrap();
+        std::fs::create_dir_all(store.root().join("state/engineering")).unwrap();
+        std::fs::write(
+            store.root().join("state/engineering/observations.json"),
+            "local evidence",
+        )
+        .unwrap();
+        std::fs::write(
+            store.root().join("state/other.json"),
+            "preserve unrelated content",
+        )
+        .unwrap();
+        let snapshot = DeploySnapshot::prepare(store.root()).unwrap();
+        assert!(!snapshot.project_dir().join("state/engineering").exists());
+        assert!(snapshot.project_dir().join("state/other.json").is_file());
+    }
 
     #[test]
     fn edits_after_preflight_cannot_change_the_uploaded_archive() {

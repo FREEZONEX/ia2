@@ -285,6 +285,8 @@ fn sibling_web_dir(project_dir: &Path) -> Option<PathBuf> {
 /// Shared state for the HTTP handlers.
 #[derive(Clone)]
 struct AppState {
+    engineering: Arc<ironplc_bridge::monitor::engineering::EngineeringService>,
+    engineering_dir: PathBuf,
     project_name: String,
     /// PROGRAM instances actually scheduled, derived from tasks.toml.
     /// Reported by /status so attached IDEs / operators can see what's
@@ -509,6 +511,8 @@ async fn main() -> Result<()> {
 
     let store = Arc::new(store);
     let state = AppState {
+        engineering: Arc::default(),
+        engineering_dir: args.state_dir.join("engineering"),
         project_name,
         program_instances,
         devices: device_names,
@@ -561,6 +565,8 @@ async fn main() -> Result<()> {
             .route("/logs/stream", get(logs_stream))
             .route("/discover", get(discover))
             .route("/sdo", get(sdo_upload))
+            .route("/engineering-state", get(engineering_history))
+            .route("/engineering-state/refresh", post(engineering_refresh))
             .route("/system", get(system))
             .route("/pause", post(rt_pause))
             .route("/resume", post(rt_resume))
@@ -2557,4 +2563,34 @@ async fn sdo_upload(
         StatusCode::from_u16(status).expect("SDO status code"),
         Json(body),
     )
+}
+
+async fn engineering_history(State(state): State<AppState>) -> axum::response::Response {
+    match state.engineering.history(state.engineering_dir).await {
+        Ok(history) => Json(history).into_response(),
+        Err(message) => (StatusCode::SERVICE_UNAVAILABLE, message).into_response(),
+    }
+}
+
+async fn engineering_refresh(
+    State(state): State<AppState>,
+    Json(target): Json<ironplc_bridge::monitor::engineering::EngineeringTarget>,
+) -> axum::response::Response {
+    match state
+        .engineering
+        .refresh(
+            state.engineering_dir,
+            state.project_name,
+            target,
+            state.handle,
+        )
+        .await
+    {
+        Ok(result) => Json(result).into_response(),
+        Err((status, message)) => (
+            StatusCode::from_u16(status).expect("engineering status"),
+            message,
+        )
+            .into_response(),
+    }
 }

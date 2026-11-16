@@ -1,3 +1,4 @@
+import { EngineeringState } from "./EngineeringState"
 import { Info, Plus, Trash2 } from "@/components/ui/icons"
 
 import { Button } from "@/components/ui/button"
@@ -141,6 +142,7 @@ export function EthercatDeviceEditor({
       />
 
       <div className="min-h-0 flex-1 space-y-6 overflow-auto p-4">
+        <EngineeringState device={device.name} slaves={device.protocol === "ethercat" ? device.slaves.map(s => s.index) : []} />
         <section>
           <SectionHeader title="MainDevice" />
           <div className="ia2-field-grid">
