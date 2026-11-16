@@ -86,6 +86,11 @@ the deadline, and the LAST OBSERVED value ("expected level > 20 within
 6000ms — last observed 3.5") — fix the logic, re-run. Execution stops
 at the first failed step (later steps depend on earlier state).
 
+The [axis capture fixture](../../../../examples/axis_capture_sim/) uses the
+`_sim` EtherCAT clock. Its `pre_enable_abort.toml` verifies the PLC evidence
+for a consumed request with no motion start. Run the same fixture with the
+local edge binary to exercise capture and V1 export.
+
 The reference example lives at `examples/sim_smoke/` (tank integrator +
 alarm + scenario); it also runs as a cargo e2e test.
 

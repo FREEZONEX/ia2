@@ -117,6 +117,14 @@ contract](../../../../docs/api.md#offline-axis-replay). A successful HTTP
 request can include excluded runs and comparisons. Check each run's
 `status` and each comparison's `exclusion_reason`.
 
+For a synchronized edge, use
+`cs --server http://127.0.0.1:13001 api GET /axis-capture/<device>` over
+the monitor connection. Start and stop recordings by the runtime ID,
+bus generation and capture ID. Save the frozen archive before another start
+or runtime stop. Confirm PLC execution and parameter readbacks from independent
+evidence before [exporting a capture](../../../../docs/api.md#edge-axis-capture)
+as a V1 request.
+
 ## Domain verbs
 
 ### Validate / inspect (offline where possible)

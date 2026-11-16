@@ -599,6 +599,15 @@ start a second master to obtain a parameter dump. Rollback must retain the
 verification-mode runtime if replaying the previous binary's startup downloads
 would violate the current maintenance scope.
 
+### Recording an existing synchronized EtherCAT exchange
+
+Use the [edge capture API](api.md#edge-axis-capture) over the existing
+monitor connection to arm a bounded recording. Confirm the runtime, bus
+generation and axis before starting. Download the frozen archive before
+starting another capture or stopping the process. Validate the real PDO
+map and compare scan and bus timing with capture on and off as part of
+[axis capture field acceptance](axis-tuning.md#v2-bounded-edge-capture).
+
 ### Opt-in bus-clocked scans
 
 EtherCAT `scan_sync = true` selects the existing bus as the PLC clock and commits

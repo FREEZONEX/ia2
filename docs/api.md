@@ -194,6 +194,78 @@ being processed, a further request returns HTTP 503; retry after a replay finish
 See the [axis tuning milestone and roadmap](axis-tuning.md) for acceptance
 coverage and the next integration stages.
 
+## Edge axis capture
+
+These routes belong to the edge runtime. Use `cs --server <edge-loopback-url> api`
+on the existing monitor connection. Percent-encode a device name that contains
+slashes. Capture observes one axis on the existing `scan_sync` EtherCAT DC
+session. The capture API never sends a PDO or an SDO.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/axis-capture/{device}` | Return `runtime_id`, the current `bus` (or `null`), and the latest capture's progress (or `null`). |
+| POST | `/axis-capture/{device}` | Start one bounded capture. Return HTTP 201 and its ID and scope. |
+| GET | `/axis-capture/{device}/{id}` | Download the frozen raw archive as JSON. |
+| POST | `/axis-capture/{device}/{id}/stop` | Stop recording and return its final progress. Repeating the request for the same retained ID returns the same reason. |
+| POST | `/axis-capture/{device}/{id}/replay` | Supply independent evidence and download a one-run [V1 request](#offline-axis-replay). |
+
+Start with `{runtime_id, bus_generation, slave, counts_per_revolution,
+max_samples, duration_ms}`. Read the runtime and bus identities first.
+`slave` is a bus index from `bus.capturable_slaves`. Supply the verified
+motor encoder counts per revolution. The cycle period must divide 20 ms
+exactly. Both bounds are mandatory: 1–100,000 samples and 1–120,000 ms
+from acceptance. Each adapter keeps one recording. A new start replaces
+its previous frozen capture, so download the archive before starting again.
+
+The archive records the runtime, bus session generation, slave identity,
+configured PDO widths, signedness and byte offsets, encoder scale,
+whether the source is simulated, and the final reason. Each row describes an
+exchange attempt. TX and RX timestamps are in host monotonic nanoseconds
+relative to the start of that bus session. The output ticket is the one
+selected by the scan gate, or `null` if the gate selected its zero image.
+DC and WKC are reported from the returned exchange when available.
+`dc_gap` is the number of missed DC slots between adjacent recorded attempts,
+with `0` marking a discontinuity such as a repeat or reversal in the clock.
+`null` means the pair is consecutive or its clock evidence is incomplete.
+A transport failure, WKC mismatch, non-OP response or missing PDO
+cannot provide fresh feedback. A missed recorder lock is counted in
+`dropped_samples` and leaves a gap in attempt numbers.
+
+The sample limit, duration limit, explicit stop, or end of the bus session
+freezes the record. Only exchanges completed within the recording window
+are included. A reconnect creates a new generation and keeps the previous
+frozen capture until a new recording is started. A process restart clears
+the in-memory archive.
+
+The export body contains `{run_id, plc, profile?, cohort?, parameter_readback?}`.
+`plc` contains `capture_id`, the raw archive's `scope` plus
+`request_consumed`, `plc_started` (boolean or null), `normal_completion`,
+and optional `terminal_reason`, `scan_count_before` and `scan_count_after`.
+Provide an ordered pair if supplying scan counts. `parameter_readback`
+contains `{scope, values}`, with byte arrays using the V1 readback format.
+For normal completion the exporter requires a consumed request, a confirmed
+PLC start, increasing scan counts, a motion profile and a nonempty readback.
+Use separately recorded PLC evidence and independent parameter readbacks
+from the same runtime and bus generation. The export hashes the exact raw
+archive JSON bytes for the V1 source identity. Save the raw GET response
+with an HTTP client that preserves the bytes, such as `curl -fsS -o`.
+The JSON printed by `cs api` is formatted. Keep the raw archive and
+independent evidence with the exported request.
+
+V1 export unwraps signed 32-bit positions using the shortest modular steps.
+This assumes the initial target-to-feedback difference and each position
+increment fit inside half the encoder word. V1 requires numeric samples,
+so missing values are encoded as zero placeholders. Missing clocks,
+invalid PDO data, recorder drops and bus-session termination exclude the
+run from metrics. An OP exchange with the wrong WKC keeps that counter for
+V1 to flag. The raw archive retains the actual quality and end reason.
+
+An unsupported device or evicted capture returns 404. A changed runtime or
+generation, unavailable session, active recording on start, or download before
+freeze returns 409. Invalid bounds, axis selection or evidence are rejected.
+The runtime serves one raw or replay download at a time. A busy download
+returns 503. Save the archive before stopping the runtime.
+
 ## Health & lifecycle
 
 | Method | Path | Purpose | Notes |

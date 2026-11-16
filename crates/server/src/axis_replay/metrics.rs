@@ -1,33 +1,12 @@
 use std::ops::Range;
 
-use serde::{Deserialize, Serialize};
+use ironplc_bridge::axis_replay::{Profile, PEAK_NS};
+use serde::Serialize;
 
 use super::{Sample, Sampling, MAX_ABS_COUNTS};
 
-pub(super) const PEAK_NS: u64 = 20_000_000;
 const SPEED_NS: u64 = 100_000_000;
 const STARTUP_NS: u64 = 2_000_000_000;
-
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub(super) enum Profile {
-    Single {
-        command_rpm: f64,
-        steady_slots: u32,
-        settle_ns: u64,
-        encoder_span: Option<[i64; 2]>,
-    },
-    Reversal {
-        command_rpm: f64,
-        endpoints: [i64; 2],
-        ramp_slots: u16,
-        steady_slots: u16,
-        decel_slots: u16,
-        hold_slots: u16,
-        legs: u16,
-        steady_tail_slots: u16,
-    },
-}
 
 #[derive(Debug, Serialize)]
 pub(super) struct Metrics {

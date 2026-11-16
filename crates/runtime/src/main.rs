@@ -41,6 +41,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt as _;
 use tracing_subscriber::EnvFilter;
 
+mod axis_capture;
 mod northbound;
 mod panic_guard;
 mod supervisor;
@@ -561,6 +562,7 @@ async fn main() -> Result<()> {
             .route("/logs/stream", get(logs_stream))
             .route("/discover", get(discover))
             .route("/sdo", get(sdo_upload))
+            .merge(axis_capture::routes())
             .route("/system", get(system))
             .route("/pause", post(rt_pause))
             .route("/resume", post(rt_resume))

@@ -377,12 +377,17 @@ fn finish_step_tick(mode: &std::sync::Mutex<RuntimeMode>) {
     }
 }
 
+type AxisCaptureSlot = std::sync::OnceLock<(String, Arc<dyn iocore::axis_capture::AxisCapture>)>;
+
 /// Cheap-to-clone handle to a running scan loop. Multiple clones share the
 /// same `stop` flag, snapshot fan-out, and command queue. Drop the last
 /// clone to let resources go; explicit `.stop()` is preferred for clean
 /// shutdown.
 #[derive(Clone)]
 pub struct ProgramHandle {
+    /// There can be at most one scan-synchronized adapter. Keep its
+    /// passive observer accessible without queuing work on the scan loop.
+    axis_capture: Arc<AxisCaptureSlot>,
     stop: Arc<AtomicBool>,
     snapshot_tx: broadcast::Sender<VarSnapshot>,
     cmd_tx: tokio::sync::mpsc::Sender<RuntimeCommand>,
@@ -470,6 +475,13 @@ pub struct ProgramHandle {
 }
 
 impl ProgramHandle {
+    pub fn axis_capture(&self, device: &str) -> Option<Arc<dyn iocore::axis_capture::AxisCapture>> {
+        self.axis_capture
+            .get()
+            .filter(|(name, _)| name == device)
+            .map(|(_, capture)| capture.clone())
+    }
+
     /// Cooperative stop. The scan loop checks the flag between rounds, so a
     /// healthy scan in flight finishes, publishes, and the final RETAIN
     /// checkpoint is written. A scan still running `STOP_GRACE` after the flag
@@ -1055,6 +1067,8 @@ fn spawn_units_with_grace(
     let (latch_tx, latch_rx) = tokio::sync::mpsc::channel(1);
     let mode = Arc::new(std::sync::Mutex::new(RuntimeMode::Running));
     let forces = Arc::new(std::sync::Mutex::new(HashMap::<String, i32>::new()));
+    let axis_capture = Arc::new(AxisCaptureSlot::new());
+    let axis_capture_slot = axis_capture.clone();
     let device_reports = Arc::new(std::sync::Mutex::new(Vec::<DeviceReport>::new()));
     let device_health = Arc::new(std::sync::Mutex::new(Vec::<DeviceHealth>::new()));
     let watchdog_tripped = Arc::new(AtomicBool::new(false));
@@ -1122,6 +1136,14 @@ fn spawn_units_with_grace(
             }
         };
         let (mut devices, reports, failed_specs) = io_rt.block_on(acquire_devices(device_source));
+
+        if let Some(capture) = devices.iter().find_map(|device| {
+            device
+                .axis_capture_handle()
+                .map(|handle| (device.name().to_owned(), handle))
+        }) {
+            let _ = axis_capture_slot.set(capture);
+        }
 
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1348,6 +1370,7 @@ fn spawn_units_with_grace(
     });
 
     ProgramHandle {
+        axis_capture,
         stop,
         snapshot_tx,
         cmd_tx,

@@ -1,0 +1,9 @@
+[[tasks]]
+name = "motion"
+interval_ms = 20
+priority = 1
+
+[[programs]]
+instance = "main_inst"
+program = "main"
+task = "motion"

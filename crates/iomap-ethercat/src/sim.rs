@@ -21,13 +21,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use iocore::axis_capture::{AxisCapture, SlaveIdentity};
 use iocore::{ChannelValue, IoDevice, IoError};
 use project::{EthercatChannel, EthercatConfig, EthercatDataType, EthercatPdoDirection};
 
+use crate::axis_capture::{Recorder, Reply};
 use crate::validate;
 
 type SimImage = HashMap<String, ChannelValue>;
 pub struct SimEthercat {
+    capture: Option<Arc<Recorder>>,
     cycle: Option<Arc<crate::cycle::Gate<SimImage>>>,
     staged: Option<(crate::cycle::Ticket, SimImage)>,
     name: String,
@@ -199,6 +202,7 @@ impl SimEthercat {
             gear_axes = config.gear.len(),
             "ethercat device ready (sim mode)"
         );
+        let capture = Recorder::new(&name, config, true);
         if let Some(clock) = cycle.clone() {
             let values = values.clone();
             let stop = gear_stop.clone();
@@ -207,12 +211,39 @@ impl SimEthercat {
                 .filter(|c| c.direction == EthercatPdoDirection::RxPdo)
                 .map(|c| (c.name.clone(), c.data_type))
                 .collect();
+            let capture_worker = capture.clone();
+            let capture_slaves: Vec<_> = if capture_worker.is_some() {
+                discovered
+                    .iter()
+                    .map(|sd| SlaveIdentity {
+                        index: sd.index,
+                        name: sd.name.clone(),
+                        vendor_id: sd.vendor_id,
+                        product_id: sd.product_id,
+                        revision: None,
+                        serial: None,
+                        input_bytes: sd.input_bytes,
+                        output_bytes: sd.output_bytes,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let expected_wkc = capture_slaves
+                .iter()
+                .map(|sd| usize::from(sd.input_bytes > 0) + 2 * usize::from(sd.output_bytes > 0))
+                .sum::<usize>();
+            let cycle_ns = u64::from(config.cycle_us) * 1_000;
             std::thread::Builder::new()
                 .name("ec-sim-cycle".into())
                 .spawn(move || {
+                    let capture_session = capture_worker.as_ref().and_then(|capture| {
+                        capture.open_session(u16::try_from(expected_wkc).ok()?, capture_slaves)
+                    });
+                    let mut sequence = 0;
                     while !stop.load(Ordering::Relaxed) {
                         let now = std::time::Instant::now();
-                        clock.consume(|image| {
+                        let selected_ticket = clock.consume(|image| {
                             let mut live = values.lock().expect("sim values poisoned");
                             for (name, ty) in &outputs {
                                 live.insert(
@@ -226,6 +257,31 @@ impl SimEthercat {
                         });
                         let deadline = now + clock.period;
                         let image = values.lock().expect("sim values poisoned").clone();
+                        sequence += 1;
+                        if let Some((session, attempt)) =
+                            capture_session.as_ref().and_then(|session| {
+                                session
+                                    .begin(sequence, now)
+                                    .map(|attempt| (session, attempt))
+                            })
+                        {
+                            let tx = std::time::Instant::now();
+                            let (command, feedback) = attempt.sim_pdo(&image).unzip();
+                            let reply = Reply::Received {
+                                dc_ns: sequence * cycle_ns,
+                                wkc: session.expected_wkc(),
+                                all_op: true,
+                                feedback,
+                            };
+                            session.finish(
+                                attempt,
+                                tx,
+                                std::time::Instant::now(),
+                                selected_ticket,
+                                command,
+                                reply,
+                            );
+                        }
                         clock.publish(image, deadline);
                         std::thread::sleep(
                             deadline.saturating_duration_since(std::time::Instant::now()),
@@ -236,6 +292,7 @@ impl SimEthercat {
                 .map_err(|e| IoError::Connect(e.to_string()))?;
         }
         Ok(Self {
+            capture,
             cycle,
             staged: None,
             name,
@@ -269,6 +326,11 @@ impl IoDevice for SimEthercat {
     }
     fn is_healthy(&self) -> bool {
         !self.cycle.as_ref().is_some_and(|c| c.is_faulted())
+    }
+    fn axis_capture_handle(&self) -> Option<Arc<dyn AxisCapture>> {
+        self.capture
+            .clone()
+            .map(|handle| handle as Arc<dyn AxisCapture>)
     }
     fn cycle_period(&self) -> Option<std::time::Duration> {
         self.cycle.as_ref().map(|c| c.period)

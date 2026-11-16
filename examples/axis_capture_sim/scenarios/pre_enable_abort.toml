@@ -1,0 +1,16 @@
+description = "A trial request is consumed and leaves the axis disabled"
+
+[[steps]]
+expect = { var = "requests_consumed", op = "eq", value = 0, within_ms = 3000 }
+
+[[steps]]
+set = { var = "trial_request", value = true }
+
+[[steps]]
+expect = { var = "requests_consumed", op = "eq", value = 1, within_ms = 2000 }
+
+[[steps]]
+expect = { var = "trial_starts", op = "eq", value = 0, within_ms = 1000 }
+
+[[steps]]
+expect = { var = "drive_command", op = "eq", value = 0, within_ms = 1000 }

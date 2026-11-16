@@ -138,6 +138,11 @@ Use `cs api POST /api/axis-replay --from replay.json` to evaluate
 recorded axis motion and compare parameter trials offline. See the
 [axis tuning milestone and roadmap](docs/axis-tuning.md).
 
+The opt-in [edge axis capture](docs/api.md#edge-axis-capture) records the
+existing synchronized EtherCAT exchange and exports that replay format.
+Use `cs --server http://127.0.0.1:13001 api GET /axis-capture/<device>`
+to read the capture status over the edge's loopback monitor connection.
+
 ## Project on disk
 
 ```
