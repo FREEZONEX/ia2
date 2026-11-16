@@ -36,3 +36,6 @@ project = { path = "../project" }
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
+
+[target.'cfg(unix)'.dev-dependencies]
+rustix = { version = "1.1", features = ["fs", "process"] }

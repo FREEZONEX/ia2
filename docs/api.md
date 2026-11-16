@@ -114,6 +114,86 @@ Clients must associate versions with individual edit buffers, not a global
 latest-version cache: another agent/tab's new GET must never validate an
 older buffer. A conflict must preserve the local edits and stop Save/Run.
 
+## Offline axis replay
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/api/axis-replay` | Analyze captured axis samples and compare matched parameter trials. Stateless, usable without an open project. Accepts normalized JSON samples and returns per-run evidence and comparison results. |
+
+Use `cs api POST /api/axis-replay --from replay.json`. The server analyzes
+the request in memory. Source paths are labels carried into the response.
+The importer verifies archive hashes and attests PLC events and parameter
+readbacks before submission.
+
+### Request schema v1
+
+| Field | Shape |
+|---|---|
+| `schema_version` | `1` |
+| `sampling` | `{cycle_ns, counts_per_revolution, expected_wkc}`. Positive integers. The cycle must divide 20 ms exactly. All runs in a request use this sampling configuration. |
+| `runs[]` | `{id, source, evidence, cohort?, profile?, parameter_readback?, samples}`. Run IDs must be unique. |
+| `source` | `{path, sha256}`. Capture label and 64-hex-digit digest. |
+| `evidence` | `{zero_capture_drops, request_consumed, plc_started?, normal_completion, terminal_reason?}`. The first four fields are booleans. Omit or send `null` for unverified `plc_started`. |
+| `samples[]` | `{dc_ns, position_counts, target_counts, following_error_counts, torque_permille, controlword, statusword, error_code, wkc}`. One row per PDO return in capture order. Position and target are unwrapped motor encoder counts in the same coordinate frame, with magnitude at most 2⁵². Torque is in tenths of a percent of rated torque. CiA 402 control and status words are unsigned. |
+| `profile` | Single move or a continuous reversal profile as defined below. Supply a profile for normally completed runs. |
+| `cohort` | An importer-provided identity for comparable runs. Use the same value only when the axis, load, runtime, and preceding conditions match. |
+| `parameter_readback` | Object mapping parameter IDs to their independently read byte arrays. Use stable IDs and byte order across runs. |
+| `comparisons[]` | Optional `{id, parameter, max_start_span_counts, max_relative_target_delta_counts, design}`. `design` is `{kind:"pair", reference, candidate}` or `{kind:"aba", before, candidate, after}`, referring to run IDs. Send the A/B/A captures in their measured roles. |
+
+- A single move uses `{kind:"single", command_rpm, steady_slots, settle_ns, encoder_span?}`.
+  The sign of `command_rpm` sets direction. Target-position increments identify
+  the plateau on the nominal clock. After `settle_ns`, the optional
+  `[low, high]` encoder span restricts the evaluation to a complete traversal
+  of the specified range.
+- Continuous reversal uses `{kind:"reversal", command_rpm, endpoints, ramp_slots,
+  steady_slots, decel_slots, hold_slots, legs, steady_tail_slots}`. Supply a
+  positive speed, `[low, high]` endpoints, and an even leg count of at least
+  two. Legs start from the low endpoint and alternate direction. The
+  analyzer anchors the sequence at the recorded disable command and checks
+  every target against the declared trapezoid and endpoint holds.
+
+Each request may contain up to 24 MiB, 100,000 samples total, 32 runs,
+32 comparisons, and 256 parameter readbacks of up to 1 KiB each per run.
+Use separate requests for separate experiments. Invalid schema, oversized
+readbacks, duplicate IDs, and unknown comparison references
+return HTTP 400.
+A body over the byte limit returns HTTP 413. When two replays are already
+being processed, a further request returns HTTP 503; retry after a replay finishes.
+
+### Results
+
+- A run has `status`, `reason`, `terminal_reason`, `capture`, and `metrics`.
+  `analyzed` requires a consumed request, confirmed PLC start and normal
+  completion, and one continuous enable command with matching feedback.
+  It includes a two-second startup window, enabled speed/torque peaks,
+  and per-leg steady statistics. Feedback speed uses the measured DC time
+  over 20 ms or 100 ms of nominal slots. Steady RMS is the population RMS
+  after subtracting mean speed. Reversals include overshoot, hold-end
+  error, and turnaround torque.
+- An excluded run has `metrics:null`. `dc_discontinuity` includes counts of
+  discontinuities and missing slots, and the first pair of DC timestamps.
+  `pre_enable_abort` requires a consumed request, verified absence of a PLC
+  start, and zero enable commands and feedback. Other exclusions cover
+  insufficient capture or a missing (zero) DC reference time, WKC mismatch,
+  drive fault, incomplete execution,
+  and invalid profiles. Counts with magnitude above 2⁵² exclude that run
+  with `status: "invalid_profile"` and `metrics:null`; the request still
+  returns HTTP 200 so other runs can be evaluated.
+- A comparison returns either `result` or `exclusion_reason`. It requires
+  analyzed, distinct captures in the same cohort and profile, starts inside
+  the declared span, and readbacks differing only for the selected
+  parameter. The recorded target intervals must have the same slot count.
+  Subtract each capture's target at enable before checking the per-slot
+  difference between the candidate and each reference. Metrics use the
+  median of each group and direction. An A/B/A comparison reports both
+  reference medians, their spread, and the change
+  relative to their mean. `assessment` indicates where the candidate falls
+  relative to the observed references. These are descriptive comparisons
+  scoped to the measured conditions.
+
+See the [axis tuning milestone and roadmap](axis-tuning.md) for acceptance
+coverage and the next integration stages.
+
 ## Health & lifecycle
 
 | Method | Path | Purpose | Notes |
@@ -210,11 +290,23 @@ read-only device-template catalog used to pre-fill devices from a bus scan.
 | `GET` | `/api/hmi/{path}/check` | Structural validation plus variable-existence warnings against the project's POUs. Returns `HmiIssue[]`. |
 | `POST` | `/api/hmi/{path}/generate` | Deterministic first-pass screen from project truth (alarmbar, per-POU sections, BOOL→indicator, numeric→value, `*_sp`→setpoint input, one trend). Body `{ force?, title? }`; 409 if the screen exists and `force` is absent. Returns the generated `HmiDoc`. |
 | `GET` | `/api/hmi-symbols` | The built-in symbol catalog (`HmiSymbolInfo[]`: name, bindable keys, props, default size) — an agent's palette reference. |
-| `GET` | `/api/library` | Registry libraries + per-project import state. Returns `LibrarySummary[]` (name, version, `imported_version`, `imported_files`). |
-| `POST` | `/api/library/import` | Vendor blocks into the project. Body: `ImportLibraryRequest { library, blocks?[] }` (empty `blocks` = all; re-import overwrites = the update path). Returns `ImportLibraryResponse { library, version, imported[] }`. |
+| `GET` | `/api/library` | Registry libraries and the selected project's import state. Returns `LibrarySummary[]` (name, version, `imported_version`, `imported_files`). With no project open and no selector, returns the registry alone. An explicit unknown project returns 400. |
+| `POST` | `/api/library/import` | Commit the selected block files and their version entry together. Body `ImportLibraryRequest { library, blocks?[] }`. Empty `blocks` selects all. Re-import overwrites selected files and preserves the rest. Returns `ImportLibraryResponse { library, version, imported[] }` after commit. |
 | `DELETE` | `/api/library/{name}` | Drop `pous/lib/<name>/` and the project.toml entry. Idempotent. |
 | `GET` | `/api/device-catalog` | Validated device templates from `<library-dir>/devices/`. Returns `CatalogEntry[]`. |
 | `GET` | `/api/device-catalog/match?vendor_id=&product_id=` | Resolve a discovered slave's identity to a catalog template (pre-fill a device from an EtherCAT scan instead of hand-typing PDI offsets). Returns `CatalogEntry`; 404 when the identity isn't catalogued. |
+
+Library import publishes the existing project mutation after commit.
+Import and removal return 409 for aliases on the project filesystem or
+when a required replacement cannot preserve file access permissions.
+A failure before commit rolls back the selected files and version entry.
+If rollback needs intervention or the commit result cannot be confirmed,
+the API returns 503 with a recovery or commit message. Library state reads
+also return 503 while the selected project is busy or blocked on recovery.
+A committed import can return success while removal of its recovery files
+is pending. After losing an import response, reopen or read the project to
+determine the imported version and contents before deciding whether to retry.
+[Library import recovery](library-import.md)
 
 ## Devices
 
@@ -336,29 +428,34 @@ Online debugging of the locally-running program (the IDE-side bridge). For
 the *deployed* edge runtime, proxy the same ops through
 `POST /api/edges/{name}/runtime/{op}`. All return `409` when nothing is running.
 
-Variable writes accept optional `pulse_ms: <u32>`: the runtime writes zero
-after that delay, counted from when the write was applied (time it spent
-queued behind a slow scan does not shorten the pulse), including while
-paused. A later accepted pulse, ordinary
-write (including MQTT), or force to the same resolved variable supersedes
-the earlier reset; bare and qualified names share ownership. Rejected writes
-leave the existing reset active. The current reset bypasses write governance
-so a positive minimum cannot prevent zero. If its device is disconnected,
-zero still lands in the VM and the runtime logs the failed delivery; normal
-output synchronization sends the current value when the link returns.
-Once the request has been read, neither the write nor its reset depends on
-the client: one that disconnects before the answer still gets both.
+Variable writes accept optional `pulse_ms: <u32>`. The duration starts when
+the write is applied to the VM. The runtime services due resets on the first
+eligible scan round at or after expiry, including while paused. Each round
+has a separate budget of up to 16 due resets, earliest deadline first. Any
+remaining expiries carry over to subsequent rounds. A later accepted pulse,
+ordinary write (including MQTT), or force to the same resolved variable
+supersedes the earlier reset. Bare and qualified names share ownership.
+Rejected writes leave the existing reset active. The reset bypasses write
+governance so a positive minimum cannot prevent zero. If its device is
+disconnected, zero still lands in the VM and the runtime logs that delivery
+is unconfirmed. Normal output synchronization sends the current value when
+the link returns. Once enqueued, the pulse write and its reset survive a
+client disconnect.
 This contract is shared by the IDE server and the edge runtime's `/write`.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/api/runtime/pause` | Halt the scan loop: the program stops advancing and no new outputs are pushed, but adapter workers (the EtherCAT cyclic thread, Modbus polling) keep running and keep sending the last values — a debug stop, not a safe state; stopping the program runs the failsafe pass. Returns `ModeResponse { mode }`. |
+| `POST` | `/api/runtime/pause` | Pause program execution. In timer-driven mode, adapter workers continue and may hold the last output values. In bus-clocked mode, pause latches normal outputs off until restart. Check `failsafe_status` for adapter acknowledgements. Returns `ModeResponse { mode }`. |
 | `POST` | `/api/runtime/resume` | Resume free-running. Returns `ModeResponse`. |
 | `POST` | `/api/runtime/step` | Advance N cycles while paused. Body: `StepRequest { cycles }` (default 1). Returns `ModeResponse`. |
 | `GET` | `/api/runtime/forces` | List currently-forced variables. Returns `ForceEntry[]` (`[]` when not running). |
 | `POST` | `/api/runtime/forces/{name}` | Pin a variable every cycle until released. Body: `ForceRequest { value }`. Returns `ForceResponse { name, value }`; 404 unknown variable, 409 if stopped. **Precedence:** the force is applied after the input read and *before* the program runs, so it beats the bus but loses to the program — a variable the program assigns every scan (most outputs) is overwritten by that assignment and the forced value never reaches the field. Force is for variables the program only reads. |
 | `DELETE` | `/api/runtime/forces/{name}` | Release a forced variable. Idempotent (200 even if it wasn't forced). |
 | `POST` | `/api/runtime/inject-scan-stall` | Fault injection (test primitive): stall the next `scans` scans by `stall_ms` each so the scan watchdog trips through its real overrun path. Body: `{ stall_ms, scans? }` (`scans` defaults to threshold + 1). Backs the scenario DSL's `inject` step; on a live plant this deliberately drives the runtime into latched failsafe — only a program restart recovers. 409 if stopped. |
+
+Server and edge debug writes, force changes and scan-stall injection return
+HTTP 429 when the scan command queue is full. Rejection happens before enqueueing. Stop and output inhibition have their own paths. See the
+[cycle handoff contract](scan-cycle-handoff.md) for timing and fault fields.
 
 ## Runtime history & alarms
 
@@ -445,7 +542,7 @@ origin header to the runtime, where every write — whatever it claimed
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/api/lsp` | WebSocket upgrade. Bridges to a freshly-spawned ironplc LSP process (JSON-RPC). | Frame format = bare JSON-RPC bodies — proxy adds/strips Content-Length headers for stdio |
+| `GET` | `/api/lsp` | WebSocket upgrade. Bridges to a freshly-spawned ironplc LSP process (JSON-RPC). Frame format = bare JSON-RPC bodies — proxy adds/strips Content-Length headers for stdio. If the launcher cannot start, closes with code `1011` and a short reinstall message; the server log includes the full launcher path. |
 
 ## Internal / debug aids
 
@@ -528,7 +625,7 @@ the IDE server. The legacy-browser limitation above also applies here.
 | `GET` | `/logs/stream` | SSE stream of log lines as they're emitted (no backlog; pair with `/logs` for history). |
 | `GET` | `/discover` | Per-device connect reports + discovered EtherCAT topology. Powers `cs get edges/<n>/scan`. |
 | `GET` | `/system` | Edge NICs / serial ports / arch, for authoring device configs against real edge facts. Powers `cs get edges/<n>/system`. |
-| `POST` | `/pause` | Halt the scan loop: the program stops advancing and no new outputs are pushed, but adapter workers (the EtherCAT cyclic thread, Modbus polling) keep running and keep sending the last values — a debug stop, not a safe state; stopping the program runs the failsafe pass. Returns `{ mode }`. |
+| `POST` | `/pause` | Pause program execution with the same output semantics as `/api/runtime/pause`. Returns `{ mode }`. |
 | `POST` | `/resume` | Resume free-running. Returns `{ mode }`. |
 | `POST` | `/step` | Advance N cycles while paused. Body: `{ cycles }`. Returns `{ mode }`. |
 | `POST` | `/write` | One-shot write of a variable. Body: `{ name, value }`. Returns the applied value. Subject to the deployed project's `[governance]` (project.toml): `write_mode = "allowlist"` rejects writes to variables with no matching `[[governance.rules]]` entry (403), and a rule's `min`/`max` clamp the value (the response echoes the clamped value — a clamp is also logged and lands in `/audit` as `result: "clamped"` with both `requested` and `applied`, never silent). A write no honest clamp exists for is denied 403 instead: `NaN` to a min/max-ruled REAL, or a rule range containing no representable value of the variable's type. The response also carries `undelivered_device`: when the variable has an Output mapping onto a device whose transport is down, the write is still applied (a Stop that flushes when the link returns beats one never commanded) and this names that device, so a caller must not report a bare success. `null` on a healthy link or an internal variable — and it is transport health only, never proof that the value took effect. |
@@ -608,10 +705,11 @@ its configuration with `cs api GET /api/edges/<percent-encoded-full-name>`.
 The existing local runtime status and edge status surfaces include optional
 `device_health[].cycle` for `scan_sync` EtherCAT devices. It contains period,
 issued/committed/consumed counters, the first latched fault, and a bounded ring
-of monotonic host-time events. A cycle fault sets `watchdog_tripped` and makes
-that device unhealthy; resuming or bus recovery does not clear it. The CLI
-resource is unchanged: `cs get runtime/status`. Details and timing limits:
-[cycle handoff contract](scan-cycle-handoff.md).
+of monotonic host-time events. Optional `handoff_timing` aggregates timings
+over every accepted commit since the gate was created. `committed` gives its
+coverage. A cycle fault sets `watchdog_tripped` and makes that device unhealthy.
+Explicit program restart creates a new gate. See the field definitions in
+the [cycle handoff contract](scan-cycle-handoff.md).
 
 ### Output inhibition and device acknowledgement
 

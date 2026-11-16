@@ -10,8 +10,10 @@ pub enum ApiError {
     NoProject,
     NotFound(String),
     Conflict(String),
+    TooManyRequests(String),
     PreconditionFailed,
     BadRequest(String),
+    PayloadTooLarge(String),
     /// 422 — the request was well-formed but the resulting state fails
     /// validation (e.g. an HMI ops batch whose result has structural
     /// errors).
@@ -19,6 +21,7 @@ pub enum ApiError {
     /// 403 — the request was understood but project policy forbids it
     /// (write governance denied the write).
     Forbidden(String),
+    Unavailable(String),
     Internal(String),
 }
 
@@ -35,6 +38,11 @@ impl From<StoreError> for ApiError {
             StoreError::EdgeNotFound(n) => Self::NotFound(format!("edge '{n}' not found")),
             StoreError::FolderNotFound(n) => Self::NotFound(format!("folder '{n}' not found")),
             StoreError::FolderNotEmpty(n) => Self::Conflict(format!("folder '{n}' not empty")),
+            e @ (StoreError::LibraryPathConflict(..)
+            | StoreError::LibraryPermissionConflict { .. }) => Self::Conflict(e.to_string()),
+            e @ (StoreError::LibraryBusy
+            | StoreError::LibraryRecoveryRequired(..)
+            | StoreError::LibraryCommitUnconfirmed(..)) => Self::Unavailable(e.to_string()),
             other => Self::Internal(other.to_string()),
         }
     }
@@ -62,6 +70,7 @@ impl From<ironplc_bridge::RuntimeWriteError> for ApiError {
         match e {
             E::UnknownVariable(n) => Self::NotFound(format!("variable '{n}' not declared")),
             E::Disconnected => Self::Conflict("scan loop has stopped".into()),
+            E::Busy => Self::TooManyRequests(e.to_string()),
             E::Vm(msg) => Self::Internal(msg),
             E::GovernanceDenied(n) => {
                 Self::Forbidden(format!("write to '{n}' rejected by project governance"))
@@ -76,11 +85,14 @@ impl IntoResponse for ApiError {
             Self::NoProject => (StatusCode::CONFLICT, "no project open".to_string()),
             Self::NotFound(s) => (StatusCode::NOT_FOUND, s),
             Self::Conflict(s) => (StatusCode::CONFLICT, s),
+            Self::TooManyRequests(s) => (StatusCode::TOO_MANY_REQUESTS, s),
             Self::PreconditionFailed => (StatusCode::PRECONDITION_FAILED,
                 "document changed since it was read; re-read it and reapply your edit (local edits have not been saved)".into()),
             Self::BadRequest(s) => (StatusCode::BAD_REQUEST, s),
+            Self::PayloadTooLarge(s) => (StatusCode::PAYLOAD_TOO_LARGE, s),
             Self::Unprocessable(s) => (StatusCode::UNPROCESSABLE_ENTITY, s),
             Self::Forbidden(s) => (StatusCode::FORBIDDEN, s),
+            Self::Unavailable(s) => (StatusCode::SERVICE_UNAVAILABLE, s),
             Self::Internal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
         };
         (status, body).into_response()

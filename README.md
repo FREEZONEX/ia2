@@ -134,6 +134,10 @@ HTTP 412 / CLI exit 2: re-read and reapply your edit, without discarding the
 other writer's changes. New named resources need no flag. Raw `cs api`
 requests remain compatible and unconditional unless a precondition is sent.
 
+Use `cs api POST /api/axis-replay --from replay.json` to evaluate
+recorded axis motion and compare parameter trials offline. See the
+[axis tuning milestone and roadmap](docs/axis-tuning.md).
+
 ## Project on disk
 
 ```
@@ -175,6 +179,10 @@ systemd — the unit's `--bind` port and `ActiveState` — so a wrong or
 changed port (or a stopped service) gives a clear answer instead of a
 blind failure. A transient EtherCAT bring-up timeout is retried rather
 than left dead until a manual restart. See `docs/edge-deploy.md`.
+
+Proposed product capability: [device parameter state and change tracking](docs/field-state-design.md)
+— timestamped observations shared by the API, CLI and UI, with explicit historical
+state and evidence references. See the [review and regression plan](docs/field-state-regression.md).
 
 ## Agent skill (Claude Code · Codex · Kimi Code · Cursor · …)
 

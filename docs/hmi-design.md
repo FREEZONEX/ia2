@@ -160,6 +160,12 @@ data source in v1 — the live `VarSnapshot` stream — because that is the one
 source that exists; the spec object leaves room for `device_health` and
 history queries later without reshaping documents.
 
+Bindings accept `BYTE`, `WORD`, `DWORD` and `LWORD` feedback in IEC
+`2#`, `8#` and `16#` notation. A plain readout keeps the original notation.
+Expressions, maps, numeric formats and live trends use the numeric value
+within the declared type's width and JavaScript's safe integer range. A
+wider `LWORD` can still be displayed in full as text.
+
 **Actions** are the write path and are never implicit. A node may carry
 `action.tap` (or `action.commit` for `input`) of kind `write`, `toggle`,
 `pulse` (write 1 then 0 after `ms`) or `nav`, each naming a variable and

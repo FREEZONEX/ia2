@@ -1,3 +1,4 @@
+mod axis_replay;
 mod catalog;
 mod conditional;
 #[cfg(test)]
@@ -317,6 +318,7 @@ async fn main() -> anyhow::Result<()> {
         // Compile / runtime
         .route("/api/check", post(routes::check))
         .route("/api/symbols", post(routes::symbols))
+        .route("/api/axis-replay", axis_replay::route())
         .route("/api/run", post(routes::run))
         .route("/api/stop", post(routes::stop))
         .route("/api/events", get(routes::events))
@@ -467,6 +469,11 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     let local = listener.local_addr()?;
+    // Opt-in machine-readable bind result for subprocess callers. Publish
+    // only after this process owns the listener.
+    if std::env::var("IA2_PRINT_LISTEN_ADDR").as_deref() == Ok("1") {
+        println!("IA2_LISTEN_ADDR={local}");
+    }
     tracing::info!(addr = %local, "server listening");
     // Agent-activity watchdog: every 500 ms, check whether the last
     // CLI heartbeat aged out past the TTL; if so, flip `active=false`

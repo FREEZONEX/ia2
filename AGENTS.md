@@ -75,17 +75,19 @@ directories.
    numbers, or customer document references in code, comments, or
    commits; libraries carry no vendor-benchmark names.
 
-## Quality gate (there is NO CI — run this locally before finishing)
+## Local quality gate
+
+Prepare the Rust and Web dependencies separately using the repository's lock files.
 
 ```bash
-./scripts/check-agent-adaptation.sh
-cargo fmt --all
-cargo clippy --workspace --all-targets -- -D warnings   # exit code proves it
-cargo build -p server          # real server required by CLI sim e2e
-cargo test  --workspace         # includes the sim e2e + deploy-script tests
-cargo build --release -p server -p ia2-cli -p ia2-runtime -p lsp-launcher
-pnpm --filter @cs/web build && pnpm --filter @cs/web test
+git submodule update --init --recursive
+cargo fetch --locked
+pnpm install --frozen-lockfile
+python3 scripts/offline-regression.py
 ```
+
+`just ci` runs the same entry point. See [local regression](docs/local-regression.md)
+for evidence, targeted suites, and startup diagnostics.
 
 `cargo test -p server` also regenerates `apps/web/src/types/generated/`
 (ts-rs, via the `TS_RS_EXPORT_DIR` in `.cargo/config.toml`). The

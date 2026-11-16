@@ -366,7 +366,7 @@ fn host_deadline_still_applies_inside_the_phase_selection_window() {
         if late {
             assert_eq!(
                 clock.status().fault.as_deref(),
-                Some("missing output frame or missed bus cycle")
+                Some("bus cycle missed output selection deadline")
             );
             assert_latched(&clock, &mut continuity, selected);
         } else {

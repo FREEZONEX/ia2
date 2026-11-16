@@ -1594,6 +1594,7 @@ fn write_err(e: RuntimeWriteError) -> (StatusCode, String) {
         RuntimeWriteError::Disconnected => {
             (StatusCode::CONFLICT, "scan loop has stopped".to_string())
         }
+        RuntimeWriteError::Busy => (StatusCode::TOO_MANY_REQUESTS, e.to_string()),
         RuntimeWriteError::Vm(e) => (StatusCode::INTERNAL_SERVER_ERROR, e),
         RuntimeWriteError::GovernanceDenied(n) => (
             StatusCode::FORBIDDEN,

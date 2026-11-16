@@ -1,7 +1,7 @@
 //! HTTP route handlers.
 //!
 //! Grouped by concern (project lifecycle / POUs / devices / iomap / runtime
-//! / health) but kept in one file because the layer is still small.
+//! / health), with extracted handlers in dedicated child modules.
 
 use crate::conditional::{self, Versioned};
 use axum::http::HeaderMap;
@@ -9,23 +9,16 @@ use axum::http::HeaderMap;
 use std::convert::Infallible;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 
 use axum::{
-    extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
-        FromRequestParts, Path as AxumPath, Query, State,
-    },
+    extract::{FromRequestParts, Path as AxumPath, Query, State},
     http::request::Parts,
-    response::{
-        sse::{Event, KeepAlive, Sse},
-        IntoResponse,
-    },
+    response::sse::{Event, KeepAlive, Sse},
     Json,
 };
 use futures_util::stream::Stream;
-use futures_util::{SinkExt, StreamExt as FuturesStreamExt};
+use futures_util::StreamExt as FuturesStreamExt;
 use ironplc_bridge::{CheckDiagnostic, DeviceSpec, VariableInfo};
 use project::{
     default_projects_dir, load_last_opened, save_last_opened, Device, Edge, EthercatBringup, IoMap,
@@ -33,8 +26,6 @@ use project::{
     ProjectManifest, ProjectStore, ProjectTree, Protocol, ProtocolConfig, Task, Tasks,
 };
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt as TokioStreamExt;
 use ts_rs::TS;
@@ -44,6 +35,11 @@ use crate::error::ApiError;
 use crate::events::{topic, AppEvent, MutationDetail};
 use crate::state::RunningProgram;
 use serde::Deserialize as SerdeDeserialize;
+
+mod library_catalog;
+pub use library_catalog::{
+    import_library, list_device_catalog, list_libraries, match_device_catalog, remove_library,
+};
 
 /// HTTP header name used by every multi-project-aware client. The web
 /// app sets it from the `?project=` URL search param; CLI sets it
@@ -624,14 +620,14 @@ pub async fn get_pou(
     AxumPath(path): AxumPath<String>,
 ) -> Result<Versioned<Pou>, ApiError> {
     with_project(&state, &project, |store| {
-        let file = conditional::file(store, "pous", &path)?;
-        conditional::read(&file, || {
-            let language = store.pou_file_language(&path)?;
-            let source = store.read_pou_source(&path)?;
-            Ok(Pou {
-                path: path.clone(),
-                declarations: ironplc_bridge::extract_pou_declarations(&source, language),
-                source,
+        store.with_pou_file(&path, |file, language| {
+            conditional::read(file, || {
+                let source = std::fs::read_to_string(file).map_err(project::StoreError::from)?;
+                Ok(Pou {
+                    path: path.clone(),
+                    declarations: ironplc_bridge::extract_pou_declarations(&source, language),
+                    source,
+                })
             })
         })
     })
@@ -769,169 +765,6 @@ fn reject_library_path(path: &str) -> Result<(), ApiError> {
         ));
     }
     Ok(())
-}
-
-/// GET /api/library — every library in the server's registry, each
-/// decorated with its imported state in the addressed project (when
-/// one is open; browse works without).
-pub async fn list_libraries(
-    State(state): State<AppState>,
-    project: ProjectName,
-) -> Json<Vec<crate::library::LibrarySummary>> {
-    let registry = crate::library::scan(state.library_dir.as_deref());
-    let mut out: Vec<_> = registry.iter().map(|l| l.to_summary()).collect();
-    // No open project (agent browsing a fresh server) → plain listing.
-    let _ = with_project(&state, &project, |store| {
-        let versions = store.read_libraries()?;
-        let slugs = store.list_pou_paths()?;
-        for summary in &mut out {
-            summary.imported_version = versions.get(&summary.name).cloned();
-            let prefix = format!("{}/{}/", project::LIBRARY_SLUG_PREFIX, summary.name);
-            summary.imported_files = slugs
-                .iter()
-                .filter_map(|s| s.strip_prefix(&prefix))
-                .filter(|rest| !rest.contains('/'))
-                .map(str::to_string)
-                .collect();
-        }
-        Ok(())
-    });
-    Json(out)
-}
-
-#[derive(Debug, Deserialize, TS)]
-#[ts(export)]
-pub struct ImportLibraryRequest {
-    /// Registry library name, e.g. `process-control`.
-    pub library: String,
-    /// Bare block file names to import (`fb_pid.st`). Empty / omitted
-    /// imports every block in the library. Re-importing overwrites —
-    /// that's the update path.
-    #[serde(default)]
-    pub blocks: Vec<String>,
-}
-
-#[derive(Debug, Serialize, TS)]
-#[ts(export)]
-pub struct ImportLibraryResponse {
-    pub library: String,
-    pub version: String,
-    /// Block files written under `pous/lib/<library>/`.
-    pub imported: Vec<String>,
-}
-
-/// POST /api/library/import — vendor registry blocks into the project.
-pub async fn import_library(
-    State(state): State<AppState>,
-    project: ProjectName,
-    Json(req): Json<ImportLibraryRequest>,
-) -> Result<Json<ImportLibraryResponse>, ApiError> {
-    let registry = crate::library::scan(state.library_dir.as_deref());
-    let lib = registry
-        .into_iter()
-        .find(|l| l.name == req.library)
-        .ok_or_else(|| ApiError::NotFound(format!("library '{}' not in registry", req.library)))?;
-
-    let chosen: Vec<&crate::library::RegistryBlockFile> = if req.blocks.is_empty() {
-        lib.blocks.iter().collect()
-    } else {
-        req.blocks
-            .iter()
-            .map(|want| {
-                lib.blocks.iter().find(|b| &b.file == want).ok_or_else(|| {
-                    ApiError::BadRequest(format!(
-                        "library '{}' has no block file '{want}'",
-                        lib.name
-                    ))
-                })
-            })
-            .collect::<Result<_, _>>()?
-    };
-
-    // Read every source up-front so an unreadable registry file fails
-    // the request before the project is half-written.
-    let mut files = Vec::with_capacity(chosen.len());
-    for block in &chosen {
-        let content = fs::read_to_string(&block.path).map_err(|e| {
-            ApiError::Internal(format!("reading registry block '{}': {e}", block.file))
-        })?;
-        files.push((block.file.clone(), content));
-    }
-
-    let imported = with_project(&state, &project, |store| {
-        for (file, content) in &files {
-            store.write_library_file(&lib.name, file, content)?;
-        }
-        store.set_library_entry(&lib.name, &lib.version)?;
-        Ok(files.iter().map(|(f, _)| f.clone()).collect::<Vec<_>>())
-    })?;
-    emit_mutation(
-        &state,
-        &project,
-        topic::PROJECT,
-        MutationDetail::LibraryImported {
-            name: lib.name.clone(),
-        },
-    );
-    Ok(Json(ImportLibraryResponse {
-        library: lib.name,
-        version: lib.version,
-        imported,
-    }))
-}
-
-/// GET /api/device-catalog — validated device templates from
-/// `<library-dir>/devices/` (see library/devices/README.md).
-pub async fn list_device_catalog(
-    State(state): State<AppState>,
-) -> Json<Vec<crate::catalog::CatalogEntry>> {
-    Json(crate::catalog::scan(state.library_dir.as_deref()))
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CatalogMatchQuery {
-    pub vendor_id: u32,
-    pub product_id: u32,
-}
-
-/// GET /api/device-catalog/match?vendor_id=&product_id= — resolve a
-/// discovered slave's identity to a catalog template, so the IDE /
-/// agent can pre-fill a device from a bus scan instead of hand-typing
-/// PDI offsets. 404 when the identity isn't in the catalog.
-pub async fn match_device_catalog(
-    State(state): State<AppState>,
-    Query(q): Query<CatalogMatchQuery>,
-) -> Result<Json<crate::catalog::CatalogEntry>, ApiError> {
-    let entries = crate::catalog::scan(state.library_dir.as_deref());
-    crate::catalog::match_identity(&entries, q.vendor_id, q.product_id)
-        .cloned()
-        .map(Json)
-        .ok_or_else(|| {
-            ApiError::NotFound(format!(
-                "no catalog entry for vendor_id={} product_id={}",
-                q.vendor_id, q.product_id
-            ))
-        })
-}
-
-/// DELETE /api/library/{name} — drop `pous/lib/<name>/` and the
-/// project.toml entry. Idempotent on the directory.
-pub async fn remove_library(
-    State(state): State<AppState>,
-    project: ProjectName,
-    AxumPath(name): AxumPath<String>,
-) -> Result<Json<RunResponse>, ApiError> {
-    with_project(&state, &project, |store| {
-        store.remove_library_dir(&name)?;
-        store.remove_library_entry(&name).map_err(Into::into)
-    })?;
-    emit_mutation(
-        &state,
-        &project,
-        topic::PROJECT,
-        MutationDetail::LibraryRemoved { name },
-    );
-    Ok(Json(RunResponse { ok: true }))
 }
 
 /// Variables declared inside any POU in this file. Empty list if parse
@@ -2312,13 +2145,10 @@ pub async fn validate_project(
         // /alarms that claims coverage it does not have.
         {
             let alarms = store.read_alarms()?;
-            let mut sources = Vec::new();
-            for path in store.list_pou_paths()? {
-                sources.push(store.read_pou_source(&path)?);
-            }
-            let declared_names: Vec<String> = sources
+            let declared_names: Vec<String> = store
+                .read_pous()?
                 .iter()
-                .flat_map(|src| ironplc_bridge::extract_variables(src))
+                .flat_map(|pou| ironplc_bridge::extract_variables(&pou.source))
                 .map(|v| v.name)
                 .collect();
             let declared: std::collections::HashSet<&str> =
@@ -2399,11 +2229,13 @@ pub async fn project_pous(
     project: ProjectName,
 ) -> Result<Json<ProjectPous>, ApiError> {
     with_project(&state, &project, |store| {
-        let paths = store.list_pou_paths()?;
         let mut out = Vec::new();
-        for path in paths {
-            let language = store.pou_file_language(&path)?;
-            let source = store.read_pou_source(&path)?;
+        for project::PouFileSource {
+            path,
+            source,
+            language,
+        } in store.read_pous()?
+        {
             for d in ironplc_bridge::extract_pou_declarations(&source, language) {
                 out.push(PouInProject {
                     file_path: path.clone(),
@@ -2447,10 +2279,8 @@ pub async fn project_variables(
     project: ProjectName,
 ) -> Result<Json<ProjectVariables>, ApiError> {
     with_project(&state, &project, |store| {
-        let paths = store.list_pou_paths()?;
         let mut out = Vec::new();
-        for path in paths {
-            let source = store.read_pou_source(&path)?;
+        for project::PouFileSource { path, source, .. } in store.read_pous()? {
             for v in ironplc_bridge::extract_variables(&source) {
                 out.push(ProjectVariable {
                     file_path: path.clone(),
@@ -2958,187 +2788,8 @@ pub async fn poke_demo_slave(
     Ok(Json(RunResponse { ok: true }))
 }
 
-// ============================================================
-//  LSP WebSocket bridge
-// ============================================================
-
-/// Ceiling on one LSP message body from the child. Semantic tokens for a
-/// large POU are measured in kilobytes; 16 MiB is far above anything real and
-/// far below "allocate whatever the stream claims".
-const MAX_LSP_BODY_BYTES: usize = 16 * 1024 * 1024;
-
-/// Ceiling on one header line. `read_line` grows its buffer until a newline
-/// arrives, so a child emitting none would grow it without limit.
-const MAX_LSP_HEADER_BYTES: usize = 8 * 1024;
-
-/// Upgrade to WebSocket and bridge to a freshly-spawned ironplc LSP
-/// process. WS frames are LSP JSON-RPC bodies (no Content-Length header);
-/// the proxy adds/strips headers when talking to stdio.
-pub async fn lsp(ws: WebSocketUpgrade) -> impl IntoResponse {
-    ws.on_upgrade(handle_lsp_ws)
-}
-
-fn lsp_launcher_path() -> PathBuf {
-    if let Ok(p) = std::env::var("LSP_LAUNCHER") {
-        return PathBuf::from(p);
-    }
-    let mut path = std::env::current_exe().expect("current_exe");
-    path.pop();
-    path.push("lsp-launcher");
-    path
-}
-
-async fn handle_lsp_ws(mut socket: WebSocket) {
-    let cmd = lsp_launcher_path();
-    let mut child = match Command::new(&cmd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!(path = %cmd.display(), %e, "failed to spawn lsp-launcher");
-            // Close with a reason instead of dropping the socket cold:
-            // the browser's devtools then show WHY the LSP died (a
-            // missing sidecar binary — i.e. an incomplete install)
-            // rather than a bare disconnect. The editor keeps working
-            // either way; diagnostics come from /api/check.
-            let _ = socket
-                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                    code: 1011, // internal error
-                    reason: format!(
-                        "lsp-launcher not available at {} — reinstall (the \
-                         binary ships alongside ia2-server)",
-                        cmd.display()
-                    )
-                    .into(),
-                })))
-                .await;
-            return;
-        }
-    };
-    tracing::info!(path = %cmd.display(), "lsp-launcher spawned for ws client");
-
-    let mut stdin = child.stdin.take().expect("stdin");
-    let stdout = child.stdout.take().expect("stdout");
-    let (mut ws_tx, mut ws_rx) = FuturesStreamExt::split(socket);
-
-    // WS → child stdin: add LSP Content-Length framing.
-    let to_child = async move {
-        while let Some(msg) = FuturesStreamExt::next(&mut ws_rx).await {
-            let Ok(msg) = msg else { break };
-            let text = match msg {
-                Message::Text(t) => t.to_string(),
-                Message::Close(_) => break,
-                _ => continue,
-            };
-            let body = text.as_bytes();
-            let header = format!("Content-Length: {}\r\n\r\n", body.len());
-            if stdin.write_all(header.as_bytes()).await.is_err() {
-                break;
-            }
-            if stdin.write_all(body).await.is_err() {
-                break;
-            }
-            if stdin.flush().await.is_err() {
-                break;
-            }
-        }
-    };
-
-    // child stdout → WS: strip LSP Content-Length framing.
-    let from_child = async move {
-        let mut reader = BufReader::new(stdout);
-        loop {
-            match read_lsp_frame(&mut reader).await {
-                Ok(Some(text)) => {
-                    if ws_tx.send(Message::Text(text.into())).await.is_err() {
-                        return;
-                    }
-                }
-                Ok(None) => return,
-                Err(why) => {
-                    tracing::error!(%why, "lsp stdout stopped being LSP framing; closing the bridge");
-                    return;
-                }
-            }
-        }
-    };
-
-    tokio::select! {
-        _ = to_child => {}
-        _ = from_child => {}
-    }
-    let _ = child.kill().await;
-}
-
-/// Read one LSP frame from a child's stdout: headers, then exactly
-/// `Content-Length` bytes of body.
-///
-/// `Ok(None)` is a clean EOF. `Err` means the stream stopped being LSP
-/// framing and re-syncing it would be guesswork — the caller closes the
-/// bridge rather than guess.
-///
-/// Both reads are bounded. The child is our own lsp-launcher, so this is not
-/// a security boundary — it is blast-radius control. A desynced or buggy
-/// child announcing a wild `Content-Length` would make `vec![0u8; len]`
-/// allocate it verbatim, and THIS process is also the one holding a running
-/// PLC program: an OOM abort here stops the plant, not just the editor's
-/// autocomplete.
-///
-/// A header block with no `Content-Length`, and a body that is not UTF-8,
-/// are both skipped rather than fatal — that is the pre-existing behaviour
-/// and it costs one message, not the session.
-async fn read_lsp_frame<R: tokio::io::AsyncBufRead + Unpin>(
-    reader: &mut R,
-) -> Result<Option<String>, String> {
-    loop {
-        let mut content_length: Option<usize> = None;
-        loop {
-            let mut line = Vec::new();
-            let n = match reader
-                .take(MAX_LSP_HEADER_BYTES as u64)
-                .read_until(b'\n', &mut line)
-                .await
-            {
-                Ok(0) => return Ok(None),
-                Ok(n) => n,
-                Err(e) => return Err(format!("read: {e}")),
-            };
-            if n == MAX_LSP_HEADER_BYTES && !line.ends_with(b"\n") {
-                return Err(format!("header line exceeded {MAX_LSP_HEADER_BYTES} bytes"));
-            }
-            let Ok(line) = String::from_utf8(line) else {
-                return Err("header line was not UTF-8".into());
-            };
-            let trimmed = line.trim_end_matches(['\r', '\n']);
-            if trimmed.is_empty() {
-                break;
-            }
-            if let Some(v) = trimmed.strip_prefix("Content-Length:") {
-                content_length = v.trim().parse().ok();
-            }
-        }
-        let Some(len) = content_length else {
-            continue;
-        };
-        if len > MAX_LSP_BODY_BYTES {
-            return Err(format!(
-                "Content-Length {len} exceeds the {MAX_LSP_BODY_BYTES}-byte ceiling"
-            ));
-        }
-        let mut body = vec![0u8; len];
-        if let Err(e) = reader.read_exact(&mut body).await {
-            return Err(format!("body read: {e}"));
-        }
-        match String::from_utf8(body) {
-            Ok(text) => return Ok(Some(text)),
-            Err(_) => continue,
-        }
-    }
-}
+mod lsp;
+pub use lsp::lsp;
 
 // ============================================================
 //  Helpers
@@ -3203,7 +2854,10 @@ fn resolve_user_path(raw: &str) -> PathBuf {
 /// check): the clone is `{root, manifest}`-cheap, and compiling unlocked
 /// on `spawn_blocking` keeps the global registry responsive to every
 /// other window. Prefer `with_project` for quick metadata reads.
-fn owned_store(state: &AppState, project: &ProjectName) -> Result<ProjectStore, ApiError> {
+pub(crate) fn owned_store(
+    state: &AppState,
+    project: &ProjectName,
+) -> Result<ProjectStore, ApiError> {
     with_project(state, project, |store| Ok(store.clone()))
 }
 
@@ -3702,75 +3356,6 @@ mod project_header_tests {
             .unwrap()
             .as_deref()
             .is_none());
-    }
-}
-
-#[cfg(test)]
-mod lsp_frame_tests {
-    use super::{read_lsp_frame, MAX_LSP_BODY_BYTES, MAX_LSP_HEADER_BYTES};
-    use tokio::io::BufReader;
-
-    async fn frames(input: &[u8]) -> Result<Vec<String>, String> {
-        let mut r = BufReader::new(std::io::Cursor::new(input.to_vec()));
-        let mut out = Vec::new();
-        loop {
-            match read_lsp_frame(&mut r).await? {
-                Some(t) => out.push(t),
-                None => return Ok(out),
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn back_to_back_frames_are_split_on_content_length() {
-        let got = frames(b"Content-Length: 2\r\n\r\n{}Content-Length: 5\r\n\r\n[1,2]")
-            .await
-            .expect("well-framed");
-        assert_eq!(got, vec!["{}".to_string(), "[1,2]".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn a_clean_eof_ends_the_stream() {
-        assert_eq!(frames(b"").await.unwrap(), Vec::<String>::new());
-    }
-
-    /// The lever this guard exists for: `vec![0u8; len]` would have
-    /// allocated whatever the stream claimed, in the process that also holds
-    /// the running PLC program.
-    #[tokio::test]
-    async fn an_implausible_content_length_is_refused_not_allocated() {
-        let input = format!("Content-Length: {}\r\n\r\n", u32::MAX);
-        let err = frames(input.as_bytes()).await.expect_err("must refuse");
-        assert!(err.contains("exceeds the"), "{err}");
-        assert!(err.contains(&MAX_LSP_BODY_BYTES.to_string()), "{err}");
-    }
-
-    /// A child that emits no newline would grow `read_line`'s buffer without
-    /// limit — same allocation lever, different door.
-    #[tokio::test]
-    async fn a_header_line_without_a_newline_is_bounded() {
-        let input = vec![b'x'; MAX_LSP_HEADER_BYTES + 10];
-        let err = frames(&input).await.expect_err("must refuse");
-        assert!(err.contains("header line exceeded"), "{err}");
-    }
-
-    /// Pre-existing tolerances kept: a header block with no Content-Length
-    /// costs one message, not the session.
-    #[tokio::test]
-    async fn a_header_block_without_content_length_is_skipped() {
-        let got = frames(b"X-Note: hi\r\n\r\nContent-Length: 2\r\n\r\n{}")
-            .await
-            .expect("skips, then reads");
-        assert_eq!(got, vec!["{}".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn a_body_that_is_not_utf8_costs_one_message_not_the_session() {
-        let mut input = b"Content-Length: 2\r\n\r\n".to_vec();
-        input.extend_from_slice(&[0xff, 0xfe]);
-        input.extend_from_slice(b"Content-Length: 2\r\n\r\n{}");
-        let got = frames(&input).await.expect("skips the bad body");
-        assert_eq!(got, vec!["{}".to_string()]);
     }
 }
 
@@ -4395,3 +3980,6 @@ mod deploy_precheck_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod library_catalog_tests;

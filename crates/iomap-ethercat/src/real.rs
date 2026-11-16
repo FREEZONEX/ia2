@@ -36,6 +36,7 @@
 //!   being touched from a tokio task.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::{mpsc, Mutex, MutexGuard, PoisonError};
@@ -44,8 +45,11 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use ethercrab::std::ethercat_now;
-use ethercrab::subdevice_group::DcConfiguration;
-use ethercrab::{DcSync, MainDevice, MainDeviceConfig, PduStorage, Timeouts};
+use ethercrab::subdevice_group::{CycleInfo, DcConfiguration, Op};
+use ethercrab::{
+    DcSync, MainDevice, MainDeviceConfig, PduStorage, RegisterAddress, SubDeviceGroup,
+    SubDeviceState, Timeouts,
+};
 use iocore::{ChannelValue, HealthTracker, HealthTransition, IoDevice, IoError};
 use project::{
     EthercatChannel, EthercatConfig, EthercatDcSync, EthercatPdoDirection, EthercatSlave,
@@ -59,6 +63,7 @@ use crate::SlaveDiscovery;
 /// unhealthy (one ERROR log per outage, not one per cycle — at a 1 ms
 /// cycle that distinction matters).
 const UNHEALTHY_AFTER_TX_ERRORS: u32 = 10;
+const SHUTDOWN_SAFE_OP_BUDGET: Duration = Duration::from_millis(250);
 
 // Storage sizing — picked to comfortably cover a typical edge configuration
 // (an EK1100-class coupler + EL modules). Sized for plant-scale buses,
@@ -144,12 +149,25 @@ macro_rules! copy_outputs_to_bus {
     }};
 }
 
+macro_rules! zero_bus_outputs {
+    ($group:expr, $maindevice:expr) => {{
+        for sd in $group.iter(&$maindevice) {
+            sd.outputs_raw_mut().fill(0);
+        }
+    }};
+}
+
 /// Both cyclic modes record the actual final exchange, independently of
 /// joining the worker/socket. Re-walk/backoff exits never call this macro
 /// and therefore retain the initial unconfirmed result.
 macro_rules! final_zero_exchange {
-    ($group:expr, $maindevice:expr, $pdi:expr, $latch:expr, $outcome:expr, $dc:expr, $exchange:expr) => {{
-        copy_outputs_to_bus!($group, $maindevice, $pdi, $latch);
+    ($group:expr, $maindevice:expr, $pdi:expr, $latch:expr, $inhibited:expr, $outcome:expr, $dc:expr, $exchange:expr) => {{
+        if !$inhibited.load(Ordering::Acquire) {
+            copy_outputs_to_bus!($group, $maindevice, $pdi, $latch);
+        }
+        if $inhibited.compare_exchange(false, false, Ordering::Acquire, Ordering::Acquire).is_err() {
+            zero_bus_outputs!($group, $maindevice);
+        }
         let layout: Vec<(usize, usize)> = $group
             .iter(&$maindevice)
             .map(|sd| {
@@ -172,11 +190,133 @@ macro_rules! final_zero_exchange {
             ),
             Err(error) => Err(format!("final zero-output exchange failed: {error}")),
         };
+        let confirmed = result.is_ok();
         match &result {
             Ok(()) => tracing::info!(expected_wkc, "ethercat final zero-output exchange acknowledged"),
             Err(error) => tracing::warn!(%error, "ethercat final zero-output delivery unconfirmed"),
         }
-        *$outcome.lock().unwrap_or_else(PoisonError::into_inner) = result;
+        *$outcome.lock().unwrap_or_else(PoisonError::into_inner) =
+            result.map_err(|error| format!("zero-output delivery unconfirmed: {error}"));
+        confirmed
+    }};
+}
+
+/// Keep the state request, confirmation and zero PDO exchanges under one deadline.
+async fn hold_zero_until_safe_op<F>(
+    mut next_cycle: Instant,
+    mut exchange: impl FnMut(Instant) -> F,
+    confirm: impl Future<Output = Result<(), String>>,
+    budget: Duration,
+) -> Result<(), String>
+where
+    F: Future<Output = Result<Instant, String>>,
+{
+    let cyclic = async {
+        loop {
+            smol::Timer::at(next_cycle).await;
+            next_cycle = exchange(Instant::now()).await?;
+        }
+    };
+    let deadline = async {
+        smol::Timer::after(budget).await;
+        Err("timed out waiting for SAFE-OP".into())
+    };
+    smol::future::or(deadline, smol::future::or(cyclic, confirm)).await
+}
+
+async fn confirm_shutdown_safe_op<DC>(
+    group: &SubDeviceGroup<MAX_SUBDEVICES, PDI_LEN, ethercrab::DefaultLock, Op, DC>,
+    maindevice: &MainDevice<'_>,
+) -> Result<(), String> {
+    let safe_op = u16::from(u8::from(SubDeviceState::SafeOp));
+    for slave in group.iter(maindevice) {
+        // Leave the AL error-acknowledge bit clear.
+        slave
+            .register_write(RegisterAddress::AlControl, safe_op)
+            .await
+            .map_err(|error| {
+                format!(
+                    "station {:#06x} SAFE-OP request: {error}",
+                    slave.configured_address()
+                )
+            })?;
+    }
+
+    loop {
+        let mut all_safe_op = true;
+        for slave in group.iter(maindevice) {
+            let status: u16 = slave
+                .register_read(RegisterAddress::AlStatus)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "station {:#06x} AL status: {error}",
+                        slave.configured_address()
+                    )
+                })?;
+            if status & 0x10 != 0 {
+                return Err(format!(
+                    "station {:#06x} reported AL error ({status:#06x})",
+                    slave.configured_address()
+                ));
+            }
+            all_safe_op &= status & 0x0f == safe_op;
+        }
+        if all_safe_op {
+            return Ok(());
+        }
+        smol::Timer::after(Duration::from_millis(2)).await;
+    }
+}
+
+fn record_shutdown_safe_op(outcome: &Mutex<Result<(), String>>, result: Result<(), String>) {
+    match result {
+        Ok(()) => tracing::info!("ethercat SAFE-OP confirmed before stopping PDOs"),
+        Err(error) => {
+            tracing::warn!(%error, "ethercat SAFE-OP transition unconfirmed; releasing transport");
+            *outcome.lock().unwrap_or_else(PoisonError::into_inner) = Err(format!(
+                "zero-output delivery confirmed; SAFE-OP transition unconfirmed: {error}"
+            ));
+        }
+    }
+}
+
+macro_rules! finish_cyclic_stop {
+    ($group:expr, $maindevice:expr, $pdi:expr, $latch:expr, $inhibited:expr, $outcome:expr, $dc:expr, $exchange:expr, $delay:expr) => {{
+        let exchange = $exchange;
+        let delay = $delay;
+        let mut next_cycle = Instant::now();
+        if final_zero_exchange!(
+            $group,
+            $maindevice,
+            $pdi,
+            $latch,
+            $inhibited,
+            $outcome,
+            $dc,
+            async {
+                let sent_at = Instant::now();
+                exchange().await.inspect(|reply| {
+                    next_cycle = sent_at + delay(&reply.extra);
+                })
+            }
+        ) {
+            let result = hold_zero_until_safe_op(
+                next_cycle,
+                |sent_at| async move {
+                    exchange()
+                        .await
+                        .map(|reply| sent_at + delay(&reply.extra))
+                        .map_err(|error| {
+                            format!("zero PDO exchange during SAFE-OP transition: {error}")
+                        })
+                },
+                confirm_shutdown_safe_op(&$group, &$maindevice),
+                SHUTDOWN_SAFE_OP_BUDGET,
+            )
+            .await;
+            record_shutdown_safe_op(&$outcome, result);
+        }
     }};
 }
 
@@ -293,6 +433,27 @@ macro_rules! gear_tick {
     }};
 }
 
+/// Final admission point for a timer-driven cyclic image. A fence that
+/// arrives during PDI copy or gear work discards the prepared image. The
+/// worker remains the sole owner of the exchange, including in-flight frames.
+macro_rules! prepare_timer_outputs {
+    ($group:expr, $maindevice:expr, $pdi:expr, $latch:expr, $engines:expr, $bus_ok:expr, $inhibited:expr) => {{
+        if !$inhibited.load(Ordering::Acquire) {
+            copy_outputs_to_bus!($group, $maindevice, $pdi, $latch);
+            gear_tick!($group, $maindevice, $engines, $bus_ok, $latch);
+        }
+        if $inhibited
+            .compare_exchange(false, false, Ordering::Acquire, Ordering::Acquire)
+            .is_err()
+        {
+            for engine in $engines.iter_mut() {
+                engine.inhibit_outputs();
+            }
+            zero_bus_outputs!($group, $maindevice);
+        }
+    }};
+}
+
 /// Post-cycle: snapshot inputs back into our mirror.
 macro_rules! copy_inputs_from_bus {
     ($group:expr, $maindevice:expr, $pdi:expr, $latch:expr, $changes:expr) => {{
@@ -383,14 +544,9 @@ fn lock_pdi_for_cycle<'a>(
     mirror
 }
 
-/// Bounded wait for the cyclic worker thread to stop on graceful
-/// shutdown. The loop observes `shutdown` within ~one cycle (plus, at
-/// worst, one ethercrab PDU timeout on a wedged bus), then attempts a
-/// final zeroed exchange if a cyclic group is still owned. Capped
-/// so a hung bus can't push the whole shutdown past systemd's kill
-/// timeout: if we blow it, we abandon the thread and let process
-/// teardown reap it.
-const WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// Report a slow worker without releasing transport ownership. The edge
+/// process sets its own overall drain deadline before exiting.
+const WORKER_JOIN_WARN_AFTER: Duration = Duration::from_secs(2);
 
 // EtherCrab's group walk constructs large fixed-capacity values. Leave
 // room for those temporaries and the pinned master future on this worker.
@@ -517,23 +673,23 @@ pub struct RealEthercat {
     /// by read/write_channel before the PDI channel lookup.
     gear_routing: crate::gear::GearRouting,
     pdi: Arc<Mutex<PdiMirror>>,
+    outputs_inhibited: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     /// Flipped by the worker (via a drop guard) on every `smol_main`
-    /// exit path, so `shutdown` can join with a bound instead of risking
-    /// a wait on a thread that's already gone.
+    /// exit path, so device health reflects a worker that can no longer exchange.
     stopped: Arc<AtomicBool>,
     /// Mirrored from the cyclic worker's `HealthTracker`: `false` after
     /// `UNHEALTHY_AFTER_TX_ERRORS` consecutive `tx_rx` failures, `true`
     /// again on the first successful exchange.
     healthy: Arc<AtomicBool>,
     reinitializing: Arc<AtomicBool>,
-    /// Worker-owned final exchange result. Joining only proves closure;
-    /// success here requires a returned zero PDI exchange with full WKC/OP.
-    final_exchange: Arc<Mutex<Result<(), String>>>,
+    /// Worker-owned protocol confirmation. Joining proves resource closure;
+    /// success here requires both zero PDO delivery in OP and SAFE-OP confirmation.
+    shutdown_confirmation: Arc<Mutex<Result<(), String>>>,
     /// Subdevices found during the bus walk at connect (for `/discover`).
     discovered: Vec<SlaveDiscovery>,
     // The cyclic worker. Joined by `shutdown` on a clean stop (so the
-    // final exchange outcome can be collected); on `Drop` it's only
+    // shutdown confirmation can be collected); on `Drop` it's only
     // signalled, not joined — drop can run mid-teardown and must not block.
     _thread: Option<thread::JoinHandle<()>>,
 }
@@ -546,10 +702,11 @@ struct WorkerShared {
     sdo_rx: smol::channel::Receiver<crate::sdo::Request>,
     verify_init_sdo: bool,
     pdi: Arc<Mutex<PdiMirror>>,
+    outputs_inhibited: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
     healthy: Arc<AtomicBool>,
-    final_exchange: Arc<Mutex<Result<(), String>>>,
+    shutdown_confirmation: Arc<Mutex<Result<(), String>>>,
     /// Latched `true` by the worker the first time it meets a poisoned PDI
     /// mirror: from then on every cycle forces the outputs to zero and keeps
     /// the gear engines disengaged (see `lock_pdi_for_cycle`). Never cleared —
@@ -573,29 +730,6 @@ struct WorkerShared {
     /// In-cycle gear engines (one per configured [[gear]] axis), owned by
     /// the cyclic worker and ticked between the mirror copy and tx_rx.
     engines: Vec<crate::gear::GearEngine>,
-}
-
-/// Wait up to `timeout` for the worker to flag `stopped`, then join it.
-/// Returns `true` if the thread was joined without panic, `false` on panic
-/// or timeout (on timeout the process exit reaps the abandoned thread).
-/// Sync + bounded so it can run on a blocking pool without ever holding
-/// the shutdown past the service supervisor's deadline.
-fn join_worker(
-    stopped: &AtomicBool,
-    handle: Option<thread::JoinHandle<()>>,
-    timeout: Duration,
-) -> bool {
-    let deadline = Instant::now() + timeout;
-    while !stopped.load(Ordering::Relaxed) {
-        if Instant::now() >= deadline {
-            return false;
-        }
-        thread::sleep(Duration::from_millis(2));
-    }
-    if let Some(handle) = handle {
-        return handle.join().is_ok();
-    }
-    true
 }
 
 /// Whether the bus-side init succeeded. Sent back over the oneshot.
@@ -680,11 +814,12 @@ impl RealEthercat {
             .map(|c| (c.name.clone(), c.clone()))
             .collect();
         let pdi = Arc::new(Mutex::new(PdiMirror::default()));
+        let outputs_inhibited = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
         let stopped = Arc::new(AtomicBool::new(false));
         let healthy = Arc::new(AtomicBool::new(true));
-        let final_exchange = Arc::new(Mutex::new(Err(
-            "no final zero-output exchange was completed".into(),
+        let shutdown_confirmation = Arc::new(Mutex::new(Err(
+            "zero-output delivery unconfirmed: no final zero-output exchange was completed".into(),
         )));
         let pdi_poisoned = Arc::new(AtomicBool::new(false));
         let cycles = Arc::new(AtomicU64::new(0));
@@ -719,10 +854,11 @@ impl RealEthercat {
             sdo_rx,
             verify_init_sdo,
             pdi: pdi.clone(),
+            outputs_inhibited: outputs_inhibited.clone(),
             shutdown: shutdown.clone(),
             stopped: stopped.clone(),
             healthy: healthy.clone(),
-            final_exchange: final_exchange.clone(),
+            shutdown_confirmation: shutdown_confirmation.clone(),
             pdi_poisoned,
             cycles: cycles.clone(),
             input_changes: input_changes.clone(),
@@ -749,6 +885,25 @@ impl RealEthercat {
                 )
             })
             .map_err(|e| IoError::Connect(format!("spawn ethercat thread: {e}")))?;
+        // Own the thread before awaiting the handshake. Dropping an abandoned
+        // connect requests a stop, just as dropping a connected adapter does.
+        let mut device = Self {
+            cycle,
+            staged: None,
+            sdo,
+            name,
+            channels,
+            gear_routing,
+            pdi,
+            outputs_inhibited,
+            shutdown,
+            stopped,
+            healthy,
+            reinitializing,
+            shutdown_confirmation,
+            discovered: Vec::new(),
+            _thread: Some(thread),
+        };
 
         // Wait for the worker to report success or failure. The init walk
         // is bounded (timeouts inside ethercrab); a generous wait here is
@@ -759,11 +914,11 @@ impl RealEthercat {
                 .map_err(|e| format!("init handshake timed out: {e}"))
         })
         .await
-        .map_err(|e| IoError::Connect(format!("init join: {e}")))?
-        .map_err(IoError::Connect)?;
+        .map_err(|e| IoError::Connect(format!("init join: {e}")))
+        .and_then(|result| result.map_err(IoError::Connect));
 
         match init {
-            InitResult::Ok { discovered } => {
+            Ok(InitResult::Ok { discovered }) => {
                 // The bus is walked and the cyclic worker is live — now
                 // hold the discovered topology against the configuration.
                 // Identity first (wrong/missing module), then PDI ranges
@@ -781,14 +936,7 @@ impl RealEthercat {
                 }
                 problems.extend(validate::validate_gear_offsets(&config.gear, &discovered));
                 if !problems.is_empty() {
-                    // A failed connect must not leak a live cyclic thread
-                    // driving the bus: signal it down and join (bounded).
-                    shutdown.store(true, Ordering::Relaxed);
-                    let stopped_for_join = stopped.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        join_worker(&stopped_for_join, Some(thread), WORKER_JOIN_TIMEOUT)
-                    })
-                    .await;
+                    device.stop_worker().await;
                     return Err(IoError::Connect(format!(
                         "ethercat bus validation failed: {}",
                         problems.join("; ")
@@ -796,40 +944,60 @@ impl RealEthercat {
                 }
 
                 tracing::info!(
-                    name = %name,
+                    name = %device.name,
                     nic = %config.nic,
                     cycle_us,
                     discovered = discovered.len(),
                     "ethercat device live"
                 );
                 spawn_cycle_watchdog(
-                    name.clone(),
+                    device.name.clone(),
                     cycles,
                     input_changes,
-                    stopped.clone(),
-                    healthy.clone(),
-                    shutdown.clone(),
-                    reinitializing.clone(),
+                    device.stopped.clone(),
+                    device.healthy.clone(),
+                    device.shutdown.clone(),
+                    device.reinitializing.clone(),
                     reinits,
                 );
-                Ok(Self {
-                    cycle,
-                    staged: None,
-                    sdo,
-                    name,
-                    channels,
-                    gear_routing,
-                    pdi,
-                    shutdown,
-                    stopped,
-                    healthy,
-                    reinitializing,
-                    final_exchange,
-                    discovered,
-                    _thread: Some(thread),
-                })
+                device.discovered = discovered;
+                Ok(device)
             }
-            InitResult::Err(e) => Err(IoError::Connect(format!("ethercat init: {e}"))),
+            Ok(InitResult::Err(error)) => {
+                device.stop_worker().await;
+                Err(IoError::Connect(format!("ethercat init: {error}")))
+            }
+            Err(error) => {
+                device.stop_worker().await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Retain the handle across a slow drain or cancelled shutdown wait.
+    async fn stop_worker(&mut self) -> bool {
+        self.inhibit_outputs();
+        self.shutdown.store(true, Ordering::Relaxed);
+        let warning_at = tokio::time::Instant::now() + WORKER_JOIN_WARN_AFTER;
+        let mut warned = false;
+        while self
+            ._thread
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+        {
+            if !warned && tokio::time::Instant::now() >= warning_at {
+                tracing::warn!(
+                    device = %self.name,
+                    elapsed_s = WORKER_JOIN_WARN_AFTER.as_secs(),
+                    "ethercat cyclic worker still owns its resources; waiting before replacement"
+                );
+                warned = true;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        match self._thread.take() {
+            Some(worker) => worker.join().is_ok(),
+            None => self.stopped.load(Ordering::Relaxed),
         }
     }
 
@@ -841,6 +1009,7 @@ impl RealEthercat {
 
 impl Drop for RealEthercat {
     fn drop(&mut self) {
+        self.outputs_inhibited.store(true, Ordering::Release);
         self.shutdown.store(true, Ordering::Relaxed);
         // Don't join here — drop can run mid-teardown and must never block
         // the runtime. The worker exits on the next cycle tick. A clean
@@ -859,7 +1028,7 @@ impl IoDevice for RealEthercat {
         self.cycle.as_ref().map(|c| c.period)
     }
     fn cycle_status(&self) -> Option<iocore::cycle::CycleStatus> {
-        self.cycle.as_ref().map(|c| c.status())
+        self.cycle.as_ref().and_then(|c| c.try_status())
     }
     async fn begin_cycle(&mut self) -> Result<(), IoError> {
         if let Some(cycle) = &self.cycle {
@@ -933,6 +1102,11 @@ impl IoDevice for RealEthercat {
     }
 
     async fn write_channel(&mut self, channel: &str, value: ChannelValue) -> Result<(), IoError> {
+        if self.outputs_inhibited.load(Ordering::Acquire) {
+            return Err(IoError::Transport(
+                "ethercat ordinary outputs are inhibited".into(),
+            ));
+        }
         // Gear parameter channels route into the lock-free shared params
         // the cyclic loop reads each tick — never into PDI bytes.
         if let Some(res) = self.gear_routing.write(channel, &value) {
@@ -977,6 +1151,15 @@ impl IoDevice for RealEthercat {
         )
     }
 
+    fn inhibit_outputs(&mut self) {
+        self.outputs_inhibited.store(true, Ordering::Release);
+        if let Some(cycle) = &self.cycle {
+            if !cycle.is_faulted() {
+                cycle.trip("failsafe requested; restart required");
+            }
+        }
+    }
+
     /// Zero the entire output PDI mirror for every discovered slave.
     /// The next cyclic tick on the worker thread copies these zeros
     /// onto the bus surface and `tx_rx`'s them out — at default cycle
@@ -987,9 +1170,7 @@ impl IoDevice for RealEthercat {
     /// unavailable during an unhealthy bus/re-walk. The mirror is still
     /// zeroed even when transmission cannot be confirmed.
     async fn enter_failsafe(&mut self) -> Result<(), IoError> {
-        if let Some(cycle) = &self.cycle {
-            cycle.trip("failsafe requested; restart required");
-        }
+        self.inhibit_outputs();
         self.staged = None;
         // Gear axes first: drop every engage request so the engines fall
         // back to shadow/hold instead of re-driving targets over the
@@ -1043,36 +1224,25 @@ impl IoDevice for RealEthercat {
 
     /// Graceful teardown: signal the cyclic worker to stop and JOIN it.
     /// After `enter_failsafe` clears the output mirror, the worker attempts
-    /// one last `tx_rx` if it still owns a cyclic group. Joining confirms
-    /// resource closure; its separately recorded exchange result confirms
-    /// protocol acknowledgement, not physical actuator state.
-    /// Bounded so a wedged bus can't stall the process past its kill
-    /// timeout. The join runs on a blocking thread so we don't park the
-    /// async executor on a std thread join.
+    /// one last OP exchange if it still owns a cyclic group, then maintains
+    /// zero PDOs until it confirms SAFE-OP or the transition budget expires.
+    /// Joining confirms resource closure independently of those receipts.
+    /// Keep the thread handle through a slow drain. The edge process
+    /// bounds its overall shutdown separately; the IDE may not start a
+    /// replacement while this worker can still use the socket.
     async fn shutdown(&mut self) -> Result<(), IoError> {
-        self.shutdown.store(true, Ordering::Relaxed);
-        let handle = self._thread.take();
-        let stopped = self.stopped.clone();
-        let joined =
-            tokio::task::spawn_blocking(move || join_worker(&stopped, handle, WORKER_JOIN_TIMEOUT))
-                .await
-                .unwrap_or(false);
-        if joined {
+        if self.stop_worker().await {
             tracing::info!(device = %self.name, "ethercat cyclic worker joined; socket resources drained");
         } else {
-            tracing::warn!(
-                device = %self.name,
-                timeout_s = WORKER_JOIN_TIMEOUT.as_secs(),
-                "ethercat cyclic worker did not join successfully; timeout or panic, resource closure unconfirmed"
-            );
+            tracing::warn!(device = %self.name, "ethercat cyclic worker did not join successfully");
             return Err(IoError::Transport(format!(
                 "ethercat '{}': worker join failed; resource closure and zero-output delivery unconfirmed",
                 self.name
             )));
         }
-        self.final_exchange.lock().unwrap_or_else(PoisonError::into_inner).clone().map_err(|error| {
+        self.shutdown_confirmation.lock().unwrap_or_else(PoisonError::into_inner).clone().map_err(|error| {
             IoError::Transport(format!(
-                "ethercat '{}': worker joined and socket drained, but zero-output delivery unconfirmed: {error}",
+                "ethercat '{}': worker joined and socket drained, but shutdown unconfirmed: {error}",
                 self.name
             ))
         })
@@ -1443,10 +1613,11 @@ fn smol_main(
         sdo_rx,
         verify_init_sdo,
         pdi,
+        outputs_inhibited,
         shutdown,
         stopped,
         healthy,
-        final_exchange,
+        shutdown_confirmation,
         pdi_poisoned,
         cycles,
         input_changes,
@@ -1455,8 +1626,8 @@ fn smol_main(
         mut engines,
     } = shared;
     // Flip `stopped` on EVERY exit path (init failure or loop end) via a
-    // drop guard, so a bounded join never waits on a thread that's already
-    // gone. Created first thing so even the early `try_split` error returns
+    // drop guard, so health can detect a worker that's already gone.
+    // Created first thing so even the early `try_split` error returns
     // flag completion.
     struct DoneGuard(Arc<AtomicBool>);
     impl Drop for DoneGuard {
@@ -1972,7 +2143,9 @@ fn smol_main(
                         "EtherCAT DC cycle timer"
                     );
                     if first_init {
-                        let _ = init_tx.send(InitResult::Ok { discovered });
+                        if init_tx.send(InitResult::Ok { discovered }).is_err() {
+                            break 'supervise;
+                        }
                         first_init = false;
                     } else {
                         tracing::info!(
@@ -2012,32 +2185,35 @@ fn smol_main(
                     while !shutdown.load(Ordering::Relaxed) {
                         cycles.fetch_add(1, Ordering::Relaxed);
                         let cycle_start = std::time::Instant::now();
-                        if let Some(clock) = &cycle {
-                            let selection_miss = clock.consume_before(dc_continuity.as_ref().map(|d| d.send_before), |image| {
+                        let selection_miss = if let Some(clock) = &cycle {
+                            clock.consume_before(dc_continuity.as_ref().map(|d| d.send_before), |image| {
                                 {
                                     let mut mirror = lock_pdi_for_cycle(&pdi, &pdi_poisoned);
                                     if let Some(image) = image { mirror.outputs.clone_from(&image.outputs); }
                                     else { for bytes in mirror.outputs.values_mut() { bytes.fill(0); } }
                                 }
                                 copy_outputs_to_bus!(group, maindevice, pdi, pdi_poisoned);
-                            });
-                            if let Some(miss) = selection_miss {
-                                tracing::error!(
-                                    sequence = miss.sequence,
-                                    send_window_excess_us = miss.checked_at.saturating_duration_since(miss.send_before).as_micros() as u64,
-                                    selection_delay_us = miss.checked_at.saturating_duration_since(cycle_start).as_micros() as u64,
-                                    wake_lateness_us = dc_continuity.as_ref().map(|d| cycle_start.saturating_duration_since(d.deadline).as_micros() as u64),
-                                    timer_entry_margin_us = previous_wait.map(|(deadline, entered, _)| deadline.saturating_duration_since(entered).as_micros() as u64),
-                                    timer_entry_late_us = previous_wait.map(|(deadline, entered, _)| entered.saturating_duration_since(deadline).as_micros() as u64),
-                                    previous_dc_ns = dc_continuity.as_ref().map(|d| d.last_dc_ns),
-                                    "EtherCAT DC send window expired; zero outputs selected"
-                                );
-                            }
-                        } else { copy_outputs_to_bus!(group, maindevice, pdi, pdi_poisoned); }
-                        gear_tick!(group, maindevice, engines, bus_ok, pdi_poisoned);
+                            })
+                        } else {
+                            prepare_timer_outputs!(group, maindevice, pdi, pdi_poisoned,
+                                engines, bus_ok, outputs_inhibited);
+                            None
+                        };
                         let exchange_start = Instant::now();
                         let response = group.tx_rx_dc(&maindevice).await;
                         let exchange_end = Instant::now();
+                        if let Some(miss) = selection_miss {
+                            tracing::error!(
+                                sequence = miss.sequence,
+                                send_window_excess_us = miss.checked_at.saturating_duration_since(miss.send_before).as_micros() as u64,
+                                selection_delay_us = miss.checked_at.saturating_duration_since(cycle_start).as_micros() as u64,
+                                wake_lateness_us = dc_continuity.as_ref().map(|d| cycle_start.saturating_duration_since(d.deadline).as_micros() as u64),
+                                timer_entry_margin_us = previous_wait.map(|(deadline, entered, _)| deadline.saturating_duration_since(entered).as_micros() as u64),
+                                timer_entry_late_us = previous_wait.map(|(deadline, entered, _)| entered.saturating_duration_since(deadline).as_micros() as u64),
+                                previous_dc_ns = dc_continuity.as_ref().map(|d| d.last_dc_ns),
+                                "EtherCAT DC send window expired; zero outputs selected"
+                            );
+                        }
                         if let Some((deadline, wait_start, previous_exchange_end)) = previous_wait {
                             let late = cycle_start.saturating_duration_since(deadline);
                             if late >= sync0 {
@@ -2204,19 +2380,16 @@ fn smol_main(
                          (previously this wedged until a process restart)"
                         );
                     } else {
-                        // Final flush before teardown: failsafe has zeroed the
-                        // output mirror; push it out once more so the drive latches
-                        // controlword = 0 (Disable Voltage) before the thread stops,
-                        // instead of de-energizing only via its own SyncManager
-                        // watchdog once the master goes away.
-                        final_zero_exchange!(
+                        finish_cyclic_stop!(
                             group,
                             maindevice,
                             pdi,
                             pdi_poisoned,
-                            final_exchange,
+                            outputs_inhibited,
+                            shutdown_confirmation,
                             true,
-                            group.tx_rx_dc(&maindevice)
+                            || group.tx_rx_dc(&maindevice),
+                            |timing: &CycleInfo| timing.next_cycle_wait
                         );
                         tracing::info!("ethercat cyclic loop exiting (shutdown signalled)");
                     }
@@ -2243,7 +2416,9 @@ fn smol_main(
 
                     let discovered = capture_discovery!(group, maindevice, pdi, pdi_poisoned);
                     if first_init {
-                        let _ = init_tx.send(InitResult::Ok { discovered });
+                        if init_tx.send(InitResult::Ok { discovered }).is_err() {
+                            break 'supervise;
+                        }
                         first_init = false;
                     } else {
                         tracing::info!(
@@ -2269,8 +2444,15 @@ fn smol_main(
                         async {
                             while !shutdown.load(Ordering::Relaxed) {
                                 cycles.fetch_add(1, Ordering::Relaxed);
-                                copy_outputs_to_bus!(group, maindevice, pdi, pdi_poisoned);
-                                gear_tick!(group, maindevice, engines, bus_ok, pdi_poisoned);
+                                prepare_timer_outputs!(
+                                    group,
+                                    maindevice,
+                                    pdi,
+                                    pdi_poisoned,
+                                    engines,
+                                    bus_ok,
+                                    outputs_inhibited
+                                );
                                 match group.tx_rx(&maindevice).await {
                                     Ok(resp) => {
                                         note_bus_shape(
@@ -2334,24 +2516,23 @@ fn smol_main(
                          (previously this wedged until a process restart)"
                         );
                     } else {
-                        // Final flush before teardown: failsafe has zeroed the
-                        // output mirror; push it out once more so the SubDevices
-                        // latch their safe (zero) outputs before the thread stops.
-                        final_zero_exchange!(
+                        finish_cyclic_stop!(
                             group,
                             maindevice,
                             pdi,
                             pdi_poisoned,
-                            final_exchange,
+                            outputs_inhibited,
+                            shutdown_confirmation,
                             false,
-                            group.tx_rx(&maindevice)
+                            || group.tx_rx(&maindevice),
+                            |_: &()| sync0
                         );
                         tracing::info!("ethercat cyclic loop exiting (shutdown signalled)");
                     }
                 }
             }
         }
-        // Keep the pump alive through the final zero-output exchange above.
+        // Keep the pump alive through the final exchange and SAFE-OP attempt.
         // Complete its cancellation before the worker's stopped flag is set.
         pump.stop().await;
     });
@@ -2857,9 +3038,8 @@ mod tests {
         assert!(polls < 100, "PDU wait should park, not busy-poll: {polls}");
     }
 
-    // The bus-side paths need a real NIC + CAP_NET_RAW, so these exercise
-    // the bounded-join logic in isolation — that's the part that has to
-    // hold the line on shutdown latency regardless of bus health.
+    // The bus-side paths need a real NIC + CAP_NET_RAW, so these use
+    // stand-in worker threads and inspect teardown and delivery separately.
 
     pub(super) fn device_with_outputs(stopped_flag: bool) -> RealEthercat {
         let mut outputs = HashMap::new();
@@ -2884,12 +3064,14 @@ mod tests {
                 inputs: HashMap::new(),
                 outputs,
             })),
+            outputs_inhibited: Arc::new(AtomicBool::new(false)),
             shutdown: Arc::new(AtomicBool::new(false)),
             stopped: Arc::new(AtomicBool::new(stopped_flag)),
             healthy: Arc::new(AtomicBool::new(true)),
             reinitializing: Arc::new(AtomicBool::new(false)),
-            final_exchange: Arc::new(Mutex::new(Err(
-                "no final zero-output exchange was completed".into(),
+            shutdown_confirmation: Arc::new(Mutex::new(Err(
+                "zero-output delivery unconfirmed: no final zero-output exchange was completed"
+                    .into(),
             ))),
             discovered: Vec::new(),
             _thread: None,
@@ -3010,16 +3192,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_propagates_the_workers_final_exchange_result() {
+    async fn shutdown_propagates_the_workers_protocol_confirmation() {
         for outcome in [
             Ok(()),
             Err("final exchange timed out".into()),
             Err("partial WKC".into()),
+            Err("zero-output delivery confirmed; SAFE-OP transition unconfirmed: timed out waiting for SAFE-OP".into()),
         ] {
             let mut dev = device_with_outputs(false);
             let shutdown = dev.shutdown.clone();
             let stopped = dev.stopped.clone();
-            let exchange = dev.final_exchange.clone();
+            let exchange = dev.shutdown_confirmation.clone();
             let worker_outcome = outcome.clone();
             dev._thread = Some(thread::spawn(move || {
                 while !shutdown.load(Ordering::Relaxed) {
@@ -3038,11 +3221,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_cannot_release_the_adapter_while_its_worker_still_owns_the_socket() {
+        let mut dev = device_with_outputs(false);
+        let (release, stalled) = mpsc::channel();
+        let stopped = dev.stopped.clone();
+        let exchange = dev.shutdown_confirmation.clone();
+        dev._thread = Some(thread::spawn(move || {
+            stalled.recv().unwrap();
+            *exchange.lock().unwrap() = Ok(());
+            stopped.store(true, Ordering::Relaxed);
+        }));
+
+        assert!(tokio::time::timeout(
+            WORKER_JOIN_WARN_AFTER + Duration::from_millis(50),
+            dev.shutdown(),
+        )
+        .await
+        .is_err());
+        assert!(
+            dev._thread.is_some(),
+            "a cancelled waiter must retain ownership"
+        );
+        assert!(!dev.stopped.load(Ordering::Relaxed));
+
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), dev.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(dev._thread.is_none());
+        assert!(dev.stopped.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
     async fn shutdown_does_not_report_a_panicked_worker_as_joined() {
         let mut dev = device_with_outputs(false);
         let stopped = dev.stopped.clone();
         // Even an earlier success cannot mask a subsequent panic.
-        *dev.final_exchange.lock().unwrap() = Ok(());
+        *dev.shutdown_confirmation.lock().unwrap() = Ok(());
         dev._thread = Some(thread::spawn(move || {
             stopped.store(true, Ordering::Relaxed);
             panic!("worker panic after exchange");
@@ -3066,6 +3282,64 @@ mod tests {
         ] {
             assert!(check_final_exchange(zero, 12, count, wkc, states).is_err());
         }
+    }
+
+    #[test]
+    fn safe_op_confirmation_keeps_zero_pdo_cycles_running() {
+        let cycles = std::cell::Cell::new(0);
+        let (progress, observed) = smol::channel::bounded(3);
+        let result = smol::block_on(hold_zero_until_safe_op(
+            Instant::now(),
+            |sent_at| {
+                cycles.set(cycles.get() + 1);
+                progress.try_send(()).unwrap();
+                std::future::ready(Ok(sent_at + Duration::from_millis(2)))
+            },
+            async {
+                for _ in 0..3 {
+                    observed.recv().await.unwrap();
+                }
+                Ok(())
+            },
+            Duration::from_secs(1),
+        ));
+        assert_eq!(result, Ok(()));
+        assert_eq!(cycles.get(), 3);
+    }
+
+    #[test]
+    fn safe_op_reports_communication_failure_or_slave_refusal() {
+        let pdo_error = smol::block_on(hold_zero_until_safe_op(
+            Instant::now(),
+            |_| std::future::ready(Err("PDO exchange failed".into())),
+            std::future::pending(),
+            Duration::from_secs(1),
+        ));
+        assert_eq!(pdo_error.unwrap_err(), "PDO exchange failed");
+
+        let refusal = smol::block_on(hold_zero_until_safe_op(
+            Instant::now(),
+            |_| std::future::pending(),
+            std::future::ready(Err("station 0x1003 reported AL error".into())),
+            Duration::from_secs(1),
+        ));
+        let outcome = Mutex::new(Ok(()));
+        record_shutdown_safe_op(&outcome, refusal);
+        assert_eq!(
+            outcome.into_inner().unwrap().unwrap_err(),
+            "zero-output delivery confirmed; SAFE-OP transition unconfirmed: station 0x1003 reported AL error"
+        );
+    }
+
+    #[test]
+    fn safe_op_budget_bounds_an_unresponsive_bus() {
+        let result = smol::block_on(hold_zero_until_safe_op(
+            Instant::now(),
+            |_| std::future::pending(),
+            std::future::pending(),
+            Duration::from_millis(10),
+        ));
+        assert_eq!(result.unwrap_err(), "timed out waiting for SAFE-OP");
     }
 
     #[test]
@@ -3180,51 +3454,6 @@ mod tests {
         assert_eq!(logged, 12);
     }
 
-    #[test]
-    fn join_worker_joins_a_thread_that_stops() {
-        let stopped = Arc::new(AtomicBool::new(false));
-        let flag = stopped.clone();
-        let worker = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(20));
-            flag.store(true, Ordering::Relaxed);
-        });
-
-        let start = Instant::now();
-        assert!(
-            join_worker(&stopped, Some(worker), WORKER_JOIN_TIMEOUT),
-            "should report a successful join once the worker stops"
-        );
-        assert!(
-            start.elapsed() < Duration::from_secs(1),
-            "join should return promptly after the worker stops"
-        );
-    }
-
-    #[test]
-    fn join_worker_returns_immediately_if_already_stopped() {
-        let stopped = Arc::new(AtomicBool::new(true));
-        let start = Instant::now();
-        // No handle: the common Drop-already-ran case must not block.
-        assert!(join_worker(&stopped, None, WORKER_JOIN_TIMEOUT));
-        assert!(start.elapsed() < Duration::from_millis(50));
-    }
-
-    #[test]
-    fn join_worker_abandons_a_thread_that_never_stops() {
-        let stopped = Arc::new(AtomicBool::new(false));
-        // A worker that outlives the (short) timeout and never flags stop.
-        let worker = thread::spawn(|| thread::sleep(Duration::from_millis(500)));
-
-        let start = Instant::now();
-        assert!(
-            !join_worker(&stopped, Some(worker), Duration::from_millis(40)),
-            "should give up rather than block on a worker that won't stop"
-        );
-        assert!(
-            start.elapsed() < Duration::from_millis(300),
-            "must return shortly after the timeout, not wait out the worker"
-        );
-    }
     #[tokio::test]
     async fn synchronized_real_bit_packer_stages_outputs_and_latches_inputs_without_a_bus() {
         let mut dev = device_with_outputs(false);
@@ -3377,6 +3606,7 @@ mod worker_poison_latch {
                 let group = group(4, vec![0; 4]);
                 let pdi = mirror(image);
                 let latch = AtomicBool::new(false);
+                let inhibited = AtomicBool::new(false);
                 let outcome = Mutex::new(Err("no exchange completed".into()));
                 let reply = if timeout {
                     Err("PDU timeout")
@@ -3388,15 +3618,17 @@ mod worker_poison_latch {
                 };
                 // Run the exact production macro shared by tx_rx_dc and
                 // tx_rx, against a bus surface initially holding 0xEE.
-                final_zero_exchange!(
+                let may_request_safe_op = final_zero_exchange!(
                     group,
                     (),
                     pdi,
                     latch,
+                    inhibited,
                     outcome,
                     dc,
                     std::future::ready(reply)
                 );
+                assert_eq!(may_request_safe_op, confirmed);
                 assert_eq!(outcome.lock().unwrap().is_ok(), confirmed);
                 if timeout {
                     assert!(outcome
@@ -3468,6 +3700,54 @@ mod worker_poison_latch {
 
     fn engaged_feedback(routing: &crate::gear::GearRouting) -> ChannelValue {
         routing.read("gear_engaged").unwrap()
+    }
+
+    #[test]
+    fn timer_driven_output_fence_drops_the_whole_frame_before_failsafe_io() {
+        let mut dev = tests::device_with_outputs(false);
+        let pdi = &dev.pdi;
+        lock_pdi(pdi).outputs.insert(0, vec![0x0f, 0, 0, 0, 0, 0]);
+        let g = group(6, enabled_drive_inputs());
+        let md = ();
+        let poison_latch = AtomicBool::new(false);
+        let (mut engines, routing) = engaged_gear();
+
+        prepare_timer_outputs!(
+            g,
+            md,
+            pdi,
+            poison_latch,
+            engines,
+            true,
+            dev.outputs_inhibited
+        );
+        assert!(
+            target(&g) > 0,
+            "precondition: a gear target reached the wire image"
+        );
+        assert_eq!(engaged_feedback(&routing), ChannelValue::Bool(true));
+
+        dev.inhibit_outputs();
+        let pdi = &dev.pdi;
+        assert_eq!(
+            lock_pdi(pdi).outputs[&0][0],
+            0x0f,
+            "the old mirror is still nonzero"
+        );
+        for bus_ok in [false, true] {
+            engage(&routing);
+            prepare_timer_outputs!(
+                g,
+                md,
+                pdi,
+                poison_latch,
+                engines,
+                bus_ok,
+                dev.outputs_inhibited
+            );
+            assert_eq!(g.wire(), vec![0; 6]);
+            assert_eq!(engaged_feedback(&routing), ChannelValue::Bool(false));
+        }
     }
 
     #[test]

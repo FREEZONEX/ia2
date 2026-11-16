@@ -87,7 +87,13 @@ including `instance.variable` on multi-PROGRAM runs. When the same bare
 name exists in more than one PROGRAM the renderer shows "—" rather than
 guessing, and `check` tells you to qualify it. Expressions see only
 the single bound value `x` on purpose — logic that spans variables belongs
-in a POU, not hidden in a screen. `action` is the only write path
+in a POU, not hidden in a screen. For a `WORD` status value such as `16#0027`,
+a plain binding displays the original text and an expression can test a bit
+with `x % 8 >= 4`. `BYTE`, `WORD`, `DWORD` and `LWORD` feedback also accepts
+`2#` and `8#` notation. Arithmetic requires a value within the declared type's
+width and JavaScript's safe integer range.
+
+`action` is the only write path
 (`write` / `toggle` / `pulse` / `set_value` / `nav`), every action is
 declared in the reviewable document, and `confirm` defaults to true —
 leave it on for anything that moves the plant. A pulse's 0-write is a

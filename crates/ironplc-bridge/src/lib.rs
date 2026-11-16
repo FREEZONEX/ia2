@@ -317,9 +317,9 @@ pub fn compile_project_units(
                 .into(),
         ));
     }
-    let pou_paths = store
-        .list_pou_paths()
-        .map_err(|e| BridgeError::Parse(format!("listing pous: {e}")))?;
+    let pous = store
+        .read_pous()
+        .map_err(|e| BridgeError::Parse(format!("reading project POU snapshot: {e}")))?;
     let options = parser_options();
 
     // Parse every POU file once; elements are cloned per unit below.
@@ -328,19 +328,22 @@ pub fn compile_project_units(
     let mut program_decls: Vec<(String, ironplc_dsl::common::ProgramDeclaration)> = Vec::new();
     let mut shared_elements: Vec<LibraryElementKind> = Vec::new();
     let mut sources = Sources::default();
-    for path in &pou_paths {
-        let language = store
-            .pou_file_language(path)
-            .map_err(|e| BridgeError::Parse(format!("language for '{path}': {e}")))?;
-        let source = store
-            .read_pou_source(path)
-            .map_err(|e| BridgeError::Parse(format!("reading pou '{path}': {e}")))?;
+    let mut globals = Vec::new();
+    for project::PouFileSource {
+        path,
+        source,
+        language,
+    } in pous
+    {
         let st = source_to_st(&source, language)?;
         let cleaned = strip_any_configuration(&st);
-        let file_id = FileId::from_string(path);
+        let file_id = FileId::from_string(&path);
         let library = ironplc_parser::parse_program(&cleaned, &file_id, &options)
             .map_err(|d| BridgeError::Parse(format!("parsing '{path}': {d:?}")))?;
         sources.0.insert(file_id, cleaned);
+        if tasks.programs.len() > 1 {
+            collect_globals(&path, &library, &mut globals);
+        }
         for element in library.elements {
             match element {
                 LibraryElementKind::ProgramDeclaration(p) => {
@@ -351,6 +354,8 @@ pub fn compile_project_units(
         }
     }
 
+    // Enforce the globals rule against the same inputs used to compile.
+    reject_globals(tasks, &globals).map_err(BridgeError::Parse)?;
     let mut units = Vec::with_capacity(tasks.programs.len());
     for p in &tasks.programs {
         let wanted = sanitise_ident(&p.program).to_lowercase();
@@ -462,7 +467,10 @@ pub fn reject_shared_globals(
     if tasks.programs.len() <= 1 {
         return Ok(());
     }
-    let globals = extract_project_global_vars(store);
+    reject_globals(tasks, &extract_project_global_vars(store))
+}
+
+fn reject_globals(tasks: &project::Tasks, globals: &[(String, String)]) -> Result<(), String> {
     if globals.is_empty() {
         return Ok(());
     }
@@ -482,37 +490,39 @@ pub fn reject_shared_globals(
 }
 
 pub fn extract_project_global_vars(store: &project::ProjectStore) -> Vec<(String, String)> {
-    let Ok(paths) = store.list_pou_paths() else {
+    let Ok((_, pous)) = store.read_pou_context(None) else {
         return Vec::new();
     };
     let options = parser_options();
     let mut out = Vec::new();
-    for path in &paths {
-        let Ok(language) = store.pou_file_language(path) else {
-            continue;
-        };
-        let Ok(source) = store.read_pou_source(path) else {
-            continue;
-        };
+    for project::PouFileSource {
+        path,
+        source,
+        language,
+    } in pous
+    {
         let Ok(st) = source_to_st(&source, language) else {
             continue;
         };
         let cleaned = strip_any_configuration(&st);
-        let file_id = FileId::from_string(path);
-        let Ok(library) = ironplc_parser::parse_program(&cleaned, &file_id, &options) else {
-            continue;
-        };
-        for element in &library.elements {
-            if let LibraryElementKind::GlobalVarDeclarations(decls) = element {
-                for v in decls {
-                    if let Some(id) = v.identifier.symbolic_id() {
-                        out.push((path.clone(), id.to_string()));
-                    }
+        let file_id = FileId::from_string(&path);
+        if let Ok(library) = ironplc_parser::parse_program(&cleaned, &file_id, &options) {
+            collect_globals(&path, &library, &mut out);
+        }
+    }
+    out
+}
+
+fn collect_globals(path: &str, library: &Library, out: &mut Vec<(String, String)>) {
+    for element in &library.elements {
+        if let LibraryElementKind::GlobalVarDeclarations(decls) = element {
+            for variable in decls {
+                if let Some(id) = variable.identifier.symbolic_id() {
+                    out.push((path.to_string(), id.to_string()));
                 }
             }
         }
     }
-    out
 }
 
 /// Compile one POU file for an ad-hoc isolated run, returning the
@@ -542,33 +552,26 @@ pub fn compile_isolated_in_project_full(
     if tasks.programs.is_empty() {
         return Err(BridgeError::Parse("no PROGRAM instance to run".into()));
     }
-    let language = store
-        .pou_file_language(pou_path)
-        .map_err(|e| BridgeError::Parse(format!("language for '{pou_path}': {e}")))?;
-    let source = store
-        .read_pou_source(pou_path)
-        .map_err(|e| BridgeError::Parse(format!("reading pou '{pou_path}': {e}")))?;
+    let (primary, siblings) = store
+        .read_pou_context(Some(pou_path))
+        .map_err(|e| BridgeError::Parse(format!("reading POU context for '{pou_path}': {e}")))?;
+    let project::PouFileSource {
+        source, language, ..
+    } = primary.expect("requested POU");
     let st = source_to_st(&source, language)?;
     let mut combined = String::with_capacity(st.len() + 1024);
     combined.push_str(&strip_any_configuration(&st));
     if !combined.ends_with('\n') {
         combined.push('\n');
     }
-    if let Ok(paths) = store.list_pou_paths() {
-        let options = parser_options();
-        for path in &paths {
-            if path == pou_path {
-                continue;
-            }
-            let Ok(lang) = store.pou_file_language(path) else {
-                continue;
-            };
-            let Ok(raw) = store.read_pou_source(path) else {
-                continue;
-            };
-            let Some(context) = isolated_type_context(&raw, lang, path, &options) else {
-                continue;
-            };
+    let options = parser_options();
+    for project::PouFileSource {
+        path,
+        source,
+        language,
+    } in siblings
+    {
+        if let Some(context) = isolated_type_context(&source, language, &path, &options) {
             combined.push_str(&context);
             if !combined.ends_with('\n') {
                 combined.push('\n');
@@ -816,8 +819,13 @@ pub fn check_pou_in_project(
     language: project::PouLanguage,
     buffer_path: Option<&str>,
 ) -> Vec<CheckDiagnostic> {
-    let context = project_context_libraries(store, source, language, buffer_path);
-    check_pou_source_with_context(source, language, &context)
+    match project_context_libraries(store, source, language, buffer_path) {
+        Ok(context) => check_pou_source_with_context(source, language, &context),
+        Err(error) => vec![synthetic_transpile_diag(
+            "PROJECT-READ",
+            &BridgeError::Parse(error.to_string()),
+        )],
+    }
 }
 
 /// Check a set of loose files TOGETHER: each file is analysed with every
@@ -929,10 +937,8 @@ fn project_context_libraries(
     buffer_source: &str,
     buffer_language: project::PouLanguage,
     buffer_path: Option<&str>,
-) -> Vec<Library> {
-    let Ok(paths) = store.list_pou_paths() else {
-        return Vec::new();
-    };
+) -> Result<Vec<Library>, project::StoreError> {
+    let (_, pous) = store.read_pou_context(None)?;
     // Identity fallback: with no slug to exclude, skip any context file
     // that re-declares one of the buffer's own POU names (IEC names are
     // case-insensitive).
@@ -946,21 +952,20 @@ fn project_context_libraries(
     };
     let options = parser_options();
     let mut out = Vec::new();
-    for path in &paths {
+    for project::PouFileSource {
+        path,
+        source,
+        language,
+    } in pous
+    {
         if buffer_path == Some(path.as_str()) {
             continue;
         }
-        let Ok(language) = store.pou_file_language(path) else {
-            continue;
-        };
-        let Ok(raw) = store.read_pou_source(path) else {
-            continue;
-        };
-        let Ok(st) = source_to_st(&raw, language) else {
+        let Ok(st) = source_to_st(&source, language) else {
             continue;
         };
         let cleaned = strip_any_configuration(&st);
-        let file_id = FileId::from_string(path);
+        let file_id = FileId::from_string(&path);
         let Ok(lib) = ironplc_parser::parse_program(&cleaned, &file_id, &options) else {
             continue;
         };
@@ -969,7 +974,7 @@ fn project_context_libraries(
         }
         out.push(lib);
     }
-    out
+    Ok(out)
 }
 
 fn library_declares_any(lib: &Library, lower_names: &[String]) -> bool {
