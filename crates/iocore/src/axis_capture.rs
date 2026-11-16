@@ -18,6 +18,9 @@ pub trait AxisCapture: Send + Sync {
     fn start(&self, request: Start) -> Result<Progress, CaptureError>;
     fn stop(&self, id: &str) -> Result<Progress, CaptureError>;
     fn frozen(&self, id: &str) -> Result<Arc<Capture>, CaptureError>;
+    /// Final access after the runtime has attempted its output safety and teardown.
+    /// Return the retained archive with its original end reason if already frozen.
+    fn freeze_for_shutdown(&self) -> Option<Arc<Capture>>;
 }
 
 #[derive(Debug, Error)]

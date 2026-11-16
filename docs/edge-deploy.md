@@ -604,8 +604,11 @@ would violate the current maintenance scope.
 Use the [edge capture API](api.md#edge-axis-capture) over the existing
 monitor connection to arm a bounded recording. Confirm the runtime, bus
 generation and axis before starting. Download the frozen archive before
-starting another capture or stopping the process. Validate the real PDO
-map and compare scan and bus timing with capture on and off as part of
+starting another capture. A protective shutdown can stop the process first.
+After the bridge drain, check `<state-dir>/axis-capture/last-shutdown.json`
+and copy the retained archive with the matching capture ID into the run's
+evidence. The journal reports save failures and timeouts. Validate the real
+PDO map and compare scan and bus timing with capture on and off as part of
 [axis capture field acceptance](axis-tuning.md#v2-bounded-edge-capture).
 
 ### Opt-in bus-clocked scans

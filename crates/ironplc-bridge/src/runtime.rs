@@ -482,6 +482,12 @@ impl ProgramHandle {
             .map(|(_, capture)| capture.clone())
     }
 
+    /// Call after shutdown, while this handle still owns the passive observer.
+    pub fn freeze_axis_capture_for_shutdown(&self) -> Option<Arc<iocore::axis_capture::Capture>> {
+        let (_, capture) = self.axis_capture.get()?;
+        capture.freeze_for_shutdown()
+    }
+
     /// Cooperative stop. The scan loop checks the flag between rounds, so a
     /// healthy scan in flight finishes, publishes, and the final RETAIN
     /// checkpoint is written. A scan still running `STOP_GRACE` after the flag

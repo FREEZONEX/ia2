@@ -234,8 +234,20 @@ cannot provide fresh feedback. A missed recorder lock is counted in
 The sample limit, duration limit, explicit stop, or end of the bus session
 freezes the record. Only exchanges completed within the recording window
 are included. A reconnect creates a new generation and keeps the previous
-frozen capture until a new recording is started. A process restart clears
-the in-memory archive.
+frozen capture until a new recording is started. Capture IDs in these routes
+refer to in-memory records of the current process.
+
+On graceful process shutdown, the runtime first drains the bridge. It then
+atomically saves any retained archive to
+`<state-dir>/axis-capture/last-shutdown.json`, using time left in the existing
+shutdown budget. An already frozen archive keeps its original end reason and
+JSON bytes. An active capture is finalized with the worker's end reason.
+The file is one slot per state directory. A subsequent shutdown with a capture
+can replace it, so copy the file to the operation's evidence directory.
+A shutdown with no capture leaves it alone. Check its capture ID and scope
+against the run receipt before use. This file is diagnostic evidence and is
+available even after the process exits. A drain timeout, forced termination or
+failed save can leave only an older file or no file.
 
 The export body contains `{run_id, plc, profile?, cohort?, parameter_readback?}`.
 `plc` contains `capture_id`, the raw archive's `scope` plus

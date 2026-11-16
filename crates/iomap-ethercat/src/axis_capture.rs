@@ -464,6 +464,16 @@ impl AxisCapture for Recorder {
         }
         Ok(rec.data.clone())
     }
+
+    fn freeze_for_shutdown(&self) -> Option<Arc<Capture>> {
+        let mut state = self.state.lock();
+        self.expire(&mut state, Instant::now());
+        // The sim worker can still be winding down. Retiring the tag also
+        // prevents an exchange in flight from appending to the frozen archive.
+        self.freeze(&mut state, EndReason::WorkerStopped);
+        state.bus = None;
+        state.recording.as_ref().map(|rec| rec.data.clone())
+    }
 }
 
 impl Session<'_> {

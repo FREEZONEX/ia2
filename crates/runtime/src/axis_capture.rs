@@ -1,6 +1,7 @@
 //! Edge control plane for a passive EtherCAT capture.
 
 use std::convert::Infallible;
+use std::path::PathBuf;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Path, State};
@@ -13,6 +14,7 @@ use ironplc_bridge::axis_capture::{
     AxisCapture, CaptureError, Progress, ReplayImport, Start, Status,
 };
 use ironplc_bridge::axis_replay::Source;
+use ironplc_bridge::ProgramHandle;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
@@ -20,6 +22,50 @@ use tokio::sync::Semaphore;
 use super::{runtime_instance_id, AppState};
 
 static DOWNLOAD: Semaphore = Semaphore::const_new(1);
+
+pub(crate) async fn save_after_drain(
+    handle: ProgramHandle,
+    state_dir: PathBuf,
+    deadline: tokio::time::Instant,
+) {
+    let path = state_dir.join("axis-capture").join("last-shutdown.json");
+    let (send, receive) = tokio::sync::oneshot::channel();
+    let worker_path = path.clone();
+    // A Tokio blocking task can keep the runtime alive on drop if its I/O
+    // stalls. The process can exit after the deadline with this thread detached.
+    let worker = std::thread::Builder::new()
+        .name("axis-capture-save".into())
+        .spawn(move || {
+            let save = || -> anyhow::Result<Option<String>> {
+                let Some(archive) = handle.freeze_axis_capture_for_shutdown() else {
+                    return Ok(None);
+                };
+                let bytes = serde_json::to_vec(&*archive)?;
+                std::fs::create_dir_all(worker_path.parent().expect("archive directory"))?;
+                project::write_atomic(&worker_path, bytes)?;
+                Ok(Some(archive.capture_id.clone()))
+            };
+            let _ = send.send(save());
+        });
+    if let Err(error) = worker {
+        tracing::warn!(%error, path = %path.display(), "axis capture shutdown save could not start");
+        return;
+    }
+
+    match tokio::time::timeout_at(deadline, receive).await {
+        Ok(Ok(Ok(Some(id)))) => {
+            tracing::info!(%id, path = %path.display(), "axis capture saved after bridge drain")
+        }
+        Ok(Ok(Ok(None))) => {}
+        Ok(Ok(Err(error))) => {
+            tracing::warn!(%error, path = %path.display(), "axis capture shutdown save failed")
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(%error, path = %path.display(), "axis capture shutdown save worker did not report a result")
+        }
+        Err(_) => tracing::warn!(path = %path.display(), "axis capture shutdown save timed out"),
+    }
+}
 
 pub(crate) fn routes() -> Router<AppState> {
     Router::new()
