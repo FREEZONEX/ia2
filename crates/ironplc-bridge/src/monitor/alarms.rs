@@ -88,7 +88,8 @@ pub struct AlarmEngine {
     device_defs: HashMap<String, AlarmDef>,
     /// The built-in "alarm evaluation is lost" alarm, once it has ever been
     /// raised (see [`AlarmEngine::note_supervision`]).
-    supervision_def: Option<AlarmDef>,
+    builtin_defs: HashMap<String, AlarmDef>,
+    retain_owner: Option<u64>,
     states: HashMap<String, AlarmRuntime>,
     journal: VecDeque<AlarmJournalEntry>,
 }
@@ -102,14 +103,15 @@ impl AlarmEngine {
         Self {
             defs,
             device_defs: HashMap::new(),
-            supervision_def: None,
+            builtin_defs: HashMap::new(),
+            retain_owner: None,
             states,
             journal: VecDeque::new(),
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.defs.is_empty() && self.device_defs.is_empty() && self.supervision_def.is_none()
+        self.defs.is_empty() && self.device_defs.is_empty() && self.builtin_defs.is_empty()
     }
 
     /// Raise or return the built-in alarm for "alarm evaluation is lost", the
@@ -125,25 +127,55 @@ impl AlarmEngine {
     /// otherwise indistinguishable from "all clear". Returns whether it
     /// changed. Idempotent: the same state twice is no change.
     pub fn note_supervision(&mut self, lost: Option<&str>, wall_now_us: u64) -> bool {
-        let id = project::SUPERVISION_ALARM_ID;
-        match lost {
-            Some(why) => {
+        let message = lost.map(|why| format!("Alarm evaluation is lost: {why}. Process alarms are not being evaluated, so a quiet alarm list is not an all-clear; treat the alarm list and live values as stale"));
+        self.note_builtin(
+            project::SUPERVISION_ALARM_ID,
+            "snapshot_tap",
+            message,
+            AlarmSeverity::Critical,
+            wall_now_us,
+        )
+    }
+
+    pub fn set_retain_owner(&mut self, owner: u64) {
+        self.retain_owner = Some(owner);
+    }
+
+    pub fn note_retain(&mut self, owner: u64, problem: Option<&str>, wall_now_us: u64) -> bool {
+        if self.retain_owner != Some(owner) {
+            return false;
+        }
+        self.note_builtin(
+            "__supervision/retain",
+            "retain",
+            problem.map(|p| format!("RETAIN: {p}")),
+            AlarmSeverity::High,
+            wall_now_us,
+        )
+    }
+
+    fn note_builtin(
+        &mut self,
+        id: &str,
+        variable: &str,
+        message: Option<String>,
+        severity: AlarmSeverity,
+        wall_now_us: u64,
+    ) -> bool {
+        match message {
+            Some(message) => {
                 if self.states.get(id).is_some_and(|st| st.active) {
                     return false;
                 }
                 let def = AlarmDef {
                     id: id.to_string(),
-                    variable: "snapshot_tap".to_string(),
+                    variable: variable.to_string(),
                     condition: AlarmCondition::IsFalse,
                     limit: None,
                     deadband: 0.0,
                     delay_ms: 0,
-                    severity: AlarmSeverity::Critical,
-                    message: format!(
-                        "Alarm evaluation is lost: {why}. Process alarms are not being \
-                         evaluated, so a quiet alarm list is not an all-clear; treat \
-                         the alarm list and live values as stale"
-                    ),
+                    severity,
+                    message,
                 };
                 let st = self.states.entry(id.to_string()).or_default();
                 st.active = true;
@@ -156,12 +188,11 @@ impl AlarmEngine {
                     &mut self.journal,
                     journal_entry(&def, wall_now_us, "raised", 0.0),
                 );
-                self.supervision_def = Some(def);
+                self.builtin_defs.insert(id.into(), def);
                 true
             }
             None => {
-                let (Some(st), Some(def)) =
-                    (self.states.get_mut(id), self.supervision_def.as_ref())
+                let (Some(st), Some(def)) = (self.states.get_mut(id), self.builtin_defs.get(id))
                 else {
                     return false;
                 };
@@ -282,7 +313,7 @@ impl AlarmEngine {
             .defs
             .iter()
             .chain(self.device_defs.values())
-            .chain(self.supervision_def.iter())
+            .chain(self.builtin_defs.values())
             .find(|d| d.id == id)
             .ok_or_else(|| format!("no alarm '{id}'"))?
             .clone();
@@ -302,7 +333,7 @@ impl AlarmEngine {
             .defs
             .iter()
             .chain(self.device_defs.values())
-            .chain(self.supervision_def.iter())
+            .chain(self.builtin_defs.values())
             .map(|d| state_of(d, self.states.get(&d.id).unwrap_or(&DEFAULT_RT)))
             .collect();
         out.sort_by(|a, b| {

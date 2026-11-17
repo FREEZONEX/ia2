@@ -19,3 +19,7 @@ Every example is plain text (TOML + ST + JSON; the harness adds bash)
 — read them like code, copy them as starting points. If a doc
 references an example that
 isn't in this table, that's a bug (see `MEMORY/principles.md` § 3).
+
+- `retain_recovery`: declared first-start defaults and a durable scalar checkpoint.
+- `retain_required`: terminal startup rejection for missing required RETAIN state;
+  run from a fresh copy. Both are device-free and exercised by the CLI sim e2e.

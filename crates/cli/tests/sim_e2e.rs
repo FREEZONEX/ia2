@@ -1179,3 +1179,88 @@ fn cycle_handoff_scenarios_expose_exact_sequence_and_latched_fault_over_http() {
     );
     cs(&server.base).args(["stop"]).assert().success();
 }
+
+#[test]
+fn retain_scenarios_and_cli_share_the_persisted_recovery_result() {
+    for (name, scenario, admitted) in [
+        ("retain_recovery", "first_start", true),
+        ("retain_required", "required_missing", false),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join(name);
+        copy_dir(&repo_root().join("examples").join(name), &proj);
+        let server = spawn_server(tmp.path());
+        server.open_project(&proj);
+        cs(&server.base)
+            .args(["project", "check"])
+            .arg(&proj)
+            .assert()
+            .success();
+        cs(&server.base)
+            .args(["--project", name, "sim", "run"])
+            .arg(proj.join(format!("scenarios/{scenario}.toml")))
+            .timeout(std::time::Duration::from_secs(10))
+            .assert()
+            .success();
+        let output = cs(&server.base)
+            .args(["--project", name, "get", "runtime/retain"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let status: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(status["recovery"]["admitted"], admitted);
+        if admitted {
+            // Stop's receipt is asynchronous; wait for the owned writer to finish.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                let out = cs(&server.base)
+                    .args(["--project", name, "get", "runtime/retain/checkpoint"])
+                    .output()
+                    .unwrap();
+                if out.status.success() {
+                    let exported: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+                    assert_eq!(exported["state"]["vars"]["main_inst.value"]["bits"], "42");
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        } else {
+            cs(&server.base)
+                .args(["--project", name, "get", "runtime/retain/checkpoint"])
+                .assert()
+                .code(2);
+            assert!(!proj.join("retain-state/retain.json").exists());
+            let request = tmp.path().join("resolve.json");
+            std::fs::write(&request, r#"{"expected_source_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","action":"cold_start","initialize_required":true}"#).unwrap();
+            cs(&server.base)
+                .args([
+                    "--project",
+                    name,
+                    "api",
+                    "POST",
+                    "/api/runtime/retain/resolve",
+                    "--from",
+                ])
+                .arg(&request)
+                .assert()
+                .success();
+            let recovered = proj.join("scenarios/recovered.toml");
+            std::fs::write(
+                &recovered,
+                r#"[[steps]]
+expect = { var = "value", op = "eq", value = 42, within_ms = 3000 }
+"#,
+            )
+            .unwrap();
+            cs(&server.base)
+                .args(["--project", name, "sim", "run"])
+                .arg(&recovered)
+                .timeout(std::time::Duration::from_secs(10))
+                .assert()
+                .success();
+        }
+    }
+}

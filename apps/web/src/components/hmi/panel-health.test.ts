@@ -18,6 +18,13 @@ const running: HmiRuntimeState = {
 }
 
 describe("derivePanelHealth", () => {
+  it("reports RETAIN storage attention while scans still run", () => {
+    const health = derivePanelHealth({ ...running, retainProblem: "RETAIN persistence loss budget exceeded" }, 0)
+    expect(health.tone).toBe("warn")
+    expect(health.badge).toBe("RETAIN")
+    expect(health.text).toContain("loss budget exceeded")
+  })
+
   it("reports a healthy run as green", () => {
     const h = derivePanelHealth(running, 0)
     expect(h.kind).toBe("running")

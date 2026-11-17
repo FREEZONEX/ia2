@@ -1,215 +1,555 @@
-//! Read / write the RETAIN variable state file.
-//!
-//! The file is a single JSON object the runtime writes atomically
-//! (tmp + rename) every few seconds and on graceful shutdown:
-//!
-//! ```json
-//! { "schema": 2,
-//!   "saved_at_us": 1700000000000000,
-//!   "scan_count": 12345,
-//!   "vars": { "setpoint": 1078523331, "total_m3": 4631166901565532406 } }
-//! ```
-//!
-//! Schema 2: each value is the variable's **raw 64-bit VM slot**
-//! (`read_variable_raw` / `write_variable_raw`), stored verbatim. That
-//! round-trips every IEC type losslessly — including LREAL / LINT /
-//! ULINT / LWORD, which schema 1's i32 encoding truncated.
-//!
-//! Schema 1 files (i32 values) are migrated on load: the VM's
-//! `write_variable(i32)` sign-extends (`v as i64 as u64`), so applying
-//! the same widening reproduces exactly the slot the old restore path
-//! would have produced.
+//! Identity- and type-checked RETAIN recovery, shared by server and edge.
+//! Raw scalar slots are lossless decimal strings on disk and on the wire.
+//! No filesystem operation occurs in a scan round.
+mod storage;
+#[cfg(test)]
+mod tests;
+mod worker;
 
-use std::collections::HashMap;
-use std::fs;
-use std::path::Path;
-
+use ironplc_container::debug_section::iec_type_tag as tag;
+use ironplc_vm::{Vm, VmBuffers};
+use project::{ColdStartCondition, RetainPolicy};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use ts_rs::TS;
 
-#[derive(Debug, Serialize, Deserialize)]
+pub(crate) use worker::RetainWriter;
+pub use worker::{
+    CheckpointExport, CheckpointReceipt, FinalSave, PersistenceHealth, RetainControl, RetainStatus,
+};
+pub const SCHEMA: u32 = 3;
+
+pub fn digest(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(deny_unknown_fields)]
+pub struct RetainIdentity {
+    pub project_id: String,
+    pub instance_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(deny_unknown_fields)]
+pub struct SlotLayout {
+    pub type_name: String,
+    pub width_bits: u8,
+}
+impl SlotLayout {
+    pub fn scalar(name: &str) -> Result<Self, String> {
+        let name = name.to_uppercase();
+        let width_bits = match name.as_str() {
+            "BOOL" => 1,
+            "SINT" | "USINT" | "BYTE" => 8,
+            "INT" | "UINT" | "WORD" => 16,
+            "DINT" | "UDINT" | "DWORD" | "REAL" => 32,
+            "LINT" | "ULINT" | "LWORD" | "LREAL" => 64,
+            _ => return Err(format!("unsupported RETAIN shape/type {name}; only elementary numeric/BOOL scalar slots are supported")),
+        };
+        Ok(Self {
+            type_name: name,
+            width_bits,
+        })
+    }
+    fn validate(&self) -> Result<(), String> {
+        if Self::scalar(&self.type_name)? != *self {
+            return Err("inconsistent RETAIN width/type".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedValue {
+    pub layout: SlotLayout,
+    pub bits: String,
+}
+impl RetainedValue {
+    fn raw(&self) -> Result<u64, String> {
+        self.layout.validate()?;
+        self.bits
+            .parse()
+            .map_err(|_| "invalid unsigned 64-bit RETAIN slot".into())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(deny_unknown_fields)]
+pub struct ResolutionEvidence {
+    pub action: ResolutionAction,
+    pub source_sha256: String,
+    #[serde(default)]
+    pub replaced_source_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(deny_unknown_fields)]
 pub struct RetainState {
-    /// Schema version — bump when the value encoding changes
-    /// incompatibly. Loading a higher schema than this binary
-    /// supports falls back to "no restored state".
     pub schema: u32,
-    /// Microseconds since the program started when this file was
-    /// last written. Useful for "stale state" diagnostics; not used
-    /// for correctness.
-    #[serde(default)]
-    pub saved_at_us: u64,
-    /// Scan count at flush time. Same role as `saved_at_us` —
-    /// surfaces "when did this snapshot come from".
-    #[serde(default)]
+    pub identity: RetainIdentity,
+    /// Content provenance, not an admission identity. Logic-only edits are compatible.
+    pub content_sha256: String,
+    #[ts(type = "number")]
+    pub saved_at_unix_ms: u64,
+    #[ts(type = "number")]
     pub scan_count: u64,
-    /// Variable name → last-known raw 64-bit VM slot value. Names
-    /// match `VarDebugInfo.name` (lower-cased; see
-    /// `extract_retain_vars` in lib.rs).
-    pub vars: HashMap<String, u64>,
+    #[ts(type = "number")]
+    pub data_generation: u64,
+    pub vars: BTreeMap<String, RetainedValue>,
+    pub resolution: Option<ResolutionEvidence>,
 }
 
-/// Current schema version. Increment when the on-disk shape changes
-/// in a way older versions can't read.
-const SCHEMA: u32 = 2;
-
-/// Schema-1 shape, kept only for migration. Values are the i32 the
-/// old `write_variable` restore path accepted. (`schema` itself is
-/// re-checked via the probe in `load`, so it's not declared here.)
-#[derive(Debug, Deserialize)]
-struct RetainStateV1 {
-    #[serde(default)]
-    saved_at_us: u64,
-    #[serde(default)]
-    scan_count: u64,
-    vars: HashMap<String, i32>,
+#[derive(Debug, Clone)]
+pub struct RetainConfig {
+    pub path: Option<PathBuf>,
+    pub policy: RetainPolicy,
 }
-
-/// Read `path` and return parsed state, or `Ok(None)` if the file
-/// doesn't exist (first run / fresh deploy). Schema-1 files migrate
-/// in memory (sign-extended, matching the old restore semantics); the
-/// next flush rewrites them as schema 2. Returns `Err` on I/O or
-/// parse errors so the caller can log loudly without aborting startup.
-pub fn load(path: &Path) -> std::io::Result<Option<RetainState>> {
-    let bytes = match fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    // Peek the schema first — v1 stored i32 values which won't parse
-    // into the u64 map (negatives), so dispatch before full decode.
-    #[derive(Deserialize)]
-    struct SchemaOnly {
-        #[serde(default)]
-        schema: u32,
-    }
-    let probe: SchemaOnly = serde_json::from_slice(&bytes)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    if probe.schema > SCHEMA {
-        tracing::warn!(
-            ?path,
-            file_schema = probe.schema,
-            binary_schema = SCHEMA,
-            "retain state file has higher schema than this binary supports; ignoring"
-        );
-        return Ok(None);
-    }
-    if probe.schema <= 1 {
-        let v1: RetainStateV1 = serde_json::from_slice(&bytes)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        tracing::info!(?path, "migrating retain state file schema 1 → 2");
-        return Ok(Some(RetainState {
-            schema: SCHEMA,
-            saved_at_us: v1.saved_at_us,
-            scan_count: v1.scan_count,
-            // Same widening `write_variable(i32)` applied on restore.
-            vars: v1
-                .vars
-                .into_iter()
-                .map(|(k, v)| (k, v as i64 as u64))
-                .collect(),
-        }));
-    }
-    let state: RetainState = serde_json::from_slice(&bytes)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    Ok(Some(state))
-}
-
-/// Write atomically through [`project::write_atomic`] — the same writer
-/// every project file uses: temporary → fsync → rename → directory fsync,
-/// so a crash or power cut leaves either the previous good file or the new
-/// one, never a partial write. The parent directory is created if missing
-/// so callers don't have to pre-mkdir `state/`.
-pub fn save(path: &Path, state: &RetainState) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
+impl RetainConfig {
+    pub fn ephemeral() -> Self {
+        Self {
+            path: None,
+            policy: RetainPolicy::default(),
         }
     }
-    let bytes = serde_json::to_vec_pretty(state)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    project::write_atomic(path, bytes)
 }
 
-/// Builder helper so the runtime doesn't have to know the schema
-/// version or field layout.
-pub fn build(vars: HashMap<String, u64>, saved_at_us: u64, scan_count: u64) -> RetainState {
-    RetainState {
-        schema: SCHEMA,
-        saved_at_us,
-        scan_count,
-        vars,
+#[derive(Debug, Clone)]
+pub(crate) struct Entry {
+    pub unit: usize,
+    pub key: String,
+    pub slot: u16,
+    pub layout: SlotLayout,
+}
+#[derive(Debug, Clone)]
+pub(crate) struct Plan {
+    pub entries: Vec<Entry>,
+    pub initial: RetainState,
+}
+impl Plan {
+    pub fn from_units(units: &[crate::ProgramUnit], policy: &RetainPolicy) -> Result<Self, String> {
+        policy.validate()?;
+        let mut entries = Vec::new();
+        let mut vars = BTreeMap::new();
+        let mut content = Vec::new();
+        for (unit_index, unit) in units.iter().enumerate() {
+            unit.container
+                .write_to(&mut content)
+                .map_err(|e| e.to_string())?;
+            content.extend_from_slice(unit.instance.as_bytes());
+            let mut buffers = VmBuffers::from_container(&unit.container);
+            let vm = Vm::new()
+                .load(&unit.container, &mut buffers)
+                .map_err(|e| format!("RETAIN initial VM: {e:?}"))?;
+            let vm = vm
+                .start()
+                .map_err(|e| format!("RETAIN initial VM: {e:?}"))?;
+            for name in &unit.retain_vars {
+                let info = unit
+                    .container
+                    .debug_section
+                    .iter()
+                    .flat_map(|d| &d.var_names)
+                    .find(|v| &v.name == name)
+                    .ok_or_else(|| {
+                        format!("RETAIN declaration {name} has no supported debug slot")
+                    })?;
+                if !matches!(
+                    info.iec_type_tag,
+                    tag::BOOL
+                        | tag::SINT
+                        | tag::INT
+                        | tag::DINT
+                        | tag::LINT
+                        | tag::USINT
+                        | tag::UINT
+                        | tag::UDINT
+                        | tag::ULINT
+                        | tag::REAL
+                        | tag::LREAL
+                        | tag::BYTE
+                        | tag::WORD
+                        | tag::DWORD
+                        | tag::LWORD
+                ) {
+                    return Err(format!(
+                        "unsupported RETAIN shape {} ({name})",
+                        info.type_name
+                    ));
+                }
+                let layout = SlotLayout::scalar(&info.type_name)?;
+                let key = format!("{}.{}", unit.instance.to_lowercase(), name.to_lowercase());
+                let raw = vm
+                    .read_variable_raw(info.var_index)
+                    .map_err(|e| format!("RETAIN initial read: {e:?}"))?;
+                if vars
+                    .insert(
+                        key.clone(),
+                        RetainedValue {
+                            layout: layout.clone(),
+                            bits: raw.to_string(),
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(format!("duplicate RETAIN key {key}"));
+                }
+                entries.push(Entry {
+                    unit: unit_index,
+                    key,
+                    slot: info.var_index.raw(),
+                    layout,
+                });
+            }
+        }
+        for required in &policy.required {
+            if !vars.contains_key(&required.to_lowercase()) {
+                return Err(format!("required RETAIN key {required} is not declared"));
+            }
+        }
+        Ok(Self {
+            entries,
+            initial: RetainState {
+                schema: SCHEMA,
+                identity: RetainIdentity {
+                    project_id: policy.project_id.clone().unwrap_or_default(),
+                    instance_id: policy.instance_id.clone(),
+                },
+                content_sha256: digest(&content),
+                saved_at_unix_ms: 0,
+                scan_count: 0,
+                data_generation: 0,
+                vars,
+                resolution: None,
+            },
+        })
+    }
+    pub fn sample(
+        &self,
+        raw: BTreeMap<String, u64>,
+        generation: u64,
+        scan_count: u64,
+    ) -> RetainState {
+        let mut state = self.initial.clone();
+        state.vars = self
+            .entries
+            .iter()
+            .filter_map(|e| {
+                raw.get(&e.key).map(|v| {
+                    (
+                        e.key.clone(),
+                        RetainedValue {
+                            layout: e.layout.clone(),
+                            bits: v.to_string(),
+                        },
+                    )
+                })
+            })
+            .collect();
+        state.data_generation = generation;
+        state.scan_count = scan_count;
+        state.saved_at_unix_ms = crate::monitor::wall_now_us() / 1000;
+        state
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn load_returns_none_for_missing_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("nope.json");
-        assert!(load(&path).unwrap().is_none());
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryKind {
+    Disabled,
+    Pending,
+    FirstStart,
+    Restored,
+    Migrated,
+    ColdStart,
+    Corrupt,
+    UnsupportedVersion,
+    LegacyUnverified,
+    IdentityMismatch,
+    LayoutMismatch,
+    ReadFailed,
+    ProtectionFailed,
+    WriterBusy,
+    ConfigurationError,
+}
+impl RecoveryKind {
+    fn cold_condition(self) -> Option<ColdStartCondition> {
+        match self {
+            Self::FirstStart => Some(ColdStartCondition::Missing),
+            Self::Corrupt => Some(ColdStartCondition::Corrupt),
+            Self::UnsupportedVersion => Some(ColdStartCondition::UnsupportedVersion),
+            Self::LegacyUnverified => Some(ColdStartCondition::LegacyUnverified),
+            Self::IdentityMismatch => Some(ColdStartCondition::IdentityMismatch),
+            Self::LayoutMismatch => Some(ColdStartCondition::LayoutMismatch),
+            _ => None,
+        }
     }
-
-    #[test]
-    fn save_then_load_roundtrip_preserves_vars() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state").join("retain.json");
-        let mut vars = HashMap::new();
-        vars.insert("setpoint".into(), 42u64);
-        // Full 64-bit patterns survive: an LREAL bit pattern and a
-        // sign-extended negative DINT slot.
-        vars.insert("total_m3".into(), 1234.5678f64.to_bits());
-        vars.insert("counter".into(), (-17i32) as i64 as u64);
-        save(&path, &build(vars.clone(), 12345, 100)).unwrap();
-        let loaded = load(&path).unwrap().unwrap();
-        assert_eq!(loaded.vars, vars);
-        assert_eq!(loaded.scan_count, 100);
-        assert_eq!(loaded.schema, SCHEMA);
-        assert_eq!(
-            f64::from_bits(loaded.vars["total_m3"]),
-            1234.5678,
-            "LREAL slot bits round-trip losslessly"
-        );
+}
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RecoveryResult {
+    pub kind: RecoveryKind,
+    /// Original classification survives a policy-authorized cold start.
+    pub source_kind: RecoveryKind,
+    pub admitted: bool,
+    pub writes_enabled: bool,
+    pub reason: String,
+    pub source_sha256: Option<String>,
+    pub resolution: Option<ResolutionEvidence>,
+    pub archive_path: Option<String>,
+    pub restored: Vec<String>,
+    pub initialized: Vec<String>,
+    pub removed: Vec<String>,
+}
+impl RecoveryResult {
+    pub(crate) fn new(kind: RecoveryKind, admitted: bool, reason: impl Into<String>) -> Self {
+        Self {
+            kind,
+            source_kind: kind,
+            admitted,
+            writes_enabled: false,
+            reason: reason.into(),
+            source_sha256: None,
+            resolution: None,
+            archive_path: None,
+            restored: vec![],
+            initialized: vec![],
+            removed: vec![],
+        }
     }
+}
 
-    #[test]
-    fn load_migrates_schema1_with_sign_extension() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("retain.json");
-        let v1 = serde_json::json!({
-            "schema": 1,
-            "saved_at_us": 7,
-            "scan_count": 9,
-            "vars": { "setpoint": 42, "counter": -17 }
-        });
-        std::fs::write(&path, v1.to_string()).unwrap();
-        let loaded = load(&path).unwrap().unwrap();
-        assert_eq!(loaded.schema, SCHEMA);
-        assert_eq!(loaded.saved_at_us, 7);
-        assert_eq!(loaded.vars["setpoint"], 42u64);
-        // -17 widens exactly as the old write_variable(i32) restore did.
-        assert_eq!(loaded.vars["counter"], (-17i32) as i64 as u64);
+/// Pure compatibility decision used by recovery and deployment consumers.
+/// Rejected decisions return no values: no partial restore can reach a VM.
+pub fn compatibility(
+    state: &RetainState,
+    expected: &RetainState,
+    policy: &RetainPolicy,
+) -> Result<BTreeMap<String, u64>, (RecoveryKind, String)> {
+    if state.schema != SCHEMA {
+        return Err((
+            RecoveryKind::UnsupportedVersion,
+            format!("unsupported RETAIN schema {}", state.schema),
+        ));
     }
+    if state.identity != expected.identity {
+        return Err((
+            RecoveryKind::IdentityMismatch,
+            "RETAIN project/instance identity mismatch".into(),
+        ));
+    }
+    let mut restored = BTreeMap::new();
+    for (key, saved) in &state.vars {
+        let raw = saved
+            .raw()
+            .map_err(|e| (RecoveryKind::Corrupt, format!("{key}: {e}")))?;
+        if let Some(target) = expected.vars.get(key) {
+            if target.layout != saved.layout {
+                return Err((
+                    RecoveryKind::LayoutMismatch,
+                    format!(
+                        "RETAIN {key}: {:?} -> {:?} requires explicit migration",
+                        saved.layout, target.layout
+                    ),
+                ));
+            }
+            restored.insert(key.clone(), raw);
+        }
+    }
+    for required in &policy.required {
+        if !restored.contains_key(&required.to_lowercase()) {
+            return Err((
+                RecoveryKind::LayoutMismatch,
+                format!("required RETAIN {required} missing"),
+            ));
+        }
+    }
+    Ok(restored)
+}
 
-    #[test]
-    fn load_rejects_corrupt_file_loudly() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("retain.json");
-        std::fs::write(&path, b"not json at all").unwrap();
-        let err = load(&path).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolutionAction {
+    ColdStart,
+    Discard,
+    Migrate,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum Conversion {
+    Exact,
+    DintToReal,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(deny_unknown_fields)]
+pub struct MigrationRule {
+    pub from: String,
+    pub to: String,
+    pub source_layout: SlotLayout,
+    pub conversion: Conversion,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveRequest {
+    pub expected_source_sha256: String,
+    /// Select an already preserved checkpoint for rollback; no filesystem paths.
+    #[serde(default)]
+    pub migration_source_sha256: Option<String>,
+    pub action: ResolutionAction,
+    #[serde(default)]
+    pub initialize_required: bool,
+    /// Required for legacy data, whose file cannot prove either identity or types.
+    pub attested_source_identity: Option<RetainIdentity>,
+    #[serde(default)]
+    pub rules: Vec<MigrationRule>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ResolveResult {
+    pub replaced_source_sha256: String,
+    pub preserved_current_path: String,
+    pub action: ResolutionAction,
+    pub source_sha256: String,
+    pub archive_path: String,
+    pub checkpoint_sha256: String,
+    pub receipt: project::AtomicWriteReceipt,
+    pub restart_required: bool,
+}
 
-    #[test]
-    fn load_ignores_future_schema_versions() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("retain.json");
-        let future = serde_json::json!({
-            "schema": SCHEMA + 5,
-            "vars": { "x": 1 }
-        });
-        std::fs::write(&path, future.to_string()).unwrap();
-        assert!(load(&path).unwrap().is_none());
+fn migrate(
+    bytes: &[u8],
+    request: &ResolveRequest,
+    plan: &Plan,
+    policy: &RetainPolicy,
+) -> Result<RetainState, String> {
+    let json: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    let schema = json
+        .get("schema")
+        .and_then(|v| v.as_u64())
+        .ok_or("missing RETAIN schema")?;
+    let mut target = plan.initial.clone();
+    let mut sources = BTreeMap::<String, RetainedValue>::new();
+    match schema {
+        1 | 2 => {
+            if request.attested_source_identity.as_ref() != Some(&target.identity) {
+                return Err("legacy migration needs attested_source_identity matching the destination; verify it from external evidence".into());
+            }
+            let vars = json
+                .get("vars")
+                .and_then(|v| v.as_object())
+                .ok_or("legacy vars missing")?;
+            for rule in &request.rules {
+                let value = vars
+                    .get(&rule.from)
+                    .ok_or_else(|| format!("missing source {}", rule.from))?;
+                let raw = if schema == 1 {
+                    let i = value.as_i64().ok_or("schema 1 needs i32")?;
+                    i32::try_from(i).map_err(|_| "schema 1 outside i32")? as i64 as u64
+                } else {
+                    value.as_u64().ok_or("schema 2 needs u64")?
+                };
+                sources.insert(
+                    rule.from.clone(),
+                    RetainedValue {
+                        layout: rule.source_layout.clone(),
+                        bits: raw.to_string(),
+                    },
+                );
+            }
+        }
+        3 => {
+            let old: RetainState = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+            if old.identity != target.identity {
+                return Err(
+                    "migration cannot transfer state across project/instance identities".into(),
+                );
+            }
+            sources = old.vars;
+        }
+        _ => return Err(format!("schema {schema} has no migration decoder")),
     }
+    let mut assigned = std::collections::HashSet::new();
+    for rule in &request.rules {
+        if !assigned.insert(rule.to.clone()) {
+            return Err("duplicate migration target".into());
+        }
+        let old = sources
+            .get(&rule.from)
+            .ok_or_else(|| format!("missing source {}", rule.from))?;
+        if old.layout != rule.source_layout {
+            return Err(format!("source layout mismatch: {}", rule.from));
+        }
+        let new = target
+            .vars
+            .get_mut(&rule.to)
+            .ok_or_else(|| format!("unknown target {}", rule.to))?;
+        let raw = old.raw()?;
+        new.bits = match rule.conversion {
+            Conversion::Exact if old.layout == new.layout => raw.to_string(),
+            Conversion::DintToReal
+                if old.layout.type_name == "DINT" && new.layout.type_name == "REAL" =>
+            {
+                let value = raw as i32;
+                let converted = value as f32;
+                if converted as f64 != value as f64 {
+                    return Err("DINT -> REAL would lose integer precision".into());
+                }
+                u64::from(converted.to_bits()).to_string()
+            }
+            _ => return Err("migration type/conversion mismatch".into()),
+        };
+    }
+    // Explicit complete mapping avoids silently retaining old data the reviewer
+    // did not authorize, and distinguishes defaults from migrated values.
+    for key in target.vars.keys() {
+        if !assigned.contains(key)
+            && (!request.initialize_required
+                || policy.required.iter().any(|r| r.eq_ignore_ascii_case(key)))
+        {
+            return Err(format!("migration needs an explicit rule for {key}"));
+        }
+    }
+    target.resolution = Some(ResolutionEvidence {
+        action: ResolutionAction::Migrate,
+        source_sha256: digest(bytes),
+        replaced_source_sha256: None,
+    });
+    Ok(target)
+}
+
+pub(crate) fn now_ms() -> u64 {
+    crate::monitor::wall_now_us() / 1000
+}
+
+/// Offline maintenance entry. Acquires the same exclusive lease as a runtime;
+/// never connects devices and never starts a scan.
+pub fn resolve_stopped(
+    config: &RetainConfig,
+    units: &[crate::ProgramUnit],
+    request: &ResolveRequest,
+) -> Result<ResolveResult, String> {
+    storage::resolve(config, &Plan::from_units(units, &config.policy)?, request)
+}
+
+/// Compile-time target descriptor for deployment/rollback compatibility checks.
+/// Runs only VM initialization in memory, without I/O or scheduled scans.
+pub fn declaration_state(
+    units: &[crate::ProgramUnit],
+    policy: &RetainPolicy,
+) -> Result<RetainState, String> {
+    Plan::from_units(units, policy).map(|plan| plan.initial)
 }

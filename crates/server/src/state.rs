@@ -228,6 +228,8 @@ pub struct AppState {
     /// (alongside the SSE `Error` + `Stopped` events); cleared by the
     /// next /api/run.
     pub last_error: Arc<Mutex<Option<String>>>,
+    pub retain_controls:
+        Arc<Mutex<std::collections::HashMap<String, Arc<ironplc_bridge::retain::RetainControl>>>>,
     /// What the most-recent /api/run call asked the bridge to run.
     /// Lets the IDE recover "running ad-hoc / running scheduled, which
     /// PROGRAM(s)" after a page reload without an out-of-band channel.
@@ -310,6 +312,7 @@ impl AppState {
             attachments: AttachmentRegistry::new(),
             last_snapshot: Arc::new(Mutex::new(None)),
             last_error: Arc::new(Mutex::new(None)),
+            retain_controls: Arc::new(Mutex::new(std::collections::HashMap::new())),
             running_info: Arc::new(Mutex::new(None)),
             agent: Arc::new(Mutex::new(AgentActivityState::default())),
             library_dir,

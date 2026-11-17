@@ -256,3 +256,10 @@ is equivalent. There is no SDO set/rm resource.
 Opt-in EtherCAT bus-clocked scans and their offline regression fixture are
 documented in [the cycle handoff contract](docs/scan-cycle-handoff.md). Inspect
 the bounded sequence diagnostics with `cs get runtime/status`.
+
+
+RETAIN storage and recovery: [identity, compatible layouts, migration and loss
+budgets](docs/retain-recovery.md). Inspect a declared persistent run through
+`cs get runtime/retain` and `cs get runtime/retain/checkpoint`; the same result is
+visible in the Monitor and edge panel. Legacy files require an explicit,
+source-preserving transition to schema 3.
