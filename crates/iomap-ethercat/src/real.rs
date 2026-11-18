@@ -2222,7 +2222,7 @@ fn smol_main(
                     while !shutdown.load(Ordering::Relaxed) {
                         let sequence = cycles.fetch_add(1, Ordering::Relaxed) + 1;
                         let cycle_start = std::time::Instant::now();
-                        let selected_ticket = if let Some(clock) = &cycle {
+                        let selection = if let Some(clock) = &cycle {
                             clock.consume_before(dc_continuity.as_ref().map(|d| d.send_before), |image| {
                                 {
                                     let mut mirror = lock_pdi_for_cycle(&pdi, &pdi_poisoned);
@@ -2234,7 +2234,7 @@ fn smol_main(
                         } else {
                             prepare_timer_outputs!(group, maindevice, pdi, pdi_poisoned,
                                 engines, bus_ok, outputs_inhibited);
-                            None
+                            crate::cycle::OutputSelection::default()
                         };
                         let attempt = capture_session.as_ref().and_then(|session| {
                             let attempt = session.begin(sequence, cycle_start)?;
@@ -2245,6 +2245,18 @@ fn smol_main(
                         let exchange_start = Instant::now();
                         let response = group.tx_rx_dc(&maindevice).await;
                         let exchange_end = Instant::now();
+                        if let Some(miss) = selection.miss {
+                            tracing::error!(
+                                sequence = miss.sequence,
+                                send_window_excess_us = miss.checked_at.saturating_duration_since(miss.send_before).as_micros() as u64,
+                                selection_delay_us = miss.checked_at.saturating_duration_since(cycle_start).as_micros() as u64,
+                                wake_lateness_us = dc_continuity.as_ref().map(|d| cycle_start.saturating_duration_since(d.deadline).as_micros() as u64),
+                                timer_entry_margin_us = previous_wait.map(|(deadline, entered, _)| deadline.saturating_duration_since(entered).as_micros() as u64),
+                                timer_entry_late_us = previous_wait.map(|(deadline, entered, _)| entered.saturating_duration_since(deadline).as_micros() as u64),
+                                previous_dc_ns = dc_continuity.as_ref().map(|d| d.last_dc_ns),
+                                "EtherCAT DC send window expired; zero outputs selected"
+                            );
+                        }
                         if let Some((session, attempt, command)) = attempt {
                             let reply = match &response {
                                 Ok(resp) => {
@@ -2267,7 +2279,7 @@ fn smol_main(
                                 Err(ethercrab::error::Error::Timeout(_)) => Reply::Timeout,
                                 Err(_) => Reply::Failed,
                             };
-                            session.finish(attempt, exchange_start, exchange_end, selected_ticket, command, reply);
+                            session.finish(attempt, exchange_start, exchange_end, selection.ticket, command, reply);
                         }
                         if let Some((deadline, wait_start, previous_exchange_end)) = previous_wait {
                             let late = cycle_start.saturating_duration_since(deadline);
@@ -2604,6 +2616,10 @@ fn smol_main(
         smol::block_on(master);
     }
 }
+
+#[cfg(test)]
+#[path = "dc_pipeline_tests.rs"]
+mod dc_pipeline_tests;
 
 #[cfg(test)]
 mod tests {
