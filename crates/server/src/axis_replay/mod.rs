@@ -5,8 +5,7 @@ mod metrics;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{BTreeMap, HashSet};
-use std::num::{NonZeroU16, NonZeroU32};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::extract::{DefaultBodyLimit, FromRequest, Request};
@@ -17,15 +16,15 @@ use tokio::sync::Semaphore;
 
 use crate::error::ApiError;
 use compare::{Comparison, ComparisonResult};
-use metrics::{Metrics, Profile};
+use ironplc_bridge::axis_replay::{
+    Run, Sample, Sampling, Source, MAX_PARAMETERS_PER_RUN, MAX_READBACK_BYTES, MAX_SAMPLES,
+};
+use metrics::Metrics;
 
 const MAX_BODY_BYTES: usize = 24 * 1024 * 1024;
 const MAX_CONCURRENT_REQUESTS: usize = 2;
 const MAX_RUNS: usize = 32;
 const MAX_COMPARISONS: usize = 32;
-const MAX_SAMPLES: usize = 100_000;
-const MAX_PARAMETERS_PER_RUN: usize = 256;
-const MAX_READBACK_BYTES: usize = 1024;
 const MAX_ABS_COUNTS: u64 = 1 << 52;
 
 #[derive(Deserialize)]
@@ -36,78 +35,6 @@ pub(crate) struct ReplayRequest {
     runs: Vec<Run>,
     #[serde(default)]
     comparisons: Vec<Comparison>,
-}
-
-#[derive(Clone, Copy, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Sampling {
-    cycle_ns: NonZeroU32,
-    counts_per_revolution: NonZeroU32,
-    expected_wkc: NonZeroU16,
-}
-
-impl Sampling {
-    fn width(self, window_ns: u64) -> usize {
-        (window_ns / u64::from(self.cycle_ns.get())) as usize
-    }
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct Source {
-    path: String,
-    sha256: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Run {
-    id: String,
-    source: Source,
-    evidence: Evidence,
-    cohort: Option<String>,
-    profile: Option<Profile>,
-    #[serde(default)]
-    parameter_readback: BTreeMap<String, Vec<u8>>,
-    samples: Vec<Sample>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Evidence {
-    zero_capture_drops: bool,
-    request_consumed: bool,
-    plc_started: Option<bool>,
-    normal_completion: bool,
-    terminal_reason: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Sample {
-    dc_ns: u64,
-    position_counts: i64,
-    target_counts: i64,
-    following_error_counts: i32,
-    torque_permille: i16,
-    controlword: u16,
-    statusword: u16,
-    error_code: u16,
-    wkc: u16,
-}
-
-impl Sample {
-    fn enabled(&self) -> bool {
-        self.statusword & 0x006f == 0x0027
-    }
-
-    fn enable_command(&self) -> bool {
-        self.controlword & 0x008f == 0x000f
-    }
-
-    fn drive_fault(&self) -> bool {
-        self.error_code != 0 || self.statusword & 0x0008 != 0
-    }
 }
 
 #[derive(Serialize)]
@@ -162,7 +89,6 @@ struct DcDiscontinuity {
 }
 
 fn inspect_capture(samples: &[Sample], sampling: Sampling) -> CaptureQuality {
-    let period = u64::from(sampling.cycle_ns.get());
     let mut quality = CaptureQuality {
         samples: samples.len(),
         ..CaptureQuality::default()
@@ -173,16 +99,10 @@ fn inspect_capture(samples: &[Sample], sampling: Sampling) -> CaptureQuality {
         quality.enabled_frames += usize::from(sample.enabled());
         quality.enable_command_frames += usize::from(sample.enable_command());
     }
-    let min_interval = (period / 2).max(1);
-    let max_interval = period + period / 2;
     for (index, pair) in samples.windows(2).enumerate() {
         let previous = pair[0].dc_ns;
         let current = pair[1].dc_ns;
-        let slot_step = (current / period).saturating_sub(previous / period);
-        let interval = current.checked_sub(previous);
-        if slot_step != 1 || !interval.is_some_and(|dt| (min_interval..=max_interval).contains(&dt))
-        {
-            let missing_slots = slot_step.saturating_sub(1);
+        if let Some(missing_slots) = sampling.dc_gap(previous, current) {
             quality.dc_discontinuities += 1;
             quality.dc_missing_slots = quality.dc_missing_slots.saturating_add(missing_slots);
             quality
@@ -275,7 +195,7 @@ fn analyze(request: ReplayRequest) -> Result<ReplayResult, String> {
     if request.schema_version != 1 {
         return Err("axis replay requires schema_version 1".into());
     }
-    if !metrics::PEAK_NS.is_multiple_of(u64::from(request.sampling.cycle_ns.get())) {
+    if !Sampling::supports_cycle(request.sampling.cycle_ns.get()) {
         return Err("cycle_ns must divide the 20 ms speed window".into());
     }
     if !(1..=MAX_RUNS).contains(&request.runs.len()) {

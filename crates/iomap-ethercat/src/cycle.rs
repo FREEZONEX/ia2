@@ -14,6 +14,8 @@ use std::{
 };
 use tokio::sync::watch;
 
+pub(crate) const MAX_SYNC_PDI_BYTES: usize = 1024;
+
 const TRACE_CAPACITY: usize = 32;
 /// First DC output-selection expiry, sampled after acquiring the gate lock.
 /// Returned to the worker so diagnostics can separate wakeup from selection
@@ -24,6 +26,12 @@ pub(crate) struct DcSelectionMiss {
     pub checked_at: Instant,
     pub send_before: Instant,
 }
+#[derive(Default)]
+pub(crate) struct OutputSelection {
+    pub ticket: Option<u64>,
+    pub miss: Option<DcSelectionMiss>,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Ticket {
     pub sequence: u64,
@@ -258,8 +266,8 @@ impl<T: Clone> Gate<T> {
     }
     /// Callback runs under the gate lock. Failsafe cannot race an accepted
     /// frame back onto the mirror. None means ZERO outputs, never hold-last.
-    pub fn consume(&self, apply: impl FnOnce(Option<&T>)) {
-        let _ = self.consume_before(None, apply);
+    pub fn consume(&self, apply: impl FnOnce(Option<&T>)) -> Option<u64> {
+        self.consume_before(None, apply).ticket
     }
     /// The real DC worker additionally bounds selection by the predicted
     /// end of the next reference-clock slot. Check AFTER taking the lock.
@@ -267,7 +275,7 @@ impl<T: Clone> Gate<T> {
         &self,
         send_before: Option<Instant>,
         apply: impl FnOnce(Option<&T>),
-    ) -> Option<DcSelectionMiss> {
+    ) -> OutputSelection {
         self.consume_with_clock(Instant::now, send_before, apply)
     }
     fn consume_with_clock(
@@ -275,14 +283,14 @@ impl<T: Clone> Gate<T> {
         now: impl FnOnce() -> Instant,
         send_before: Option<Instant>,
         apply: impl FnOnce(Option<&T>),
-    ) -> Option<DcSelectionMiss> {
+    ) -> OutputSelection {
         let mut s = self.state.lock().expect("cycle gate poisoned");
         let now = now();
-        let mut miss = None;
+        let mut result = OutputSelection::default();
         if s.status.fault.is_none() {
             if let Some(limit) = send_before.filter(|limit| now >= *limit) {
                 let sequence = s.status.issued;
-                miss = Some(DcSelectionMiss {
+                result.miss = Some(DcSelectionMiss {
                     sequence,
                     checked_at: now,
                     send_before: limit,
@@ -311,6 +319,7 @@ impl<T: Clone> Gate<T> {
                     self.fail(&mut s, reason, now);
                 } else {
                     s.status.consumed += 1;
+                    result.ticket = Some(ticket.sequence);
                     self.event(
                         &mut s,
                         "consume",
@@ -324,7 +333,7 @@ impl<T: Clone> Gate<T> {
         }
         apply(s.pending.as_ref());
         s.pending = None;
-        miss
+        result
     }
     /// Called only after a successful OP exchange and a complete input copy.
     pub fn publish(&self, image: T, deadline: Instant) {
@@ -367,8 +376,8 @@ impl<T: Clone> Gate<T> {
     pub(crate) fn commit_at(&self, ticket: Ticket, image: T, now: Instant) -> Result<(), IoError> {
         self.commit_with_clock(ticket, image, || now)
     }
-    pub(crate) fn consume_at(&self, now: Instant, apply: impl FnOnce(Option<&T>)) {
-        let _ = self.consume_with_clock(|| now, None, apply);
+    pub(crate) fn consume_at(&self, now: Instant, apply: impl FnOnce(Option<&T>)) -> Option<u64> {
+        self.consume_with_clock(|| now, None, apply).ticket
     }
     pub(crate) fn publish_at(&self, image: T, deadline: Instant, now: Instant) {
         self.publish_with_clock(image, deadline, || now);
@@ -441,7 +450,8 @@ mod tests {
             )
             .unwrap();
             now += g.period;
-            g.consume_at(now, |frame| wire.push(*frame.unwrap()));
+            let selected = g.consume_at(now, |frame| wire.push(*frame.unwrap()));
+            assert_eq!(selected, Some(t.sequence));
         }
         assert_eq!(wire, (1..=10_000).map(|n| [n, n * 2]).collect::<Vec<_>>());
         let status = g.status();
@@ -500,7 +510,8 @@ mod tests {
             } else {
                 now + g.period
             };
-            g.consume_at(consume_at, |frame| assert!(frame.is_none()));
+            let selected = g.consume_at(consume_at, |frame| assert!(frame.is_none()));
+            assert_eq!(selected, None);
             assert!(g.status().fault.is_some());
             // A healthy transport and fresh data NEVER re-arm a failed gate.
             g.publish_at([8, 16], now + g.period * 4, now + g.period * 3);
@@ -591,15 +602,19 @@ mod tests {
                     } else {
                         Duration::from_nanos(1)
                     };
-                let miss = g.consume_with_clock(
+                let selection = g.consume_with_clock(
                     || selected_at,
                     Some(limit),
                     |frame| {
                         assert_eq!(frame, (armed && !late).then_some(&[1, 2]));
                     },
                 );
-                assert_eq!(miss.is_some(), late);
-                if let Some(miss) = miss {
+                assert_eq!(
+                    selection.ticket,
+                    ticket.filter(|_| !late).map(|ticket| ticket.sequence)
+                );
+                assert_eq!(selection.miss.is_some(), late);
+                if let Some(miss) = selection.miss {
                     assert_eq!(miss.sequence, u64::from(armed));
                     assert_eq!(miss.checked_at, selected_at);
                     assert_eq!(miss.send_before, limit);
@@ -611,6 +626,7 @@ mod tests {
                                 assert!(frame.is_none());
                             }
                         )
+                        .miss
                         .is_none(),
                         "only the first expiry is reported"
                     );

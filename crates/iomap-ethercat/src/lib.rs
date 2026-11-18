@@ -15,6 +15,7 @@
 //! Both modes implement the same `IoDevice` trait so the runtime composes
 //! them identically with Modbus devices.
 
+mod axis_capture;
 mod bits;
 pub mod cam;
 mod cycle;
@@ -105,6 +106,12 @@ impl IoDevice for EthercatDevice {
         match &self.0 {
             Inner::Real(r) => r.sdo_upload_handle(),
             Inner::Sim(_) => None,
+        }
+    }
+    fn axis_capture_handle(&self) -> Option<std::sync::Arc<dyn iocore::axis_capture::AxisCapture>> {
+        match &self.0 {
+            Inner::Real(r) => r.axis_capture_handle(),
+            Inner::Sim(s) => s.axis_capture_handle(),
         }
     }
     fn cycle_period(&self) -> Option<std::time::Duration> {

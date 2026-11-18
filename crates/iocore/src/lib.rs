@@ -6,6 +6,8 @@
 //! `iomap-ethercat`) and the ironplc-bridge runtime can all depend on it
 //! without forming a cycle.
 
+pub mod axis_capture;
+pub mod axis_replay;
 pub mod cycle;
 mod health;
 pub mod realtime;
@@ -137,6 +139,10 @@ pub trait IoDevice: Send {
     fn name(&self) -> &str;
     /// A read-only handle to the existing master; never creates another owner.
     fn sdo_upload_handle(&self) -> Option<std::sync::Arc<dyn sdo::SdoUpload>> {
+        None
+    }
+    /// Observe a synchronized device's existing PDO exchanges.
+    fn axis_capture_handle(&self) -> Option<std::sync::Arc<dyn axis_capture::AxisCapture>> {
         None
     }
     /// Opt-in clock: the scan waits for this device's completed bus exchange.

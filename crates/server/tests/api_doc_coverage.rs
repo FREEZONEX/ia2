@@ -74,4 +74,9 @@ fn every_mounted_route_has_a_row_in_api_md() {
         &doc,
         "edge runtime",
     );
+    assert_documented(
+        &root.join("crates/runtime/src/axis_capture.rs"),
+        &doc,
+        "edge axis capture",
+    );
 }

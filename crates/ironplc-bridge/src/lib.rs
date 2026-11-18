@@ -29,6 +29,7 @@ pub use sfc_transpile::{
 };
 
 pub use errors::BridgeError;
+pub use iocore::{axis_capture, axis_replay};
 pub use runtime::{
     spawn_units, spawn_units_with_retain, DeviceFailsafeError, DeviceHealth, DeviceReport,
     DeviceSpec, DiscoveredSlave, FailsafeStatus, InputQuality, OutputLatchError, ProgramHandle,

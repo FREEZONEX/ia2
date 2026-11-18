@@ -30,6 +30,42 @@ returns, and submits the measured samples to IA2 through `cs api`. IA2
 calculates the metrics independently. The driver compares the results
 with the archived per-run and per-leg values.
 
+## V2 bounded edge capture
+
+The existing EtherCAT DC worker can record one axis when `scan_sync` is
+enabled and the cycle divides 20 ms. Start through the
+[edge capture API](api.md#edge-axis-capture) with an explicit sample and
+duration limit. TX comes from the selected, final PDI image. RX comes from
+that exchange only when the WKC agrees and all slaves report OP. The worker
+fills a preinitialized buffer and skips a sample if the recorder is busy.
+Serialization, hashing and V1 export run outside the cycle.
+
+The project must declare the following CiA 402 PDO fields at subindex 0.
+All fields are byte-aligned in the slave's PDI, in little-endian order.
+
+| Direction | Object | Value |
+|---|---|---|
+| RxPDO | `0x6040` | Controlword, unsigned 16-bit |
+| RxPDO | `0x607A` | Target position, signed 32-bit |
+| TxPDO | `0x6041` | Statusword, unsigned 16-bit |
+| TxPDO | `0x6064` | Actual position, signed 32-bit |
+| TxPDO | `0x60F4` | Following error, signed 32-bit |
+| TxPDO | `0x6077` | Actual torque, signed 16-bit in tenths of a percent |
+| TxPDO | `0x603F` | Error code, unsigned 16-bit |
+
+The `_sim` path uses its existing input and output images and reports a
+synthetic DC clock. [The offline example](../examples/axis_capture_sim/)
+demonstrates request consumption with the axis disabled. Automated exchange
+tests inject a DC gap, duplicate and backwards clocks, missing clock and
+PDO fields, bad WKC, non-OP replies, timeouts, dropped samples and session
+changes. The V1 handler tests replay exports with known speed and rejected runs.
+
+For field acceptance, confirm the configured map and encoder scale against
+the drive. Match a frozen capture to passive wire data from the same authorized
+trajectory, including the TX/RX pairs, DC, WKC and end reason. Measure PLC
+scan and bus timing with capture enabled and disabled. Machine timing and
+the acceptable capture duration on a target remain field measurements.
+
 ## Roadmap
 
 | Milestone | Deliverable | Exit evidence |

@@ -41,6 +41,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt as _;
 use tracing_subscriber::EnvFilter;
 
+mod axis_capture;
 mod northbound;
 mod panic_guard;
 mod supervisor;
@@ -48,9 +49,10 @@ mod tap;
 
 const DEFAULT_BIND: &str = "127.0.0.1:13001";
 
-/// Upper bound on the graceful bridge drain (stop scan loop -> failsafe ->
-/// join the EtherCAT cyclic thread). Comfortably under systemd's
-/// `TimeoutStopSec=10s` so a clean exit always wins the race against
+/// Upper bound on graceful shutdown. The bridge drain (stop scan loop ->
+/// failsafe -> join the EtherCAT cyclic thread) gets the full budget.
+/// Saving a retained capture can only use time left over. The bound is
+/// under systemd's `TimeoutStopSec=10s` so a clean exit wins the race against
 /// SIGKILL; if a wedged bus blows this budget we log and exit anyway,
 /// falling back to the drive's own watchdog.
 const BRIDGE_DRAIN_TIMEOUT: Duration = Duration::from_secs(7);
@@ -594,6 +596,7 @@ async fn main() -> Result<()> {
             .route("/logs/stream", get(logs_stream))
             .route("/discover", get(discover))
             .route("/sdo", get(sdo_upload))
+            .merge(axis_capture::routes())
             .route("/system", get(system))
             .route("/pause", post(rt_pause))
             .route("/resume", post(rt_resume))
@@ -693,7 +696,9 @@ async fn main() -> Result<()> {
     tracing::info!(
         "shutdown signalled; draining bridge (stop scan loop -> failsafe -> join fieldbus)"
     );
-    match tokio::time::timeout(BRIDGE_DRAIN_TIMEOUT, handle.shutdown()).await {
+    let deadline = tokio::time::Instant::now() + BRIDGE_DRAIN_TIMEOUT;
+    let drain = tokio::time::timeout_at(deadline, handle.shutdown()).await;
+    match drain {
         Ok(()) => tracing::info!(
             "bridge drained; inspect failsafe/shutdown results above for unconfirmed outputs"
         ),
@@ -707,6 +712,9 @@ async fn main() -> Result<()> {
     // SSE connections. Clients on the SSH tunnel handle the disconnect.
     server_task.abort();
     tracing::info!(retain = %serde_json::to_string(&handle.retain().status()).unwrap_or_default(), "RETAIN final receipt");
+    if drain.is_ok() {
+        axis_capture::save_after_drain(handle, args.state_dir, deadline).await;
+    }
     tracing::info!("ia2-runtime exiting");
     Ok(())
 }
