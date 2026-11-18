@@ -1,0 +1,8 @@
+name = "retain_recovery"
+version = "0.1"
+[retain]
+project_id = "example-retain-recovery-v1"
+instance_id = "simulator"
+sample_interval_ms = 100
+max_loss_ms = 2000
+on_loss = "warn"

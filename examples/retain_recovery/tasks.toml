@@ -1,0 +1,8 @@
+[[tasks]]
+name = "cycle"
+interval_ms = 100
+priority = 1
+[[programs]]
+instance = "main_inst"
+program = "main"
+task = "cycle"

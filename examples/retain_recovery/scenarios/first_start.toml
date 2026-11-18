@@ -1,0 +1,5 @@
+description = "Declared first start automatically admits initializer values"
+[[steps]]
+expect = { var = "value", op = "eq", value = 42, within_ms = 3000 }
+[[steps]]
+wait_ms = 250

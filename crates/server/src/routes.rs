@@ -2360,7 +2360,7 @@ pub async fn run(
     };
     let req_program = req.program.clone();
     let req_file_path = req.file_path.clone();
-    let (units, device_specs, mappings, alarm_defs, governance) =
+    let (units, device_specs, mappings, alarm_defs, governance, retain_config) =
         tokio::task::spawn_blocking(move || -> Result<_, ApiError> {
             let store = &store;
             let req = RunRequest {
@@ -2432,6 +2432,14 @@ pub async fn run(
                 alarms,
                 // Per-run freshness, same as tasks/iomap/alarms above.
                 fresh_governance(store)?,
+                {
+                    let policy = store.read_retain_policy()?;
+                    let path = policy
+                        .project_id
+                        .as_ref()
+                        .map(|_| store.root().join("retain-state/retain.json"));
+                    ironplc_bridge::retain::RetainConfig { path, policy }
+                },
             ))
         })
         .await
@@ -2464,11 +2472,20 @@ pub async fn run(
     // run picks up definition edits without a server restart.
     *state.alarms.lock() = ironplc_bridge::monitor::AlarmEngine::new(alarm_defs);
 
-    // IDE-side server runs are ephemeral — they're for the user
-    // poking values, not for persisted plant state. We leave
-    // `state_path = None`; only the headless `ia2-runtime` edge
-    // binary points it at a real disk location.
-    let handle = ironplc_bridge::spawn_units(units, device_specs, mappings, None, governance);
+    // A declared RETAIN identity enables project-local persistence. Unconfigured
+    // IDE runs remain ephemeral; required-data policy is never discarded.
+    let handle = ironplc_bridge::spawn_units_with_retain(
+        units,
+        device_specs,
+        mappings,
+        retain_config,
+        governance,
+    );
+    state
+        .retain_controls
+        .lock()
+        .insert(project_name.clone(), handle.retain());
+    handle.retain().supervise(state.alarms.clone());
 
     // Record what kind of run this is so /api/runtime/status can label
     // the Monitor pane on a fresh page load (which would otherwise have

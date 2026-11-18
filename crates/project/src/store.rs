@@ -44,6 +44,10 @@ impl ProjectStore {
         // max, empty/duplicate variables) must be a loud load error —
         // never a policy that silently misbehaves on the scan thread.
         manifest.governance.validate().map_err(invalid_governance)?;
+        manifest
+            .retain
+            .validate()
+            .map_err(|e| StoreError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
         let store = Self { root, manifest };
         store.migrate_applications_to_pous()?;
         Ok(store)
@@ -82,6 +86,7 @@ impl ProjectStore {
             name: name.to_string(),
             version: "0.1".into(),
             governance: crate::types::WriteGovernance::default(),
+            retain: crate::RetainPolicy::default(),
         };
         write_atomic(&manifest_path, toml::to_string_pretty(&manifest)?)?;
         write_atomic(
@@ -141,6 +146,17 @@ impl ProjectStore {
         &self.manifest.name
     }
 
+    /// Fresh, validated persistence/admission policy for the next run.
+    pub fn read_retain_policy(&self) -> Result<crate::RetainPolicy, StoreError> {
+        let text = fs::read_to_string(self.root.join("project.toml"))?;
+        let manifest: ProjectManifest = toml::from_str(&text)?;
+        manifest
+            .retain
+            .validate()
+            .map_err(|e| StoreError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+        Ok(manifest.retain)
+    }
+
     /// The project's write-governance policy (`[governance]` in
     /// project.toml). Defaults to fully open when absent.
     ///
@@ -161,6 +177,10 @@ impl ProjectStore {
         let text = fs::read_to_string(self.root.join("project.toml"))?;
         let manifest: ProjectManifest = toml::from_str(&text)?;
         manifest.governance.validate().map_err(invalid_governance)?;
+        manifest
+            .retain
+            .validate()
+            .map_err(|e| StoreError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
         Ok(manifest.governance)
     }
 

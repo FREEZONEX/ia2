@@ -20,6 +20,7 @@ import type { HmiDoc } from "@/types/generated/HmiDoc"
 import type { RuntimeMode } from "@/types/generated/RuntimeMode"
 
 export type HmiRuntimeState = {
+  retainProblem?: string | null
   running: boolean
   /** Active fault / last error to show in the alarm bar; null when calm. */
   alarm: string | null

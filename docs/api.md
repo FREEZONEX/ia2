@@ -747,3 +747,86 @@ unconfirmed devices; it does not clear the latch or replace its first reason.
 A successful retry returns `false` (the run was already inhibited). The alarm
 supervisor does not introduce an automatic retry or re-arm policy. Runtime/CLI
 status views show pending and rejected attempts separately from transport health.
+
+## RETAIN recovery and persistence
+
+Both binaries use `ironplc_bridge::retain`; no client infers recovery from logs
+or from a running scan counter. The IDE's `/api/runtime/status` includes `retain`
+for the queried project's last run, including after it faulted or stopped. The
+edge's `/status` and `/health` include the same object, and edge probes preserve it.
+An older runtime omitting it has **unknown** RETAIN health.
+
+| Method | Path | Description |
+| --- | --- | --- |
+| GET | `/api/runtime/retain` | Project-scoped recovery decision and live persistence health; 409 before a run in this server session. |
+| GET | `/api/runtime/retain/checkpoint` | Last durability-confirmed checkpoint and receipt from this run; 409 before one exists. Does not sample or wait for a write. |
+| POST | `/api/runtime/retain/resolve` | Explicit stopped-run resolution, with expected source SHA256; 409 while a writer owns the file or the source changed. |
+
+The edge exposes `GET /retain`, `GET /retain/checkpoint` and
+`POST /retain/resolve` with identical bodies. Edge resolution can be used after a
+recovery-denied start; use the offline `--retain-resolve request.json` entry for
+maintenance after stopping a healthy process. It compiles the project and takes
+the same file lease without connecting devices or starting scans.
+
+`RetainStatus` has `run_id`, `policy`, `attention`, `recovery`, and `persistence`.
+`recovery` includes `kind`, `source_kind`, `admitted`, `writes_enabled`, `reason`,
+`source_sha256`, `archive_path`, `resolution`, `restored`, `initialized`, `removed`.
+Kinds distinguish `disabled`, `pending`, `first_start`, `restored`, `migrated`,
+`cold_start`, `corrupt`, `unsupported_version`, `legacy_unverified`,
+`identity_mismatch`, `layout_mismatch`, `read_failed`, `protection_failed`,
+`writer_busy`, and `configuration_error`. Policy-authorized cold start retains
+the original cause in `source_kind`; required data never silently takes defaults.
+`attention` is the shared human-readable condition consumed by the UI and the
+built-in `__supervision/retain` alarm (high, immediate, acknowledged independently).
+
+`persistence` includes data/sample generations, `pending_age_ms`, `writing`,
+`queued`, `last_replacement`, `last_durable`, `last_error`, `final_save`,
+`max_loss_ms`, `on_loss`, and `budget_exceeded`. Receipts identify the run,
+scan/generation, sample/completion wall times, checkpoint SHA256 and the storage
+result (`replaced`, `durable`, `directory_sync_error`). A replacement without a
+successful directory sync is never reported as durable. `pending_age_ms` uses
+monotonic elapsed time since the first uncommitted scan or the last durable
+sample; it is a conservative bound assuming every completed scan can change data.
+It includes unsampled time and slow/failed writes. A sampling interval is not a
+loss guarantee. Data generation counts completed scans across all PROGRAMs
+plus accepted writes/pulse resets to retained slots (including while paused);
+the display `scan_count` remains their maximum. `CheckpointExport` includes
+`state`, `receipt` and `checkpoint_json`, the exact UTF-8 JSON bytes whose
+SHA256 matches `receipt.sha256`. Consumers must hash those bytes rather than
+reserializing the parsed object. After Stop, the final receipt is `durable`, `unconfirmed`,
+`failed`, `skipped` (aborted scan/disabled storage) or `timed_out`; `not_requested`
+and `pending` describe unfinished lifecycle stages. A timeout keeps its receipt
+even if a blocked syscall later finishes. The file lease outlives that syscall.
+
+Resolution JSON contains `expected_source_sha256`, `action` (`cold_start`,
+`discard`, `migrate`), `initialize_required` (default false),
+`attested_source_identity` (nullable), and `rules` (default empty).
+Missing-file resolution uses SHA256 of empty bytes. Every resolution archives
+its source first; cold start/discard initializes current declaration defaults,
+and `initialize_required=true` explicitly authorizes that for required data.
+Discard only discards old RETAIN values from the replacement, preserving the
+source archive; it never deletes history or engineering state. Migration rules
+name `from`, `to`, `source_layout: {type_name,width_bits}`, and `conversion`
+(`exact` or lossless `dint_to_real`). Every retained destination needs a rule by
+default; `initialize_required=true` permits defaults only for unmapped optional
+destinations during migration. Required migration destinations always need rules.
+Unknown schemas have no decoder. Schema 1/2 require an externally verified
+`attested_source_identity` matching the destination and explicit source types.
+The response includes the action, source/archive/checkpoint identity, storage
+receipt and `restart_required=true`. Neither resolution nor resume clears an
+existing runtime latch. Restart and recheck admission. A 200 with `durable=false`
+reports a replacement with unconfirmed durability, not successful durable recovery.
+
+See [RETAIN compatibility and operations](retain-recovery.md) for the project
+policy, compatibility matrix and rollback instructions.
+
+For rollback, an optional `migration_source_sha256` selects an already preserved
+`retain-archive/<sha256>.json` as the migration source. It accepts only a verified
+64-digit hex content address, never an arbitrary path. `expected_source_sha256`
+still guards the current file. The result additionally reports
+`replaced_source_sha256` and `preserved_current_path`; both the current and selected
+source survive. `recovery.resolution` and subsequent checkpoint `resolution`
+retain both hashes and the explicit action. The initial resolved checkpoint is
+reported as `migrated`/`cold_start`; subsequent normal restarts are compatible
+restores while preserving that lineage. `declaration_state` and `compatibility`
+are the shared Rust target-descriptor/check functions for deployment consumers.
