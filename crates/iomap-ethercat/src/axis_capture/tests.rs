@@ -130,7 +130,17 @@ fn pairs_selected_output_with_fresh_input_and_freezes_at_capacity() {
             feedback: Some(feedback),
         },
     );
+    let page = recorder.page(id, 0).unwrap();
+    assert_eq!(page.samples.len(), 1);
+    assert_eq!(page.samples[0].attempt, 6);
+    assert!(page.progress.end_reason.is_none());
+    assert!(recorder.page(id, 2).is_err());
+    assert!(recorder.page("other", 0).is_err());
     record(&session, 7, good_reply(1 + PERIOD));
+    let tail = recorder.page(id, 1).unwrap();
+    assert_eq!(tail.samples[0].attempt, 7);
+    assert!(tail.progress.end_reason.is_some());
+    assert!(recorder.page(id, 2).unwrap().samples.is_empty());
 
     let frozen = recorder.frozen(id).unwrap();
     assert_eq!(frozen.end_reason, Some(EndReason::SampleLimit));

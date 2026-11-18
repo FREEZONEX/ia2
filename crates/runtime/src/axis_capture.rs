@@ -74,6 +74,7 @@ pub(crate) fn routes() -> Router<AppState> {
             get(status).post(start).layer(DefaultBodyLimit::max(4096)),
         )
         .route("/axis-capture/{device}/{id}", get(archive))
+        .route("/axis-capture/{device}/{id}/samples/{offset}", get(samples))
         .route("/axis-capture/{device}/{id}/stop", post(stop))
         .route("/axis-capture/{device}/{id}/replay", post(replay))
 }
@@ -145,6 +146,13 @@ async fn stop(
     Path((device, id)): Path<(String, String)>,
 ) -> Result<Json<Progress>, Error> {
     Ok(Json(capture(&state, &device)?.stop(&id)?))
+}
+
+async fn samples(
+    State(state): State<AppState>,
+    Path((device, id, offset)): Path<(String, String, usize)>,
+) -> Result<Json<ironplc_bridge::axis_capture::SamplePage>, Error> {
+    Ok(Json(capture(&state, &device)?.page(&id, offset)?))
 }
 
 async fn archive(

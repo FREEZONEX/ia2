@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use iocore::axis_capture::{
     AxisCapture, Bus, Capture, CaptureError, Command, EndReason, Exchange, Feedback, InputQuality,
-    PdoField, Progress, Scope, SlaveIdentity, Start, Status, MAX_DURATION_MS,
+    PdoField, Progress, SamplePage, Scope, SlaveIdentity, Start, Status, MAX_DURATION_MS,
 };
 use iocore::axis_replay::{Sampling, MAX_SAMPLES};
 use iocore::ChannelValue;
@@ -449,6 +449,31 @@ impl AxisCapture for Recorder {
         self.expire(&mut state, Instant::now());
         self.freeze(&mut state, EndReason::OperatorStop);
         Ok(self.progress(state.recording.as_ref().unwrap()))
+    }
+
+    fn page(&self, id: &str, offset: usize) -> Result<SamplePage, CaptureError> {
+        // Allocate outside the exchange lock. Never share the active Arc with a reader.
+        const PAGE_SIZE: usize = 256;
+        let mut samples = Vec::with_capacity(PAGE_SIZE);
+        let mut state = self.state.lock();
+        self.expire(&mut state, Instant::now());
+        let rec = state
+            .recording
+            .as_ref()
+            .filter(|r| r.data.capture_id == id)
+            .ok_or(CaptureError::NotFound)?;
+        if offset > rec.used {
+            return Err(CaptureError::Invalid(
+                "offset exceeds recorded samples".into(),
+            ));
+        }
+        let end = rec.used.min(offset.saturating_add(PAGE_SIZE));
+        samples.extend_from_slice(&rec.data.samples[offset..end]);
+        Ok(SamplePage {
+            progress: self.progress(rec),
+            offset,
+            samples,
+        })
     }
 
     fn frozen(&self, id: &str) -> Result<Arc<Capture>, CaptureError> {

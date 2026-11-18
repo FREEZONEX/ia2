@@ -17,6 +17,7 @@ pub trait AxisCapture: Send + Sync {
     fn status(&self) -> Status;
     fn start(&self, request: Start) -> Result<Progress, CaptureError>;
     fn stop(&self, id: &str) -> Result<Progress, CaptureError>;
+    fn page(&self, id: &str, offset: usize) -> Result<SamplePage, CaptureError>;
     fn frozen(&self, id: &str) -> Result<Arc<Capture>, CaptureError>;
     /// Final access after the runtime has attempted its output safety and teardown.
     /// Return the retained archive with its original end reason if already frozen.
@@ -89,6 +90,13 @@ pub struct Progress {
     pub samples: usize,
     pub dropped_samples: u32,
     pub end_reason: Option<EndReason>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SamplePage {
+    pub progress: Progress,
+    pub offset: usize,
+    pub samples: Vec<Exchange>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]

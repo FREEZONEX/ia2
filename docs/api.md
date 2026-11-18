@@ -205,6 +205,7 @@ session. The capture API never sends a PDO or an SDO.
 |---|---|---|
 | GET | `/axis-capture/{device}` | Return `runtime_id`, the current `bus` (or `null`), and the latest capture's progress (or `null`). |
 | POST | `/axis-capture/{device}` | Start one bounded capture. Return HTTP 201 and its ID and scope. |
+| GET | `/axis-capture/{device}/{id}/samples/{offset}` | Read up to 256 stored exchanges starting at a zero-based offset during or after recording, with capture progress and drop counts. Advance by the returned row count. An empty page is caught up. A replaced capture returns 404. |
 | GET | `/axis-capture/{device}/{id}` | Download the frozen raw archive as JSON. |
 | POST | `/axis-capture/{device}/{id}/stop` | Stop recording and return its final progress. Repeating the request for the same retained ID returns the same reason. |
 | POST | `/axis-capture/{device}/{id}/replay` | Supply independent evidence and download a one-run [V1 request](#offline-axis-replay). |
