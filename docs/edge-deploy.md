@@ -531,12 +531,14 @@ grace_secs = 30         # 1..=3600; ignored for "report"
 - **No EtherCAT hardware on the dev machine**: leave `nic = "_sim"`. The
   IDE will let you configure PDOs and the bridge will respond in sim
   mode. On the edge, configure the real NIC.
-- **Retained / persistent variables** ARE preserved across deploys:
-  `VAR RETAIN` state lives in a `state/` directory that sits BESIDE the
-  versioned `current` symlink (`$INSTALL_DIR/state/`), so a symlink swap
-  never touches it (schema-2 lossless 64-bit slots; see
-  `crates/ironplc-bridge/src/retain.rs` and the flush interval in the
-  bridge). Deleting `$INSTALL_DIR/state/` is the manual cold-start.
+- **Retained variables** use schema 3 with explicit `[retain]` project/instance
+  identity, typed scalar layouts, source preservation and recovery admission.
+  State remains beside the versioned release in `$INSTALL_DIR/state/`.
+  Schema 1/2 needs explicit migration or cold start; unknown/corrupt data is
+  never silently overwritten. Do not delete the whole state directory: it
+  also contains history and observations. Use the shared RETAIN resolution
+  API or the stopped-process `--retain-resolve request.json` entry. See
+  [compatibility, loss budgets and rollback](retain-recovery.md).
 - **Hot patch / online change** (Codesys-style in-place code update) is
   not implemented. Deploy is stop → swap → start. Plan downtime.
 - **Real-time**: stock Linux gives soft-RT only; scan jitter is in the

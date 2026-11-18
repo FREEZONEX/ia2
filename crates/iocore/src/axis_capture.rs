@@ -278,7 +278,7 @@ impl Capture {
         if plc.normal_completion
             && (!plc.request_consumed
                 || plc.plc_started != Some(true)
-                || !scans.is_some_and(|(before, after)| after > before)
+                || scans.is_none_or(|(before, after)| after <= before)
                 || import.profile.is_none()
                 || parameter_readback.is_empty())
         {

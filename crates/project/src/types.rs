@@ -13,6 +13,8 @@ pub struct ProjectManifest {
     /// variable writable, any value).
     #[serde(default, skip_serializing_if = "WriteGovernance::is_default")]
     pub governance: WriteGovernance,
+    #[serde(default, skip_serializing_if = "crate::RetainPolicy::is_default")]
+    pub retain: crate::RetainPolicy,
 }
 
 fn default_version() -> String {

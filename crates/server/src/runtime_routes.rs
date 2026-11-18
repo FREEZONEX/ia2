@@ -113,6 +113,9 @@ pub async fn runtime_alarm_journal(
 #[derive(Debug, Serialize, TS)]
 #[ts(export)]
 pub struct RuntimeStatus {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub retain: Option<ironplc_bridge::retain::RetainStatus>,
     pub running: bool,
     pub project: Option<String>,
     /// Program instances declared in tasks.toml (what's actually scheduled).
@@ -251,7 +254,12 @@ pub async fn runtime_status(
             None => (None, vec![], vec![], false, None, None, None, None, None),
         }
     };
+    let retain = project_name
+        .as_ref()
+        .and_then(|name| state.retain_controls.lock().get(name).cloned())
+        .map(|c| c.status());
     Json(RuntimeStatus {
+        retain,
         running,
         project: project_name,
         program_instances: programs,
@@ -612,6 +620,58 @@ pub async fn edge_sdo_upload(
         address.slave, address.index, address.subindex
     );
     edge_proxy_response(crate::edges::proxy_edge_runtime_get(&edge, &path).await)
+}
+
+fn retain_control(
+    state: &AppState,
+    project: &ProjectName,
+) -> Result<std::sync::Arc<ironplc_bridge::retain::RetainControl>, ApiError> {
+    let name = {
+        let projects = state.projects.lock();
+        match project.as_deref() {
+            Some(name) => projects.get(name),
+            None => projects.active(),
+        }
+        .ok_or(ApiError::NoProject)?
+        .name()
+        .to_owned()
+    };
+    state.retain_controls.lock().get(&name).cloned().ok_or_else(|| ApiError::Conflict("no RETAIN result for this project's current server session; start the intended run first".into()))
+}
+
+pub async fn runtime_retain(
+    State(state): State<AppState>,
+    project: ProjectName,
+) -> Result<Json<ironplc_bridge::retain::RetainStatus>, ApiError> {
+    Ok(Json(retain_control(&state, &project)?.status()))
+}
+
+pub async fn runtime_retain_checkpoint(
+    State(state): State<AppState>,
+    project: ProjectName,
+) -> Result<Json<ironplc_bridge::retain::CheckpointExport>, ApiError> {
+    retain_control(&state, &project)?
+        .checkpoint()
+        .map(Json)
+        .ok_or_else(|| {
+            ApiError::Conflict("no durability-confirmed RETAIN checkpoint from this run".into())
+        })
+}
+
+pub async fn runtime_retain_resolve(
+    State(state): State<AppState>,
+    project: ProjectName,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<ironplc_bridge::retain::ResolveRequest>,
+) -> Result<Json<ironplc_bridge::retain::ResolveResult>, ApiError> {
+    let _gate = state.run_gate.lock().await;
+    let control = retain_control(&state, &project)?;
+    state.maybe_attribute_external(origin_of(&headers).as_deref(), "resolve RETAIN".into());
+    tokio::task::spawn_blocking(move || control.resolve(&request))
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .map(Json)
+        .map_err(ApiError::Conflict)
 }
 
 #[cfg(test)]

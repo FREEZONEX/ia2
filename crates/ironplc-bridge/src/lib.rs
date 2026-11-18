@@ -8,7 +8,7 @@ mod fbd_transpile;
 mod ld_transpile;
 pub mod monitor;
 mod problem_docs;
-mod retain;
+pub mod retain;
 mod runtime;
 #[cfg(feature = "scan-trace")]
 mod scan_trace;
@@ -31,10 +31,10 @@ pub use sfc_transpile::{
 pub use errors::BridgeError;
 pub use iocore::{axis_capture, axis_replay};
 pub use runtime::{
-    spawn_units, DeviceFailsafeError, DeviceHealth, DeviceReport, DeviceSpec, DiscoveredSlave,
-    FailsafeStatus, InputQuality, OutputLatchError, ProgramHandle, ProgramUnit, RuntimeMode,
-    RuntimeWriteError, VarSnapshot, VarValue, WriteOutcome, DEFAULT_SCAN_INTERVAL_MS,
-    RETAIN_FLUSH_INTERVAL, WATCHDOG_OVERRUN_THRESHOLD,
+    spawn_units, spawn_units_with_retain, DeviceFailsafeError, DeviceHealth, DeviceReport,
+    DeviceSpec, DiscoveredSlave, FailsafeStatus, InputQuality, OutputLatchError, ProgramHandle,
+    ProgramUnit, RuntimeMode, RuntimeWriteError, VarSnapshot, VarValue, WriteOutcome,
+    DEFAULT_SCAN_INTERVAL_MS, RETAIN_FLUSH_INTERVAL, WATCHDOG_OVERRUN_THRESHOLD,
 };
 
 // Re-exported so downstream crates (server / runtime) can name the

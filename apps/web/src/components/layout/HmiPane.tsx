@@ -72,6 +72,7 @@ export function HmiPane() {
         // the standalone edge panel has always shown it.
         return {
           running: s.running && !latch,
+          retainProblem: s.retain?.attention ?? null,
           alarm: [s.last_error, latch].filter(Boolean).join(". ") || null,
           mode: s.mode?.kind,
           scanPeriodMs: s.scan_period_ms,

@@ -1,0 +1,6 @@
+name = "retain_required"
+version = "0.1"
+[retain]
+project_id = "example-retain-required-v1"
+instance_id = "simulator"
+required = ["main_inst.value"]

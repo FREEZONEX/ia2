@@ -93,6 +93,9 @@ impl AttachmentRegistry {
 #[derive(Debug, Serialize, TS)]
 #[ts(export)]
 pub struct EdgeProbe {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub retain: Option<ironplc_bridge::retain::RetainStatus>,
     /// `true` when the ssh + curl chain reached the runtime's `/health`.
     pub reachable: bool,
     /// Latest scan count from `/health`, if reachable.
@@ -301,6 +304,7 @@ pub async fn probe_edge(edge: &Edge) -> EdgeProbe {
 
 fn unreachable_probe(error: String) -> EdgeProbe {
     EdgeProbe {
+        retain: None,
         reachable: false,
         scan_count: None,
         uptime_secs: None,
@@ -324,6 +328,8 @@ fn unreachable_probe(error: String) -> EdgeProbe {
 fn probe_from_health_body(body: &str) -> EdgeProbe {
     #[derive(Deserialize)]
     struct Health {
+        #[serde(default)]
+        retain: Option<ironplc_bridge::retain::RetainStatus>,
         status: String,
         uptime_secs: u64,
         scan_count: u64,
@@ -359,6 +365,7 @@ fn probe_from_health_body(body: &str) -> EdgeProbe {
         return unreachable_probe(format!("runtime not ok: {}", parsed.status));
     }
     EdgeProbe {
+        retain: parsed.retain,
         reachable: true,
         scan_count: Some(parsed.scan_count),
         uptime_secs: Some(parsed.uptime_secs),

@@ -31,6 +31,16 @@ function mountMonitor(collapsed = false) {
 }
 
 describe("confirmed Monitor controls", () => {
+  it("keeps RETAIN attention visible after a rejected run stops", async () => {
+    mocks.runtime.mockReturnValue({ isRunning: false, currentPou: { path: "main" }, running: null, attached: null })
+    mocks.fetchRuntimeStatus.mockResolvedValue({ ...runningStatus(), retain: {
+      attention: "source archive could not be synced", recovery: { kind: "protection_failed" },
+      persistence: { pending_age_ms: null, final_save: "skipped", last_durable: null, writing: false, queued: false },
+    } })
+    mountMonitor(true)
+    expect((await screen.findByRole("alert")).textContent).toContain("source archive could not be synced")
+  })
+
   it("shows failsafe failures despite healthy transport and preserves the latch reason", async () => {
     mocks.fetchRuntimeStatus.mockResolvedValue({
       ...runningStatus(),

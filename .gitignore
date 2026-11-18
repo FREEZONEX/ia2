@@ -49,3 +49,6 @@ pki/
 # Agent-harness run records (transcripts/artifacts) — publishing is a human decision
 examples/agent-harness/runs/*
 !examples/agent-harness/runs/.gitkeep
+
+# Local IDE RETAIN checkpoints and source archives (export explicitly via API).
+retain-state/

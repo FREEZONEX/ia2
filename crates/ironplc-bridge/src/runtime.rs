@@ -15,7 +15,7 @@
 //! Devices stay owned by the thread and are shared across units
 //! sequentially — no concurrency on the bus.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -389,6 +389,7 @@ pub struct ProgramHandle {
     /// passive observer accessible without queuing work on the scan loop.
     axis_capture: Arc<AxisCaptureSlot>,
     stop: Arc<AtomicBool>,
+    retain: Arc<retain::RetainControl>,
     snapshot_tx: broadcast::Sender<VarSnapshot>,
     cmd_tx: tokio::sync::mpsc::Sender<RuntimeCommand>,
     latch_tx: tokio::sync::mpsc::Sender<LatchRequest>,
@@ -486,6 +487,10 @@ impl ProgramHandle {
     pub fn freeze_axis_capture_for_shutdown(&self) -> Option<Arc<iocore::axis_capture::Capture>> {
         let (_, capture) = self.axis_capture.get()?;
         capture.freeze_for_shutdown()
+    }
+
+    pub fn retain(&self) -> Arc<retain::RetainControl> {
+        self.retain.clone()
     }
 
     /// Cooperative stop. The scan loop checks the flag between rounds, so a
@@ -854,9 +859,8 @@ impl ProgramHandle {
 pub const DEFAULT_SCAN_INTERVAL_MS: u64 = 100;
 
 /// How often to flush retained variable values to disk during normal
-/// operation. Power loss between flushes loses up to this much state.
-/// 5 s strikes a balance between disk churn and worst-case data loss
-/// for typical setpoints / counters / accumulators.
+/// operation. This is a sampling interval, NOT a maximum loss window.
+/// Completion latency and durability are reported by the RETAIN controller.
 pub const RETAIN_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// One scheduled PROGRAM instance: its own compiled `Container` plus the
@@ -894,11 +898,8 @@ pub struct ProgramUnit {
 /// on resume and executing individual paused steps. Upstream's cyclic task
 /// timer must not silently skip a scan that IA2 has already counted.
 ///
-/// RETAIN variables across all units persist into one state file when
-/// `state_path` is set; keys are `instance.variable` when there is more
-/// than one unit, bare names otherwise. Restore accepts *either*
-/// spelling (see `lookup_retain_value`), so adding or removing a PROGRAM
-/// from `tasks.toml` doesn't reset the values that survive.
+/// Persistent callers should use `spawn_units_with_retain` with an explicit
+/// project identity and policy. Ephemeral callers keep using this wrapper.
 pub fn spawn_units(
     units: Vec<ProgramUnit>,
     device_specs: Vec<DeviceSpec>,
@@ -912,6 +913,23 @@ pub fn spawn_units(
         mappings,
         state_path,
         governance,
+    )
+}
+
+pub fn spawn_units_with_retain(
+    units: Vec<ProgramUnit>,
+    device_specs: Vec<DeviceSpec>,
+    mappings: Vec<Mapping>,
+    config: retain::RetainConfig,
+    governance: WriteGovernance,
+) -> ProgramHandle {
+    spawn_units_configured(
+        units,
+        DeviceSource::Specs(device_specs),
+        mappings,
+        config,
+        governance,
+        RECONNECT_JOIN_GRACE,
     )
 }
 
@@ -1049,6 +1067,29 @@ fn spawn_units_with_grace(
     governance: WriteGovernance,
     reconnect_join_grace: Duration,
 ) -> ProgramHandle {
+    spawn_units_configured(
+        units,
+        device_source,
+        mappings,
+        retain::RetainConfig {
+            path: state_path,
+            policy: Default::default(),
+        },
+        governance,
+        reconnect_join_grace,
+    )
+}
+
+fn spawn_units_configured(
+    units: Vec<ProgramUnit>,
+    device_source: DeviceSource,
+    mappings: Vec<Mapping>,
+    retain_config: retain::RetainConfig,
+    governance: WriteGovernance,
+    reconnect_join_grace: Duration,
+) -> ProgramHandle {
+    let retain = retain::RetainControl::new(retain_config, &units);
+    let retain_thread = retain.clone();
     let stop = Arc::new(AtomicBool::new(false));
     // Normalised exactly as `UnitClock::interval` below, and MIN across
     // units because `scan_count` is the max across units — the fastest task
@@ -1099,6 +1140,15 @@ fn spawn_units_with_grace(
     let device_reports_reconnect = device_reports.clone();
 
     let join_handle = std::thread::spawn(move || {
+        // A failed writer must not make explicit resolution available while
+        // the scan thread still owns live VM state. Cover early returns/panics.
+        struct RetainScanGuard(Arc<retain::RetainControl>);
+        impl Drop for RetainScanGuard {
+            fn drop(&mut self) {
+                self.0.scan_finished();
+            }
+        }
+        let _retain_scan = RetainScanGuard(retain_thread.clone());
         // Owns the fault sender for the whole thread, so however the
         // thread ends, a run nobody asked to stop reads as a fault.
         let exit = ExitGuard {
@@ -1127,6 +1177,7 @@ fn spawn_units_with_grace(
             Err(e) => {
                 tracing::error!(%e, "failed to create io runtime");
                 record_fault(fault_tx, format!("failed to create io runtime: {e}"));
+                retain_thread.finish_without_writer();
                 return;
             }
         };
@@ -1138,6 +1189,18 @@ fn spawn_units_with_grace(
             Ok(period) => period,
             Err(why) => {
                 record_fault(fault_tx, why);
+                retain_thread.finish_without_writer();
+                return;
+            }
+        };
+        // Admission precedes any connection/output arming. A failed RETAIN
+        // restore cannot be bypassed by resume, step, or a healthy scan counter.
+        let (restored, mut retain_writer) = match retain_thread.prepare(io_rt.handle()) {
+            Ok(prepared) => prepared,
+            Err(reason) => {
+                note_latch_reason(&latch_reason_clone, format!("RETAIN recovery: {reason}"));
+                watchdog_tripped_clone.store(true, Ordering::Release);
+                record_fault(fault_tx, format!("RETAIN recovery: {reason}"));
                 return;
             }
         };
@@ -1166,12 +1229,8 @@ fn spawn_units_with_grace(
             }
         };
         let io_handle = io_rt.handle().clone();
-        let (retain_tx, retain_task) = state_path
-            .as_ref()
-            .filter(|_| units.iter().any(|unit| !unit.retain_vars.is_empty()))
-            .map(|path| retain_writer(path.clone(), &io_handle))
-            .unzip();
 
+        let retain_end = retain_thread.clone();
         rt.block_on(async move {
             // Seed health from the connect outcomes: configured devices
             // that failed to connect start unhealthy (the per-round
@@ -1260,8 +1319,9 @@ fn spawn_units_with_grace(
                 consecutive_overruns_clone,
                 fault_tx,
                 &reconnect,
-                state_path,
-                retain_tx.as_ref(),
+                &retain_thread,
+                &restored,
+                retain_writer.as_mut(),
             ))
             .catch_unwind()
             .await;
@@ -1301,12 +1361,8 @@ fn spawn_units_with_grace(
             // Finish the last RETAIN checkpoint only after the field devices
             // have been driven safe and drained. No writer from this run may
             // remain when a replacement run reloads the same checkpoint.
-            drop(retain_tx);
-            if let Some(task) = retain_task {
-                if let Err(error) = task.await {
-                    tracing::warn!(%error, "retain writer failed");
-                }
-            }
+            if let Some(writer) = retain_writer { writer.finish().await; }
+            else { retain_thread.finish_without_writer(); }
             // "Cleanly" only when nothing faulted AND no device's failsafe or
             // shutdown call failed: a VM trap or a failed start also returns
             // normally, and a panicking or erroring adapter used to leave this
@@ -1373,11 +1429,15 @@ fn spawn_units_with_grace(
                 std::panic::resume_unwind(panic);
             }
         });
+        if retain_end.status().persistence.final_save == retain::FinalSave::TimedOut {
+            io_rt.shutdown_timeout(Duration::from_millis(100));
+        }
     });
 
     ProgramHandle {
         axis_capture,
         stop,
+        retain,
         snapshot_tx,
         cmd_tx,
         latch_tx,
@@ -2469,8 +2529,9 @@ async fn run_loop_async(
     // the watch — only when the scan thread exits).
     fault: &tokio::sync::watch::Sender<Option<String>>,
     reconnect: &ReconnectState,
-    state_path: Option<PathBuf>,
-    retain_tx: Option<&RetainSender>,
+    retain_control: &retain::RetainControl,
+    restored: &BTreeMap<String, u64>,
+    mut retain_writer: Option<&mut retain::RetainWriter>,
 ) {
     if units.is_empty() {
         tracing::error!("no program units to run — scan loop not started");
@@ -2694,78 +2755,20 @@ async fn run_loop_async(
             "unit scheduled"
         );
     }
-    tracing::info!(
-        units = n_units,
-        devices = devices.len(),
-        state_path = ?state_path,
-        "scan loop ready"
-    );
+    tracing::info!(units = n_units, devices = devices.len(), "scan loop ready");
 
-    // ---- Resolve RETAIN names → (unit, state-file key, var index) ----
-    // Keys are `instance.variable` when several units run (so same-
-    // named retain vars in different units don't collide on disk) and
-    // bare names for the single-unit case — the historical format.
-    let mut retain_entries: Vec<(usize, String, u16)> = Vec::new();
-    for (i, unit) in units.iter().enumerate() {
-        for name in &unit.retain_vars {
-            match var_index_by_name[i].get(name) {
-                Some(&idx) => {
-                    let key = if n_units > 1 {
-                        format!("{}.{}", unit.instance, name)
-                    } else {
-                        name.clone()
-                    };
-                    retain_entries.push((i, key, idx));
-                }
-                None => {
-                    // Possible if the user removed a RETAIN var from
-                    // source between runs but the state file still
-                    // references it. The next save rewrites the file
-                    // without the stale entry.
-                    tracing::warn!(instance = %unit.instance, var = %name, "retain var not in debug map; skipping");
-                }
-            }
-        }
-    }
-
-    // ---- Restore RETAIN values from disk before scanning starts ----
-    if !retain_entries.is_empty() {
-        if let Some(path) = state_path.as_ref() {
-            match retain::load(path) {
-                Ok(Some(state)) => {
-                    let mut restored = 0;
-                    for (i, key, idx) in &retain_entries {
-                        let value = lookup_retain_value(&state.vars, &units[*i].instance, key);
-                        if let Some(value) = value {
-                            // Raw 64-bit slot write — lossless for all
-                            // IEC types (schema 2; v1 files arrive here
-                            // pre-widened by retain::load's migration).
-                            if runnings[*i]
-                                .write_variable_raw(VarIndex::new(*idx), value)
-                                .is_ok()
-                            {
-                                restored += 1;
-                            } else {
-                                tracing::warn!(var = %key, "restore write trapped; skipping");
-                            }
-                        }
-                    }
-                    tracing::info!(
-                        restored,
-                        total = retain_entries.len(),
-                        saved_at_us = state.saved_at_us,
-                        "restored retain variables from state file"
-                    );
-                }
-                Ok(None) => {
-                    tracing::info!(?path, "no retain state file yet; starting fresh");
-                }
-                Err(e) => {
-                    // Don't refuse to start on a corrupt state file —
-                    // log and continue with defaults. Operator can
-                    // inspect or delete the file out-of-band.
-                    tracing::warn!(?path, %e, "failed to read retain state file; using defaults");
-                }
+    // The complete identity/layout decision was made before devices connected.
+    // Every slot is validated before scanning; a trap faults the run before
+    // outputs, and no partially restored checkpoint is ever queued.
+    for entry in retain_control.entries() {
+        if let Some(value) = restored.get(&entry.key) {
+            if let Err(error) =
+                runnings[entry.unit].write_variable_raw(VarIndex::new(entry.slot), *value)
+            {
+                note_latch_reason(&latch_reason, format!("RETAIN VM restore: {error:?}"));
+                watchdog_tripped.store(true, Ordering::Release);
+                record_fault(fault, format!("RETAIN VM restore: {error:?}"));
+                return;
             }
         }
     }
@@ -2864,6 +2867,15 @@ async fn run_loop_async(
             break;
         }
 
+        if retain_control.must_inhibit() && !watchdog_tripped.load(Ordering::Relaxed) {
+            note_latch_reason(
+                &latch_reason,
+                "RETAIN persistence loss budget exceeded".into(),
+            );
+            watchdog_tripped.store(true, Ordering::Release);
+            begin_failsafe_attempts(&failsafe_status, devices.iter().map(|dev| dev.name()));
+            failsafe_jobs.start(devices, &failsafe_status, |_, _| true);
+        }
         failsafe_jobs.collect_ready(devices, &failsafe_status).await;
         if pending_latch_ack.is_some() && !failsafe_ack_pending(&failsafe_status) {
             if let Some((newly, ack)) = pending_latch_ack.take() {
@@ -3026,6 +3038,7 @@ async fn run_loop_async(
                             match allowed {
                                 Ok(v) => match runnings[u].write_variable(VarIndex::new(idx), v) {
                                     Ok(()) => {
+                                        retain_control.mark_write(u, idx);
                                         // Only an accepted write supersedes a pulse;
                                         // governance/VM failures leave its reset live.
                                         pulses.set(
@@ -3117,6 +3130,7 @@ async fn run_loop_async(
             let variable = debug_maps[unit].var(index).map_or("?", |info| &info.name);
             match runnings[unit].write_variable(VarIndex::new(index), 0) {
                 Ok(()) => {
+                    retain_control.mark_write(unit, index);
                     let outcome = mapped_write_outcome(
                         0,
                         index,
@@ -3155,6 +3169,12 @@ async fn run_loop_async(
         }
         if matches!(current_mode, RuntimeMode::Paused) {
             prev_paused = true;
+            if last_retain_flush.elapsed() >= retain_control.sample_interval() {
+                if let Some(writer) = retain_writer.as_deref_mut() {
+                    queue_retain_values(writer, retain_control, &runnings, &clocks, false);
+                }
+                last_retain_flush = Instant::now();
+            }
             if last_snapshot.elapsed() >= SNAPSHOT_PERIOD {
                 snapshots.publish(
                     &runnings,
@@ -3587,12 +3607,11 @@ async fn run_loop_async(
             last_snapshot = Instant::now();
         }
 
-        // Only sample the VM here. Encoding and storage run on the
-        // single checkpoint writer, which coalesces pending checkpoints.
-        if let Some(writer) = retain_tx.filter(|_| {
-            !retain_entries.is_empty() && last_retain_flush.elapsed() >= RETAIN_FLUSH_INTERVAL
-        }) {
-            queue_retain_values(writer, &retain_entries, &runnings, start, &clocks);
+        retain_control.mark_scan(clocks.iter().map(|c| c.scan_count).sum());
+        if last_retain_flush.elapsed() >= retain_control.sample_interval() {
+            if let Some(writer) = retain_writer.as_deref_mut() {
+                queue_retain_values(writer, retain_control, &runnings, &clocks, false);
+            }
             last_retain_flush = Instant::now();
         }
 
@@ -3624,8 +3643,11 @@ async fn run_loop_async(
     // value to reload on next startup. Skipped after an abort (VM trap,
     // exhausted budget, or a Stop that found a hung scan): the interrupted
     // unit's variables are partial, so the last periodic checkpoint stands.
-    if let Some(writer) = retain_tx.filter(|_| !scan_aborted && !retain_entries.is_empty()) {
-        queue_retain_values(writer, &retain_entries, &runnings, start, &clocks);
+    if !scan_aborted {
+        retain_control.mark_scan(clocks.iter().map(|c| c.scan_count).sum());
+        if let Some(writer) = retain_writer {
+            queue_retain_values(writer, retain_control, &runnings, &clocks, true);
+        }
     }
 
     for running in runnings {
@@ -3660,82 +3682,21 @@ fn value_for_type(raw: u64, type_tag: u8) -> ChannelValue {
     }
 }
 
-/// Find one retain variable's saved value in a loaded state file,
-/// accepting every key spelling this runtime writes.
-///
-/// The canonical key depends on how many units are scheduled —
-/// `instance.variable` for a multi-PROGRAM project, the bare name for a
-/// single one — so the *same* variable changes spelling on disk when a
-/// program is added to or removed from `tasks.toml`. Trying only the
-/// canonical key and the qualified-to-bare direction covered growing the
-/// schedule but not shrinking it: dropping the second PROGRAM left the
-/// survivor looking up `counter` in a file that had written
-/// `a_inst.counter`, so every retained value silently reset to its
-/// initialiser. Both directions are tried, so a schedule change never
-/// loses state.
-///
-/// Only *this* unit's instance is ever tried, never another's — a bare
-/// key must not adopt a different PROGRAM's saved value.
-fn lookup_retain_value(vars: &HashMap<String, u64>, instance: &str, key: &str) -> Option<u64> {
-    if let Some(v) = vars.get(key) {
-        return Some(*v);
-    }
-    let bare = key.split_once('.').map_or(key, |(_, bare)| bare);
-    vars.get(bare)
-        .or_else(|| vars.get(&format!("{instance}.{bare}")))
-        .copied()
-}
-
-type RetainSender = tokio::sync::watch::Sender<Option<Arc<crate::retain::RetainState>>>;
-
-fn retain_writer(
-    path: PathBuf,
-    io: &tokio::runtime::Handle,
-) -> (RetainSender, tokio::task::JoinHandle<()>) {
-    spawn_retain_writer(io, move |state| {
-        if let Err(error) = crate::retain::save(&path, state) {
-            tracing::warn!(?path, %error, "retain flush failed");
-        }
-    })
-}
-
-fn spawn_retain_writer(
-    io: &tokio::runtime::Handle,
-    mut save: impl FnMut(&crate::retain::RetainState) + Send + 'static,
-) -> (RetainSender, tokio::task::JoinHandle<()>) {
-    let (tx, mut rx) = tokio::sync::watch::channel::<Option<Arc<crate::retain::RetainState>>>(None);
-    let runtime = io.clone();
-    let task = io.spawn_blocking(move || {
-        while runtime.block_on(rx.changed()).is_ok() {
-            let state = rx.borrow_and_update().clone();
-            if let Some(state) = state {
-                save(&state);
-            }
-        }
-    });
-    (tx, task)
-}
-
-/// Sample raw slots losslessly, including LREAL and 64-bit integer lanes.
 fn queue_retain_values(
-    writer: &RetainSender,
-    retain_entries: &[(usize, String, u16)],
+    writer: &mut retain::RetainWriter,
+    control: &retain::RetainControl,
     runnings: &[VmRunning],
-    start: Instant,
     clocks: &[UnitClock],
+    final_sample: bool,
 ) {
-    let mut vars = HashMap::with_capacity(retain_entries.len());
-    for (unit, key, idx) in retain_entries {
-        if let Ok(raw) = runnings[*unit].read_variable_raw(VarIndex::new(*idx)) {
-            vars.insert(key.clone(), raw);
-        }
+    let mut vars = BTreeMap::new();
+    for entry in control.entries() {
+        let Ok(raw) = runnings[entry.unit].read_variable_raw(VarIndex::new(entry.slot)) else {
+            return;
+        };
+        vars.insert(entry.key.clone(), raw);
     }
-    let now_us = start.elapsed().as_micros() as u64;
-    writer.send_replace(Some(Arc::new(crate::retain::build(
-        vars,
-        now_us,
-        max_scan_count(clocks),
-    ))));
+    writer.sample(vars, max_scan_count(clocks), final_sample);
 }
 
 #[cfg(test)]
@@ -6511,207 +6472,6 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
             .await
             .expect("shutdown");
-    }
-
-    // ---- RETAIN: the wiring between retain.rs and the scan loop ----
-    //
-    // The on-disk format had unit tests and the AST extraction had unit
-    // tests; the part that joins them — resolve a name to a slot, restore
-    // before the first scan, flush on a cadence — had none, and every
-    // scan-loop test above passes `retain_vars: Vec::new()` with no state
-    // path. That gap is why the key-spelling asymmetry below survived.
-
-    /// A PROGRAM with one RETAIN variable that the scan loop never
-    /// modifies, so a restored value stays observable in the snapshot.
-    #[tokio::test]
-    async fn stalled_retain_storage_coalesces_and_flushes_the_final_checkpoint() {
-        let (saved, mut received) = tokio::sync::mpsc::unbounded_channel();
-        let (release, stalled) = std::sync::mpsc::channel();
-        let (writer, task) =
-            spawn_retain_writer(&tokio::runtime::Handle::current(), move |state| {
-                saved.send(state.scan_count).unwrap();
-                if state.scan_count == 1 {
-                    stalled.recv().unwrap();
-                }
-            });
-        let checkpoint = |n| Some(Arc::new(crate::retain::build(HashMap::new(), 0, n)));
-        writer.send_replace(checkpoint(1));
-        assert_eq!(received.recv().await, Some(1));
-        writer.send_replace(checkpoint(2));
-        writer.send_replace(checkpoint(3));
-        drop(writer);
-        release.send(()).unwrap();
-        task.await.unwrap();
-        assert_eq!(received.recv().await, Some(3));
-        assert_eq!(received.recv().await, None);
-    }
-
-    fn retain_container() -> Container {
-        crate::compile(
-            "PROGRAM main\n\
-                VAR RETAIN counter : DINT := 0; END_VAR\n\
-                VAR ticks : INT := 0; END_VAR\n\
-                ticks := ticks + 1;\n\
-            END_PROGRAM",
-        )
-        .expect("retain program compiles")
-    }
-
-    fn retain_unit(instance: &str) -> ProgramUnit {
-        ProgramUnit {
-            retain_vars: vec!["counter".into()],
-            ..unit(instance, retain_container(), 10, 1)
-        }
-    }
-
-    /// Write a state file by hand so the restore assertion doesn't depend
-    /// on a previous run's timing.
-    fn seed_retain_file(path: &std::path::Path, entries: &[(&str, u64)]) {
-        let vars: HashMap<String, u64> = entries
-            .iter()
-            .map(|(k, v)| ((*k).to_string(), *v))
-            .collect();
-        crate::retain::save(path, &crate::retain::build(vars, 0, 0)).expect("seed state file");
-    }
-
-    async fn restored_counter(handle: &ProgramHandle, name: &str) -> String {
-        let mut rx = handle.subscribe();
-        let snap = last_snapshot_within(&mut rx, Duration::from_millis(300)).await;
-        var_value(&snap, name)
-    }
-
-    #[test]
-    fn a_retain_key_is_found_under_either_spelling() {
-        let vars: HashMap<String, u64> = [("counter".to_string(), 7u64)].into_iter().collect();
-        // Single-unit run reading a file written while two units ran.
-        let qualified: HashMap<String, u64> =
-            [("a_inst.counter".to_string(), 7u64)].into_iter().collect();
-        assert_eq!(
-            lookup_retain_value(&qualified, "a_inst", "counter"),
-            Some(7),
-            "shrinking the schedule must still find the value"
-        );
-        // Multi-unit run reading a file written while one unit ran.
-        assert_eq!(
-            lookup_retain_value(&vars, "a_inst", "a_inst.counter"),
-            Some(7),
-            "growing the schedule must still find the value"
-        );
-        // Exact key wins, and is tried first.
-        let both: HashMap<String, u64> = [
-            ("counter".to_string(), 1u64),
-            ("a_inst.counter".to_string(), 2u64),
-        ]
-        .into_iter()
-        .collect();
-        assert_eq!(
-            lookup_retain_value(&both, "a_inst", "a_inst.counter"),
-            Some(2)
-        );
-        assert_eq!(lookup_retain_value(&both, "a_inst", "counter"), Some(1));
-    }
-
-    /// The bare spelling must never adopt a *different* PROGRAM's saved
-    /// value — that would be worse than losing it.
-    #[test]
-    fn a_bare_retain_key_does_not_adopt_another_instances_value() {
-        let other: HashMap<String, u64> = [("b_inst.counter".to_string(), 99u64)]
-            .into_iter()
-            .collect();
-        assert_eq!(lookup_retain_value(&other, "a_inst", "counter"), None);
-        assert_eq!(
-            lookup_retain_value(&other, "a_inst", "a_inst.counter"),
-            None
-        );
-    }
-
-    /// Regression: removing a PROGRAM from `tasks.toml` used to reset every
-    /// retained value in the PROGRAM that stayed.
-    ///
-    /// Two units write `a_inst.counter`; the survivor runs alone, so its
-    /// canonical key is the bare `counter`, and the old lookup only ever
-    /// walked qualified -> bare. A totalizer that had been counting for
-    /// months silently restarted at its initialiser, with nothing logged.
-    #[tokio::test]
-    async fn dropping_a_program_keeps_the_survivors_retained_values() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("state").join("retain.json");
-        seed_retain_file(&path, &[("a_inst.counter", 4242), ("b_inst.counter", 7)]);
-
-        let handle = spawn_units_inner(
-            vec![retain_unit("a_inst")],
-            DeviceSource::Prebuilt(Vec::new()),
-            Vec::new(),
-            Some(path.clone()),
-            WriteGovernance::default(),
-        );
-        assert_eq!(
-            restored_counter(&handle, "counter").await,
-            "4242",
-            "the surviving PROGRAM's retained value must come back"
-        );
-        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
-            .await
-            .expect("shutdown");
-    }
-
-    /// The other direction, which already worked and must keep working:
-    /// adding a second PROGRAM to a project whose state file still holds
-    /// bare names.
-    #[tokio::test]
-    async fn adding_a_program_keeps_the_existing_retained_values() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("retain.json");
-        seed_retain_file(&path, &[("counter", 4242)]);
-
-        let handle = spawn_units_inner(
-            vec![retain_unit("a_inst"), retain_unit("b_inst")],
-            DeviceSource::Prebuilt(Vec::new()),
-            Vec::new(),
-            Some(path.clone()),
-            WriteGovernance::default(),
-        );
-        // `counter` is declared by both units, so snapshots qualify it.
-        assert_eq!(restored_counter(&handle, "a_inst.counter").await, "4242");
-        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
-            .await
-            .expect("shutdown");
-    }
-
-    /// The flush half: a multi-unit run writes one merged file keyed by
-    /// instance, and the final flush on stop captures it.
-    #[tokio::test]
-    async fn a_multi_unit_run_flushes_one_file_keyed_by_instance() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("retain.json");
-        seed_retain_file(&path, &[("counter", 4242)]);
-
-        let handle = spawn_units_inner(
-            vec![retain_unit("a_inst"), retain_unit("b_inst")],
-            DeviceSource::Prebuilt(Vec::new()),
-            Vec::new(),
-            Some(path.clone()),
-            WriteGovernance::default(),
-        );
-        tokio::time::sleep(Duration::from_millis(40)).await;
-        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
-            .await
-            .expect("shutdown");
-
-        let state = crate::retain::load(&path)
-            .expect("state file reads")
-            .expect("state file exists");
-        let mut keys: Vec<&String> = state.vars.keys().collect();
-        keys.sort();
-        assert_eq!(
-            keys,
-            vec!["a_inst.counter", "b_inst.counter"],
-            "each instance gets its own key so same-named vars don't collide"
-        );
-        assert_eq!(
-            state.vars["a_inst.counter"], 4242,
-            "the restored value round-trips back out on the final flush"
-        );
     }
 
     fn counting_program() -> Container {

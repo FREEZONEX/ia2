@@ -10,6 +10,7 @@
  * state would be a lie an operator acts on.
  */
 
+import type { RetainStatus } from "@/types/generated/RetainStatus"
 import type { DeviceHealth } from "@/types/generated/DeviceHealth"
 import type { RuntimeMode } from "@/types/generated/RuntimeMode"
 import type { SnapshotTapHealth } from "@/types/generated/SnapshotTapHealth"
@@ -107,6 +108,9 @@ export function derivePanelHealth(
       text: `ALARMS NOT EVALUATED — ${state.alarmsBlind}${lost}. Treat the alarm list and live values as stale.${latchSentence(latchIn)}`,
     }
   }
+  if (state?.retainProblem) {
+    return { kind: "degraded", tone: "warn", badge: "RETAIN", text: `RETAIN — ${state.retainProblem}` }
+  }
   const down = state?.unhealthyDevices ?? []
   if (down.length > 0) {
     return {
@@ -138,6 +142,7 @@ export function derivePanelHealth(
 /** The slice of the edge runtime's /status the panel reads. The full
  *  shape is documented in docs/api.md (edge runtime table). */
 export type EdgeStatus = {
+  retain?: RetainStatus | null
   project?: string | null
   fault?: string | null
   watchdog_tripped?: boolean
@@ -191,6 +196,7 @@ export function edgeRuntimeState(s: EdgeStatus): HmiRuntimeState {
   return {
     running: !latch && s.fault == null && (s.mode == null || s.mode.kind === "running"),
     alarm: [s.fault, latch].filter(Boolean).join(". ") || null,
+    retainProblem: s.retain?.attention ?? null,
     mode: s.mode?.kind,
     scanPeriodMs: s.scan_period_ms ?? null,
     unhealthyDevices: (s.device_health ?? [])

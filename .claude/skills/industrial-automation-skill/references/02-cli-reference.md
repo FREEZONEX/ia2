@@ -401,3 +401,32 @@ acknowledgement remains unconfirmed until the owner returns a result. The
 IDE waits for actual EtherCAT worker exit before a replacement run. Restart
 creates a fresh gate after teardown. Establish physical output state with
 independent feedback.
+
+
+## RETAIN recovery
+
+`cs get runtime/retain --project NAME --server URL` returns the shared recovery
+conclusion and persistence health for that project's last run, even after a
+startup fault. `cs get runtime/retain/checkpoint --project NAME --server URL`
+exports only a durability-confirmed checkpoint and its receipt; 409 means none
+exists yet. Edge `/retain` and `/retain/checkpoint` have the same contract.
+
+Persistent projects declare `[retain].project_id` and `instance_id`, required
+qualified keys, cold-start conditions and optional loss budget in project.toml.
+Undeclared IDE runs remain ephemeral. Persistent edge runs do not silently adopt
+schema 1/2 or same-name values. Compare identity and scalar layout before any
+VM restoration. Read `recovery.admitted`, `attention`, `last_durable`,
+`pending_age_ms` and `final_save`; Running and a 5-second sampling cadence do not
+prove recovery or a maximum loss window.
+
+Use the existing `cs api` JSON-body mechanism for
+`POST /api/runtime/retain/resolve` (edge: `/retain/resolve`) only after the run's
+writer stops. Supply an expected source SHA256 and an explicit cold_start,
+discard or complete migration mapping; initialize_required explicitly permits
+required defaults. Source bytes are archived first. A stopped edge can use
+`ia2-runtime --project-dir PROJECT --state-dir STATE --retain-resolve REQUEST`;
+this compiles and locks storage but never connects devices. Keep REQUEST,
+verification copies and evidence inside the active project. The result requires
+restart and does not reset a latch. Never delete the whole state directory or
+replay failed motion to initialize RETAIN. See docs/retain-recovery.md for the
+supported type/transition matrix and downgrade restrictions.
