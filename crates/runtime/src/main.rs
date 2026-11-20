@@ -475,6 +475,15 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(args.bind)
         .await
         .with_context(|| format!("binding {}", args.bind))?;
+    let local = listener.local_addr()?;
+    // Subprocess callers use the same opt-in announcement as the IDE server.
+    // Report the owned socket before starting any device.
+    if std::env::var("IA2_PRINT_LISTEN_ADDR").as_deref() == Ok("1") {
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
+        writeln!(stdout, "IA2_LISTEN_ADDR={local}")?;
+        stdout.flush()?;
+    }
 
     // ---- Spawn the bridge ----
     let handle: ProgramHandle = ironplc_bridge::spawn_units_with_retain(
@@ -674,7 +683,7 @@ async fn main() -> Result<()> {
     // Around everything, the standalone panel and its static files included.
     let app = panic_guard::guard_browsers(app, &browser_guard);
 
-    tracing::info!(addr = %args.bind, "monitor server listening");
+    tracing::info!(addr = %local, "monitor server listening");
 
     // Run the HTTP server as a background task. We deliberately do NOT gate
     // shutdown on it via `with_graceful_shutdown`: the long-lived SSE

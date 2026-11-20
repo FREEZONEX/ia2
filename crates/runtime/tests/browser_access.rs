@@ -9,10 +9,13 @@
 
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+mod support;
+use support::TestRuntime;
 
 fn write_project(dir: &Path) {
     let write = |rel: &str, text: &str| {
@@ -35,59 +38,51 @@ fn write_project(dir: &Path) {
     );
 }
 
-struct Runtime {
-    child: Child,
-    port: u16,
-}
-
-impl Drop for Runtime {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-fn start(dir: &Path) -> Runtime {
+fn start(dir: &Path) -> TestRuntime {
     start_with(dir, &[])
 }
 
-fn start_with(dir: &Path, extra_args: &[&str]) -> Runtime {
+fn start_with(dir: &Path, extra_args: &[&str]) -> TestRuntime {
     start_on(dir, "127.0.0.1", extra_args)
 }
 
-fn start_on(dir: &Path, bind_ip: &str, extra_args: &[&str]) -> Runtime {
+fn start_on(dir: &Path, bind_ip: &str, extra_args: &[&str]) -> TestRuntime {
     let project = dir.join("project");
     write_project(&project);
-    let port = {
-        let l = TcpListener::bind((bind_ip, 0)).unwrap();
-        l.local_addr().unwrap().port()
-    };
-    let child = Command::new(env!("CARGO_BIN_EXE_ia2-runtime"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ia2-runtime"));
+    command
         .arg("--project-dir")
         .arg(&project)
         .arg("--state-dir")
         .arg(dir.join("state"))
-        .arg("--bind")
-        .arg(std::net::SocketAddr::new(bind_ip.parse().unwrap(), port).to_string())
         .args(extra_args)
         .env_remove("IA2_ALLOWED_ORIGINS")
         .env("HOME", dir)
         .env("XDG_CONFIG_HOME", dir.join("config"))
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("start ia2-runtime");
-    let runtime = Runtime { child, port };
+        .current_dir(dir);
+    let mut runtime = TestRuntime::spawn(
+        &mut command,
+        bind_ip.parse().unwrap(),
+        &dir.join("runtime.log"),
+    );
+    let port = runtime.port;
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
         if send(port, "GET", "/health", &[], "").is_some_and(|r| r.status == 200) {
             return runtime;
         }
+        if let Some(status) = runtime.child.try_wait().unwrap() {
+            panic!(
+                "runtime exited {status} before answering /health on port {port}:\n{}",
+                runtime.output()
+            );
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
-    panic!("the runtime did not answer /health on port {port}");
+    panic!(
+        "runtime did not answer /health on port {port}:\n{}",
+        runtime.output()
+    );
 }
 
 struct Reply {
