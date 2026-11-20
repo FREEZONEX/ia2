@@ -409,12 +409,15 @@ async fn type_rejection_latches_before_any_scan_and_stays_protected_on_stop() {
         c,
         Default::default(),
     );
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut faults = handle.fault_watch();
+    let fault = tokio::time::timeout(Duration::from_secs(5), faults.wait_for(Option::is_some))
+        .await
+        .expect("RETAIN admission did not report a fault")
+        .expect("scan thread stopped without reporting the RETAIN fault")
+        .clone()
+        .unwrap();
     assert!(handle.watchdog_tripped());
-    assert!(handle
-        .fault()
-        .unwrap()
-        .contains("requires explicit migration"));
+    assert!(fault.contains("requires explicit migration"), "{fault}");
     assert!(handle.retain().checkpoint().is_none());
     handle.shutdown().await;
     assert_eq!(fs::read(path).unwrap(), bytes);
