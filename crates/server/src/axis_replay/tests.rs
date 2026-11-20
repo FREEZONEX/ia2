@@ -314,3 +314,191 @@ fn comparisons_exclude_mixed_profiles_and_multiple_parameter_changes() {
         .unwrap()
         .contains("relative targets differ"));
 }
+
+#[tokio::test]
+async fn v2_exports_are_scored_or_excluded_by_the_v1_api() {
+    use ironplc_bridge::axis_capture::{
+        Capture, Command, EndReason, Exchange, Feedback, InputQuality, PdoField, ReplayImport,
+        Scope, SlaveIdentity,
+    };
+
+    let input = request(vec![run("source", 30, 1)], vec![]);
+    let original: super::ReplayRequest = serde_json::from_value(input).unwrap();
+    let sampling = original.sampling;
+    let run = original.runs.into_iter().next().unwrap();
+    let scope = Scope {
+        runtime_id: "sim-run".into(),
+        bus_generation: 7,
+        device: "sim-bus".into(),
+        slave: 0,
+    };
+    let mut capture = Capture {
+        capture_schema_version: 1,
+        capture_id: "sim-run-7-1".into(),
+        scope: scope.clone(),
+        slave: SlaveIdentity {
+            index: 0,
+            name: "sim-axis".into(),
+            vendor_id: 0,
+            product_id: 0,
+            revision: None,
+            serial: None,
+            input_bytes: 14,
+            output_bytes: 6,
+        },
+        // The EtherCAT recorder tests cover the mapping. Replay takes
+        // its already decoded numbers, so the metadata need not match.
+        mapping: [PdoField {
+            role: "test",
+            direction: "tx_pdo",
+            object: 0,
+            sub_index: 0,
+            offset_bytes: 0,
+            width_bits: 0,
+            signed: false,
+        }; 7],
+        sampling,
+        simulated: true,
+        max_samples: 130,
+        duration_ms: 3_000,
+        dropped_samples: 0,
+        end_reason: Some(EndReason::SampleLimit),
+        samples: run
+            .samples
+            .into_iter()
+            .enumerate()
+            .map(|(i, sample)| Exchange {
+                attempt: i as u64 + 1,
+                dc_ns: Some(sample.dc_ns),
+                wkc: Some(sample.wkc),
+                all_op: Some(true),
+                input_quality: InputQuality::Fresh,
+                command: Some(Command {
+                    controlword: sample.controlword,
+                    target_raw: (i32::MAX - 6).wrapping_add(sample.target_counts as i32),
+                }),
+                feedback: Some(Feedback {
+                    statusword: sample.statusword,
+                    position_raw: (i32::MAX - 6).wrapping_add(sample.position_counts as i32),
+                    following_error_counts: sample.following_error_counts,
+                    torque_permille: sample.torque_permille,
+                    error_code: sample.error_code,
+                }),
+                ..Exchange::default()
+            })
+            .collect(),
+    };
+    let capture_id = capture.capture_id.clone();
+    let import = |started: bool, normal_completion| {
+        serde_json::from_value::<ReplayImport>(json!({
+            "run_id": "offline-sim",
+            "plc": {
+                "capture_id": capture_id,
+                "scope": scope,
+                "request_consumed": true,
+                "plc_started": started,
+                "normal_completion": normal_completion,
+                "scan_count_before": 1,
+                "scan_count_after": 131,
+                "terminal_reason": (!started).then_some("PLC declined the request"),
+            },
+            "parameter_readback": { "scope": scope, "values": run.parameter_readback },
+            "profile": run.profile
+        }))
+        .unwrap()
+    };
+    let go = |capture: &Capture, import| {
+        let payload =
+            serde_json::to_vec(&capture.replay(import, run.source.clone()).unwrap()).unwrap();
+        async move {
+            let response = Router::new()
+                .route("/api/axis-replay", route())
+                .oneshot(post(Body::from(payload)))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            serde_json::from_slice::<Value>(&to_bytes(response.into_body(), 100_000).await.unwrap())
+                .unwrap()
+        }
+    };
+    let valid_import = import(true, true);
+    let mut missing_data = import(true, true);
+    missing_data.parameter_readback = None;
+    assert!(capture.replay(missing_data, run.source.clone()).is_err());
+    let mut other_run = import(true, true);
+    other_run.plc.scope.bus_generation += 1;
+    assert!(capture.replay(other_run, run.source.clone()).is_err());
+    let mut other_axis = import(true, true);
+    other_axis.parameter_readback.as_mut().unwrap().scope.slave += 1;
+    assert!(capture.replay(other_axis, run.source.clone()).is_err());
+
+    let result = go(&capture, valid_import).await;
+    assert_eq!(result["runs"][0]["status"], "analyzed");
+    assert_eq!(
+        result["runs"][0]["metrics"]["legs"][0]["steady_speed_mean_rpm"],
+        5.0
+    );
+
+    let mut reverse = import(true, true);
+    reverse.profile = Some(ironplc_bridge::axis_replay::Profile::Single {
+        command_rpm: -5.0,
+        steady_slots: 120,
+        settle_ns: 1_000_000_000,
+        encoder_span: None,
+    });
+    let samples = capture.samples.clone();
+    for row in &mut capture.samples {
+        let command = row.command.as_mut().unwrap();
+        command.target_raw = !command.target_raw;
+        let feedback = row.feedback.as_mut().unwrap();
+        feedback.position_raw = command.target_raw;
+    }
+    // Descending through the signed wrap has the same 5 rpm magnitude.
+    let result = go(&capture, reverse).await;
+    assert_eq!(result["runs"][0]["status"], "analyzed");
+    assert_eq!(
+        result["runs"][0]["metrics"]["legs"][0]["steady_speed_mean_rpm"],
+        -5.0
+    );
+    capture.samples = samples;
+    let mut variants: Vec<(_, &str)> = Vec::new();
+    let mut gap = capture.samples.clone();
+    for row in &mut gap[4..] {
+        row.dc_ns = row.dc_ns.map(|dc| dc + u64::from(sampling.cycle_ns.get()));
+    }
+    variants.push((gap, "dc_discontinuity"));
+    let mut clockless = capture.samples.clone();
+    clockless[4].dc_ns = None;
+    variants.push((clockless, "invalid_capture"));
+    let mut low_wkc = capture.samples.clone();
+    low_wkc[4].wkc = Some(1);
+    low_wkc[4].input_quality = InputQuality::UnexpectedWkc;
+    low_wkc[4].feedback = None;
+    variants.push((low_wkc, "invalid_wkc"));
+    let mut stale = capture.samples.clone();
+    stale[4].input_quality = InputQuality::NotOperational;
+    stale[4].feedback = None;
+    variants.push((stale, "invalid_capture"));
+    let mut missing_sample = capture.samples.clone();
+    missing_sample.remove(4);
+    variants.push((missing_sample, "invalid_capture"));
+    for (samples, expected) in variants {
+        capture.samples = samples;
+        let result = go(&capture, import(true, true)).await;
+        assert_eq!(result["runs"][0]["status"], expected);
+        assert!(result["runs"][0]["metrics"].is_null());
+    }
+
+    capture.samples.truncate(4);
+    for row in &mut capture.samples {
+        row.command = Some(Command::default());
+        row.feedback = Some(Feedback::default());
+    }
+    let result = go(&capture, import(false, false)).await;
+    assert_eq!(result["runs"][0]["status"], "pre_enable_abort");
+    assert_eq!(
+        result["runs"][0]["terminal_reason"],
+        "PLC declined the request"
+    );
+    assert!(result["runs"][0]["metrics"].is_null());
+}

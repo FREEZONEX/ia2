@@ -36,7 +36,7 @@ server); a scenario file plays the plant. This is the step between
 ```bash
 cs sim run scenarios/fill.toml                 # runs tasks.toml, plays the scenario, stops
 cs sim run s.toml --program main               # one PROGRAM instead of the schedule
-cs sim run s.toml --trace /tmp/trace.jsonl     # record every polled snapshot
+cs sim run s.toml --trace target/task-tmp/trace.jsonl     # record every polled snapshot
 cs sim run s.toml --no-run                     # attach to a run you already started
 ```
 
@@ -85,6 +85,11 @@ Exit 0 = all held · 1 = a step failed, and the report names the step,
 the deadline, and the LAST OBSERVED value ("expected level > 20 within
 6000ms — last observed 3.5") — fix the logic, re-run. Execution stops
 at the first failed step (later steps depend on earlier state).
+
+The [axis capture fixture](../../../../examples/axis_capture_sim/) uses the
+`_sim` EtherCAT clock. Its `pre_enable_abort.toml` verifies the PLC evidence
+for a consumed request with no motion start. Run the same fixture with the
+local edge binary to exercise capture and V1 export.
 
 The reference example lives at `examples/sim_smoke/` (tank integrator +
 alarm + scenario); it also runs as a cargo e2e test.
@@ -259,3 +264,20 @@ device/error rows. Panels show these results alongside the latch cause; a
 healthy transport or latch flag is not proof of physical safety. Simulated
 acknowledgement verifies the software contract only. An omitted/null report
 means acknowledgement is unavailable, not that every device was confirmed.
+
+
+## RETAIN recovery scenarios
+
+Use fresh project-local copies of `examples/retain_recovery` and
+`examples/retain_required`: run `cs project check` and `cs sim run` with the
+selected `--project` and loopback `--server`, inside `cs agent run`. The first
+asserts allowed initializer startup; the second expects a terminal RETAIN fault
+when required state is absent. Do not reuse a previously initialized required
+fixture. Create `target/task-tmp` before using it for traces.
+
+The built-in `__supervision/retain` alarm reports the same `attention` shown in
+runtime RETAIN status: denied recovery, an abnormal policy-approved cold start,
+a storage error or an exceeded data-loss budget. An acknowledged alarm does not
+waive admission or clear an output latch. Process/fsync failure and abrupt exit
+need `scripts/retain-process-regression.py` and Rust storage tests; simulation
+alone does not establish physical power-loss durability.

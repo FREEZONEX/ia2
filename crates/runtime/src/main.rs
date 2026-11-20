@@ -41,6 +41,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt as _;
 use tracing_subscriber::EnvFilter;
 
+mod axis_capture;
 mod northbound;
 mod panic_guard;
 mod supervisor;
@@ -48,9 +49,10 @@ mod tap;
 
 const DEFAULT_BIND: &str = "127.0.0.1:13001";
 
-/// Upper bound on the graceful bridge drain (stop scan loop -> failsafe ->
-/// join the EtherCAT cyclic thread). Comfortably under systemd's
-/// `TimeoutStopSec=10s` so a clean exit always wins the race against
+/// Upper bound on graceful shutdown. The bridge drain (stop scan loop ->
+/// failsafe -> join the EtherCAT cyclic thread) gets the full budget.
+/// Saving a retained capture can only use time left over. The bound is
+/// under systemd's `TimeoutStopSec=10s` so a clean exit wins the race against
 /// SIGKILL; if a wedged bus blows this budget we log and exit anyway,
 /// falling back to the drive's own watchdog.
 const BRIDGE_DRAIN_TIMEOUT: Duration = Duration::from_secs(7);
@@ -154,6 +156,7 @@ struct Args {
     /// `infra/install.sh` lays out a typical edge deployment
     /// (`/opt/ia2/state/retain.json` alongside `/opt/ia2/current/`).
     state_dir: PathBuf,
+    retain_resolve: Option<PathBuf>,
     /// Built web assets (the IDE's `dist/`). When set, the runtime
     /// serves the standalone HMI panel at `/hmi/{screen}` so operator
     /// clients on the plant network can open screens straight off the
@@ -171,6 +174,7 @@ fn parse_args() -> Result<Args> {
     let mut project_dir: Option<PathBuf> = None;
     let mut bind = DEFAULT_BIND.to_string();
     let mut state_dir: Option<PathBuf> = None;
+    let mut retain_resolve = None;
     let mut static_dir: Option<PathBuf> = None;
     let mut allow_origins: Vec<String> = Vec::new();
 
@@ -188,6 +192,12 @@ fn parse_args() -> Result<Args> {
             "--state-dir" => {
                 state_dir = Some(PathBuf::from(
                     iter.next().context("--state-dir requires a value")?,
+                ));
+            }
+            "--retain-resolve" => {
+                retain_resolve = Some(PathBuf::from(
+                    iter.next()
+                        .context("--retain-resolve requires a JSON request file")?,
                 ));
             }
             "--static-dir" => {
@@ -236,6 +246,7 @@ fn parse_args() -> Result<Args> {
         project_dir,
         bind,
         state_dir,
+        retain_resolve,
         static_dir,
         allow_origins,
     })
@@ -252,6 +263,7 @@ fn print_help() {
          --bind <addr>          Local socket for the monitor server (default {DEFAULT_BIND}).\n  \
          --state-dir <path>     Where to persist RETAIN variables (default: sibling 'state/' of\n                         \
          the install root). Survives version swaps; safe to back up.\n  \
+         --retain-resolve <json> Resolve stopped RETAIN state without connecting devices.\n  \
          --static-dir <path>    Built web assets. When set, operator clients can open the\n                         \
          project's HMI screens at http://<edge>:<port>/hmi/<screen>.\n                         \
          Default: web/ next to the project dir, when it holds the\n                         \
@@ -409,7 +421,8 @@ async fn main() -> Result<()> {
     // don't pre-create anything here. Skip the path entirely if no
     // unit declares RETAIN vars — no file means no future confusion
     // about "what's in this state.json".
-    let state_path = if retain_var_count == 0 {
+    let retain_policy = store.read_retain_policy()?;
+    let state_path = if retain_var_count == 0 && retain_policy.project_id.is_none() {
         None
     } else {
         let p = args.state_dir.join("retain.json");
@@ -433,6 +446,23 @@ async fn main() -> Result<()> {
         Some(p)
     };
 
+    let retain_config = ironplc_bridge::retain::RetainConfig {
+        path: state_path,
+        policy: retain_policy,
+    };
+    if let Some(request_path) = &args.retain_resolve {
+        let request = serde_json::from_slice(&std::fs::read(request_path)?)?;
+        let result = ironplc_bridge::retain::resolve_stopped(&retain_config, &units, &request)
+            .map_err(|e| anyhow!(e))?;
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        if !result.receipt.durable {
+            return Err(anyhow!(
+                "RETAIN replacement completed but durability is unconfirmed"
+            ));
+        }
+        return Ok(());
+    }
+
     // ---- Claim the API socket before anything touches a field device ----
     // `spawn_units` starts the thread that connects the devices and begins
     // driving outputs. If the bind fails after that (the port is held, the
@@ -447,11 +477,11 @@ async fn main() -> Result<()> {
         .with_context(|| format!("binding {}", args.bind))?;
 
     // ---- Spawn the bridge ----
-    let handle: ProgramHandle = ironplc_bridge::spawn_units(
+    let handle: ProgramHandle = ironplc_bridge::spawn_units_with_retain(
         units,
         device_specs,
         iomap.mappings,
-        state_path,
+        retain_config,
         store.governance().clone(),
     );
 
@@ -479,6 +509,8 @@ async fn main() -> Result<()> {
             Arc::new(Mutex::new(ironplc_bridge::monitor::AlarmEngine::default()))
         }
     };
+
+    handle.retain().supervise(alarms.clone());
 
     // Fan out the bridge's snapshots into a runtime-owned broadcast channel,
     // so we can keep the latest snapshot in shared state for /status and so
@@ -560,11 +592,15 @@ async fn main() -> Result<()> {
         Router::new()
             .route("/health", get(health))
             .route("/status", get(status))
+            .route("/retain", get(retain_status))
+            .route("/retain/checkpoint", get(retain_checkpoint))
+            .route("/retain/resolve", post(retain_resolve))
             .route("/events", get(events))
             .route("/logs", get(logs))
             .route("/logs/stream", get(logs_stream))
             .route("/discover", get(discover))
             .route("/sdo", get(sdo_upload))
+            .merge(axis_capture::routes())
             .route("/engineering-state", get(engineering_history))
             .route("/engineering-state/refresh", post(engineering_refresh))
             .route("/system", get(system))
@@ -666,7 +702,9 @@ async fn main() -> Result<()> {
     tracing::info!(
         "shutdown signalled; draining bridge (stop scan loop -> failsafe -> join fieldbus)"
     );
-    match tokio::time::timeout(BRIDGE_DRAIN_TIMEOUT, handle.shutdown()).await {
+    let deadline = tokio::time::Instant::now() + BRIDGE_DRAIN_TIMEOUT;
+    let drain = tokio::time::timeout_at(deadline, handle.shutdown()).await;
+    match drain {
         Ok(()) => tracing::info!(
             "bridge drained; inspect failsafe/shutdown results above for unconfirmed outputs"
         ),
@@ -679,6 +717,10 @@ async fn main() -> Result<()> {
     // The server has done its job; stop accepting and drop any in-flight
     // SSE connections. Clients on the SSH tunnel handle the disconnect.
     server_task.abort();
+    tracing::info!(retain = %serde_json::to_string(&handle.retain().status()).unwrap_or_default(), "RETAIN final receipt");
+    if drain.is_ok() {
+        axis_capture::save_after_drain(handle, args.state_dir, deadline).await;
+    }
     tracing::info!("ia2-runtime exiting");
     Ok(())
 }
@@ -730,6 +772,7 @@ fn init_logging() -> LogCapture {
 
 #[derive(Serialize)]
 struct Health {
+    retain: ironplc_bridge::retain::RetainStatus,
     status: &'static str,
     uptime_secs: u64,
     scan_count: u64,
@@ -802,6 +845,7 @@ fn health_of(
 ) -> Health {
     let devices = handle.device_health();
     Health {
+        retain: handle.retain().status(),
         status: "ok",
         uptime_secs,
         scan_count,
@@ -817,6 +861,31 @@ fn health_of(
 }
 
 use ironplc_bridge::monitor::{self, ForceEntry, ModeResponse};
+
+async fn retain_status(
+    State(state): State<AppState>,
+) -> Json<ironplc_bridge::retain::RetainStatus> {
+    Json(state.handle.retain().status())
+}
+async fn retain_checkpoint(
+    State(state): State<AppState>,
+) -> Result<Json<ironplc_bridge::retain::CheckpointExport>, (axum::http::StatusCode, String)> {
+    state.handle.retain().checkpoint().map(Json).ok_or((
+        axum::http::StatusCode::CONFLICT,
+        "no durability-confirmed RETAIN checkpoint from this run".into(),
+    ))
+}
+async fn retain_resolve(
+    State(state): State<AppState>,
+    Json(request): Json<ironplc_bridge::retain::ResolveRequest>,
+) -> Result<Json<ironplc_bridge::retain::ResolveResult>, (axum::http::StatusCode, String)> {
+    let control = state.handle.retain();
+    tokio::task::spawn_blocking(move || control.resolve(&request))
+        .await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map(Json)
+        .map_err(|e| (axum::http::StatusCode::CONFLICT, e))
+}
 
 #[cfg(test)]
 mod write_response_tests {
@@ -990,6 +1059,7 @@ fn runtime_instance_id() -> &'static str {
 
 #[derive(Serialize)]
 struct Status {
+    retain: ironplc_bridge::retain::RetainStatus,
     runtime_id: &'static str,
     version: &'static str,
     /// What built this binary: the source commit (suffixed `-dirty` when the
@@ -1078,6 +1148,7 @@ async fn status(State(state): State<AppState>) -> Json<Status> {
         .filter(|a| a.standing())
         .count();
     Json(Status {
+        retain: state.handle.retain().status(),
         runtime_id: runtime_instance_id(),
         version: env!("CARGO_PKG_VERSION"),
         build_commit: env!("IA2_BUILD_COMMIT"),

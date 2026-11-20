@@ -4,6 +4,7 @@ struct ExecutionProbe {
     writes: Arc<AtomicU64>,
     failsafe: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
+    read_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
 
 #[async_trait::async_trait]
@@ -12,6 +13,10 @@ impl IoDevice for ExecutionProbe {
         "probe"
     }
     async fn read_channel(&mut self, _: &str) -> Result<ChannelValue, IoError> {
+        if let Some((entered, release)) = &self.read_gate {
+            entered.notify_one();
+            release.notified().await;
+        }
         Ok(ChannelValue::I32(0))
     }
     async fn write_channel(&mut self, _: &str, _: ChannelValue) -> Result<(), IoError> {
@@ -38,11 +43,11 @@ async fn infinite_scan_faults_drains_devices_and_does_not_publish_or_persist_par
         writes: writes.clone(),
         failsafe: fs.clone(),
         shutdown: sd.clone(),
+        read_gate: None,
     };
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("retain.json");
-    let checkpoint = b"{\"schema\":2,\"scan_count\":7,\"vars\":{\"x\":42}}";
-    std::fs::write(&path, checkpoint).unwrap();
+
     let (c, metadata) = crate::compile_with_metadata(
         "PROGRAM main VAR RETAIN x : DINT; END_VAR
          x := 99; WHILE TRUE DO x := x + 1; END_WHILE; END_PROGRAM",
@@ -50,6 +55,15 @@ async fn infinite_scan_faults_drains_devices_and_does_not_publish_or_persist_par
     .unwrap();
     let mut u = single_unit(c, 1);
     u.retain_vars = metadata.retain_vars;
+    let mut checkpoint_state = retain::Plan::from_units(
+        std::slice::from_ref(&u),
+        &test_retain_config(path.clone()).policy,
+    )
+    .unwrap()
+    .initial;
+    checkpoint_state.vars.get_mut("main.x").unwrap().bits = "42".into();
+    let checkpoint = serde_json::to_vec(&checkpoint_state).unwrap();
+    std::fs::write(&path, &checkpoint).unwrap();
     let mapping = Mapping {
         application: "main".into(),
         variable: "x".into(),
@@ -61,12 +75,13 @@ async fn infinite_scan_faults_drains_devices_and_does_not_publish_or_persist_par
         max: None,
         description: None,
     };
-    let handle = spawn_units_inner(
+    let handle = spawn_units_configured(
         vec![u],
         DeviceSource::Prebuilt(vec![Box::new(device)]),
         vec![mapping],
-        Some(path.clone()),
+        test_retain_config(path.clone()),
         WriteGovernance::default(),
+        RECONNECT_JOIN_GRACE,
     );
     let mut snapshots = handle.subscribe();
     join_scan_thread(&handle)
@@ -129,15 +144,17 @@ async fn stop_interrupts_an_infinite_scan_without_reporting_a_fault() {
     let writes = Arc::new(AtomicU64::new(0));
     let fs = Arc::new(AtomicBool::new(false));
     let sd = Arc::new(AtomicBool::new(false));
+    let input_entered = Arc::new(tokio::sync::Notify::new());
+    let input_release = Arc::new(tokio::sync::Notify::new());
     let device = ExecutionProbe {
         writes: writes.clone(),
         failsafe: fs.clone(),
         shutdown: sd.clone(),
+        read_gate: Some((input_entered.clone(), input_release.clone())),
     };
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("retain.json");
-    let checkpoint = b"{\"schema\":2,\"scan_count\":7,\"vars\":{\"x\":42}}";
-    std::fs::write(&path, checkpoint).unwrap();
+
     let (c, metadata) = crate::compile_with_metadata(
         "PROGRAM main VAR RETAIN x : DINT; END_VAR
          x := 99; WHILE TRUE DO x := x + 1; END_WHILE; END_PROGRAM",
@@ -145,6 +162,15 @@ async fn stop_interrupts_an_infinite_scan_without_reporting_a_fault() {
     .unwrap();
     let mut u = single_unit(c, 1);
     u.retain_vars = metadata.retain_vars;
+    let mut checkpoint_state = retain::Plan::from_units(
+        std::slice::from_ref(&u),
+        &test_retain_config(path.clone()).policy,
+    )
+    .unwrap()
+    .initial;
+    checkpoint_state.vars.get_mut("main.x").unwrap().bits = "42".into();
+    let checkpoint = serde_json::to_vec(&checkpoint_state).unwrap();
+    std::fs::write(&path, &checkpoint).unwrap();
     let mapping = Mapping {
         application: "main".into(),
         variable: "x".into(),
@@ -156,15 +182,29 @@ async fn stop_interrupts_an_infinite_scan_without_reporting_a_fault() {
         max: None,
         description: None,
     };
-    let handle = spawn_units_inner(
+    let handle = spawn_units_configured(
         vec![u],
         DeviceSource::Prebuilt(vec![Box::new(device)]),
-        vec![mapping],
-        Some(path.clone()),
+        vec![
+            Mapping {
+                direction: Direction::Input,
+                channel: "in".into(),
+                ..mapping.clone()
+            },
+            mapping,
+        ],
+        test_retain_config(path.clone()),
         WriteGovernance::default(),
+        RECONNECT_JOIN_GRACE,
     );
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    // Recovery may perform slow archive/fsync work. Wait for a real input
+    // phase, then release it with Stop set: that round must reach the VM's
+    // bounded execution guard instead of stopping before scanning begins.
+    tokio::time::timeout(Duration::from_secs(3), input_entered.notified())
+        .await
+        .unwrap();
     handle.stop();
+    input_release.notify_one();
     join_scan_thread(&handle).await.unwrap();
     if cfg!(debug_assertions) {
         assert_eq!(handle.fault(), None);
@@ -199,21 +239,24 @@ async fn stop_during_back_to_back_scans_still_writes_the_final_retain_checkpoint
         .unwrap();
         let mut u = single_unit(c, 1);
         u.retain_vars = metadata.retain_vars;
-        let handle = spawn_units_inner(
+        let handle = spawn_units_configured(
             vec![u],
             DeviceSource::Prebuilt(Vec::new()),
             Vec::new(),
-            Some(path.clone()),
+            test_retain_config(path.clone()),
             WriteGovernance::default(),
+            RECONNECT_JOIN_GRACE,
         );
         tokio::time::sleep(Duration::from_millis(stop_after_ms)).await;
         handle.stop();
         join_scan_thread(&handle).await.unwrap();
         assert_eq!(handle.fault(), None, "a plain Stop is not a fault");
-        let state = crate::retain::load(&path)
-            .unwrap()
-            .expect("the final flush must have written the checkpoint");
-        assert!(state.vars["n"] > 0, "the counter reflects completed scans");
+        let state: retain::RetainState =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            state.vars["main.n"].bits.parse::<u64>().unwrap() > 0,
+            "the counter reflects completed scans"
+        );
     }
 }
 
@@ -893,4 +936,73 @@ async fn an_adapter_still_queued_when_the_scan_ends_is_driven_safe_while_its_run
     );
     proxy.abort();
     slave.abort();
+}
+
+fn test_retain_config(path: PathBuf) -> retain::RetainConfig {
+    retain::RetainConfig {
+        path: Some(path),
+        policy: project::RetainPolicy {
+            project_id: Some("execution-regression".into()),
+            ..Default::default()
+        },
+    }
+}
+
+#[tokio::test]
+async fn retain_budget_uses_the_existing_latch_and_stops_output_writes() {
+    let writes = Arc::new(AtomicU64::new(0));
+    let failsafe = Arc::new(AtomicBool::new(false));
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let device = ExecutionProbe {
+        writes: writes.clone(),
+        failsafe: failsafe.clone(),
+        shutdown: shutdown.clone(),
+        read_gate: None,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_retain_config(dir.path().join("retain.json"));
+    config.policy.max_loss_ms = Some(50);
+    config.policy.on_loss = project::LossAction::Inhibit;
+    let (container, metadata) =
+        crate::compile_with_metadata("PROGRAM main VAR RETAIN x : DINT := 42; END_VAR END_PROGRAM")
+            .unwrap();
+    let mut program = single_unit(container, 10);
+    program.retain_vars = metadata.retain_vars;
+    let mapping = Mapping {
+        application: "main".into(),
+        variable: "x".into(),
+        device: "probe".into(),
+        channel: "out".into(),
+        direction: Direction::Output,
+        unit: None,
+        min: None,
+        max: None,
+        description: None,
+    };
+    let handle = spawn_units_configured(
+        vec![program],
+        DeviceSource::Prebuilt(vec![Box::new(device)]),
+        vec![mapping],
+        config,
+        Default::default(),
+        RECONNECT_JOIN_GRACE,
+    );
+    tokio::time::sleep(Duration::from_millis(180)).await;
+    assert!(handle.watchdog_tripped());
+    assert!(handle
+        .latch_reason()
+        .unwrap()
+        .contains("RETAIN persistence"));
+    assert!(failsafe.load(Ordering::Relaxed));
+    let before = writes.load(Ordering::Relaxed);
+    assert!(before > 0);
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(writes.load(Ordering::Relaxed), before);
+    handle.shutdown().await;
+    assert!(shutdown.load(Ordering::Relaxed));
+    assert_eq!(
+        handle.retain().status().persistence.final_save,
+        retain::FinalSave::Durable
+    );
+    assert!(handle.watchdog_tripped());
 }

@@ -50,7 +50,7 @@ cs --project demo get edges/edge-a/engineering-state
 应自行保存必要证据。日志容量有限，重要验收记录须另行归档。
 
 边缘服务停机时其 HTTP 历史暂不可达；已经导出的 JSON 可离线查阅，仍属历史。
-本地证据不进入部署包。RETAIN 冷启动只处理 `retain.json`，不能顺带删除工程证据。
+部署包会排除本地工程证据。RETAIN 冷启动使用显式恢复流程，工程观测档案独立保留。见 [RETAIN 恢复](retain-recovery.md)。
 
 ## Agent 如何避免重复询问
 

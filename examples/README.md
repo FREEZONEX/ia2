@@ -7,6 +7,7 @@ Real, runnable IA2 examples. The project rows open with
 | Project | What it teaches |
 |---|---|
 | `sim_smoke/` | The **`cs sim` reference**: a tiny tank integrator, an `alarms.toml` high-level alarm, and `scenarios/fill.toml` proving fill → alarm → no-overflow. Run it: `cs project open examples/sim_smoke && cs sim run examples/sim_smoke/scenarios/fill.toml`. Also exercised by the cargo e2e test (`crates/cli/tests/sim_e2e.rs`). |
+| `axis_capture_sim/` | Capture and replay of a simulated synchronized EtherCAT axis. The PLC consumes a request without enabling the axis. |
 | `eg_gear_incycle/` | EtherCAT electronic gearing — on-the-fly, phase-continuous gear-ratio change against the `_sim` NIC. |
 | `write_governance/` | Device-free scenario proving writes above/below the allowlist range are clamped and in-range values reach the program unchanged. |
 | `execution_budget/` | Device-free scenario proving finite scans, an arming alarm, and termination of an ST infinite loop with `expect_fault`. |
@@ -19,3 +20,7 @@ Every example is plain text (TOML + ST + JSON; the harness adds bash)
 — read them like code, copy them as starting points. If a doc
 references an example that
 isn't in this table, that's a bug (see `MEMORY/principles.md` § 3).
+
+- `retain_recovery`: declared first-start defaults and a durable scalar checkpoint.
+- `retain_required`: terminal startup rejection for missing required RETAIN state;
+  run from a fresh copy. Both are device-free and exercised by the CLI sim e2e.

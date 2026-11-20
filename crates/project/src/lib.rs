@@ -79,3 +79,8 @@ pub use types::{
     ProtocolConfig, Task, Tasks, WriteGovernance, WriteMode, WriteRule, ETHERCAT_SIM_NIC,
 };
 pub use types::{SupervisionAction, SupervisionConfig};
+
+pub mod retain;
+pub use retain::{ColdStartCondition, LossAction, RetainPolicy};
+
+pub use fsutil::{write_atomic_receipt, AtomicWriteReceipt};

@@ -1,0 +1,3 @@
+# RETAIN recovery/storage attention uses the shared built-in
+# __supervision/retain alarm. No process outputs are configured here.
+alarms = []

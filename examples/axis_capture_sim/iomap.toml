@@ -1,0 +1,13 @@
+[[mappings]]
+application = "main"
+variable = "drive_command"
+direction = "output"
+device = "bus"
+channel = "controlword"
+
+[[mappings]]
+application = "main"
+variable = "target_position"
+direction = "output"
+device = "bus"
+channel = "target_position"

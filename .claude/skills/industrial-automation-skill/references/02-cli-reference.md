@@ -117,6 +117,15 @@ contract](../../../../docs/api.md#offline-axis-replay). A successful HTTP
 request can include excluded runs and comparisons. Check each run's
 `status` and each comparison's `exclusion_reason`.
 
+For a synchronized edge, use
+`cs --server http://127.0.0.1:13001 api GET /axis-capture/<device>` over
+the monitor connection. Start and stop recordings by the runtime ID,
+bus generation and capture ID. Save the frozen archive before another start.
+After protective shutdown, check the run's capture ID and scope in
+`<state-dir>/axis-capture/last-shutdown.json`. Confirm PLC execution and
+parameter readbacks from independent evidence before
+[exporting a capture](../../../../docs/api.md#edge-axis-capture) as a V1 request. During recording, read ordered batches with `GET /axis-capture/<device>/<id>/samples/<offset>` and advance by the number of returned samples.
+
 ## Domain verbs
 
 ### Validate / inspect (offline where possible)
@@ -394,7 +403,7 @@ creates a fresh gate after teardown. Establish physical output state with
 independent feedback.
 
 
-### Engineering-state evidence (read-only device observations)
+## Engineering-state evidence (read-only device observations)
 
 ```bash
 cs --project demo get runtime/engineering-state
@@ -427,3 +436,31 @@ travel budget. Never restore an offset by adding the previous position to zero,
 or reset the cumulative budget on each new session. This feature supplies the
 read evidence; it does not yet persist operator confirmations or implement a
 machine-coordinate admission gate. Details: `docs/engineering-state.md`.
+
+## RETAIN recovery
+
+`cs get runtime/retain --project NAME --server URL` returns the shared recovery
+conclusion and persistence health for that project's last run, even after a
+startup fault. `cs get runtime/retain/checkpoint --project NAME --server URL`
+exports only a durability-confirmed checkpoint and its receipt; 409 means none
+exists yet. Edge `/retain` and `/retain/checkpoint` have the same contract.
+
+Persistent projects declare `[retain].project_id` and `instance_id`, required
+qualified keys, cold-start conditions and optional loss budget in project.toml.
+Undeclared IDE runs remain ephemeral. Persistent edge runs do not silently adopt
+schema 1/2 or same-name values. Compare identity and scalar layout before any
+VM restoration. Read `recovery.admitted`, `attention`, `last_durable`,
+`pending_age_ms` and `final_save`; Running and a 5-second sampling cadence do not
+prove recovery or a maximum loss window.
+
+Use the existing `cs api` JSON-body mechanism for
+`POST /api/runtime/retain/resolve` (edge: `/retain/resolve`) only after the run's
+writer stops. Supply an expected source SHA256 and an explicit cold_start,
+discard or complete migration mapping; initialize_required explicitly permits
+required defaults. Source bytes are archived first. A stopped edge can use
+`ia2-runtime --project-dir PROJECT --state-dir STATE --retain-resolve REQUEST`;
+this compiles and locks storage but never connects devices. Keep REQUEST,
+verification copies and evidence inside the active project. The result requires
+restart and does not reset a latch. Never delete the whole state directory or
+replay failed motion to initialize RETAIN. See docs/retain-recovery.md for the
+supported type/transition matrix and downgrade restrictions.

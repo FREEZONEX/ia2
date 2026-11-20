@@ -138,6 +138,11 @@ Use `cs api POST /api/axis-replay --from replay.json` to evaluate
 recorded axis motion and compare parameter trials offline. See the
 [axis tuning milestone and roadmap](docs/axis-tuning.md).
 
+The opt-in [edge axis capture](docs/api.md#edge-axis-capture) records the
+existing synchronized EtherCAT exchange and exports that replay format.
+Use `cs --server http://127.0.0.1:13001 api GET /axis-capture/<device>`
+to read the capture status over the edge's loopback monitor connection.
+
 ## Project on disk
 
 ```
@@ -257,6 +262,12 @@ Opt-in EtherCAT bus-clocked scans and their offline regression fixture are
 documented in [the cycle handoff contract](docs/scan-cycle-handoff.md). Inspect
 the bounded sequence diagnostics with `cs get runtime/status`.
 
+
+RETAIN storage and recovery: [identity, compatible layouts, migration and loss
+budgets](docs/retain-recovery.md). Inspect a declared persistent run through
+`cs get runtime/retain` and `cs get runtime/retain/checkpoint`; the same result is
+visible in the Monitor and edge panel. Legacy files require an explicit,
+source-preserving transition to schema 3.
 
 ### Inspect the engineering state
 

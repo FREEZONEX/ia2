@@ -275,14 +275,15 @@ pub(crate) fn resolve_get(path: &str) -> Result<Plan> {
             other => bail!("`cs get project/{other}`: expected project, project/variables or project/pous"),
         },
         "runtime" => match joined.as_str() {
-            "status" | "snapshot" | "forces" | "history" | "alarms" | "alarms-journal" | "engineering-state" => {
+            "status" | "snapshot" | "forces" | "history" | "alarms" | "alarms-journal"
+            | "retain" | "retain/checkpoint" | "engineering-state" => {
                 Plan::Get {
                     path: format!("/api/runtime/{joined}"),
                     render: Render::Json,
                 }
             }
             other => bail!(
-                "`cs get runtime/{other}`: expected runtime/status, snapshot, forces, history, alarms, alarms-journal or engineering-state"
+                "`cs get runtime/{other}`: expected runtime/status, snapshot, forces, history, alarms, alarms-journal, retain, retain/checkpoint or engineering-state"
             ),
         },
         "pous" => {

@@ -61,20 +61,18 @@ fn copy_tree(source: &Path, destination: &Path, depth: usize) -> std::io::Result
     let kind = std::fs::symlink_metadata(source)?.file_type();
     if kind.is_dir() {
         std::fs::create_dir(destination)?;
+        let project_root = depth == 0;
+        let project_state = depth == 1 && source.file_name().is_some_and(|name| name == "state");
         for entry in std::fs::read_dir(source)? {
             let entry = entry?;
-            if (depth == 0 && project::is_library_transaction_artifact(&entry.file_name()))
-                || (depth == 1
-                    && source.file_name().is_some_and(|n| n == "state")
-                    && entry.file_name() == "engineering")
+            let name = entry.file_name();
+            if (project_root
+                && (project::is_library_transaction_artifact(&name) || name == "retain-state"))
+                || (project_state && name == "engineering")
             {
                 continue;
             }
-            copy_tree(
-                &entry.path(),
-                &destination.join(entry.file_name()),
-                depth + 1,
-            )?;
+            copy_tree(&entry.path(), &destination.join(name), depth + 1)?;
         }
     } else if kind.is_file() {
         std::fs::copy(source, destination)?;
@@ -225,10 +223,15 @@ mod tests {
     fn library_artifacts_are_excluded_and_pending_recovery_blocks_preflight() {
         let dir = tempfile::tempdir().unwrap();
         let store = ProjectStore::create(dir.path().join("source"), "source").unwrap();
+        let local_state = store.root().join("retain-state");
+        std::fs::create_dir(&local_state).unwrap();
+        std::fs::write(local_state.join("retain.json"), "private retained data").unwrap();
         let staging = store.root().join(".ia2-library-stage");
         std::fs::create_dir(&staging).unwrap();
         std::fs::write(staging.join("new-0"), "staged bytes").unwrap();
         let snapshot = DeploySnapshot::prepare(store.root()).unwrap();
+        assert!(!snapshot.project_dir().join("retain-state").exists());
+        assert!(local_state.join("retain.json").is_file());
         assert!(!snapshot.project_dir().join(".ia2-library-stage").exists());
         assert!(!snapshot.project_dir().join(".ia2-library-lock").exists());
         assert!(staging.join("new-0").is_file());

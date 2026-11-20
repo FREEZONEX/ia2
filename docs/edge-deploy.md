@@ -531,21 +531,22 @@ grace_secs = 30         # 1..=3600; ignored for "report"
 - **No EtherCAT hardware on the dev machine**: leave `nic = "_sim"`. The
   IDE will let you configure PDOs and the bridge will respond in sim
   mode. On the edge, configure the real NIC.
-- **Retained / persistent variables** ARE preserved across deploys:
-  `VAR RETAIN` state lives in a `state/` directory that sits BESIDE the
-  versioned `current` symlink (`$INSTALL_DIR/state/`), so a symlink swap
-  never touches it (schema-2 lossless 64-bit slots; see
-  `crates/ironplc-bridge/src/retain.rs` and the flush interval in the
-  bridge). For a deliberate RETAIN cold start, stop the runtime and remove only
-  `$INSTALL_DIR/state/retain.json`; preserve historian and `engineering/`
-  evidence. Removing the entire state directory also destroys diagnostic history.
+- **Retained variables** use schema 3 with explicit `[retain]` project/instance
+  identity, typed scalar layouts, source preservation and recovery admission.
+  State remains beside the versioned release in `$INSTALL_DIR/state/`.
+  Schema 1/2 needs explicit migration or cold start; unknown/corrupt data is
+  never silently overwritten. Do not delete the whole state directory: it
+  also contains history and observations. Use the shared RETAIN resolution
+  API or the stopped-process `--retain-resolve request.json` entry. See
+  [compatibility, loss budgets and rollback](retain-recovery.md).
 - **Engineering observations** live in `$INSTALL_DIR/state/engineering/`
   (`--state-dir` override applies), outside versioned deployment directories.
   They survive process restarts, deployment swaps and rollback. The local IDE
   stores its own evidence under the project’s `state/engineering/`; deploy
   excludes that directory so local evidence is not shipped as edge observations.
   Remote GET requires a running HTTP service; for offline inspection, explicitly
-  save its JSON response or copy the archive file. See [engineering state](engineering-state.md).
+  save its JSON response or copy the archive file. See
+  [engineering state](engineering-state.md).
 - **Hot patch / online change** (Codesys-style in-place code update) is
   not implemented. Deploy is stop → swap → start. Plan downtime.
 - **Real-time**: stock Linux gives soft-RT only; scan jitter is in the
@@ -608,6 +609,18 @@ start a second master to obtain a parameter dump. Rollback must retain the
 verification-mode runtime if replaying the previous binary's startup downloads
 would violate the current maintenance scope.
 
+### Recording an existing synchronized EtherCAT exchange
+
+Use the [edge capture API](api.md#edge-axis-capture) over the existing
+monitor connection to arm a bounded recording. Confirm the runtime, bus
+generation and axis before starting. Download the frozen archive before
+starting another capture. A protective shutdown can stop the process first.
+After the bridge drain, check `<state-dir>/axis-capture/last-shutdown.json`
+and copy the retained archive with the matching capture ID into the run's
+evidence. The journal reports save failures and timeouts. Validate the real
+PDO map and compare scan and bus timing with capture on and off as part of
+[axis capture field acceptance](axis-tuning.md#v2-bounded-edge-capture).
+
 ### Opt-in bus-clocked scans
 
 EtherCAT `scan_sync = true` selects the existing bus as the PLC clock and commits
@@ -628,3 +641,46 @@ false and does not change existing project files. Source/offline validation is
 not hardware acceptance. Read the [contract and hardware boundary](scan-cycle-handoff.md)
 before preparing a synchronized edge deployment; keep initialization SDO policy
 and any existing read-only maintenance launcher intact.
+
+For a measured deep-idle wakeup problem, Linux synchronized deployments can
+also opt into `IA2_EC_MAX_IDLE_LATENCY_US` (integer microseconds, 0–1000000).
+The worker opens `/dev/cpu_dma_latency`, submits the constraint and checks the
+effective limit before initialization. It needs read/write access to that
+device; denial fails startup rather than silently falling back. The request
+persists only while the worker owns the descriptor, including safe shutdown;
+closing it releases the request. This is an aggregate system-wide CPU idle
+constraint and may increase idle power. It does not alter persistent OS
+configuration, scheduling priorities, EtherCAT DC limits or the fault latch.
+Validate both its effect on idle states and sustained disabled bus continuity
+on the target; setting a value alone is not a real-time guarantee.
+
+Choose the limit from the target's reported idle-state latencies, not from a
+state name or an earlier passing run. For example, when C1 reports 1 us, C2
+18 us and C3 350 us, a 50 us request still permits C2; a 2 us request excludes
+both C2 and C3. These are example values, not a default for every host. Read
+each online CPU's `cpuidle/state*/{name,latency,usage,time}` under
+`/sys/devices/system/cpu/cpuN/`. Compare usage and time counters over the
+qualification window while the worker's lease is held: excluded states must
+not accumulate entries or residency. Preserve the online CPU set, effective
+QoS readback, process identity and per-thread scheduling policies with the
+wire capture. Missing counters or a changed CPU set leave this check unknown.
+
+Keep a passing window's duration and workload explicit. A later recurrence
+invalidates acceptance of that deployment profile; it must not be dismissed
+because the same settings previously passed. Retain the earlier evidence,
+distinguish pre-wakeup delay from run-queue delay, and qualify any revised
+profile with the existing DC deadlines and zero-output latch intact.
+
+Qualify kernel preemption separately. A `PREEMPT_DYNAMIC` kernel can still be
+running in `voluntary` mode: an ordinary kernel worker can defer an already
+runnable `SCHED_RR` bus thread until a voluntary scheduling point. Read the
+selected mode from `/sys/kernel/debug/sched/preempt` with sufficient permission;
+neither the kernel name nor the thread priority proves it is `full`. When a
+captured wakeup-to-dispatch delay requires full preemption, a qualified host
+launcher can select `full` through that interface **before** cyclic startup,
+verify readback and refuse admission if it later differs. This is an explicit
+host-wide policy, remains after the runtime exits, and is distinct from the
+descriptor-owned idle latency request. It does not update boot configuration,
+provide PREEMPT_RT, or eliminate explicit non-preemptible sections. Keep the
+prior/selected mode in deployment evidence and repeat disabled acceptance.
+See Linux [scheduler preemption](https://www.kernel.org/doc/html/latest/scheduler/sched-preemption.html).

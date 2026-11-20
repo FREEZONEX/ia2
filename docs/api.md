@@ -194,6 +194,91 @@ being processed, a further request returns HTTP 503; retry after a replay finish
 See the [axis tuning milestone and roadmap](axis-tuning.md) for acceptance
 coverage and the next integration stages.
 
+## Edge axis capture
+
+These routes belong to the edge runtime. Use `cs --server <edge-loopback-url> api`
+on the existing monitor connection. Percent-encode a device name that contains
+slashes. Capture observes one axis on the existing `scan_sync` EtherCAT DC
+session. The capture API never sends a PDO or an SDO.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/axis-capture/{device}` | Return `runtime_id`, the current `bus` (or `null`), and the latest capture's progress (or `null`). |
+| POST | `/axis-capture/{device}` | Start one bounded capture. Return HTTP 201 and its ID and scope. |
+| GET | `/axis-capture/{device}/{id}/samples/{offset}` | Read up to 256 stored exchanges starting at a zero-based offset during or after recording, with capture progress and drop counts. Advance by the returned row count. An empty page is caught up. A replaced capture returns 404. |
+| GET | `/axis-capture/{device}/{id}` | Download the frozen raw archive as JSON. |
+| POST | `/axis-capture/{device}/{id}/stop` | Stop recording and return its final progress. Repeating the request for the same retained ID returns the same reason. |
+| POST | `/axis-capture/{device}/{id}/replay` | Supply independent evidence and download a one-run [V1 request](#offline-axis-replay). |
+
+Start with `{runtime_id, bus_generation, slave, counts_per_revolution,
+max_samples, duration_ms}`. Read the runtime and bus identities first.
+`slave` is a bus index from `bus.capturable_slaves`. Supply the verified
+motor encoder counts per revolution. The cycle period must divide 20 ms
+exactly. Both bounds are mandatory: 1–100,000 samples and 1–120,000 ms
+from acceptance. Each adapter keeps one recording. A new start replaces
+its previous frozen capture, so download the archive before starting again.
+
+The archive records the runtime, bus session generation, slave identity,
+configured PDO widths, signedness and byte offsets, encoder scale,
+whether the source is simulated, and the final reason. Each row describes an
+exchange attempt. TX and RX timestamps are in host monotonic nanoseconds
+relative to the start of that bus session. The output ticket is the one
+selected by the scan gate, or `null` if the gate selected its zero image.
+DC and WKC are reported from the returned exchange when available.
+`dc_gap` is the number of missed DC slots between adjacent recorded attempts,
+with `0` marking a discontinuity such as a repeat or reversal in the clock.
+`null` means the pair is consecutive or its clock evidence is incomplete.
+A transport failure, WKC mismatch, non-OP response or missing PDO
+cannot provide fresh feedback. A missed recorder lock is counted in
+`dropped_samples` and leaves a gap in attempt numbers.
+
+The sample limit, duration limit, explicit stop, or end of the bus session
+freezes the record. Only exchanges completed within the recording window
+are included. A reconnect creates a new generation and keeps the previous
+frozen capture until a new recording is started. Capture IDs in these routes
+refer to in-memory records of the current process.
+
+On graceful process shutdown, the runtime first drains the bridge. It then
+atomically saves any retained archive to
+`<state-dir>/axis-capture/last-shutdown.json`, using time left in the existing
+shutdown budget. An already frozen archive keeps its original end reason and
+JSON bytes. An active capture is finalized with the worker's end reason.
+The file is one slot per state directory. A subsequent shutdown with a capture
+can replace it, so copy the file to the operation's evidence directory.
+A shutdown with no capture leaves it alone. Check its capture ID and scope
+against the run receipt before use. This file is diagnostic evidence and is
+available even after the process exits. A drain timeout, forced termination or
+failed save can leave only an older file or no file.
+
+The export body contains `{run_id, plc, profile?, cohort?, parameter_readback?}`.
+`plc` contains `capture_id`, the raw archive's `scope` plus
+`request_consumed`, `plc_started` (boolean or null), `normal_completion`,
+and optional `terminal_reason`, `scan_count_before` and `scan_count_after`.
+Provide an ordered pair if supplying scan counts. `parameter_readback`
+contains `{scope, values}`, with byte arrays using the V1 readback format.
+For normal completion the exporter requires a consumed request, a confirmed
+PLC start, increasing scan counts, a motion profile and a nonempty readback.
+Use separately recorded PLC evidence and independent parameter readbacks
+from the same runtime and bus generation. The export hashes the exact raw
+archive JSON bytes for the V1 source identity. Save the raw GET response
+with an HTTP client that preserves the bytes, such as `curl -fsS -o`.
+The JSON printed by `cs api` is formatted. Keep the raw archive and
+independent evidence with the exported request.
+
+V1 export unwraps signed 32-bit positions using the shortest modular steps.
+This assumes the initial target-to-feedback difference and each position
+increment fit inside half the encoder word. V1 requires numeric samples,
+so missing values are encoded as zero placeholders. Missing clocks,
+invalid PDO data, recorder drops and bus-session termination exclude the
+run from metrics. An OP exchange with the wrong WKC keeps that counter for
+V1 to flag. The raw archive retains the actual quality and end reason.
+
+An unsupported device or evicted capture returns 404. A changed runtime or
+generation, unavailable session, active recording on start, or download before
+freeze returns 409. Invalid bounds, axis selection or evidence are rejected.
+The runtime serves one raw or replay download at a time. A busy download
+returns 503. Save the archive before stopping the runtime.
+
 ## Health & lifecycle
 
 | Method | Path | Purpose | Notes |
@@ -804,3 +889,86 @@ unconfirmed devices; it does not clear the latch or replace its first reason.
 A successful retry returns `false` (the run was already inhibited). The alarm
 supervisor does not introduce an automatic retry or re-arm policy. Runtime/CLI
 status views show pending and rejected attempts separately from transport health.
+
+## RETAIN recovery and persistence
+
+Both binaries use `ironplc_bridge::retain`; no client infers recovery from logs
+or from a running scan counter. The IDE's `/api/runtime/status` includes `retain`
+for the queried project's last run, including after it faulted or stopped. The
+edge's `/status` and `/health` include the same object, and edge probes preserve it.
+An older runtime omitting it has **unknown** RETAIN health.
+
+| Method | Path | Description |
+| --- | --- | --- |
+| GET | `/api/runtime/retain` | Project-scoped recovery decision and live persistence health; 409 before a run in this server session. |
+| GET | `/api/runtime/retain/checkpoint` | Last durability-confirmed checkpoint and receipt from this run; 409 before one exists. Does not sample or wait for a write. |
+| POST | `/api/runtime/retain/resolve` | Explicit stopped-run resolution, with expected source SHA256; 409 while a writer owns the file or the source changed. |
+
+The edge exposes `GET /retain`, `GET /retain/checkpoint` and
+`POST /retain/resolve` with identical bodies. Edge resolution can be used after a
+recovery-denied start; use the offline `--retain-resolve request.json` entry for
+maintenance after stopping a healthy process. It compiles the project and takes
+the same file lease without connecting devices or starting scans.
+
+`RetainStatus` has `run_id`, `policy`, `attention`, `recovery`, and `persistence`.
+`recovery` includes `kind`, `source_kind`, `admitted`, `writes_enabled`, `reason`,
+`source_sha256`, `archive_path`, `resolution`, `restored`, `initialized`, `removed`.
+Kinds distinguish `disabled`, `pending`, `first_start`, `restored`, `migrated`,
+`cold_start`, `corrupt`, `unsupported_version`, `legacy_unverified`,
+`identity_mismatch`, `layout_mismatch`, `read_failed`, `protection_failed`,
+`writer_busy`, and `configuration_error`. Policy-authorized cold start retains
+the original cause in `source_kind`; required data never silently takes defaults.
+`attention` is the shared human-readable condition consumed by the UI and the
+built-in `__supervision/retain` alarm (high, immediate, acknowledged independently).
+
+`persistence` includes data/sample generations, `pending_age_ms`, `writing`,
+`queued`, `last_replacement`, `last_durable`, `last_error`, `final_save`,
+`max_loss_ms`, `on_loss`, and `budget_exceeded`. Receipts identify the run,
+scan/generation, sample/completion wall times, checkpoint SHA256 and the storage
+result (`replaced`, `durable`, `directory_sync_error`). A replacement without a
+successful directory sync is never reported as durable. `pending_age_ms` uses
+monotonic elapsed time since the first uncommitted scan or the last durable
+sample; it is a conservative bound assuming every completed scan can change data.
+It includes unsampled time and slow/failed writes. A sampling interval is not a
+loss guarantee. Data generation counts completed scans across all PROGRAMs
+plus accepted writes/pulse resets to retained slots (including while paused);
+the display `scan_count` remains their maximum. `CheckpointExport` includes
+`state`, `receipt` and `checkpoint_json`, the exact UTF-8 JSON bytes whose
+SHA256 matches `receipt.sha256`. Consumers must hash those bytes rather than
+reserializing the parsed object. After Stop, the final receipt is `durable`, `unconfirmed`,
+`failed`, `skipped` (aborted scan/disabled storage) or `timed_out`; `not_requested`
+and `pending` describe unfinished lifecycle stages. A timeout keeps its receipt
+even if a blocked syscall later finishes. The file lease outlives that syscall.
+
+Resolution JSON contains `expected_source_sha256`, `action` (`cold_start`,
+`discard`, `migrate`), `initialize_required` (default false),
+`attested_source_identity` (nullable), and `rules` (default empty).
+Missing-file resolution uses SHA256 of empty bytes. Every resolution archives
+its source first; cold start/discard initializes current declaration defaults,
+and `initialize_required=true` explicitly authorizes that for required data.
+Discard only discards old RETAIN values from the replacement, preserving the
+source archive; it never deletes history or engineering state. Migration rules
+name `from`, `to`, `source_layout: {type_name,width_bits}`, and `conversion`
+(`exact` or lossless `dint_to_real`). Every retained destination needs a rule by
+default; `initialize_required=true` permits defaults only for unmapped optional
+destinations during migration. Required migration destinations always need rules.
+Unknown schemas have no decoder. Schema 1/2 require an externally verified
+`attested_source_identity` matching the destination and explicit source types.
+The response includes the action, source/archive/checkpoint identity, storage
+receipt and `restart_required=true`. Neither resolution nor resume clears an
+existing runtime latch. Restart and recheck admission. A 200 with `durable=false`
+reports a replacement with unconfirmed durability, not successful durable recovery.
+
+See [RETAIN compatibility and operations](retain-recovery.md) for the project
+policy, compatibility matrix and rollback instructions.
+
+For rollback, an optional `migration_source_sha256` selects an already preserved
+`retain-archive/<sha256>.json` as the migration source. It accepts only a verified
+64-digit hex content address, never an arbitrary path. `expected_source_sha256`
+still guards the current file. The result additionally reports
+`replaced_source_sha256` and `preserved_current_path`; both the current and selected
+source survive. `recovery.resolution` and subsequent checkpoint `resolution`
+retain both hashes and the explicit action. The initial resolved checkpoint is
+reported as `migrated`/`cold_start`; subsequent normal restarts are compatible
+restores while preserving that lineage. `declaration_state` and `compatibility`
+are the shared Rust target-descriptor/check functions for deployment consumers.

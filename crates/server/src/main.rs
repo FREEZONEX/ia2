@@ -328,6 +328,15 @@ async fn main() -> anyhow::Result<()> {
             get(runtime_routes::runtime_snapshot),
         )
         .route("/api/runtime/status", get(runtime_routes::runtime_status))
+        .route("/api/runtime/retain", get(runtime_routes::runtime_retain))
+        .route(
+            "/api/runtime/retain/checkpoint",
+            get(runtime_routes::runtime_retain_checkpoint),
+        )
+        .route(
+            "/api/runtime/retain/resolve",
+            post(runtime_routes::runtime_retain_resolve),
+        )
         .route("/api/runtime/sdo", get(runtime_routes::runtime_sdo_upload))
         .route(
             "/api/runtime/engineering-state",

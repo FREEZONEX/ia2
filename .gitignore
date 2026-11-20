@@ -50,5 +50,8 @@ pki/
 examples/agent-harness/runs/*
 !examples/agent-harness/runs/.gitkeep
 
+# Local IDE RETAIN checkpoints and source archives (export explicitly via API).
+retain-state/
+
 # Local diagnostic evidence (never part of deployable project configuration)
 **/state/engineering/

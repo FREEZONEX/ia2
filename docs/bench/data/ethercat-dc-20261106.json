@@ -1,0 +1,397 @@
+{
+  "recorded_at": "2026-11-06T13:16:30.574994+08:00",
+  "timezone": "UTC+8",
+  "evidence_grade": "TRANSCRIPT: recorded measurement summaries; full capture retained in bench archive",
+  "scope": "One fixed-disabled 30-minute qualification, no motion, reset, parameter download or fault injection",
+  "related_issue": "https://github.com/FREEZONEX/ia2/issues/65",
+  "related_pr": "https://github.com/FREEZONEX/ia2/pull/109",
+  "engine": {
+    "source_commit": "dea501cccded2d7bcb58acbcfb2ca1a280282afe",
+    "build_commit": "43e078f+dc-idle-qos-25f26816",
+    "sha256": "f6081398882a40c716df60ad0f2b3fe1e08234aed4b13f714bb139c8db98996c",
+    "rustc": "1.95.0"
+  },
+  "failed_50us_full": {
+    "passed": false,
+    "healthy_duration_s": 139.727163902,
+    "wire": {
+      "counts": {
+        "tx": 74885,
+        "unpaired_tx": 0,
+        "unsafe_control": 0,
+        "reset_commands": 0,
+        "rx": 74885,
+        "enabled_feedback": 0,
+        "unpaired_rx": 0,
+        "bad_disabled_wkc_or_errors": 0,
+        "active_after_zero_tail": 0,
+        "disabled_frames": 70221,
+        "nonzero_tail_bytes": 0,
+        "zero_tail_frames": 4519
+      },
+      "controlwords": [
+        [
+          0,
+          6
+        ],
+        [
+          0,
+          6
+        ],
+        [
+          0,
+          6
+        ],
+        [
+          0,
+          6
+        ]
+      ],
+      "slot_steps": {
+        "1": 70220
+      },
+      "disabled_duration_s": 140.441419,
+      "tx_intervals_us": {
+        "n": 70220,
+        "min": 1100.0,
+        "p50": 2000.0,
+        "p99": 2094.0,
+        "max": 2874.0
+      },
+      "round_trip_us": {
+        "n": 70221,
+        "min": 39.0,
+        "p50": 54.0,
+        "p99": 118.0,
+        "max": 244.0
+      },
+      "dc_phase_ns": {
+        "n": 70221,
+        "min": 928828.0,
+        "p50": 1010028.0,
+        "p99": 1131988.0,
+        "max": 1921708.0
+      },
+      "sdo_uploads": 236,
+      "sdo_downloads_or_other": 0,
+      "kernel_drops_zero": true,
+      "transition": {
+        "previous": {
+          "tx_us": 1793935238511774,
+          "rx_us": 1793935238511919,
+          "dc_ns": 2323901749152109,
+          "cw": [
+            6,
+            6,
+            6,
+            6
+          ],
+          "wkc": 12
+        },
+        "zero": {
+          "tx_us": 1793935238514752,
+          "rx_us": 1793935238514826,
+          "dc_ns": 2323901752124668,
+          "cw": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "wkc": 12
+        },
+        "slot_step": 2
+      },
+      "transition_mono_s": 2323902.6997435093,
+      "transition_at": "2026-11-06T11:20:38.514752+08:00"
+    },
+    "fault": "DC slot send window expired; restart required",
+    "archive_hashes": {
+      "wire.pcap": {
+        "bytes": 41696755,
+        "sha256": "60ee1c85bba6f7bfa56e690c78c2ce0882a661d604805cd4dbdb0ad730a20d9a"
+      },
+      "scheduler.trace": {
+        "bytes": 247647751,
+        "sha256": "68f19b1ed1272924aff093418c3a57786d1099e3e3d52a5d4684526885450517"
+      }
+    }
+  },
+  "qualified_2us_full": {
+    "passed": true,
+    "conditions": {
+      "no_terminal_fault": true,
+      "collector_completed_normally": true,
+      "healthy_window_at_least_1800s": true,
+      "wire_disabled_window_at_least_1800s": true,
+      "capture_no_kernel_drops": true,
+      "paired_frames": true,
+      "adjacent_disabled_dc_slots": true,
+      "safe_wire_outputs_and_feedback": true,
+      "no_parameter_downloads": true,
+      "all_expected_sdo_uploads": true,
+      "parameters_verified": true,
+      "startup_and_mapping": true,
+      "fresh_healthy_samples_no_scan_overrun": true,
+      "initial_and_final_profile": true,
+      "no_excluded_idle_state_entries": true,
+      "cpu_qos_released": true,
+      "no_runtime_write": true,
+      "service_stopped": true,
+      "no_dc_fault_in_process_journal": true,
+      "normal_zero_shutdown_acknowledged": true
+    },
+    "healthy_duration_s": 1800.023335709,
+    "wire_disabled_duration_s": 1807.870764,
+    "wire": {
+      "counts": {
+        "tx": 904166,
+        "unpaired_tx": 0,
+        "unsafe_control": 0,
+        "reset_commands": 0,
+        "rx": 904166,
+        "enabled_feedback": 0,
+        "unpaired_rx": 0,
+        "bad_disabled_wkc_or_errors": 0,
+        "active_after_zero_tail": 0,
+        "disabled_frames": 903902,
+        "nonzero_tail_bytes": 0,
+        "zero_tail_frames": 119
+      },
+      "controlwords": [
+        [
+          0,
+          6
+        ],
+        [
+          0,
+          6
+        ],
+        [
+          0,
+          6
+        ],
+        [
+          0,
+          6
+        ]
+      ],
+      "slot_steps": {
+        "1": 903901
+      },
+      "disabled_duration_s": 1807.870764,
+      "tx_intervals_us": {
+        "n": 903901,
+        "min": 1626.0,
+        "p50": 2000.0,
+        "p99": 2021.0,
+        "max": 2346.0
+      },
+      "round_trip_us": {
+        "n": 903902,
+        "min": 39.0,
+        "p50": 54.0,
+        "p99": 60.0,
+        "max": 306.0
+      },
+      "dc_phase_ns": {
+        "n": 903902,
+        "min": 911866.0,
+        "p50": 1011986.0,
+        "p99": 1026106.0,
+        "max": 1366706.0
+      },
+      "sdo_uploads": 236,
+      "sdo_downloads_or_other": 0,
+      "kernel_drops_zero": true,
+      "transition": {
+        "previous": {
+          "tx_us": 1793938696553099,
+          "rx_us": 1793938696553152,
+          "dc_ns": 2327359723033187,
+          "cw": [
+            6,
+            6,
+            6,
+            6
+          ],
+          "wkc": 12
+        },
+        "zero": {
+          "tx_us": 1793938696555063,
+          "rx_us": 1793938696555115,
+          "dc_ns": 2327359724994746,
+          "cw": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "wkc": 12
+        },
+        "slot_step": 1
+      },
+      "transition_mono_s": 2327360.7400541306,
+      "transition_at": "2026-11-06T12:18:16.555063+08:00"
+    },
+    "status_samples": 1747,
+    "parameters": {
+      "count": 62,
+      "matched": true,
+      "downloads": 0
+    },
+    "profile": {
+      "effective_idle_latency_us": 2,
+      "kernel_preemption": "full",
+      "bus_rr_priority": 10,
+      "scan_rr_priority": 9,
+      "napi": {
+        "gro_flush_timeout": "0",
+        "napi_defer_hard_irqs": "0"
+      },
+      "online_cpus": 16
+    },
+    "excluded_state_usage_deltas": {
+      "cpu0": {
+        "C2": 0,
+        "C3": 0
+      },
+      "cpu1": {
+        "C2": 0,
+        "C3": 0
+      },
+      "cpu10": {
+        "C2": 0,
+        "C3": 0
+      },
+      "cpu11": {
+        "C2": 0,
+        "C3": 0
+      },
+      "cpu12": {
+        "C2": 0,
+        "C3": 0
+      },
+      "cpu13": {
+        "C2": 0,
+        "C3": 0
+      },
+      "cpu14": {
+        "C2": 0,
+        "C3": 0
+      },
+      "cpu15": {
+        "C2": 0,
+        "C3": 0
+      },
+      "cpu2": {
+        "C2": 0,
+        "C3": 0
+      },
+      "cpu3": {
+        "C2": 0,
+        "C3": 0
+      },
+      "cpu4": {
+        "C2": 0,
+        "C3": 0
+      },
+      "cpu5": {
+        "C2": 0,
+        "C3": 0
+      },
+      "cpu6": {
+        "C2": 0,
+        "C3": 0
+      },
+      "cpu7": {
+        "C2": 0,
+        "C3": 0
+      },
+      "cpu8": {
+        "C2": 0,
+        "C3": 0
+      },
+      "cpu9": {
+        "C2": 0,
+        "C3": 0
+      }
+    },
+    "cpu_idle_latency_after_exit_us": 2000000000,
+    "service_running": false,
+    "archive_hashes": {
+      "wire.pcap": {
+        "bytes": 497800214,
+        "sha256": "dd510e27cba8a04cb07b95f75909790b274f6dca1a52d8b3c35a147fe9b53abe"
+      },
+      "scheduler.trace": {
+        "bytes": 253754660,
+        "sha256": "93c2660738119b9b64abdbfea087b9202e7188f125c436cb8af83806c2d5a00b"
+      },
+      "status-samples.jsonl": {
+        "bytes": 40795209,
+        "sha256": "f02f5bb0f9ac0d9a1b5952bbfc57c9b97558136991d1fe17ac2d46bfdfd5d88f"
+      },
+      "idle-window-deltas.json": {
+        "bytes": 7095,
+        "sha256": "2181d4513581f457e8c2cf1304e12db38e79f75e79513db8632e2fac1a59b54f"
+      },
+      "live-profile.json": {
+        "bytes": 672,
+        "sha256": "60baabb51bbcae43dfe29fff216b66e118ab864792402981f08c3a612f0a9348"
+      },
+      "live-profile-final.json": {
+        "bytes": 672,
+        "sha256": "60baabb51bbcae43dfe29fff216b66e118ab864792402981f08c3a612f0a9348"
+      },
+      "parameter-uploads.json": {
+        "bytes": 32301,
+        "sha256": "4dd9221b5a49d10e8490946a1fa28cd652b28136d2cf40b6df0c1391fe0eac68"
+      }
+    },
+    "all_copied_artifacts": {
+      "count": 28,
+      "bytes": 793034336,
+      "sha256_match": true
+    }
+  },
+  "linux_native": {
+    "passed": 354,
+    "failed": 0,
+    "ignored": 1,
+    "kernel": "6.8.0-139-generic",
+    "execution": "Actual x86_64 Linux, unprivileged, no physical bus interface",
+    "tests": [
+      {
+        "name": "reviewed-iomap_ethercat-tests",
+        "passed": 170,
+        "failed": 0,
+        "ignored": 0,
+        "sha256": "0d7d50f1c0dfa615251096107101f44d5fed4ffa926aa1281661f14a10274331"
+      },
+      {
+        "name": "current-iomap_ethercat-tests",
+        "passed": 170,
+        "failed": 0,
+        "ignored": 0,
+        "sha256": "4f8e4e5038ab57e90b74e9699f89a7226bd8dfde36fe1176069ce8700c021f53"
+      },
+      {
+        "name": "current-iocore-tests",
+        "passed": 14,
+        "failed": 0,
+        "ignored": 1,
+        "sha256": "8fc3c0be21177962289c86eb2388a66016e821f86761d5c75bd4fd24f17bbdfa"
+      }
+    ]
+  },
+  "test_source_commits": {
+    "reviewed": "dfac3a57f2841e5854d06f38fe7ab3467d3b7c61",
+    "pr_baseline": "f2f8591e34a83eaba30781cfc9bcfedd8963f614"
+  },
+  "limits": [
+    "Disabled-only finite window; does not establish hard realtime or motion quality.",
+    "The scheduler ring covers only its retained interval; full wire and sampled status have separate coverage.",
+    "No fault injection was requested or executed in this field run."
+  ]
+}

@@ -66,6 +66,8 @@ export function MonitorPane({ collapsed, onToggleCollapse }: { collapsed: boolea
   const [forces, setForces] = useState<Set<string>>(new Set())
   const [pendingCommand, setPendingCommand] = useState<string | null>(null)
   const [commandError, setCommandError] = useState<string | null>(null)
+  const [retainNotice, setRetainNotice] = useState<string | null>(null)
+  const [retainAttention, setRetainAttention] = useState(false)
   const [statusError, setStatusError] = useState<string | null>(null)
   const [runtimeFault, setRuntimeFault] = useState<string | null>(null)
   const [alarmCount, setAlarmCount] = useState(0)
@@ -79,6 +81,9 @@ export function MonitorPane({ collapsed, onToggleCollapse }: { collapsed: boolea
     try {
       const data = await fetchRuntimeStatus()
       if (revision !== revisionRef.current) return
+      const retain = data.retain
+      setRetainAttention(!!retain?.attention)
+      setRetainNotice(retain && retain.recovery.kind !== "disabled" ? `RETAIN ${retain.recovery.kind}: ${retain.attention ?? retain.recovery.reason} · durable scan ${retain.persistence.last_durable?.scan_count ?? "not yet"} · pending ${retain.persistence.pending_age_ms ?? 0} ms${retain.persistence.writing ? " · saving" : ""}${retain.persistence.queued ? " · queued" : ""} · final ${retain.persistence.final_save}` : null)
       const nextMode = data.mode?.kind
       setMode(nextMode === "running" || nextMode === "paused" || nextMode === "step" ? nextMode : null)
       setForces(new Set(data.forces.map(force => force.name)))
@@ -94,7 +99,8 @@ export function MonitorPane({ collapsed, onToggleCollapse }: { collapsed: boolea
   }, [])
 
   useEffect(() => {
-    if (!isRunning || attached) {
+    if (attached) {
+      setRetainNotice(null)
       setMode(null)
       setForces(new Set())
       return
@@ -276,6 +282,7 @@ export function MonitorPane({ collapsed, onToggleCollapse }: { collapsed: boolea
           </Button>
         </>} />
       </div>
+      {retainNotice && <div role={retainAttention ? "alert" : "status"} className={cn("px-4 py-1 text-xs", retainAttention ? "text-warn" : "text-muted-foreground")}>{retainNotice}</div>}
       <div id="monitor-content" hidden={collapsed} className={cn("min-h-0 flex-1 flex-col", !collapsed && "flex")}>
         {(vars.length > 0 || (isRunning && !attached)) && <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 px-4 py-2">
           {vars.length > 0 && <label className="flex h-8 min-w-40 max-w-72 flex-1 items-center gap-2 rounded border border-input bg-background px-2">

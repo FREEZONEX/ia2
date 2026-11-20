@@ -50,12 +50,15 @@ use ethercrab::{
     DcSync, MainDevice, MainDeviceConfig, PduStorage, RegisterAddress, SubDeviceGroup,
     SubDeviceState, Timeouts,
 };
+use iocore::axis_capture::{AxisCapture, EndReason, SlaveIdentity};
 use iocore::{ChannelValue, HealthTracker, HealthTransition, IoDevice, IoError};
 use project::{
     EthercatChannel, EthercatConfig, EthercatDcSync, EthercatPdoDirection, EthercatSlave,
 };
 
+use crate::axis_capture::{Recorder, Reply};
 use crate::bits;
+use crate::cycle::MAX_SYNC_PDI_BYTES;
 use crate::validate;
 use crate::SlaveDiscovery;
 
@@ -664,6 +667,7 @@ fn observe_dc_exchange<T: Clone>(
 }
 
 pub struct RealEthercat {
+    capture: Option<Arc<Recorder>>,
     cycle: Option<Arc<crate::cycle::Gate<PdiMirror>>>,
     staged: Option<(crate::cycle::Ticket, PdiMirror)>,
     sdo: Arc<crate::sdo::Client>,
@@ -697,6 +701,7 @@ pub struct RealEthercat {
 /// The `Arc` handles `connect` shares with the cyclic worker thread,
 /// bundled so `smol_main` keeps a readable signature.
 struct WorkerShared {
+    capture: Option<Arc<Recorder>>,
     cycle: Option<Arc<crate::cycle::Gate<PdiMirror>>>,
     rt_priority: Option<i32>,
     sdo_rx: smol::channel::Receiver<crate::sdo::Request>,
@@ -848,7 +853,9 @@ impl RealEthercat {
         let dc_sync = config.dc_sync;
         let dc_static_sync_iterations = config.dc_static_sync_iterations;
         let slaves = config.slaves.clone();
+        let capture = Recorder::new(&name, config, false);
         let shared = WorkerShared {
+            capture: capture.clone(),
             cycle: cycle.clone(),
             rt_priority,
             sdo_rx,
@@ -888,6 +895,7 @@ impl RealEthercat {
         // Own the thread before awaiting the handshake. Dropping an abandoned
         // connect requests a stop, just as dropping a connected adapter does.
         let mut device = Self {
+            capture,
             cycle,
             staged: None,
             sdo,
@@ -1021,6 +1029,12 @@ impl Drop for RealEthercat {
 
 #[async_trait]
 impl IoDevice for RealEthercat {
+    fn axis_capture_handle(&self) -> Option<Arc<dyn AxisCapture>> {
+        self.capture
+            .clone()
+            .map(|handle| handle as Arc<dyn AxisCapture>)
+    }
+
     fn sdo_upload_handle(&self) -> Option<Arc<dyn iocore::sdo::SdoUpload>> {
         Some(self.sdo.clone())
     }
@@ -1608,6 +1622,7 @@ fn smol_main(
     init_tx: mpsc::SyncSender<InitResult>,
 ) {
     let WorkerShared {
+        capture,
         cycle,
         rt_priority,
         sdo_rx,
@@ -2054,7 +2069,7 @@ fn smol_main(
                         .iter()
                         .map(|d| usize::from(d.input_bytes) + usize::from(d.output_bytes))
                         .sum();
-                    if cycle.is_some() && pdi_bytes > 1024 {
+                    if cycle.is_some() && pdi_bytes > MAX_SYNC_PDI_BYTES {
                         walk_fail(
                             first_init,
                             &init_tx,
@@ -2158,6 +2173,28 @@ fn smol_main(
                     expected_subdevices = Some(found_subdevices);
                     reinitializing.store(false, Ordering::Relaxed);
 
+                    let capture_session = capture.as_ref().and_then(|capture| {
+                        let slaves = group
+                            .iter(&maindevice)
+                            .enumerate()
+                            .map(|(index, sd)| {
+                                let id = sd.identity();
+                                let io = sd.io_raw();
+                                SlaveIdentity {
+                                    index: index as u16,
+                                    name: sd.name().to_owned(),
+                                    vendor_id: id.vendor_id,
+                                    product_id: id.product_id,
+                                    revision: Some(id.revision),
+                                    serial: Some(id.serial),
+                                    input_bytes: io.inputs().len() as u16,
+                                    output_bytes: io.outputs().len() as u16,
+                                }
+                            })
+                            .collect();
+                        capture.open_session(expected_wkc, slaves)
+                    });
+
                     // DC cyclic loop: tx_rx_dc keeps the reference clock synced
                     // and its CycleInfo tells us when to send the next frame
                     // (stays aligned to SYNC0). The health tracker is hoisted
@@ -2183,9 +2220,9 @@ fn smol_main(
                         }
                     }
                     while !shutdown.load(Ordering::Relaxed) {
-                        cycles.fetch_add(1, Ordering::Relaxed);
+                        let sequence = cycles.fetch_add(1, Ordering::Relaxed) + 1;
                         let cycle_start = std::time::Instant::now();
-                        if let Some(clock) = &cycle {
+                        let selection = if let Some(clock) = &cycle {
                             clock.consume_before(dc_continuity.as_ref().map(|d| d.send_before), |image| {
                                 {
                                     let mut mirror = lock_pdi_for_cycle(&pdi, &pdi_poisoned);
@@ -2193,14 +2230,57 @@ fn smol_main(
                                     else { for bytes in mirror.outputs.values_mut() { bytes.fill(0); } }
                                 }
                                 copy_outputs_to_bus!(group, maindevice, pdi, pdi_poisoned);
-                            });
+                            })
                         } else {
                             prepare_timer_outputs!(group, maindevice, pdi, pdi_poisoned,
                                 engines, bus_ok, outputs_inhibited);
-                        }
+                            crate::cycle::OutputSelection::default()
+                        };
+                        let attempt = capture_session.as_ref().and_then(|session| {
+                            let attempt = session.begin(sequence, cycle_start)?;
+                            let command = group.subdevice(&maindevice, attempt.slave()).ok()
+                                .and_then(|sd| attempt.command(sd.io_raw().outputs()));
+                            Some((session, attempt, command))
+                        });
                         let exchange_start = Instant::now();
                         let response = group.tx_rx_dc(&maindevice).await;
                         let exchange_end = Instant::now();
+                        if let Some(miss) = selection.miss {
+                            tracing::error!(
+                                sequence = miss.sequence,
+                                send_window_excess_us = miss.checked_at.saturating_duration_since(miss.send_before).as_micros() as u64,
+                                selection_delay_us = miss.checked_at.saturating_duration_since(cycle_start).as_micros() as u64,
+                                wake_lateness_us = dc_continuity.as_ref().map(|d| cycle_start.saturating_duration_since(d.deadline).as_micros() as u64),
+                                timer_entry_margin_us = previous_wait.map(|(deadline, entered, _)| deadline.saturating_duration_since(entered).as_micros() as u64),
+                                timer_entry_late_us = previous_wait.map(|(deadline, entered, _)| entered.saturating_duration_since(deadline).as_micros() as u64),
+                                previous_dc_ns = dc_continuity.as_ref().map(|d| d.last_dc_ns),
+                                "EtherCAT DC send window expired; zero outputs selected"
+                            );
+                        }
+                        if let Some((session, attempt, command)) = attempt {
+                            let reply = match &response {
+                                Ok(resp) => {
+                                    let all_op = resp.all_op();
+                                    // EtherCrab's receive buffer can still contain prior
+                                    // bytes if the LRW wasn't fully acknowledged.
+                                    let feedback = if all_op && resp.working_counter == expected_wkc {
+                                        group.subdevice(&maindevice, attempt.slave()).ok()
+                                            .and_then(|sd| attempt.feedback(sd.io_raw().inputs()))
+                                    } else {
+                                        None
+                                    };
+                                    Reply::Received {
+                                        dc_ns: resp.extra.dc_system_time,
+                                        wkc: resp.working_counter,
+                                        all_op,
+                                        feedback,
+                                    }
+                                }
+                                Err(ethercrab::error::Error::Timeout(_)) => Reply::Timeout,
+                                Err(_) => Reply::Failed,
+                            };
+                            session.finish(attempt, exchange_start, exchange_end, selection.ticket, command, reply);
+                        }
                         if let Some((deadline, wait_start, previous_exchange_end)) = previous_wait {
                             let late = cycle_start.saturating_duration_since(deadline);
                             if late >= sync0 {
@@ -2361,6 +2441,13 @@ fn smol_main(
                         }
                     }
                     }, |address| crate::sdo::read(group.subdevice(&maindevice, usize::from(address.slave)), address)).await;
+                    if let Some(session) = &capture_session {
+                        session.close(if demoted && !shutdown.load(Ordering::Relaxed) {
+                            EndReason::BusSessionEnded
+                        } else {
+                            EndReason::WorkerStopped
+                        });
+                    }
                     if demoted && !shutdown.load(Ordering::Relaxed) {
                         tracing::error!(
                             "subdevice(s) out of OP mid-run — re-walking the bus \
@@ -2529,6 +2616,10 @@ fn smol_main(
         smol::block_on(master);
     }
 }
+
+#[cfg(test)]
+#[path = "dc_pipeline_tests.rs"]
+mod dc_pipeline_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3028,6 +3119,7 @@ mod tests {
         let mut outputs = HashMap::new();
         outputs.insert(0u16, vec![0xffu8; 4]);
         RealEthercat {
+            capture: None,
             cycle: None,
             staged: None,
             sdo: crate::sdo::channel(
