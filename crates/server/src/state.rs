@@ -202,6 +202,7 @@ pub struct AppState {
     /// Held by `POST /api/run` from retiring the previous run to the new
     /// run owning the slot, so two overlapping starts cannot both spawn.
     pub run_gate: Arc<tokio::sync::Mutex<()>>,
+    pub engineering: Arc<ironplc_bridge::monitor::engineering::EngineeringService>,
     /// How long `POST /api/run` waits for retired runs to finish tearing
     /// down before it refuses to start. A field so a test can shorten it.
     pub run_handover_timeout: Duration,
@@ -305,6 +306,7 @@ impl AppState {
             program: Arc::new(Mutex::new(None)),
             draining: Arc::new(Mutex::new(Vec::new())),
             run_gate: Arc::new(tokio::sync::Mutex::new(())),
+            engineering: Arc::default(),
             run_handover_timeout: RUN_HANDOVER_TIMEOUT,
             event_tx,
             demo_slave,

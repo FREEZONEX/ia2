@@ -388,6 +388,7 @@ pub struct ProgramHandle {
     /// There can be at most one scan-synchronized adapter. Keep its
     /// passive observer accessible without queuing work on the scan loop.
     axis_capture: Arc<AxisCaptureSlot>,
+    observation_session: String,
     stop: Arc<AtomicBool>,
     retain: Arc<retain::RetainControl>,
     snapshot_tx: broadcast::Sender<VarSnapshot>,
@@ -491,6 +492,11 @@ impl ProgramHandle {
 
     pub fn retain(&self) -> Arc<retain::RetainControl> {
         self.retain.clone()
+    }
+
+    /// Identity of this run, not of a drive power cycle or a mechanical origin.
+    pub fn observation_session(&self) -> &str {
+        &self.observation_session
     }
 
     /// Cooperative stop. The scan loop checks the flag between rounds, so a
@@ -1436,6 +1442,7 @@ fn spawn_units_configured(
 
     ProgramHandle {
         axis_capture,
+        observation_session: format!("{}-{}", std::process::id(), crate::monitor::wall_now_us()),
         stop,
         retain,
         snapshot_tx,

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { apiFetch, fetchPou, savePou, fetchTasks, updateTasks, documentVersion, withDocumentVersion } from "./api"
+import { fetchEngineeringHistory, refreshEngineeringState, apiFetch, fetchPou, savePou, fetchTasks, updateTasks, documentVersion, withDocumentVersion } from "./api"
 
 afterEach(() => vi.unstubAllGlobals())
 
@@ -81,5 +81,24 @@ describe("replacement writes use the draft's version", () => {
     vi.stubGlobal("fetch", fetch)
     await expect(updateTasks({ tasks: [], programs: [] })).rejects.toThrow(/Reload from disk/)
     expect(fetch).not.toHaveBeenCalled()
+  })
+})
+
+
+describe("engineering-state routing", () => {
+  it("binds the selected Unicode project and nested edge without accepting client evidence", async () => {
+    vi.stubGlobal("window", { location: { search: "?project=other" } })
+    const fetch = vi.fn().mockImplementation(() => Promise.resolve(new Response("{}")))
+    vi.stubGlobal("fetch", fetch)
+    const scope = { project: "控制 %", edge: "plant/edge-a" }
+    await fetchEngineeringHistory(scope)
+    await refreshEngineeringState(scope, { device: "motion/bus", slave: 1 })
+    expect(fetch.mock.calls[0][0]).toBe("/api/edges/plant%2Fedge-a/engineering-state")
+    expect(fetch.mock.calls[1][0]).toBe("/api/edges/plant%2Fedge-a/engineering-state/refresh")
+    const request = fetch.mock.calls[1][1]
+    expect(request.method).toBe("POST")
+    expect(request.headers.get("X-IA2-Project")).toBe(encodeURIComponent(scope.project))
+    expect(request.headers.get("X-IA2-Project-Encoding")).toBe("percent")
+    expect(JSON.parse(request.body)).toEqual({ device: "motion/bus", slave: 1 })
   })
 })

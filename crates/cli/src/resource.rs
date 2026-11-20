@@ -39,7 +39,7 @@ pub(crate) const KINDS: &[(&str, &str)] = &[
     ),
     (
         "edges",
-        "deploy targets (+ edges/<n>/probe|status|logs|scan|system|audit)",
+        "deploy targets (+ edges/<n>/probe|status|logs|scan|system|audit|engineering-state)",
     ),
     ("hmi", "operator screens (JSON docs; see also `cs hmi op`)"),
     ("iomap", "variable ↔ device.channel bindings (one doc)"),
@@ -50,7 +50,7 @@ pub(crate) const KINDS: &[(&str, &str)] = &[
     ("device-catalog", "known-device templates (ls)"),
     (
         "runtime",
-        "runtime/{status,snapshot,forces,history,alarms,alarms-journal}",
+        "runtime/{status,snapshot,forces,history,alarms,alarms-journal,engineering-state}",
     ),
     ("hmi-symbols", "HMI symbol palette contract (get)"),
 ];
@@ -59,7 +59,15 @@ pub(crate) const KINDS: &[(&str, &str)] = &[
 /// API sub-route. Names can't collide because these segments are
 /// reserved within their kind (an edge literally named `logs` would
 /// need `cs api`).
-const EDGE_SUBREADS: &[&str] = &["probe", "status", "logs", "scan", "system", "audit"];
+const EDGE_SUBREADS: &[&str] = &[
+    "probe",
+    "status",
+    "logs",
+    "scan",
+    "system",
+    "audit",
+    "engineering-state",
+];
 
 /// Sub-reads for devices — reserved segments like `EDGE_SUBREADS`.
 /// `describe` is the deterministic per-device agent reference file
@@ -267,14 +275,15 @@ pub(crate) fn resolve_get(path: &str) -> Result<Plan> {
             other => bail!("`cs get project/{other}`: expected project, project/variables or project/pous"),
         },
         "runtime" => match joined.as_str() {
-            "status" | "snapshot" | "forces" | "history" | "alarms" | "alarms-journal" | "retain" | "retain/checkpoint" => {
+            "status" | "snapshot" | "forces" | "history" | "alarms" | "alarms-journal"
+            | "retain" | "retain/checkpoint" | "engineering-state" => {
                 Plan::Get {
                     path: format!("/api/runtime/{joined}"),
                     render: Render::Json,
                 }
             }
             other => bail!(
-                "`cs get runtime/{other}`: expected runtime/status, snapshot, forces, history, alarms, alarms-journal, retain or retain/checkpoint"
+                "`cs get runtime/{other}`: expected runtime/status, snapshot, forces, history, alarms, alarms-journal, retain, retain/checkpoint or engineering-state"
             ),
         },
         "pous" => {
@@ -473,6 +482,27 @@ mod tests {
             "/api/devices/plant%20a%2Fplc1/describe"
         );
         assert_eq!(get_url("hmi/overview"), "/api/hmi/overview");
+    }
+
+    #[test]
+    fn engineering_state_uses_read_only_meta_resources() {
+        assert_eq!(
+            get_url("runtime/engineering-state"),
+            "/api/runtime/engineering-state"
+        );
+        assert_eq!(
+            get_url("edges/plant/edge-a/engineering-state"),
+            "/api/edges/plant%2Fedge-a/engineering-state"
+        );
+        assert!(resolve_set("runtime/engineering-state").is_err());
+        // Existing set/rm grammar addresses a literal edge configuration name,
+        // never the runtime observation resource. Preserve those names.
+        assert!(
+            matches!(resolve_set("edges/edge-a/engineering-state").unwrap(), SetPlan::Doc { name, .. } if name == "edge-a/engineering-state")
+        );
+        assert!(
+            matches!(resolve_rm("edges/edge-a/engineering-state").unwrap(), Plan::Rm { path, .. } if path == "/api/edges/edge-a%2Fengineering-state")
+        );
     }
 
     #[test]

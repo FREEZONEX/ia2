@@ -224,7 +224,7 @@ After deploy, an edge box looks like:
 │   │                                standalone HMI panel (/hmi) from here
 │   ├── 2026-05-12T07-15-00Z/       previous (kept for rollback)
 │   └── _initial/                   install.sh stub
-└── state/                       retain.json + historian segments — sibling of `current`,
+└── state/                       retain.json + historian segments + engineering observations — sibling of `current`,
                                  so a symlink swap never touches it
 ```
 
@@ -539,6 +539,14 @@ grace_secs = 30         # 1..=3600; ignored for "report"
   also contains history and observations. Use the shared RETAIN resolution
   API or the stopped-process `--retain-resolve request.json` entry. See
   [compatibility, loss budgets and rollback](retain-recovery.md).
+- **Engineering observations** live in `$INSTALL_DIR/state/engineering/`
+  (`--state-dir` override applies), outside versioned deployment directories.
+  They survive process restarts, deployment swaps and rollback. The local IDE
+  stores its own evidence under the project’s `state/engineering/`; deploy
+  excludes that directory so local evidence is not shipped as edge observations.
+  Remote GET requires a running HTTP service; for offline inspection, explicitly
+  save its JSON response or copy the archive file. See
+  [engineering state](engineering-state.md).
 - **Hot patch / online change** (Codesys-style in-place code update) is
   not implemented. Deploy is stop → swap → start. Plan downtime.
 - **Real-time**: stock Linux gives soft-RT only; scan jitter is in the

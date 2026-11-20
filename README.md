@@ -268,3 +268,13 @@ budgets](docs/retain-recovery.md). Inspect a declared persistent run through
 `cs get runtime/retain` and `cs get runtime/retain/checkpoint`; the same result is
 visible in the Monitor and edge panel. Legacy files require an explicit,
 source-preserving transition to schema 3.
+
+### Inspect the engineering state
+
+The EtherCAT device editor includes **Engineering state**: explicit read-only
+parameter observations, saved history and position-retention explanations.
+The same evidence is available through `cs get runtime/engineering-state` and
+`cs get edges/<name>/engineering-state`; refresh with `cs api POST` as documented
+in [Engineering state](docs/engineering-state.md). Stored readings carry their
+identity, time and errors. A configured absolute mode is not automatically a
+verified machine reference.

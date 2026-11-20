@@ -13,6 +13,7 @@
 //! drifted — the HMI pulse-reset bug was exactly that class of failure.
 
 pub mod alarms;
+pub mod engineering;
 pub mod history;
 pub mod sdo;
 

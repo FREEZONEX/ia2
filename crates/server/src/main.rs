@@ -339,6 +339,22 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/api/runtime/sdo", get(runtime_routes::runtime_sdo_upload))
         .route(
+            "/api/runtime/engineering-state",
+            get(runtime_routes::engineering_history),
+        )
+        .route(
+            "/api/runtime/engineering-state/refresh",
+            post(runtime_routes::engineering_refresh),
+        )
+        .route(
+            "/api/edges/{name}/engineering-state",
+            get(runtime_routes::edge_engineering_history),
+        )
+        .route(
+            "/api/edges/{name}/engineering-state/refresh",
+            post(runtime_routes::edge_engineering_refresh),
+        )
+        .route(
             "/api/edges/{name}/sdo",
             get(runtime_routes::edge_sdo_upload),
         )

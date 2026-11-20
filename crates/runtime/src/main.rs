@@ -297,6 +297,8 @@ fn sibling_web_dir(project_dir: &Path) -> Option<PathBuf> {
 /// Shared state for the HTTP handlers.
 #[derive(Clone)]
 struct AppState {
+    engineering: Arc<ironplc_bridge::monitor::engineering::EngineeringService>,
+    engineering_dir: PathBuf,
     project_name: String,
     /// PROGRAM instances actually scheduled, derived from tasks.toml.
     /// Reported by /status so attached IDEs / operators can see what's
@@ -473,6 +475,15 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(args.bind)
         .await
         .with_context(|| format!("binding {}", args.bind))?;
+    let local = listener.local_addr()?;
+    // Subprocess callers use the same opt-in announcement as the IDE server.
+    // Report the owned socket before starting any device.
+    if std::env::var("IA2_PRINT_LISTEN_ADDR").as_deref() == Ok("1") {
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
+        writeln!(stdout, "IA2_LISTEN_ADDR={local}")?;
+        stdout.flush()?;
+    }
 
     // ---- Spawn the bridge ----
     let handle: ProgramHandle = ironplc_bridge::spawn_units_with_retain(
@@ -541,6 +552,8 @@ async fn main() -> Result<()> {
 
     let store = Arc::new(store);
     let state = AppState {
+        engineering: Arc::default(),
+        engineering_dir: args.state_dir.join("engineering"),
         project_name,
         program_instances,
         devices: device_names,
@@ -597,6 +610,8 @@ async fn main() -> Result<()> {
             .route("/discover", get(discover))
             .route("/sdo", get(sdo_upload))
             .merge(axis_capture::routes())
+            .route("/engineering-state", get(engineering_history))
+            .route("/engineering-state/refresh", post(engineering_refresh))
             .route("/system", get(system))
             .route("/pause", post(rt_pause))
             .route("/resume", post(rt_resume))
@@ -668,7 +683,7 @@ async fn main() -> Result<()> {
     // Around everything, the standalone panel and its static files included.
     let app = panic_guard::guard_browsers(app, &browser_guard);
 
-    tracing::info!(addr = %args.bind, "monitor server listening");
+    tracing::info!(addr = %local, "monitor server listening");
 
     // Run the HTTP server as a background task. We deliberately do NOT gate
     // shutdown on it via `with_graceful_shutdown`: the long-lived SSE
@@ -2628,4 +2643,34 @@ async fn sdo_upload(
         StatusCode::from_u16(status).expect("SDO status code"),
         Json(body),
     )
+}
+
+async fn engineering_history(State(state): State<AppState>) -> axum::response::Response {
+    match state.engineering.history(state.engineering_dir).await {
+        Ok(history) => Json(history).into_response(),
+        Err(message) => (StatusCode::SERVICE_UNAVAILABLE, message).into_response(),
+    }
+}
+
+async fn engineering_refresh(
+    State(state): State<AppState>,
+    Json(target): Json<ironplc_bridge::monitor::engineering::EngineeringTarget>,
+) -> axum::response::Response {
+    match state
+        .engineering
+        .refresh(
+            state.engineering_dir,
+            state.project_name,
+            target,
+            state.handle,
+        )
+        .await
+    {
+        Ok(result) => Json(result).into_response(),
+        Err((status, message)) => (
+            StatusCode::from_u16(status).expect("engineering status"),
+            message,
+        )
+            .into_response(),
+    }
 }
